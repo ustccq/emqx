@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_mqtt_pubsub_action_info).
@@ -244,7 +232,7 @@ connector_action_config_to_bridge_v1_config(
                     <<"ingress">> =>
                         #{
                             <<"pool_size">> => PoolSize,
-                            <<"remote">> => Params,
+                            <<"remote">> => project_to(Params, "ingress_remote"),
                             <<"local">> => LocalParams
                         }
                 }
@@ -254,3 +242,8 @@ connector_action_config_to_bridge_v1_config(
         <<"resource_opts">> => ResourceOpts
     },
     BridgeV1Conf2.
+
+project_to(Params, ConnectorSchemaRef) ->
+    Fields0 = proplists:get_keys(emqx_bridge_mqtt_connector_schema:fields(ConnectorSchemaRef)),
+    Fields = lists:map(fun emqx_utils_conv:bin/1, Fields0),
+    maps:with(Fields, Params).

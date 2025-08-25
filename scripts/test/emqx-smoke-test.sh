@@ -36,13 +36,20 @@ json_status() {
 
 ## Check if the API docs are available
 check_api_docs() {
+    local attempts=5
     local url="$BASE_URL/api-docs/index.html"
-    local status
-    status="$(curl -s -o /dev/null -w "%{http_code}" "$url")"
-    if [ "$status" != "200" ]; then
-        echo "emqx return non-200 responses($status) on $url"
-        exit 1
-    fi
+    local status="undefined"
+    while [ "$status" != "200" ]; do
+        status="$(curl -s -o /dev/null -w "%{http_code}" "$url")"
+        if [ "$status" != "200" ]; then
+            if [ $attempts -eq 0 ]; then
+                echo "emqx return non-200 responses($status) on $url"
+                exit 1
+            fi
+            sleep 1
+            attempts=$((attempts-1))
+        fi
+    done
 }
 
 ## Check if the swagger.json contains hidden fields
@@ -79,11 +86,10 @@ main() {
     local JSON_STATUS
     JSON_STATUS="$(json_status)"
     check_api_docs
-    ## The json status feature was added after hotconf and bridges schema API
+    ## The json status feature was added after hotconf API
     if [ "$JSON_STATUS" != 'NOT_JSON' ]; then
         check_swagger_json
         check_schema_json hotconf "Hot Conf Schema"
-        check_schema_json bridges "Data Bridge Schema"
         check_schema_json actions "Actions and Sources Schema"
         check_schema_json connectors "Connectors Schema"
     fi

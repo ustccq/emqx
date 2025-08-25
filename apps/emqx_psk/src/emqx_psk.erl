@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_psk).
@@ -54,7 +42,7 @@
 
 %% Data backup
 -export([
-    import_config/1,
+    import_config/2,
     backup_tables/0
 ]).
 
@@ -94,7 +82,7 @@ create_tables() ->
 %% Data backup
 %%------------------------------------------------------------------------------
 
-backup_tables() -> [?TAB].
+backup_tables() -> {<<"psk">>, [?TAB]}.
 
 %%------------------------------------------------------------------------------
 %% APIs
@@ -129,14 +117,14 @@ stop() ->
 %% Data backup
 %%------------------------------------------------------------------------------
 
-import_config(#{<<"psk_authentication">> := PskConf}) ->
+import_config(_Namespace, #{<<"psk_authentication">> := PskConf}) ->
     case emqx_conf:update([psk_authentication], PskConf, #{override_to => cluster}) of
         {ok, _} ->
             {ok, #{root_key => psk_authentication, changed => []}};
         Error ->
             {error, #{root_key => psk_authentication, reason => Error}}
     end;
-import_config(_RawConf) ->
+import_config(_Namespace, _RawConf) ->
     {ok, #{root_key => psk_authentication, changed => []}}.
 
 post_config_update([?PSK_KEY], _Req, #{enable := Enable} = NewConf, _OldConf, _AppEnvs) ->

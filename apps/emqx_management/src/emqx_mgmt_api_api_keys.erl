@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_api_keys).
 
@@ -200,6 +188,11 @@ api_key(post, #{body := App}) ->
     case emqx_mgmt_auth:create(Name, Enable, ExpiredAt, Desc, Role) of
         {ok, NewApp} ->
             {200, emqx_mgmt_auth:format(NewApp)};
+        {error, Reason} when is_map(Reason) ->
+            {400, #{
+                code => 'BAD_REQUEST',
+                message => Reason
+            }};
         {error, Reason} ->
             {400, #{
                 code => 'BAD_REQUEST',
@@ -229,6 +222,8 @@ api_key_by_name(put, #{bindings := #{name := Name}, body := Body}) ->
             {200, emqx_mgmt_auth:format(App)};
         {error, not_found} ->
             {404, ?NOT_FOUND_RESPONSE};
+        {error, Reason} when is_binary(Reason) ->
+            {400, #{code => 'BAD_REQUEST', message => Reason}};
         {error, Reason} ->
             {400, #{
                 code => 'BAD_REQUEST',
@@ -239,8 +234,6 @@ api_key_by_name(put, #{bindings := #{name := Name}, body := Body}) ->
 ensure_expired_at(#{<<"expired_at">> := ExpiredAt}) when is_integer(ExpiredAt) -> ExpiredAt;
 ensure_expired_at(_) -> infinity.
 
--if(?EMQX_RELEASE_EDITION == ee).
-
 app_extend_fields() ->
     [
         {role,
@@ -248,13 +241,11 @@ app_extend_fields() ->
                 desc => ?DESC(role),
                 default => ?ROLE_API_DEFAULT,
                 example => ?ROLE_API_DEFAULT,
-                validator => fun emqx_dashboard_rbac:valid_api_role/1
+                validator => fun(Role) ->
+                    maybe
+                        {ok, _} ?= emqx_dashboard_rbac:parse_api_role(Role),
+                        ok
+                    end
+                end
             })}
     ].
-
--else.
-
-app_extend_fields() ->
-    [].
-
--endif.

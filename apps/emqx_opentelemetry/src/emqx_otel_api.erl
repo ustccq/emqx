@@ -1,27 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_otel_api).
 
 -behaviour(minirest_api).
 
 -include_lib("hocon/include/hoconsc.hrl").
--include_lib("emqx/include/http_api.hrl").
-
--import(hoconsc, [ref/2]).
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
 
 -export([
     api_spec/0,
@@ -97,7 +82,7 @@ get_raw() ->
 
 otel_config_schema() ->
     emqx_dashboard_swagger:schema_with_example(
-        ref(emqx_otel_schema, "opentelemetry"),
+        hoconsc:ref(emqx_otel_schema, "opentelemetry"),
         otel_config_example()
     ).
 
@@ -105,6 +90,7 @@ otel_config_example() ->
     #{
         exporter => #{
             endpoint => "http://localhost:4317",
+            headers => #{},
             ssl_options => #{}
         },
         logs => #{
@@ -116,6 +102,21 @@ otel_config_example() ->
         },
         traces => #{
             enable => true,
-            filter => #{trace_all => false}
+            max_queue_size => 2048,
+            scheduled_delay => "5s",
+            filter => #{
+                trace_all => false,
+                trace_mode => legacy,
+                e2e_tracing_options => #{
+                    attribute_meta_value => "emqxcl",
+                    msg_trace_level => 0,
+                    clientid_match_rules_max => 30,
+                    topic_match_rules_max => 30,
+                    sample_ratio => "10%",
+                    client_connect_disconnect => true,
+                    client_subscribe_unsubscribe => true,
+                    client_publish => true
+                }
+            }
         }
     }.

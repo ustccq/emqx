@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Gateway Interface Module for HTTP-APIs
@@ -85,7 +73,8 @@
 -elvis([
     {elvis_style, god_modules, disable},
     {elvis_style, no_nested_try_catch, disable},
-    {elvis_style, invalid_dynamic_call, disable}
+    {elvis_style, invalid_dynamic_call, disable},
+    {elvis_style, no_catch_expressions, disable}
 ]).
 
 -define(DEFAULT_CALL_TIMEOUT, 15000).
@@ -135,7 +124,9 @@ gateways(Status) ->
     end.
 
 gateway_status(GwName) ->
-    case emqx_gateway:lookup(GwName) of
+    case emqx_gateway:is_gateway_app_started() andalso emqx_gateway:lookup(GwName) of
+        false ->
+            #{node => node(), status => unloaded};
         undefined ->
             #{node => node(), status => unloaded};
         #{status := Status, config := Config} ->
@@ -340,7 +331,8 @@ list_client_subscriptions(GwName, ClientId) ->
             {ok,
                 lists:map(
                     fun({Topic, SubOpts}) ->
-                        SubOpts#{topic => Topic}
+                        Topic1 = emqx_topic:maybe_format_share(Topic),
+                        SubOpts#{topic => Topic1}
                     end,
                     Subs
                 )}
@@ -490,13 +482,8 @@ reason2msg(
         "The authentication already exist on ~s",
         [listener_id(GwName, LType, LName)]
     );
-reason2msg(
-    {bad_ssl_config, #{
-        reason := Reason,
-        which_options := Options
-    }}
-) ->
-    fmtstr("Bad TLS configuration for ~p, reason: ~s", [Options, Reason]);
+reason2msg({bad_ssl_config, Reason}) ->
+    fmtstr("Bad TLS configuration: ~0p", [Reason]);
 reason2msg(
     {#{roots := [{gateway, _}]}, [_ | _]} = Error
 ) ->

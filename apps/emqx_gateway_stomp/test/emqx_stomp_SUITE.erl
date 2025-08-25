@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_stomp_SUITE).
@@ -93,7 +81,7 @@ default_config() ->
 stomp_ver() ->
     ?STOMP_VER.
 
-restart_stomp_with_mountpoint(Mountpoint) ->
+update_stomp_with_mountpoint(Mountpoint) ->
     Conf = emqx:get_raw_config([gateway, stomp]),
     emqx_gateway_conf:update_gateway(
         stomp,
@@ -107,11 +95,18 @@ restart_stomp_with_mountpoint(Mountpoint) ->
 t_connect(_) ->
     %% Successful connect
     ConnectSucced = fun(Sock) ->
+        emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
         ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
         {ok, Frame} = recv_a_frame(Sock),
         ?assertMatch(<<"CONNECTED">>, Frame#stomp_frame.command),
         ?assertEqual(
             <<"2000,1000">>, proplists:get_value(<<"heart-beat">>, Frame#stomp_frame.headers)
+        ),
+
+        ?assertMatch(
+            ['client.connect' | _],
+            emqx_gateway_test_utils:collect_emqx_hooks_calls()
         ),
 
         ok = send_disconnect_frame(Sock, <<"12345">>),
@@ -178,8 +173,32 @@ t_auth_expire(_) ->
     with_connection(ConnectWithExpire),
     meck:unload(emqx_access_control).
 
+t_auth_failed(_) ->
+    ok = meck:new(emqx_access_control, [passthrough, no_history]),
+    ok = meck:expect(
+        emqx_access_control,
+        authenticate,
+        fun(_) ->
+            {error, not_authenticated}
+        end
+    ),
+
+    %% restart gateway to clear the shutdown count history
+    emqx_gateway:stop(stomp),
+    emqx_gateway:start(stomp),
+
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"guest">>, <<"guest">>, <<"1000,2000">>),
+        {ok, Frame} = recv_a_frame(Sock),
+        ?assertMatch(#stomp_frame{command = <<"ERROR">>}, Frame),
+
+        ListenerId = {'stomp:tcp:default', 61613},
+        ?assertEqual([{not_authenticated, 1}], esockd:get_shutdown_count(ListenerId))
+    end),
+    meck:unload(emqx_access_control).
+
 t_heartbeat(_) ->
-    %% Test heart beat
+    %% Test heartbeat
     with_connection(fun(Sock) ->
         gen_tcp:send(
             Sock,
@@ -950,6 +969,9 @@ t_rest_clientid_info(_) ->
             StompClient
         ),
 
+        %% assert keepalive
+        ?assertEqual(10, maps:get(keepalive, StompClient)),
+
         %% sub & unsub
         {200, []} = request(get, ClientPath ++ "/subscriptions"),
         ok = send_subscribe_frame(Sock, 0, <<"/queue/foo">>),
@@ -1062,7 +1084,7 @@ t_authn_superuser(_) ->
     meck:unload(emqx_access_control).
 
 t_mountpoint(_) ->
-    restart_stomp_with_mountpoint(<<"stomp/">>),
+    update_stomp_with_mountpoint(<<"stomp/">>),
 
     PubSub = fun(Sock) ->
         ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
@@ -1126,7 +1148,22 @@ t_mountpoint(_) ->
     with_connection(PubSub),
     with_connection(PubToMqtt),
     with_connection(ReceiveMsgFromMqtt),
-    restart_stomp_with_mountpoint(<<>>).
+    update_stomp_with_mountpoint(<<>>).
+
+t_update_not_restart_listener(_) ->
+    update_stomp_with_mountpoint(<<"stomp/">>),
+    with_connection(fun(Sock) ->
+        ok = send_connection_frame(Sock, <<"user1">>, <<"public">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"CONNECTED">>}}, recv_a_frame(Sock)),
+
+        update_stomp_with_mountpoint(<<>>),
+
+        %% send successfully means the listener is not restarted
+        ok = send_message_frame(Sock, <<"t/a">>, <<"hello">>),
+        ?assertMatch({ok, #stomp_frame{command = <<"RECEIPT">>}}, recv_a_frame(Sock)),
+
+        ok = send_disconnect_frame(Sock)
+    end).
 
 %% TODO: Mountpoint, AuthChain, Authorization + Mountpoint, ClientInfoOverride,
 %%       Listeners, Metrics, Stats, ClientInfo
@@ -1215,7 +1252,7 @@ get_field(body, #stomp_frame{body = Body}) ->
     Body.
 
 send_connection_frame(Sock, Username, Password) ->
-    send_connection_frame(Sock, Username, Password, <<"0,0">>).
+    send_connection_frame(Sock, Username, Password, <<"10000,10000">>).
 
 send_connection_frame(Sock, Username, Password, Heartbeat) ->
     Headers =

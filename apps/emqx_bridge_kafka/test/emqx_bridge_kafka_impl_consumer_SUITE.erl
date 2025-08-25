@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_kafka_impl_consumer_SUITE).
 
@@ -11,13 +11,13 @@
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("brod/include/brod.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
 -define(BRIDGE_TYPE_BIN, <<"kafka_consumer">>).
 -define(CONNECTOR_TYPE_BIN, <<"kafka_consumer">>).
 -define(SOURCE_TYPE_BIN, <<"kafka_consumer">>).
--define(APPS, [emqx_bridge, emqx_resource, emqx_rule_engine, emqx_bridge_kafka]).
 
 %%------------------------------------------------------------------------------
 %% CT boilerplate
@@ -68,6 +68,7 @@ testcases(sasl_auth_kerberos) ->
 testcases(once) ->
     %% tests that do not need to be run on all groups
     [
+        t_receive_after_recovery,
         t_begin_offset_earliest,
         t_bridge_rule_action_source,
         t_cluster_group,
@@ -81,7 +82,6 @@ testcases(once) ->
     ].
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:clear_screen(),
     Apps = emqx_cth_suite:start(
         [
             emqx,
@@ -94,7 +94,10 @@ init_per_suite(Config) ->
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    {ok, _Api} = emqx_common_test_http:create_default_app(),
+    %% In CI, Kafka may take a while longer to reach an usable state.  If we run the test
+    %% suites too soon, we may get some flaky failures with error messages like these:
+    %% "The coordinator is not available."
+    emqx_bridge_kafka_impl_producer_SUITE:wait_until_kafka_is_up(15),
     [
         {apps, Apps},
         {bridge_type, <<"kafka_consumer">>}
@@ -112,11 +115,13 @@ init_per_group(plain = Type, Config) ->
     DirectKafkaHost = os:getenv("KAFKA_DIRECT_PLAIN_HOST", "kafka-1.emqx.net"),
     DirectKafkaPort = list_to_integer(os:getenv("KAFKA_DIRECT_PLAIN_PORT", "9092")),
     ProxyName = "kafka_plain",
+    ProxyName2 = "kafka_2_plain",
     case emqx_common_test_helpers:is_tcp_server_available(KafkaHost, KafkaPort) of
         true ->
             Config1 = common_init_per_group(),
             [
                 {proxy_name, ProxyName},
+                {proxy_name_2, ProxyName2},
                 {kafka_host, KafkaHost},
                 {kafka_port, KafkaPort},
                 {direct_kafka_host, DirectKafkaHost},
@@ -140,11 +145,13 @@ init_per_group(sasl_plain = Type, Config) ->
     DirectKafkaHost = os:getenv("KAFKA_DIRECT_SASL_HOST", "kafka-1.emqx.net"),
     DirectKafkaPort = list_to_integer(os:getenv("KAFKA_DIRECT_SASL_PORT", "9093")),
     ProxyName = "kafka_sasl_plain",
+    ProxyName2 = "kafka_2_sasl_plain",
     case emqx_common_test_helpers:is_tcp_server_available(KafkaHost, KafkaPort) of
         true ->
             Config1 = common_init_per_group(),
             [
                 {proxy_name, ProxyName},
+                {proxy_name_2, ProxyName2},
                 {kafka_host, KafkaHost},
                 {kafka_port, KafkaPort},
                 {direct_kafka_host, DirectKafkaHost},
@@ -168,11 +175,13 @@ init_per_group(ssl = Type, Config) ->
     DirectKafkaHost = os:getenv("KAFKA_DIRECT_SSL_HOST", "kafka-1.emqx.net"),
     DirectKafkaPort = list_to_integer(os:getenv("KAFKA_DIRECT_SSL_PORT", "9094")),
     ProxyName = "kafka_ssl",
+    ProxyName2 = "kafka_2_ssl",
     case emqx_common_test_helpers:is_tcp_server_available(KafkaHost, KafkaPort) of
         true ->
             Config1 = common_init_per_group(),
             [
                 {proxy_name, ProxyName},
+                {proxy_name_2, ProxyName2},
                 {kafka_host, KafkaHost},
                 {kafka_port, KafkaPort},
                 {direct_kafka_host, DirectKafkaHost},
@@ -196,11 +205,13 @@ init_per_group(sasl_ssl = Type, Config) ->
     DirectKafkaHost = os:getenv("KAFKA_DIRECT_SASL_SSL_HOST", "kafka-1.emqx.net"),
     DirectKafkaPort = list_to_integer(os:getenv("KAFKA_DIRECT_SASL_SSL_PORT", "9095")),
     ProxyName = "kafka_sasl_ssl",
+    ProxyName2 = "kafka_2_sasl_ssl",
     case emqx_common_test_helpers:is_tcp_server_available(KafkaHost, KafkaPort) of
         true ->
             Config1 = common_init_per_group(),
             [
                 {proxy_name, ProxyName},
+                {proxy_name_2, ProxyName2},
                 {kafka_host, KafkaHost},
                 {kafka_port, KafkaPort},
                 {direct_kafka_host, DirectKafkaHost},
@@ -394,6 +405,7 @@ end_per_testcase(_Testcase, Config) ->
     ProxyPort = ?config(proxy_port, Config),
     ProducersConfigs = ?config(kafka_producers, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_bridge_v2_testlib:delete_all_rules(),
     emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     #{clientid := KafkaProducerClientId, producers := ProducersMapping} =
         ProducersConfigs,
@@ -477,7 +489,7 @@ do_start_producer(KafkaClientId, KafkaTopic) ->
     ProducerConfig =
         #{
             name => Name,
-            partitioner => roundrobin,
+            partitioner => random,
             partition_count_refresh_interval_seconds => 1_000,
             replayq_max_total_bytes => 10_000,
             replayq_seg_bytes => 9_000,
@@ -537,8 +549,12 @@ ensure_topics(Config) ->
                 ConnConfig0#{sasl => undefined}
         end,
     case brod:create_topics(Endpoints, TopicConfigs, RequestConfig, ConnConfig) of
-        ok -> ok;
-        {error, topic_already_exists} -> ok
+        ok ->
+            %% Need some time for all brokers to stabilize...
+            ct:sleep(500),
+            ok;
+        {error, topic_already_exists} ->
+            ok
     end.
 
 shared_secret_path() ->
@@ -601,8 +617,7 @@ kafka_config(TestCase, _KafkaType, Config) ->
             "    max_batch_bytes = 896KB\n"
             "    max_rejoin_attempts = 5\n"
             "    offset_commit_interval_seconds = 3s\n"
-            %% todo: matrix this
-            "    offset_reset_policy = latest\n"
+            "    offset_reset_policy = earliest\n"
             "  }\n"
             "~s"
             "  key_encoding_mode = none\n"
@@ -692,7 +707,7 @@ create_bridge(Config, Overrides) ->
     Name = ?config(kafka_name, Config),
     KafkaConfig0 = ?config(kafka_config, Config),
     KafkaConfig = emqx_utils_maps:deep_merge(KafkaConfig0, Overrides),
-    emqx_bridge:create(Type, Name, KafkaConfig).
+    emqx_bridge_testlib:create_bridge_api(Type, Name, KafkaConfig).
 
 create_bridge_wait_for_balance(Config) ->
     setup_group_subscriber_spy(self()),
@@ -724,7 +739,7 @@ create_bridge_api(Config, Overrides) ->
     Res =
         case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params, Opts) of
             {ok, {Status, Headers, Body0}} ->
-                {ok, {Status, Headers, emqx_utils_json:decode(Body0, [return_maps])}};
+                {ok, {Status, Headers, emqx_utils_json:decode(Body0)}};
             Error ->
                 Error
         end,
@@ -747,7 +762,7 @@ update_bridge_api(Config, Overrides) ->
     ct:pal("updating bridge (via http): ~p", [Params]),
     Res =
         case emqx_mgmt_api_test_util:request_api(put, Path, "", AuthHeader, Params, Opts) of
-            {ok, {_Status, _Headers, Body0}} -> {ok, emqx_utils_json:decode(Body0, [return_maps])};
+            {ok, {_Status, _Headers, Body0}} -> {ok, emqx_utils_json:decode(Body0)};
             Error -> Error
         end,
     ct:pal("bridge update result: ~p", [Res]),
@@ -783,7 +798,7 @@ do_wait_for_expected_published_messages(Messages, Acc, _Timeout) when map_size(M
 do_wait_for_expected_published_messages(Messages0, Acc0, Timeout) ->
     receive
         {publish, Msg0 = #{payload := Payload}} ->
-            case emqx_utils_json:safe_decode(Payload, [return_maps]) of
+            case emqx_utils_json:safe_decode(Payload) of
                 {error, _} ->
                     ct:pal("unexpected message: ~p; discarding", [Msg0]),
                     do_wait_for_expected_published_messages(Messages0, Acc0, Timeout);
@@ -827,6 +842,36 @@ receive_published(#{n := N, timeout := Timeout} = Opts, Acc) ->
                 msgs_so_far => Acc,
                 mailbox => process_info(self(), messages),
                 expected_remaining => N
+            }}
+        )
+    end.
+
+receive_published_payloads(Opts0) ->
+    Default = #{n => 1, timeout => 10_000},
+    #{expected := Expected0} = Opts = maps:merge(Default, Opts0),
+    Expected = maps:from_keys(Expected0, true),
+    receive_published_payloads(Expected, Opts, []).
+
+receive_published_payloads(Expected, _Opts, Acc) when map_size(Expected) == 0 ->
+    lists:reverse(Acc);
+receive_published_payloads(Expected0, Opts, Acc) ->
+    #{timeout := Timeout} = Opts,
+    receive
+        {publish, #{payload := Payload0} = Msg} ->
+            case emqx_utils_json:decode(Payload0) of
+                #{<<"value">> := V} when is_map_key(V, Expected0) ->
+                    Expected = maps:remove(V, Expected0),
+                    receive_published_payloads(Expected, Opts, [Msg | Acc]);
+                #{} ->
+                    ct:pal("unexpected publish:\n  ~p", [Msg]),
+                    receive_published_payloads(Expected0, Opts, Acc)
+            end
+    after Timeout ->
+        error(
+            {timeout, #{
+                msgs_so_far => lists:reverse(Acc),
+                mailbox => process_info(self(), messages),
+                expected_remaining => Expected0
             }}
         )
     end.
@@ -885,7 +930,8 @@ ensure_connected(Config) ->
 consumer_clientid(Config) ->
     BridgeType = ?config(bridge_type, Config),
     KafkaName = ?config(kafka_name, Config),
-    binary_to_atom(emqx_bridge_kafka_impl:make_client_id(BridgeType, KafkaName)).
+    ConnResId = emqx_connector_resource:resource_id(?global_ns, BridgeType, KafkaName),
+    emqx_bridge_kafka_impl_consumer:make_client_id(ConnResId).
 
 get_client_connection(Config) ->
     KafkaHost = ?config(kafka_host, Config),
@@ -936,7 +982,7 @@ create_rule_and_action_http(Config) ->
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     ct:pal("rule action params: ~p", [Params]),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -1010,7 +1056,7 @@ setup_group_subscriber_spy_fn() ->
 
 setup_group_subscriber_spy(TestPid) ->
     ok = meck:new(brod_group_subscriber_v2, [
-        passthrough, no_link, no_history, non_strict
+        passthrough, no_link, no_history
     ]),
     ok = meck:expect(
         brod_group_subscriber_v2,
@@ -1036,15 +1082,6 @@ setup_group_subscriber_spy(TestPid) ->
 kill_group_subscriber_spy() ->
     meck:unload(brod_group_subscriber_v2).
 
-wait_for_cluster_rpc(Node) ->
-    %% need to wait until the config handler is ready after
-    %% restarting during the cluster join.
-    ?retry(
-        _Sleep0 = 100,
-        _Attempts0 = 50,
-        true = is_pid(erpc:call(Node, erlang, whereis, [emqx_config_handler]))
-    ).
-
 setup_and_start_listeners(Node, NodeOpts) ->
     erpc:call(
         Node,
@@ -1069,39 +1106,41 @@ setup_and_start_listeners(Node, NodeOpts) ->
         end
     ).
 
-cluster(Config) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    ExtraEnvHandlerHook = setup_group_subscriber_spy_fn(),
-    Cluster = emqx_common_test_helpers:emqx_cluster(
-        [core, core],
+cluster(TestCase, Config) ->
+    AppSpecs = [
+        emqx_conf,
+        emqx_rule_engine,
+        {emqx_bridge_kafka, #{after_start => setup_group_subscriber_spy_fn()}},
+        emqx_bridge
+    ],
+    NodeSpecs = emqx_cth_cluster:mk_nodespecs(
         [
-            {apps, [emqx_conf, emqx_rule_engine, emqx_bridge_kafka, emqx_bridge]},
-            {listener_ports, []},
-            {priv_data_dir, PrivDataDir},
-            {load_schema, true},
-            {start_autocluster, true},
-            {schema_mod, emqx_enterprise_schema},
-            {load_apps, [emqx_machine]},
-            {env_handler, fun
-                (emqx) ->
-                    application:set_env(emqx, boot_modules, [broker]),
-                    ExtraEnvHandlerHook(),
-                    ok;
-                (emqx_conf) ->
-                    ok;
-                (_) ->
-                    ok
-            end}
-        ]
+            {node_name(TestCase, 1), #{
+                apps => AppSpecs ++
+                    [
+                        emqx_management,
+                        emqx_mgmt_api_test_util:emqx_dashboard(
+                            "dashboard.listeners.http.bind = 28083"
+                        )
+                    ]
+            }},
+            {node_name(TestCase, 2), #{
+                apps => AppSpecs ++
+                    [
+                        emqx_management,
+                        emqx_mgmt_api_test_util:emqx_dashboard(
+                            "dashboard.listeners.http.bind = 28084"
+                        )
+                    ]
+            }}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
     ),
-    ct:pal("cluster: ~p", [Cluster]),
-    Cluster.
+    ct:pal("cluster: ~p", [NodeSpecs]),
+    NodeSpecs.
 
-start_peer(Name, Opts) ->
-    Node = emqx_common_test_helpers:start_peer(Name, Opts),
-    % Make it possible to call `ct:pal` and friends (if running under rebar3)
-    _ = emqx_cth_cluster:share_load_module(Node, cthr),
-    Node.
+node_name(TestCase, N) ->
+    binary_to_atom(iolist_to_binary(io_lib:format("~s_~b", [TestCase, N]))).
 
 start_async_publisher(Config, KafkaTopic) ->
     TId = ets:new(kafka_payloads, [public, ordered_set]),
@@ -1156,6 +1195,21 @@ health_check(Node, Config) ->
         #{status := Status} = emqx_bridge_v2_testlib:health_check_channel(Config),
         {ok, Status}
     end).
+
+get_mqtt_port(Node) ->
+    {_IP, Port} = erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]]),
+    Port.
+
+with_brokers_down(Config, Fun) ->
+    ProxyName1 = ?config(proxy_name, Config),
+    ProxyName2 = ?config(proxy_name_2, Config),
+    ProxyHost = ?config(proxy_host, Config),
+    ProxyPort = ?config(proxy_port, Config),
+    emqx_common_test_helpers:with_failure(
+        down, ProxyName1, ProxyHost, ProxyPort, fun() ->
+            emqx_common_test_helpers:with_failure(down, ProxyName2, ProxyHost, ProxyPort, Fun)
+        end
+    ).
 
 %%------------------------------------------------------------------------------
 %% Testcases
@@ -1228,7 +1282,7 @@ t_start_and_consume_ok(Config) ->
                     <<"offset">> := OffsetReply,
                     <<"headers">> := #{<<"hkey">> := <<"hvalue">>}
                 },
-                emqx_utils_json:decode(PayloadBin, [return_maps]),
+                emqx_utils_json:decode(PayloadBin),
                 #{
                     offset_reply => OffsetReply,
                     kafka_topic => KafkaTopic,
@@ -1341,7 +1395,7 @@ t_multiple_topic_mappings(Config) ->
             %% as configured.
             Payloads =
                 lists:sort([
-                    case emqx_utils_json:safe_decode(P, [return_maps]) of
+                    case emqx_utils_json:safe_decode(P) of
                         {ok, Decoded} -> Decoded;
                         {error, _} -> P
                     end
@@ -1484,7 +1538,7 @@ t_failed_creation_then_fixed(Config) ->
             <<"offset">> := _,
             <<"headers">> := #{<<"hkey">> := <<"hvalue">>}
         },
-        emqx_utils_json:decode(PayloadBin, [return_maps]),
+        emqx_utils_json:decode(PayloadBin),
         #{
             kafka_topic => KafkaTopic,
             payload => Payload
@@ -1497,9 +1551,6 @@ t_failed_creation_then_fixed(Config) ->
 %% consume the messages produced during the down time.
 t_receive_after_recovery(Config) ->
     ct:timetrap(120_000),
-    ProxyPort = ?config(proxy_port, Config),
-    ProxyHost = ?config(proxy_host, Config),
-    ProxyName = ?config(proxy_name, Config),
     MQTTTopic = ?config(mqtt_topic, Config),
     NPartitions = ?config(num_partitions, Config),
     KafkaName = ?config(kafka_name, Config),
@@ -1520,7 +1571,7 @@ t_receive_after_recovery(Config) ->
                     key => <<"commit", (integer_to_binary(N))/binary>>,
                     value => <<"commit", (integer_to_binary(N))/binary>>
                 }
-             || N <- lists:seq(1, NPartitions)
+             || N <- lists:seq(1, NPartitions * 10)
             ],
             %% we do distinct passes over this producing part so that
             %% wolff won't batch everything together.
@@ -1557,8 +1608,7 @@ t_receive_after_recovery(Config) ->
             %% 1) cut the connection with kafka.
             WorkerRefs = maps:from_list([
                 {monitor(process, Pid), Pid}
-             || {_TopicPartition, Pid} <-
-                    maps:to_list(get_subscriber_workers())
+             || Pid <- maps:values(get_subscriber_workers())
             ]),
             NumMsgs = 50,
             Messages1 = [
@@ -1575,7 +1625,7 @@ t_receive_after_recovery(Config) ->
             on_exit(fun() -> emqtt:stop(C) end),
             {ok, _} = emqtt:connect(C),
             {ok, _, [0]} = emqtt:subscribe(C, MQTTTopic),
-            emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
+            with_brokers_down(Config, fun() ->
                 wait_downs(WorkerRefs, _Timeout2 = 1_000),
                 %% 2) publish messages while the consumer is down.
                 %% we use `pmap' to avoid wolff sending the whole
@@ -1621,8 +1671,7 @@ t_bridge_rule_action_source(Config) ->
             {ok, _} = create_bridge(Config),
             ping_until_healthy(Config, _Period = 1_500, _Timeout = 24_000),
 
-            {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
+            {ok, _} = create_rule_and_action_http(Config),
 
             RepublishTopic = <<"republish/", MQTTTopic/binary>>,
             {ok, C} = emqtt:start_link([{proto_ver, v5}]),
@@ -1673,7 +1722,7 @@ t_bridge_rule_action_source(Config) ->
                     <<"headers">> := #{<<"hkey">> := <<"hvalue">>},
                     <<"topic">> := KafkaTopic
                 },
-                emqx_utils_json:decode(RawPayload, [return_maps])
+                emqx_utils_json:decode(RawPayload)
             ),
             ?retry(
                 _Interval = 200,
@@ -1764,29 +1813,16 @@ t_cluster_group(Config) ->
     KafkaTopic = ?config(kafka_topic, Config),
     KafkaName = ?config(kafka_name, Config),
     BridgeId = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_BIN, KafkaName),
-    Cluster = cluster(Config),
+    Cluster = cluster(?FUNCTION_NAME, Config),
     ?check_trace(
         begin
-            Nodes =
-                [_N1, N2 | _] = [
-                    start_peer(Name, Opts)
-                 || {Name, Opts} <- Cluster
-                ],
-            on_exit(fun() ->
-                emqx_utils:pmap(
-                    fun(N) ->
-                        ct:pal("stopping ~p", [N]),
-                        ok = emqx_common_test_helpers:stop_peer(N)
-                    end,
-                    Nodes
-                )
-            end),
+            Nodes = [_N1, N2 | _] = emqx_cth_cluster:start(Cluster),
+            on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
             {ok, SRef0} = snabbkaffe:subscribe(
                 ?match_event(#{?snk_kind := kafka_consumer_subscriber_started}),
                 length(Nodes),
                 15_000
             ),
-            wait_for_cluster_rpc(N2),
             erpc:call(N2, fun() -> {ok, _} = create_bridge(Config) end),
             {ok, _} = snabbkaffe:receive_events(SRef0),
             lists:foreach(
@@ -1846,15 +1882,15 @@ t_node_joins_existing_cluster(Config) ->
     KafkaTopic = ?config(kafka_topic, Config),
     KafkaName = ?config(kafka_name, Config),
     BridgeId = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_BIN, KafkaName),
-    Cluster = cluster(Config),
+    Cluster = cluster(?FUNCTION_NAME, Config),
     ?check_trace(
         begin
-            [{Name1, Opts1}, {Name2, Opts2} | _] = Cluster,
-            ct:pal("starting ~p", [Name1]),
-            N1 = start_peer(Name1, Opts1),
+            [NodeSpec1, NodeSpec2 | _] = Cluster,
+            ct:pal("starting ~p", [NodeSpec1]),
+            [N1] = emqx_cth_cluster:start([NodeSpec1]),
             on_exit(fun() ->
                 ct:pal("stopping ~p", [N1]),
-                ok = emqx_common_test_helpers:stop_peer(N1)
+                ok = emqx_cth_cluster:stop([N1])
             end),
             {{ok, _}, {ok, _}} =
                 ?wait_async_action(
@@ -1881,8 +1917,7 @@ t_node_joins_existing_cluster(Config) ->
             ),
 
             %% Now, we start the second node and have it join the cluster.
-            setup_and_start_listeners(N1, Opts1),
-            TCPPort1 = emqx_common_test_helpers:listener_port(Opts1, tcp),
+            TCPPort1 = get_mqtt_port(N1),
             {ok, C1} = emqtt:start_link([{port, TCPPort1}, {proto_ver, v5}]),
             on_exit(fun() -> catch emqtt:stop(C1) end),
             {ok, _} = emqtt:connect(C1),
@@ -1893,14 +1928,13 @@ t_node_joins_existing_cluster(Config) ->
                 1,
                 30_000
             ),
-            ct:pal("starting ~p", [Name2]),
-            N2 = start_peer(Name2, Opts2),
+            ct:pal("starting ~p", [NodeSpec2]),
+            [N2] = emqx_cth_cluster:start([NodeSpec2]),
             on_exit(fun() ->
                 ct:pal("stopping ~p", [N2]),
-                ok = emqx_common_test_helpers:stop_peer(N2)
+                ok = emqx_cth_cluster:stop([N2])
             end),
             Nodes = [N1, N2],
-            wait_for_cluster_rpc(N2),
 
             {ok, _} = snabbkaffe:receive_events(SRef0),
             ?retry(
@@ -1918,13 +1952,14 @@ t_node_joins_existing_cluster(Config) ->
                 _Attempts2 = 50,
                 [] =/= erpc:call(N2, emqx_router, lookup_routes, [MQTTTopic])
             ),
+            NumMsgs = 50 * NPartitions,
             {ok, SRef1} =
                 snabbkaffe:subscribe(
                     ?match_event(#{
                         ?snk_kind := kafka_consumer_handle_message,
                         ?snk_span := {complete, _}
                     }),
-                    NPartitions,
+                    NumMsgs,
                     20_000
                 ),
             lists:foreach(
@@ -1933,7 +1968,7 @@ t_node_joins_existing_cluster(Config) ->
                     Val = <<"v", (integer_to_binary(N))/binary>>,
                     publish(Config, KafkaTopic, [#{key => Key, value => Val}])
                 end,
-                lists:seq(1, NPartitions)
+                lists:seq(1, NumMsgs)
             ),
             {ok, _} = snabbkaffe:receive_events(SRef1),
 
@@ -1977,41 +2012,22 @@ t_cluster_node_down(Config) ->
     KafkaTopic = ?config(kafka_topic, Config),
     KafkaName = ?config(kafka_name, Config),
     BridgeId = emqx_bridge_resource:bridge_id(?BRIDGE_TYPE_BIN, KafkaName),
-    Cluster = cluster(Config),
+    Cluster = cluster(?FUNCTION_NAME, Config),
     ?check_trace(
         begin
-            {_N2, Opts2} = lists:nth(2, Cluster),
-            NumNodes = length(Cluster),
-            Nodes =
-                [N1, N2 | _] =
-                lists:map(
-                    fun({Name, Opts}) ->
-                        ct:pal("starting ~p", [Name]),
-                        start_peer(Name, Opts)
-                    end,
-                    Cluster
-                ),
-            on_exit(fun() ->
-                emqx_utils:pmap(
-                    fun(N) ->
-                        ct:pal("stopping ~p", [N]),
-                        ok = emqx_common_test_helpers:stop_peer(N)
-                    end,
-                    Nodes
-                )
-            end),
+            Nodes = [N1, N2 | _] = emqx_cth_cluster:start(Cluster),
+            on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
             {ok, SRef0} = snabbkaffe:subscribe(
                 ?match_event(#{?snk_kind := kafka_consumer_subscriber_started}),
                 length(Nodes),
                 15_000
             ),
-            wait_for_cluster_rpc(N2),
-            {ok, _} = snabbkaffe:block_until(
-                %% -1 because only those that join the first node will emit the event.
-                ?match_n_events(NumNodes - 1, #{?snk_kind := emqx_machine_boot_apps_started}),
-                30_000
-            ),
-            erpc:call(N2, fun() -> {ok, _} = create_bridge(Config) end),
+            erpc:call(N2, fun() ->
+                {ok, _} = create_bridge(
+                    Config,
+                    #{<<"kafka">> => #{<<"offset_reset_policy">> => <<"earliest">>}}
+                )
+            end),
             {ok, _} = snabbkaffe:receive_events(SRef0),
             lists:foreach(
                 fun(N) ->
@@ -2031,8 +2047,7 @@ t_cluster_node_down(Config) ->
 
             %% Now, we stop one of the nodes and watch the group
             %% rebalance.
-            setup_and_start_listeners(N2, Opts2),
-            TCPPort = emqx_common_test_helpers:listener_port(Opts2, tcp),
+            TCPPort = get_mqtt_port(N2),
             {ok, C} = emqtt:start_link([{port, TCPPort}, {proto_ver, v5}]),
             on_exit(fun() -> catch emqtt:stop(C) end),
             {ok, _} = emqtt:connect(C),
@@ -2040,7 +2055,7 @@ t_cluster_node_down(Config) ->
             {TId, Pid} = start_async_publisher(Config, KafkaTopic),
 
             ct:pal("stopping node ~p", [N1]),
-            ok = emqx_common_test_helpers:stop_peer(N1),
+            ok = emqx_cth_cluster:stop([N1]),
 
             %% Give some time for the consumers in remaining node to
             %% rebalance.
@@ -2064,9 +2079,9 @@ t_cluster_node_down(Config) ->
             %% it.
             ?assertEqual([N2], NodeAssignments),
             ?assertEqual(NPartitions, map_size(Assignments)),
-            NumPublished = ets:info(TId, size),
             %% All published messages are eventually received.
-            Published = receive_published(#{n => NumPublished, timeout => 10_000}),
+            Payloads = [P || {P} <- ets:tab2list(TId)],
+            Published = receive_published_payloads(#{expected => Payloads, timeout => 10_000}),
             ct:pal("published:\n  ~p", [Published]),
             ok
         end
@@ -2100,7 +2115,8 @@ t_begin_offset_earliest(Config) ->
             ),
 
             {ok, _} = create_bridge(Config, #{
-                <<"kafka">> => #{<<"offset_reset_policy">> => <<"earliest">>}
+                <<"kafka">> => #{<<"offset_reset_policy">> => <<"earliest">>},
+                <<"resource_opts">> => #{<<"health_check_interval">> => <<"1s">>}
             }),
             ?retry(500, 20, ?assertEqual({ok, connected}, health_check(Config))),
 
@@ -2112,7 +2128,7 @@ t_begin_offset_earliest(Config) ->
             %% the consumers
             Published = receive_published(#{n => NumMessages}),
             Payloads = lists:map(
-                fun(#{payload := P}) -> emqx_utils_json:decode(P, [return_maps]) end,
+                fun(#{payload := P}) -> emqx_utils_json:decode(P) end,
                 Published
             ),
             ?assert(
@@ -2162,13 +2178,14 @@ t_resource_manager_crash_after_subscriber_started(Config) ->
 
             {Res, {ok, _}} =
                 ?wait_async_action(
-                    create_bridge(Config),
+                    create_bridge(
+                        Config,
+                        #{<<"resouce_opts">> => #{<<"health_check_interval">> => <<"1s">>}}
+                    ),
                     #{?snk_kind := kafka_consumer_subcriber_and_client_stopped},
                     10_000
                 ),
             case Res of
-                {error, {config_update_crashed, _}} ->
-                    ok;
                 {ok, _} ->
                     %% the new manager may have had time to startup
                     %% before the resource status cache is read...
@@ -2176,11 +2193,6 @@ t_resource_manager_crash_after_subscriber_started(Config) ->
                 _ ->
                     ct:fail("unexpected result: ~p", [Res])
             end,
-            ?retry(
-                _Sleep = 50,
-                _Attempts = 50,
-                ?assertEqual([], supervisor:which_children(emqx_bridge_kafka_consumer_sup))
-            ),
             ok
         end,
         []
@@ -2224,8 +2236,6 @@ t_resource_manager_crash_before_subscriber_started(Config) ->
                     10_000
                 ),
             case Res of
-                {error, {config_update_crashed, _}} ->
-                    ok;
                 {ok, _} ->
                     %% the new manager may have had time to startup
                     %% before the resource status cache is read...

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_topic).
@@ -22,6 +10,7 @@
 -export([
     match/2,
     match_any/2,
+    is_equal/2,
     validate/1,
     validate/2,
     levels/1,
@@ -33,7 +22,10 @@
     feed_var/3,
     systop/1,
     parse/1,
-    parse/2
+    parse/2,
+    intersection/2,
+    is_subset/2,
+    union/1
 ]).
 
 -export([
@@ -51,6 +43,8 @@
 -define(MULTI_LEVEL_WILDCARD_NOT_LAST(C, REST),
     ((C =:= '#' orelse C =:= <<"#">>) andalso REST =/= [])
 ).
+
+-define(IS_WILDCARD(W), W =:= '+' orelse W =:= '#').
 
 %%--------------------------------------------------------------------
 %% APIs
@@ -80,23 +74,121 @@ match(<<$$, _/binary>>, <<$+, _/binary>>) ->
 match(<<$$, _/binary>>, <<$#, _/binary>>) ->
     false;
 match(Name, Filter) when is_binary(Name), is_binary(Filter) ->
-    match(words(Name), words(Filter));
+    match_words(words(Name), words(Filter));
 match(#share{} = Name, Filter) ->
     match_share(Name, Filter);
 match(Name, #share{} = Filter) ->
     match_share(Name, Filter);
-match([], []) ->
+match(Name, Filter) when is_binary(Name) ->
+    match_words(words(Name), Filter);
+match(Name, Filter) when is_binary(Filter) ->
+    match_words(Name, words(Filter));
+match(Name, Filter) ->
+    match_words(Name, Filter).
+
+match_words([<<$$, _/binary>> | _], [W | _]) when ?IS_WILDCARD(W) ->
+    false;
+match_words(Name, Filter) ->
+    match_tokens(Name, Filter).
+
+match_tokens([], []) ->
     true;
-match([H | T1], [H | T2]) ->
-    match(T1, T2);
-match([_H | T1], ['+' | T2]) ->
-    match(T1, T2);
-match([<<>> | T1], ['' | T2]) ->
-    match(T1, T2);
-match(_, ['#']) ->
+match_tokens([H | T1], [H | T2]) ->
+    match_tokens(T1, T2);
+match_tokens([_H | T1], ['+' | T2]) ->
+    match_tokens(T1, T2);
+match_tokens([<<>> | T1], ['' | T2]) ->
+    match_tokens(T1, T2);
+match_tokens(_, ['#']) ->
     true;
-match(_, _) ->
+match_tokens(_, _) ->
     false.
+
+-spec is_equal(T, T) -> boolean() when T :: topic() | words().
+is_equal(T1, T2) when is_binary(T1) andalso is_binary(T2) ->
+    T1 =:= T2;
+is_equal(T1, T2) when is_list(T1) andalso is_list(T2) ->
+    T1 =:= T2;
+is_equal(T1, T2) when is_list(T1) ->
+    join(T1) =:= T2;
+is_equal(T1, T2) when is_list(T2) ->
+    join(T2) =:= T1.
+
+%% @doc Finds an intersection between two topics, two filters or a topic and a filter.
+%% The function is commutative: reversing parameters doesn't affect the returned value.
+%% Two topics intersect only when they are equal.
+%% The intersection of a topic and a filter is always either the topic itself or false (no intersection).
+%% The intersection of two filters is either false or a new topic filter that would match only those topics,
+%% that can be matched by both input filters.
+%% For example, the intersection of "t/global/#" and "t/+/1/+" is "t/global/1/+".
+-spec intersection(TopicOrFilter, TopicOrFilter) -> topic() | false when
+    TopicOrFilter :: topic() | words().
+intersection(Topic1, Topic2) when is_binary(Topic1) ->
+    intersection(words(Topic1), Topic2);
+intersection(Topic1, Topic2) when is_binary(Topic2) ->
+    intersection(Topic1, words(Topic2));
+intersection(Topic1, Topic2) ->
+    case intersect_start(Topic1, Topic2) of
+        false -> false;
+        Intersection -> join(Intersection)
+    end.
+
+intersect_start([<<"$", _/bytes>> | _], [W | _]) when ?IS_WILDCARD(W) ->
+    false;
+intersect_start([W | _], [<<"$", _/bytes>> | _]) when ?IS_WILDCARD(W) ->
+    false;
+intersect_start(Words1, Words2) ->
+    intersect(Words1, Words2).
+
+intersect(Words1, ['#']) ->
+    Words1;
+intersect(['#'], Words2) ->
+    Words2;
+intersect([W1], ['+']) ->
+    [W1];
+intersect(['+'], [W2]) ->
+    [W2];
+intersect([W1 | T1], [W2 | T2]) when ?IS_WILDCARD(W1), ?IS_WILDCARD(W2) ->
+    intersect_join(wildcard_intersection(W1, W2), intersect(T1, T2));
+intersect([W | T1], [W | T2]) ->
+    intersect_join(W, intersect(T1, T2));
+intersect([W1 | T1], [W2 | T2]) when ?IS_WILDCARD(W1) ->
+    intersect_join(W2, intersect(T1, T2));
+intersect([W1 | T1], [W2 | T2]) when ?IS_WILDCARD(W2) ->
+    intersect_join(W1, intersect(T1, T2));
+intersect([], []) ->
+    [];
+intersect(_, _) ->
+    false.
+
+intersect_join(_, false) -> false;
+intersect_join(W, Words) -> [W | Words].
+
+wildcard_intersection(W, W) -> W;
+wildcard_intersection(_, _) -> '+'.
+
+%% @doc Finds out if topic / topic filter T1 is a subset of topic / topic filter T2.
+-spec is_subset(topic() | words(), topic() | words()) -> boolean().
+is_subset(T1, T1) ->
+    true;
+is_subset(T1, T2) when is_binary(T1) ->
+    intersection(T1, T2) =:= T1;
+is_subset(T1, T2) ->
+    intersection(T1, T2) =:= join(T1).
+
+%% @doc Compute the smallest set of topics / topic filters that contain (have as a
+%% subset) each given topic / topic filter.
+%% Resulting set is not optimal, i.e. it's still possible to have a pair of topic
+%% filters with non-empty intersection.
+-spec union(_Set :: [topic() | words()]) -> [topic() | words()].
+union([Filter | Filters]) ->
+    %% Drop filters completely covered by `Filter`.
+    Disjoint = [F || F <- Filters, not is_subset(F, Filter)],
+    %% Drop `Filter` if completely covered by another filter.
+    Head = [Filter || not lists:any(fun(F) -> is_subset(Filter, F) end, Disjoint)],
+    Head ++ union(Disjoint);
+union([]) ->
+    [].
 
 -spec match_share(Name, Filter) -> boolean() when
     Name :: share(),
@@ -226,7 +318,7 @@ tokens(Topic) ->
     binary:split(Topic, <<"/">>, [global]).
 
 %% @doc Split Topic Path to Words
--spec words(topic()) -> words().
+-spec words(topic() | share()) -> words().
 words(#share{topic = Topic}) when is_binary(Topic) ->
     words(Topic);
 words(Topic) when is_binary(Topic) ->

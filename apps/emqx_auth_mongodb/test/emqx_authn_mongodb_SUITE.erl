@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mongodb_SUITE).
@@ -19,7 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include_lib("emqx_connector/include/emqx_connector.hrl").
+-include("../../emqx_connector/include/emqx_connector.hrl").
 -include_lib("emqx_auth/include/emqx_authn.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -38,9 +26,12 @@ init_per_testcase(_TestCase, Config) ->
         ?GLOBAL
     ),
     {ok, _} = mc_worker_api:connect(mongo_config()),
+    ok = init_seeds(),
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
+    ok = emqx_authn_test_lib:enable_node_cache(false),
+    ok = drop_seeds(),
     ok = mc_worker_api:disconnect(?MONGO_CLIENT).
 
 init_per_suite(Config) ->
@@ -102,15 +93,13 @@ t_create_invalid(_Config) ->
     ).
 
 t_authenticate(_Config) ->
-    ok = init_seeds(),
     ok = lists:foreach(
         fun(Sample) ->
             ct:pal("test_user_auth sample: ~p", [Sample]),
             test_user_auth(Sample)
         end,
         user_seeds()
-    ),
-    ok = drop_seeds().
+    ).
 
 test_user_auth(#{
     credentials := Credentials0,
@@ -244,7 +233,7 @@ test_is_superuser({Value, ExpectedValue}) ->
         is_superuser => Value
     },
 
-    {{true, _}, _} = mc_worker_api:insert(?MONGO_CLIENT, <<"users">>, [UserData]),
+    ok = create_user(UserData),
 
     Credentials = #{
         listener => 'tcp:default',
@@ -257,6 +246,75 @@ test_is_superuser({Value, ExpectedValue}) ->
         {ok, #{is_superuser => ExpectedValue}},
         emqx_access_control:authenticate(Credentials)
     ).
+
+t_node_cache(_Config) ->
+    ok = create_user(#{
+        username => <<"node_cache_user">>, password_hash => <<"password">>, salt => <<"">>
+    }),
+    Config = raw_mongo_auth_config(),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, Config}
+    ),
+    ok = emqx_authn_test_lib:enable_node_cache(true),
+    Credentials = #{
+        listener => 'tcp:default',
+        protocol => mqtt,
+        username => <<"node_cache_user">>,
+        password => <<"password">>
+    },
+
+    %% First time should be a miss, second time should be a hit
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ),
+
+    %% Change a variable in the query, should be a miss
+    _ = emqx_access_control:authenticate(Credentials#{username => <<"user2">>}),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 2}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ).
+
+-doc """
+Checks that, if an authentication backend returns the `clientid_override` attribute, it's
+used to override.
+""".
+t_clientid_override(TCConfig) when is_list(TCConfig) ->
+    OverriddenClientId = <<"overridden_clientid">>,
+    Username = <<"overriden_clientid">>,
+    Password = <<"password">>,
+    MkConfigFn = fun() ->
+        ok = create_user(#{
+            username => Username,
+            password_hash => Password,
+            salt => <<"">>,
+            clientid_override => OverriddenClientId
+        }),
+        maps:merge(
+            raw_mongo_auth_config(),
+            #{<<"clientid_override_field">> => <<"clientid_override">>}
+        )
+    end,
+    Opts = #{
+        client_opts => #{
+            username => Username,
+            password => Password
+        },
+        mk_config_fn => MkConfigFn,
+        overridden_clientid => OverriddenClientId
+    },
+    emqx_authn_test_lib:t_clientid_override(TCConfig, Opts),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Helpers
@@ -457,7 +515,11 @@ user_seeds() ->
 
 init_seeds() ->
     Users = [Values || #{data := Values} <- user_seeds()],
-    {{true, _}, _} = mc_worker_api:insert(?MONGO_CLIENT, <<"users">>, Users),
+    ok = lists:foreach(fun create_user/1, Users),
+    ok.
+
+create_user(User) ->
+    {{true, _}, _} = mc_worker_api:insert(?MONGO_CLIENT, <<"users">>, [User]),
     ok.
 
 drop_seeds() ->
@@ -486,9 +548,3 @@ mongo_username() ->
 
 mongo_password() ->
     iolist_to_binary(os:getenv("MONGO_PASSWORD", "")).
-
-start_apps(Apps) ->
-    lists:foreach(fun application:ensure_all_started/1, Apps).
-
-stop_apps(Apps) ->
-    lists:foreach(fun application:stop/1, Apps).

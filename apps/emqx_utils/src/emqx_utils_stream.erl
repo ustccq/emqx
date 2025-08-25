@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -39,7 +39,10 @@
     next/1,
     consume/1,
     consume/2,
-    foreach/2
+    foreach/2,
+    fold/3,
+    fold/4,
+    sweep/2
 ]).
 
 %% Streams from ETS tables
@@ -49,15 +52,18 @@
 
 %% Streams from .csv data
 -export([
-    csv/1
+    csv/1,
+    csv/2
 ]).
 
--export_type([stream/1]).
+-export_type([stream/1, csv_parse_opts/0]).
 
 %% @doc A stream is essentially a lazy list.
 -type stream_tail(T) :: fun(() -> next(T) | []).
 -type stream(T) :: list(T) | nonempty_improper_list(T, stream_tail(T)) | stream_tail(T).
 -type next(T) :: nonempty_improper_list(T, stream_tail(T)).
+
+-type csv_parse_opts() :: #{nullable => boolean(), filter_null => boolean()}.
 
 -dialyzer(no_improper_lists).
 
@@ -105,6 +111,7 @@ map(F, S) ->
     end.
 
 %% @doc Make a stream by filtering the underlying stream with a predicate function.
+-spec filter(fun((X) -> boolean()), stream(X)) -> stream(X).
 filter(F, S) ->
     FilterNext = fun FilterNext(St) ->
         case next(St) of
@@ -120,16 +127,6 @@ filter(F, S) ->
         end
     end,
     fun() -> FilterNext(S) end.
-
-%% @doc Consumes the stream and applies the given function to each element.
-foreach(F, S) ->
-    case next(S) of
-        [X | Rest] ->
-            F(X),
-            foreach(F, Rest);
-        [] ->
-            ok
-    end.
 
 %% @doc Drops N first elements from the stream
 -spec drop(non_neg_integer(), stream(T)) -> stream(T).
@@ -190,7 +187,7 @@ transpose_tail(S, Tail) ->
 %% @doc Make a stream by concatenating multiple streams.
 -spec chain([stream(X)]) -> stream(X).
 chain(L) ->
-    lists:foldl(fun chain/2, empty(), L).
+    lists:foldr(fun chain/2, empty(), L).
 
 %% @doc Make a stream by chaining (concatenating) two streams.
 %% The second stream begins to produce values only after the first one is exhausted.
@@ -294,6 +291,54 @@ consume(N, S, Acc) ->
             lists:reverse(Acc)
     end.
 
+%% @doc Consumes the stream and applies the given function to each element.
+-spec foreach(fun((X) -> _), stream(X)) -> ok.
+foreach(F, S) ->
+    case next(S) of
+        [X | Rest] ->
+            F(X),
+            foreach(F, Rest);
+        [] ->
+            ok
+    end.
+
+%% @doc Folds the whole stream, accumulating the result of given function applied
+%% to each element.
+-spec fold(fun((X, Acc) -> Acc), Acc, stream(X)) -> Acc.
+fold(F, Acc, S) ->
+    case next(S) of
+        [X | Rest] ->
+            fold(F, F(X, Acc), Rest);
+        [] ->
+            Acc
+    end.
+
+%% @doc Folds the first N element of the stream, accumulating the result of given
+%% function applied to each element. If there's less than N elements in the given
+%% stream, returns `[]` (a.k.a. empty stream) along with the accumulated value.
+-spec fold(fun((X, Acc) -> Acc), Acc, non_neg_integer(), stream(X)) -> {Acc, stream(X)}.
+fold(_, Acc, 0, S) ->
+    {Acc, S};
+fold(F, Acc, N, S) when N > 0 ->
+    case next(S) of
+        [X | Rest] ->
+            fold(F, F(X, Acc), N - 1, Rest);
+        [] ->
+            {Acc, []}
+    end.
+
+%% @doc Same as `consume/2` but discard the consumed values.
+-spec sweep(non_neg_integer(), stream(X)) -> stream(X).
+sweep(0, S) ->
+    S;
+sweep(N, S) when N > 0 ->
+    case next(S) of
+        [_ | Rest] ->
+            sweep(N - 1, Rest);
+        [] ->
+            []
+    end.
+
 %%
 
 -type select_result(Record, Cont) ::
@@ -325,13 +370,42 @@ ets(Cont, ContF) ->
 %% @doc Make a stream out of a .csv binary, where the .csv binary is loaded in all at once.
 %% The .csv binary is assumed to be in UTF-8 encoding and to have a header row.
 -spec csv(binary()) -> stream(map()).
-csv(Bin) when is_binary(Bin) ->
+csv(Bin) ->
+    csv(Bin, #{}).
+
+-spec csv(binary(), csv_parse_opts()) -> stream(map()).
+csv(Bin, Opts) when is_binary(Bin) ->
+    Liner =
+        case Opts of
+            #{nullable := true} ->
+                fun csv_read_nullable_line/1;
+            _ ->
+                fun csv_read_line/1
+        end,
+    Maper =
+        case Opts of
+            #{filter_null := true} ->
+                fun(Headers, Fields) ->
+                    maps:from_list(
+                        lists:filter(
+                            fun({_, Value}) ->
+                                Value =/= undefined
+                            end,
+                            lists:zip(Headers, Fields)
+                        )
+                    )
+                end;
+            _ ->
+                fun(Headers, Fields) ->
+                    maps:from_list(lists:zip(Headers, Fields))
+                end
+        end,
     Reader = fun _Iter(Headers, Lines) ->
-        case csv_read_line(Lines) of
+        case Liner(Lines) of
             {Fields, Rest} ->
                 case length(Fields) == length(Headers) of
                     true ->
-                        User = maps:from_list(lists:zip(Headers, Fields)),
+                        User = Maper(Headers, Fields),
                         [User | fun() -> _Iter(Headers, Rest) end];
                     false ->
                         error(bad_format)
@@ -353,6 +427,23 @@ csv_read_line([Line | Lines]) ->
     Fields = binary:split(Line, [<<",">>, <<" ">>, <<"\n">>], [global, trim_all]),
     {Fields, Lines};
 csv_read_line([]) ->
+    eof.
+
+csv_read_nullable_line([Line | Lines]) ->
+    %% XXX: not support ' ' for the field value
+    Fields = lists:map(
+        fun(Bin) ->
+            case string:trim(Bin, both) of
+                <<>> ->
+                    undefined;
+                Any ->
+                    Any
+            end
+        end,
+        binary:split(Line, [<<",">>], [global])
+    ),
+    {Fields, Lines};
+csv_read_nullable_line([]) ->
     eof.
 
 do_interleave(_Cont, _, [], []) ->

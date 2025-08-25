@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_SUITE).
@@ -31,17 +19,13 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include("emqx_dashboard.hrl").
-
--define(CONTENT_TYPE, "application/x-www-form-urlencoded").
 
 -define(HOST, "http://127.0.0.1:18083").
 
 -define(BASE_PATH, "/api/v5").
-
--define(APP_DASHBOARD, emqx_dashboard).
--define(APP_MANAGEMENT, emqx_management).
 
 -define(OVERVIEWS, [
     "alarms",
@@ -65,15 +49,15 @@ init_per_suite(Config) ->
         [
             emqx_conf,
             emqx_management,
-            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+            emqx_mgmt_api_test_util:emqx_dashboard()
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    emqx_common_test_http:create_default_app(),
+    _ = emqx_conf_schema:roots(),
+    ok = emqx_dashboard_desc_cache:init(),
     [{suite_apps, SuiteApps} | Config].
 
 end_per_suite(Config) ->
-    emqx_common_test_http:delete_default_app(),
     emqx_cth_suite:stop(?config(suite_apps, Config)).
 
 t_overview(_) ->
@@ -86,6 +70,50 @@ t_overview(_) ->
         {ok, _} = request_dashboard(get, api_path([Overview]), Headers)
      || Overview <- ?OVERVIEWS
     ].
+
+t_dashboard_restart(Config) ->
+    emqx_config:put([dashboard], #{
+        i18n_lang => en,
+        swagger_support => true,
+        listeners =>
+            #{
+                http =>
+                    #{
+                        inet6 => false,
+                        bind => 18083,
+                        ipv6_v6only => false,
+                        send_timeout => 10000,
+                        num_acceptors => 8,
+                        max_connections => 512,
+                        backlog => 1024,
+                        proxy_header => false
+                    }
+            }
+    }),
+    application:stop(emqx_dashboard),
+    application:start(emqx_dashboard),
+    Name = 'http:dashboard',
+    t_overview(Config),
+    [{'_', [], Rules}] = BaseDispatch = persistent_term:get(Name),
+
+    %% complete dispatch has more than 150 rules.
+    ?assertNotMatch([{[], [], cowboy_static, _} | _], Rules),
+    ?assert(erlang:length(Rules) > 150),
+
+    %% After we restart the dashboard, the dispatch rules should be the same.
+    ok = application:stop(emqx_dashboard),
+    assert_same_dispatch(BaseDispatch, Name, step_0),
+    ok = application:start(emqx_dashboard),
+    assert_same_dispatch(BaseDispatch, Name, step_1),
+    t_overview(Config),
+
+    %% erase to mock the initial dashboard startup.
+    persistent_term:erase(Name),
+    ok = application:stop(emqx_dashboard),
+    ok = application:start(emqx_dashboard),
+    assert_same_dispatch(BaseDispatch, Name, step_2),
+    t_overview(Config),
+    ok.
 
 t_admins_add_delete(_) ->
     mnesia:clear_table(?ADMIN),
@@ -122,6 +150,48 @@ t_admin_delete_self_failed(_) ->
     {error, {_, 401, _}} = request_dashboard(delete, api_path(["users", "username1"]), Header2),
     mnesia:clear_table(?ADMIN).
 
+%% This verifies that we can delete the default admin only if there is at least another
+%% admin username in the database.
+t_admin_delete_default_username(_TCConfig) ->
+    mnesia:clear_table(?ADMIN),
+    DefaultUsername = emqx_dashboard_admin:default_username(),
+    DefaultPassword = emqx_dashboard_admin:default_password(),
+    %% Sanity checks
+    ?assertNotEqual(<<"">>, DefaultUsername),
+    ?assertNotEqual(<<"">>, DefaultPassword),
+    {ok, #{}} = emqx_dashboard_admin:add_default_user(),
+    HeaderDefault = auth_header_(DefaultUsername, DefaultPassword),
+    ?assertMatch(
+        {error, {_, 400, _}},
+        request_dashboard(delete, api_path(["users", DefaultUsername]), HeaderDefault)
+    ),
+    NewAdmin = <<"newadmin">>,
+    NewPassword = <<"newadminpassword_123">>,
+    {ok, #{}} = emqx_dashboard_admin:add_user(
+        NewAdmin, NewPassword, ?ROLE_SUPERUSER, <<"description">>
+    ),
+    NewHeader = auth_header_(NewAdmin, NewPassword),
+    %% Now we can delete the default admin user
+    ?assertMatch(
+        {ok, _},
+        request_dashboard(delete, api_path(["users", DefaultUsername]), NewHeader)
+    ),
+    ?assertMatch(
+        {error, {_, 404, _}},
+        request_dashboard(delete, api_path(["users", DefaultUsername]), NewHeader)
+    ),
+    %% Cannot delete self
+    ?assertMatch(
+        {error, {_, 400, _}},
+        request_dashboard(delete, api_path(["users", NewAdmin]), NewHeader)
+    ),
+    %% Restarting the application should not restore the default admin user
+    ?assertMatch([_], emqx_dashboard_admin:admin_users()),
+    ok = application:stop(emqx_dashboard),
+    ok = application:start(emqx_dashboard),
+    ?assertMatch([_], emqx_dashboard_admin:admin_users()),
+    ok.
+
 t_rest_api(_Config) ->
     mnesia:clear_table(?ADMIN),
     Desc = <<"administrator">>,
@@ -134,7 +204,9 @@ t_rest_api(_Config) ->
                 <<"backend">> => <<"local">>,
                 <<"username">> => <<"admin">>,
                 <<"description">> => <<"administrator">>,
-                <<"role">> => ?ROLE_SUPERUSER
+                <<"role">> => ?ROLE_SUPERUSER,
+                <<"namespace">> => null,
+                <<"mfa">> => <<"none">>
             })
         ],
         get_http_data(Res0)
@@ -152,6 +224,7 @@ t_rest_api(_Config) ->
             <<"username">> => <<"usera">>,
             <<"password">> => <<"passwd_01234">>,
             <<"role">> => ?ROLE_SUPERUSER,
+            <<"mfa">> => <<"none">>,
             <<"description">> => Desc
         })
     ),
@@ -191,35 +264,41 @@ t_swagger_json(_Config) ->
 
 t_disable_swagger_json(_Config) ->
     Url = ?HOST ++ "/api-docs/index.html",
-
     ?assertMatch(
         {ok, {{"HTTP/1.1", 200, "OK"}, __, _}},
         httpc:request(get, {Url, []}, [], [{body_format, binary}])
     ),
-
     DashboardCfg = emqx:get_raw_config([dashboard]),
-    DashboardCfg2 = DashboardCfg#{<<"swagger_support">> => false},
-    emqx:update_config([dashboard], DashboardCfg2),
-    ?retry(
-        _Sleep = 1000,
-        _Attempts = 5,
-        ?assertMatch(
-            {ok, {{"HTTP/1.1", 404, "Not Found"}, _, _}},
-            httpc:request(get, {Url, []}, [], [{body_format, binary}])
-        )
+    ?check_trace(
+        {_, {ok, _}} = ?wait_async_action(
+            begin
+                DashboardCfg2 = DashboardCfg#{<<"swagger_support">> => false},
+                emqx:update_config([dashboard], DashboardCfg2)
+            end,
+            #{?snk_kind := regenerate_dispatch, i18n_lang := en},
+            3_000
+        ),
+        []
     ),
-
-    DashboardCfg3 = DashboardCfg#{<<"swagger_support">> => true},
-    emqx:update_config([dashboard], DashboardCfg3),
-    ?retry(
-        _Sleep0 = 1000,
-        _Attempts0 = 5,
-        ?assertMatch(
-            {ok, {{"HTTP/1.1", 200, "OK"}, __, _}},
-            httpc:request(get, {Url, []}, [], [{body_format, binary}])
-        )
+    ?assertMatch(
+        {ok, {{"HTTP/1.1", 404, "Not Found"}, _, _}},
+        httpc:request(get, {Url, []}, [], [{body_format, binary}])
     ),
-    ok.
+    ?check_trace(
+        {_, {ok, _}} = ?wait_async_action(
+            begin
+                DashboardCfg3 = DashboardCfg#{<<"swagger_support">> => true},
+                emqx:update_config([dashboard], DashboardCfg3)
+            end,
+            #{?snk_kind := regenerate_dispatch, i18n_lang := en},
+            3_000
+        ),
+        []
+    ),
+    ?assertMatch(
+        {ok, {{"HTTP/1.1", 200, "OK"}, _, _}},
+        httpc:request(get, {Url, []}, [], [{body_format, binary}])
+    ).
 
 t_cli(_Config) ->
     [mria:dirty_delete(?ADMIN, Admin) || Admin <- mnesia:dirty_all_keys(?ADMIN)],
@@ -240,8 +319,7 @@ t_cli(_Config) ->
 
 t_lookup_by_username_jwt(_Config) ->
     User = bin(["user-", integer_to_list(random_num())]),
-    Pwd = bin("t_password" ++ integer_to_list(random_num())),
-    emqx_dashboard_token:sign(#?ADMIN{username = User}, Pwd),
+    emqx_dashboard_token:sign(#?ADMIN{username = User}),
     ?assertMatch(
         [#?ADMIN_JWT{username = User}],
         emqx_dashboard_token:lookup_by_username(User)
@@ -254,8 +332,7 @@ t_lookup_by_username_jwt(_Config) ->
 
 t_clean_expired_jwt(_Config) ->
     User = bin(["user-", integer_to_list(random_num())]),
-    Pwd = bin("t_password" ++ integer_to_list(random_num())),
-    emqx_dashboard_token:sign(#?ADMIN{username = User}, Pwd),
+    emqx_dashboard_token:sign(#?ADMIN{username = User}),
     [#?ADMIN_JWT{username = User, exptime = ExpTime}] =
         emqx_dashboard_token:lookup_by_username(User),
     ok = emqx_dashboard_token:clean_expired_jwt(_Now1 = ExpTime),
@@ -265,6 +342,45 @@ t_clean_expired_jwt(_Config) ->
     ),
     ok = emqx_dashboard_token:clean_expired_jwt(_Now2 = ExpTime + 1),
     ?assertMatch([], emqx_dashboard_token:lookup_by_username(User)),
+    ok.
+
+t_default_password_file(Config) ->
+    Password = <<"passwordfromfile">>,
+    Passfile = filename:join(?config(priv_dir, Config), "passfile"),
+    FileURI = iolist_to_binary([<<"file://">>, Passfile]),
+    ok = file:write_file(Passfile, Password),
+    Port = 18089,
+    AppSpecs = [
+        emqx_conf,
+        {emqx_dashboard, #{
+            config =>
+                #{
+                    <<"dashboard">> =>
+                        #{
+                            <<"listeners">> => #{
+                                <<"http">> => #{
+                                    <<"enable">> => true,
+                                    %% to avoid clash with master test node
+                                    <<"bind">> => Port
+                                }
+                            },
+                            <<"default_password">> => FileURI
+                        }
+                }
+        }}
+    ],
+    Nodes = emqx_cth_cluster:start(
+        [{dash_default_pass1, #{apps => AppSpecs}}],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    Username = <<"admin">>,
+    URL = "http://127.0.0.1:" ++ integer_to_list(Port) ++ filename:join([?BASE_PATH, "login"]),
+    Body = emqx_utils_json:encode(#{username => Username, password => Password}),
+    ?assertMatch(
+        {ok, {{_, 200, _}, _, _}},
+        httpc:request(post, {URL, [], "application/json", Body}, [], [{body_format, binary}])
+    ),
+    emqx_cth_cluster:stop(Nodes),
     ok.
 
 %%------------------------------------------------------------------------------
@@ -317,15 +433,18 @@ auth_header_() ->
     auth_header_(<<"admin">>, <<"public">>).
 
 auth_header_(Username, Password) ->
-    {ok, _Role, Token} = emqx_dashboard_admin:sign_token(Username, Password),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
     {"Authorization", "Bearer " ++ binary_to_list(Token)}.
 
 api_path(Parts) ->
     ?HOST ++ filename:join([?BASE_PATH | Parts]).
 
 json(Data) ->
-    {ok, Jsx} = emqx_utils_json:safe_decode(Data, [return_maps]),
-    Jsx.
+    emqx_utils_json:decode(Data).
+
+assert_same_dispatch([{'_', [], BaseRoutes}], Name, Tag) ->
+    [{'_', [], NewRoutes}] = persistent_term:get(Name, Tag),
+    snabbkaffe_diff:assert_lists_eq(BaseRoutes, NewRoutes, #{comment => Tag}).
 
 -if(?EMQX_RELEASE_EDITION == ee).
 filter_req(Req) ->

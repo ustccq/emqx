@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_es_SUITE).
@@ -22,6 +11,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("emqx_resource/include/emqx_resource.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -49,11 +39,10 @@ init_per_suite(Config) ->
             emqx_bridge,
             emqx_rule_engine,
             emqx_management,
-            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+            emqx_mgmt_api_test_util:emqx_dashboard()
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    {ok, _} = emqx_common_test_http:create_default_app(),
     wait_until_elasticsearch_is_up(ESHost, ESPort),
     [
         {apps, Apps},
@@ -90,6 +79,7 @@ init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
+    emqx_bridge_v2_testlib:delete_all_rules(),
     emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     emqx_common_test_helpers:call_janitor(60_000),
     ok.
@@ -98,19 +88,22 @@ end_per_testcase(_TestCase, _Config) ->
 %% Helper fns
 %%-------------------------------------------------------------------------------------
 
-check_send_message_with_action(Topic, ActionName, ConnectorName, Expect) ->
+check_send_message_with_action(Topic, ActionName, ConnectorName, Expect, Line) ->
     send_message(Topic),
     %% ######################################
     %% Check if message is sent to es
     %% ######################################
     timer:sleep(500),
-    check_action_metrics(ActionName, ConnectorName, Expect).
+    check_action_metrics(ActionName, ConnectorName, Expect, Line).
 
-send_message(Topic) ->
+mk_payload() ->
     Now = emqx_utils_calendar:now_to_rfc3339(microsecond),
     Doc = #{<<"name">> => <<"emqx">>, <<"release_date">> => Now},
     Index = <<"emqx-test-index">>,
-    Payload = emqx_utils_json:encode(#{doc => Doc, index => Index}),
+    emqx_utils_json:encode(#{doc => Doc, index => Index}).
+
+send_message(Topic) ->
+    Payload = mk_payload(),
 
     ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
     {ok, Client} = emqtt:start_link([{clientid, ClientId}, {port, 1883}]),
@@ -118,8 +111,12 @@ send_message(Topic) ->
     ok = emqtt:publish(Client, Topic, Payload, [{qos, 0}]),
     ok.
 
-check_action_metrics(ActionName, ConnectorName, Expect) ->
-    ActionId = emqx_bridge_v2:id(?TYPE, ActionName, ConnectorName),
+check_action_metrics(ActionName, ConnectorName, Expect, Line) ->
+    ActionId = emqx_bridge_v2_testlib:make_chan_id(#{
+        type => ?TYPE,
+        name => ActionName,
+        connector_name => ConnectorName
+    }),
     ?retry(
         300,
         20,
@@ -132,7 +129,7 @@ check_action_metrics(ActionName, ConnectorName, Expect) ->
                 queuing => emqx_resource_metrics:queuing_get(ActionId),
                 dropped => emqx_resource_metrics:dropped_get(ActionId)
             },
-            {ActionName, ConnectorName, ActionId}
+            #{test_line => Line}
         )
     ).
 
@@ -187,6 +184,7 @@ connector_config(Overrides, Config) ->
             <<"pool_size">> => 2,
             <<"pool_type">> => <<"random">>,
             <<"enable_pipelining">> => 100,
+            <<"max_inactive">> => <<"10s">>,
             <<"ssl">> => #{
                 <<"enable">> => true,
                 <<"hibernate_after">> => <<"5s">>,
@@ -196,14 +194,27 @@ connector_config(Overrides, Config) ->
     emqx_utils_maps:deep_merge(Defaults, Overrides).
 
 create_connector(Name, Config) ->
-    Res = emqx_connector:create(?TYPE, Name, Config),
-    on_exit(fun() -> emqx_connector:remove(?TYPE, Name) end),
-    Res.
+    emqx_bridge_v2_testlib:create_connector_api([
+        {connector_type, ?TYPE},
+        {connector_name, Name},
+        {connector_config, Config}
+    ]).
 
 create_action(Name, Config) ->
-    Res = emqx_bridge_v2:create(?TYPE, Name, Config),
-    on_exit(fun() -> emqx_bridge_v2:remove(?TYPE, Name) end),
-    Res.
+    emqx_bridge_v2_testlib:create_kind_api([
+        {bridge_kind, action},
+        {action_type, ?TYPE},
+        {action_name, Name},
+        {action_config, Config}
+    ]).
+
+update_action(Name, Config) ->
+    emqx_bridge_v2_testlib:update_bridge_api([
+        {bridge_kind, action},
+        {action_type, ?TYPE},
+        {action_name, Name},
+        {action_config, Config}
+    ]).
 
 action_api_spec_props_for_get() ->
     #{
@@ -213,90 +224,69 @@ action_api_spec_props_for_get() ->
         emqx_bridge_v2_testlib:actions_api_spec_schemas(),
     Props.
 
-%%------------------------------------------------------------------------------
-%% Testcases
-%%------------------------------------------------------------------------------
-
-t_create_remove_list(Config) ->
-    [] = emqx_bridge_v2:list(),
-    ConnectorConfig = connector_config(Config),
-    {ok, _} = emqx_connector:create(?TYPE, test_connector, ConnectorConfig),
-    ActionConfig = action(<<"test_connector">>),
-    {ok, _} = emqx_bridge_v2:create(?TYPE, test_action_1, ActionConfig),
-    [ActionInfo] = emqx_bridge_v2:list(),
-    #{
-        name := <<"test_action_1">>,
-        type := <<"elasticsearch">>,
-        raw_config := _,
-        status := connected
-    } = ActionInfo,
-    {ok, _} = emqx_bridge_v2:create(?TYPE, test_action_2, ActionConfig),
-    2 = length(emqx_bridge_v2:list()),
-    ok = emqx_bridge_v2:remove(?TYPE, test_action_1),
-    1 = length(emqx_bridge_v2:list()),
-    ok = emqx_bridge_v2:remove(?TYPE, test_action_2),
-    [] = emqx_bridge_v2:list(),
-    emqx_connector:remove(?TYPE, test_connector),
+remove(Name) ->
+    {204, _} = emqx_bridge_v2_testlib:delete_kind_api(action, ?TYPE, Name, #{
+        query_params => #{<<"also_delete_dep_actions">> => <<"true">>}
+    }),
     ok.
+
+health_check(Type, Name) ->
+    emqx_bridge_v2_testlib:force_health_check(#{
+        type => Type,
+        name => Name,
+        resource_namespace => ?global_ns,
+        kind => action
+    }).
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
 
 %% Test sending a message to a bridge V2
 t_create_message(Config) ->
     ConnectorConfig = connector_config(Config),
-    {ok, _} = emqx_connector:create(?TYPE, test_connector2, ConnectorConfig),
-    ActionConfig = action(<<"test_connector2">>),
-    {ok, _} = emqx_bridge_v2:create(?TYPE, test_action_1, ActionConfig),
+    ConnectorName = <<"test_connector2">>,
+    {ok, _} = create_connector(ConnectorName, ConnectorConfig),
+    ActionConfig = action(ConnectorName),
+    ActionName = <<"test_action_1">>,
+    {ok, _} = create_action(ActionName, ActionConfig),
+    BridgeId = emqx_bridge_resource:bridge_id(?TYPE, ActionName),
     Rule = #{
-        id => <<"rule:t_es">>,
-        sql => <<"SELECT\n  *\nFROM\n  \"es/#\"">>,
-        actions => [<<"elasticsearch:test_action_1">>],
-        description => <<"sink doc to elasticsearch">>
+        <<"id">> => <<"t_es">>,
+        <<"sql">> => <<"SELECT\n  *\nFROM\n  \"es/#\"">>,
+        <<"actions">> => [BridgeId],
+        <<"description">> => <<"sink doc to elasticsearch">>
     },
-    {ok, _} = emqx_rule_engine:create_rule(Rule),
+    {201, _} = emqx_bridge_v2_testlib:create_rule_api2(Rule),
     %% Use the action to send a message
     Expect = #{match => 1, success => 1, dropped => 0, failed => 0, queuing => 0},
-    check_send_message_with_action(<<"es/1">>, test_action_1, test_connector2, Expect),
+    check_send_message_with_action(<<"es/1">>, ActionName, ConnectorName, Expect, ?LINE),
     %% Create a few more bridges with the same connector and test them
-    ActionNames1 =
-        lists:foldl(
-            fun(I, Acc) ->
-                Seq = integer_to_binary(I),
-                ActionNameStr = "test_action_" ++ integer_to_list(I),
-                ActionName = list_to_atom(ActionNameStr),
-                {ok, _} = emqx_bridge_v2:create(?TYPE, ActionName, ActionConfig),
-                Rule1 = #{
-                    id => <<"rule:t_es", Seq/binary>>,
-                    sql => <<"SELECT\n  *\nFROM\n  \"es/", Seq/binary, "\"">>,
-                    actions => [<<"elasticsearch:", (list_to_binary(ActionNameStr))/binary>>],
-                    description => <<"sink doc to elasticsearch">>
-                },
-                {ok, _} = emqx_rule_engine:create_rule(Rule1),
-                Topic = <<"es/", Seq/binary>>,
-                check_send_message_with_action(Topic, ActionName, test_connector2, Expect),
-                [ActionName | Acc]
-            end,
-            [],
-            lists:seq(2, 10)
-        ),
-    ActionNames = [test_action_1 | ActionNames1],
-    %% Remove all the bridges
     lists:foreach(
-        fun(BridgeName) ->
-            ok = emqx_bridge_v2:remove(?TYPE, BridgeName)
+        fun(I) ->
+            Seq = integer_to_binary(I),
+            ActionNameStr = "test_action_" ++ integer_to_list(I),
+            ActionName1 = list_to_atom(ActionNameStr),
+            {ok, _} = create_action(ActionName1, ActionConfig),
+            BridgeId1 = emqx_bridge_resource:bridge_id(?TYPE, ActionName1),
+            Rule1 = #{
+                <<"id">> => <<"rule_t_es", Seq/binary>>,
+                <<"sql">> => <<"SELECT\n  *\nFROM\n  \"es/", Seq/binary, "\"">>,
+                <<"actions">> => [BridgeId1],
+                <<"description">> => <<"sink doc to elasticsearch">>
+            },
+            {201, _} = emqx_bridge_v2_testlib:create_rule_api2(Rule1),
+            Topic = <<"es/", Seq/binary>>,
+            check_send_message_with_action(Topic, ActionName1, ConnectorName, Expect, ?LINE),
+            ok
         end,
-        ActionNames
-    ),
-    emqx_connector:remove(?TYPE, test_connector2),
-    lists:foreach(
-        fun(#{id := Id}) ->
-            emqx_rule_engine:delete_rule(Id)
-        end,
-        emqx_rule_engine:get_rules()
+        lists:seq(2, 10)
     ),
     ok.
 
 t_update_message(Config) ->
     ConnectorConfig = connector_config(Config),
-    {ok, _} = emqx_connector:create(?TYPE, update_connector, ConnectorConfig),
+    {ok, _} = create_connector(update_connector, ConnectorConfig),
     ActionConfig0 = action(<<"update_connector">>),
     DocId = emqx_guid:to_hexstr(emqx_guid:gen()),
     ActionConfig1 = ActionConfig0#{
@@ -308,17 +298,17 @@ t_update_message(Config) ->
             <<"doc">> => <<"${payload.doc}">>
         }
     },
-    {ok, _} = emqx_bridge_v2:create(?TYPE, update_action, ActionConfig1),
+    {ok, _} = create_action(update_action, ActionConfig1),
     Rule = #{
-        id => <<"rule:t_es_1">>,
-        sql => <<"SELECT\n  *\nFROM\n  \"es/#\"">>,
-        actions => [<<"elasticsearch:update_action">>],
-        description => <<"sink doc to elasticsearch">>
+        <<"id">> => <<"t_es_1">>,
+        <<"sql">> => <<"SELECT\n  *\nFROM\n  \"es/#\"">>,
+        <<"actions">> => [<<"elasticsearch:update_action">>],
+        <<"description">> => <<"sink doc to elasticsearch">>
     },
-    {ok, _} = emqx_rule_engine:create_rule(Rule),
+    {201, _} = emqx_bridge_v2_testlib:create_rule_api2(Rule),
     %% failed to update a nonexistent doc
     Expect0 = #{match => 1, success => 0, dropped => 0, failed => 1, queuing => 0},
-    check_send_message_with_action(<<"es/1">>, update_action, update_connector, Expect0),
+    check_send_message_with_action(<<"es/1">>, update_action, update_connector, Expect0, ?LINE),
     %% doc_as_upsert to insert a new doc
     ActionConfig2 = ActionConfig1#{
         <<"parameters">> => #{
@@ -330,9 +320,9 @@ t_update_message(Config) ->
             <<"max_retries">> => 0
         }
     },
-    {ok, _} = emqx_bridge_v2:create(?TYPE, update_action, ActionConfig2),
+    {ok, _} = update_action(update_action, ActionConfig2),
     Expect1 = #{match => 1, success => 1, dropped => 0, failed => 0, queuing => 0},
-    check_send_message_with_action(<<"es/1">>, update_action, update_connector, Expect1),
+    check_send_message_with_action(<<"es/1">>, update_action, update_connector, Expect1, ?LINE),
     %% update without doc, use msg as default
     ActionConfig3 = ActionConfig1#{
         <<"parameters">> => #{
@@ -342,31 +332,21 @@ t_update_message(Config) ->
             <<"max_retries">> => 0
         }
     },
-    {ok, _} = emqx_bridge_v2:create(?TYPE, update_action, ActionConfig3),
+    {ok, _} = update_action(update_action, ActionConfig3),
     Expect2 = #{match => 1, success => 1, dropped => 0, failed => 0, queuing => 0},
-    check_send_message_with_action(<<"es/1">>, update_action, update_connector, Expect2),
-    %% Clean
-    ok = emqx_bridge_v2:remove(?TYPE, update_action),
-    emqx_connector:remove(?TYPE, update_connector),
-    lists:foreach(
-        fun(#{id := Id}) ->
-            emqx_rule_engine:delete_rule(Id)
-        end,
-        emqx_rule_engine:get_rules()
-    ),
+    check_send_message_with_action(<<"es/1">>, update_action, update_connector, Expect2, ?LINE),
     ok.
 
 %% Test that we can get the status of the bridge V2
 t_health_check(Config) ->
     BridgeV2Config = action(<<"test_connector3">>),
     ConnectorConfig = connector_config(Config),
-    {ok, _} = emqx_connector:create(?TYPE, test_connector3, ConnectorConfig),
-    {ok, _} = emqx_bridge_v2:create(?TYPE, test_bridge_v2, BridgeV2Config),
-    #{status := connected} = emqx_bridge_v2:health_check(?TYPE, test_bridge_v2),
-    ok = emqx_bridge_v2:remove(?TYPE, test_bridge_v2),
+    {ok, _} = create_connector(test_connector3, ConnectorConfig),
+    {ok, _} = create_action(test_bridge_v2, BridgeV2Config),
+    #{status := connected} = health_check(?TYPE, test_bridge_v2),
+    ok = remove(test_bridge_v2),
     %% Check behaviour when bridge does not exist
-    {error, bridge_not_found} = emqx_bridge_v2:health_check(?TYPE, test_bridge_v2),
-    ok = emqx_connector:remove(?TYPE, test_connector3),
+    {error, bridge_not_found} = health_check(?TYPE, test_bridge_v2),
     ok.
 
 t_bad_url(Config) ->
@@ -378,16 +358,20 @@ t_bad_url(Config) ->
     ?assertMatch({ok, _}, create_connector(ConnectorName, ConnectorConfig)),
     ?assertMatch({ok, _}, create_action(ActionName, ActionConfig)),
     ?assertMatch(
-        {ok, #{
-            resource_data :=
-                #{
-                    status := ?status_disconnected,
-                    error := failed_to_start_elasticsearch_bridge
-                }
-        }},
-        emqx_connector:lookup(?TYPE, ConnectorName)
+        {ok,
+            {{_, 200, _}, _, #{
+                <<"status">> := <<"disconnected">>,
+                <<"status_reason">> := <<"failed_to_start_elasticsearch_bridge">>
+            }}},
+        emqx_bridge_v2_testlib:get_connector_api(?TYPE, ConnectorName)
     ),
-    ?assertMatch({ok, #{status := ?status_disconnected}}, emqx_bridge_v2:lookup(?TYPE, ActionName)),
+    ?assertMatch(
+        {ok, {{_, 200, _}, _, #{<<"status">> := <<"disconnected">>}}},
+        emqx_bridge_v2_testlib:get_action_api([
+            {action_type, ?TYPE},
+            {action_name, ActionName}
+        ])
+    ),
     ok.
 
 t_parameters_key_api_spec(_Config) ->
@@ -437,3 +421,23 @@ t_http_api_get(Config) ->
         emqx_bridge_v2_testlib:list_bridges_api()
     ),
     ok.
+
+t_rule_test_trace(Config) ->
+    ConnectorName = <<"t_rule_test_trace">>,
+    ActionName = <<"t_rule_test_trace">>,
+    ActionConfig = action(ConnectorName),
+    ConnectorConfig = connector_config(Config),
+    Opts = #{payload_fn => fun mk_payload/0},
+    emqx_bridge_v2_testlib:t_rule_test_trace(
+        [
+            {bridge_kind, action},
+            {connector_type, ?TYPE},
+            {connector_name, ConnectorName},
+            {connector_config, ConnectorConfig},
+            {action_type, ?TYPE},
+            {action_name, ActionName},
+            {action_config, ActionConfig}
+            | Config
+        ],
+        Opts
+    ).

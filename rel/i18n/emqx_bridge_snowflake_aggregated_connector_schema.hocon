@@ -1,0 +1,47 @@
+emqx_bridge_snowflake_aggregated_connector_schema {
+  config_connector.label:
+  """Snowflake Aggregated Connector Configuration"""
+  config_connector.desc:
+  """Configuration for a connector to Snowflake service using aggregated uploads."""
+
+  server.label:
+  """Server Host"""
+  server.desc:
+  """The address of Snowflake computing server to connect to."""
+
+  account.label:
+  """Account"""
+  account.desc:
+  """Account ID for Snowflake."""
+
+  dsn.label:
+  """DSN"""
+  dsn.desc:
+  """Data Source Name (DSN) associated with the installed Snowflake ODBC driver."""
+
+  proxy_config.label:
+  """Proxy"""
+  proxy_config.desc:
+  """Proxy configuration.  Only plain HTTP proxies are currently supported (no HTTPS)."""
+
+  proxy_config_host.label:
+  """Proxy Host"""
+  proxy_config_host.desc:
+  """Proxy host address to connect to."""
+
+  proxy_config_port.label:
+  """Proxy Port"""
+  proxy_config_port.desc:
+  """Proxy port to use when connecting."""
+
+  private_key_path.label:
+  """Private Key Path"""
+  private_key_path.desc:
+  """Full file path to the private key to be used for the ODBC connection.  This path must be the same on all nodes of the cluster."""
+
+  private_key_password.label:
+  """Private Key Password"""
+  private_key_password.desc:
+  """Password to decrypt the private key.  Do not set this value if the private key is not encrypted."""
+
+}

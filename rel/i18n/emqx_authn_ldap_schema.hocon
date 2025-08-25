@@ -3,9 +3,6 @@ emqx_authn_ldap_schema {
 ldap.desc:
 """Configuration of authenticator using LDAP as authentication data source."""
 
-ldap_deprecated.desc:
-"""This is a deprecated form, and you should avoid using it."""
-
 password_attribute.desc:
 """Indicates which attribute is used to represent the user's password."""
 
@@ -17,6 +14,12 @@ is_superuser_attribute.desc:
 
 is_superuser_attribute.label:
 """IsSuperuser Attribute"""
+
+clientid_override_attribute.desc:
+"""Indicates which attribute is used to represent a clientid override value."""
+
+clientid_override_attribute.label:
+"""ClientIdOverride Attribute"""
 
 query_timeout.desc:
 """Timeout for the LDAP query."""
@@ -35,5 +38,17 @@ method.desc:
 
 method_type.desc:
 """Authentication method type."""
+
+bind_password.desc:
+"""The template for password to bind."""
+
+bind_password.label:
+"""Bind Password"""
+
+acl_ttl_attribute.desc:
+"""Indicates which attribute is used to represent the ACL TTL."""
+
+acl_ttl_attribute.label:
+"""ACL TTL Attribute"""
 
 }

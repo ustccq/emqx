@@ -1,20 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mysql).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
@@ -25,24 +14,25 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
     on_query/3,
-    on_batch_query/3,
+    on_batch_query/4,
     on_get_status/2,
     on_format_query_result/1
 ]).
 
 %% ecpool connect & reconnect
--export([connect/1, prepare_sql_to_conn/2]).
+-export([connect/1, prepare_sql_to_conn/2, get_reconnect_callback_signature/1]).
 
 -export([
     init_prepare/1,
     prepare_sql/2,
     parse_prepare_sql/1,
     parse_prepare_sql/2,
-    unprepare_sql/1
+    unprepare_sql/2
 ]).
 
 -export([roots/0, fields/1, namespace/0]).
@@ -91,6 +81,8 @@ server() ->
     emqx_schema:servers_sc(Meta, ?MYSQL_HOST_OPTIONS).
 
 %% ===================================================================
+resource_type() -> mysql.
+
 callback_mode() -> always_sync.
 
 -spec on_start(binary(), hocon:config()) -> {ok, state()} | {error, _}.
@@ -104,7 +96,8 @@ on_start(
         ssl := SSL
     } = Config
 ) ->
-    #{hostname := Host, port := Port} = emqx_schema:parse_server(Server, ?MYSQL_HOST_OPTIONS),
+    ParseServerOpts = maps:get(parse_server_opts, Config, ?MYSQL_HOST_OPTIONS),
+    #{hostname := Host, port := Port} = emqx_schema:parse_server(Server, ParseServerOpts),
     ?SLOG(info, #{
         msg => "starting_mysql_connector",
         connector => InstId,
@@ -117,18 +110,19 @@ on_start(
             false ->
                 []
         end,
+    Password = maps:get(password, Config, undefined),
+    BasicCapabilities = maps:get(basic_capabilities, Config, #{}),
     Options =
-        maybe_add_password_opt(
-            maps:get(password, Config, undefined),
-            [
-                {host, Host},
-                {port, Port},
-                {user, Username},
-                {database, DB},
-                {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
-                {pool_size, PoolSize}
-            ]
-        ),
+        lists:flatten([
+            [{password, Password} || Password /= undefined],
+            {basic_capabilities, BasicCapabilities},
+            {host, Host},
+            {port, Port},
+            {user, Username},
+            {database, DB},
+            {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
+            {pool_size, PoolSize}
+        ]),
     State = parse_prepare_sql(Config),
     case emqx_resource_pool:start(InstId, ?MODULE, Options ++ SslOpts) of
         ok ->
@@ -140,11 +134,6 @@ on_start(
             ),
             {error, Reason}
     end.
-
-maybe_add_password_opt(undefined, Options) ->
-    Options;
-maybe_add_password_opt(Password, Options) ->
-    [{password, Password} | Options].
 
 on_stop(InstId, _State) ->
     ?SLOG(info, #{
@@ -194,18 +183,20 @@ on_query(
 on_batch_query(
     InstId,
     BatchReq = [{Key, _} | _],
-    #{query_templates := Templates} = State
+    #{query_templates := Templates} = State,
+    ChannelConfig
 ) ->
     case maps:get({Key, batch}, Templates, undefined) of
         undefined ->
             {error, {unrecoverable_error, batch_select_not_implemented}};
         Template ->
-            on_batch_insert(InstId, BatchReq, Template, State)
+            on_batch_insert(InstId, BatchReq, Template, State, ChannelConfig)
     end;
 on_batch_query(
     InstId,
     BatchReq,
-    State
+    State,
+    _
 ) ->
     ?SLOG(error, #{
         msg => "invalid request",
@@ -235,18 +226,15 @@ on_get_status(_InstId, #{pool_name := PoolName} = State) ->
         true ->
             case do_check_prepares(State) of
                 ok ->
-                    connected;
-                {ok, NState} ->
-                    %% return new state with prepared statements
-                    {connected, NState};
+                    ?status_connected;
                 {error, undefined_table} ->
-                    {disconnected, State, unhealthy_target};
+                    {?status_disconnected, unhealthy_target};
                 {error, _Reason} ->
                     %% do not log error, it is logged in prepare_sql_to_conn
-                    connecting
+                    ?status_connecting
             end;
         false ->
-            connecting
+            ?status_connecting
     end.
 
 do_get_status(Conn) ->
@@ -282,17 +270,6 @@ do_check_prepares(
         ok,
         Workers
     );
-do_check_prepares(#{prepares := ok}) ->
-    ok;
-do_check_prepares(#{prepares := {error, _}, query_templates := _} = State) ->
-    %% retry to prepare
-    case prepare_sql(State) of
-        ok ->
-            %% remove the error
-            {ok, State#{prepares => ok}};
-        {error, Reason} ->
-            {error, Reason}
-    end;
 do_check_prepares(_NoTemplates) ->
     ok.
 
@@ -353,13 +330,16 @@ do_prepare_sql(Templates, PoolName) ->
     prepare_sql_to_conn_list(Conns, Templates).
 
 get_connections_from_pool(PoolName) ->
-    [
-        begin
+    lists:map(
+        fun(Worker) ->
             {ok, Conn} = ecpool_worker:client(Worker),
             Conn
-        end
-     || {_Name, Worker} <- ecpool:workers(PoolName)
-    ].
+        end,
+        pool_workers(PoolName)
+    ).
+
+pool_workers(PoolName) ->
+    lists:map(fun({_Name, Worker}) -> Worker end, ecpool:workers(PoolName)).
 
 prepare_sql_to_conn_list([], _Templates) ->
     ok;
@@ -372,6 +352,21 @@ prepare_sql_to_conn_list([Conn | ConnList], Templates) ->
             _ = [unprepare_sql_to_conn(Conn, Template) || Template <- Templates],
             {error, R}
     end.
+
+%% this callback accepts the arg list provided to
+%% ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn, [Templates]})
+%% so ecpool_worker can de-duplicate the callbacks based on the signature.
+get_reconnect_callback_signature([Templates]) ->
+    [{{ChannelID, _}, _}] = lists:filter(
+        fun
+            ({{_, prepstmt}, _}) ->
+                true;
+            (_) ->
+                false
+        end,
+        Templates
+    ),
+    ChannelID.
 
 prepare_sql_to_conn(_Conn, []) ->
     ok;
@@ -397,16 +392,21 @@ prepare_sql_to_conn(Conn, [{{Key, prepstmt}, {SQL, _RowTemplate}} | Rest]) ->
 prepare_sql_to_conn(Conn, [{_Key, _Template} | Rest]) ->
     prepare_sql_to_conn(Conn, Rest).
 
-unprepare_sql(#{query_templates := Templates, pool_name := PoolName}) ->
-    ecpool:remove_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn}),
+unprepare_sql(ChannelID, #{query_templates := Templates, pool_name := PoolName}) ->
     lists:foreach(
-        fun(Conn) ->
-            lists:foreach(
-                fun(Template) -> unprepare_sql_to_conn(Conn, Template) end,
-                maps:to_list(Templates)
-            )
+        fun(Worker) ->
+            ok = ecpool_worker:remove_reconnect_callback_by_signature(Worker, ChannelID),
+            case ecpool_worker:client(Worker) of
+                {ok, Conn} ->
+                    lists:foreach(
+                        fun(Template) -> unprepare_sql_to_conn(Conn, Template) end,
+                        maps:to_list(Templates)
+                    );
+                _ ->
+                    ok
+            end
         end,
-        get_connections_from_pool(PoolName)
+        pool_workers(PoolName)
     ).
 
 unprepare_sql_to_conn(Conn, {{Key, prepstmt}, _}) ->
@@ -440,10 +440,9 @@ parse_prepare_sql(Key, Query, Acc) ->
 parse_batch_sql(Key, Query, Acc) ->
     case emqx_utils_sql:get_statement_type(Query) of
         insert ->
-            case emqx_utils_sql:parse_insert(Query) of
-                {ok, {Insert, Params}} ->
-                    RowTemplate = emqx_template_sql:parse(Params),
-                    Acc#{{Key, batch} => {Insert, RowTemplate}};
+            case emqx_utils_sql:split_insert(Query) of
+                {ok, SplitedInsert} ->
+                    Acc#{{Key, batch} => parse_splited_sql(SplitedInsert)};
                 {error, Reason} ->
                     ?SLOG(error, #{
                         msg => "parse insert sql statement failed",
@@ -462,6 +461,13 @@ parse_batch_sql(Key, Query, Acc) ->
             }),
             Acc
     end.
+
+parse_splited_sql({Insert, Values, OnClause}) ->
+    RowTemplate = emqx_template_sql:parse(Values),
+    {Insert, RowTemplate, OnClause};
+parse_splited_sql({Insert, Values}) ->
+    RowTemplate = emqx_template_sql:parse(Values),
+    {Insert, RowTemplate}.
 
 proc_sql_params(query, SQLOrKey, Params, _State) ->
     {SQLOrKey, Params};
@@ -483,27 +489,28 @@ proc_sql_params(TypeOrKey, SQLOrData, Params, #{query_templates := Templates}) -
 proc_sql_params(_TypeOrKey, SQLOrData, Params, _State) ->
     {SQLOrData, Params}.
 
-on_batch_insert(InstId, BatchReqs, {InsertPart, RowTemplate}, State) ->
-    Rows = [render_row(RowTemplate, Msg) || {_, Msg} <- BatchReqs],
+on_batch_insert(InstId, BatchReqs, {InsertPart, RowTemplate, OnClause}, State, ChannelConfig) ->
+    Rows = [render_row(RowTemplate, Msg, ChannelConfig) || {_, Msg} <- BatchReqs],
+    Query = [InsertPart, <<" values ">> | lists:join($,, Rows)] ++ [<<" on ">>, OnClause],
+    on_sql_query(InstId, query, Query, no_params, default_timeout, State);
+on_batch_insert(InstId, BatchReqs, {InsertPart, RowTemplate}, State, ChannelConfig) ->
+    Rows = [render_row(RowTemplate, Msg, ChannelConfig) || {_, Msg} <- BatchReqs],
     Query = [InsertPart, <<" values ">> | lists:join($,, Rows)],
     on_sql_query(InstId, query, Query, no_params, default_timeout, State).
 
-render_row(RowTemplate, Data) ->
-    % NOTE
-    % Ignoring errors here, missing variables are set to "'undefined'" due to backward
-    % compatibility requirements.
-    RenderOpts = #{escaping => mysql, undefined => <<"undefined">>},
+render_row(RowTemplate, Data, ChannelConfig) ->
+    RenderOpts =
+        case maps:get(undefined_vars_as_null, ChannelConfig, false) of
+            % NOTE:
+            %  Ignoring errors here, missing variables are set to "'undefined'" due to backward
+            %  compatibility requirements.
+            false -> #{escaping => mysql, undefined => <<"undefined">>};
+            true -> #{escaping => mysql}
+        end,
     {Row, _Errors} = emqx_template_sql:render(RowTemplate, {emqx_jsonish, Data}, RenderOpts),
     Row.
 
-on_sql_query(
-    InstId,
-    SQLFunc,
-    SQLOrKey,
-    Params,
-    Timeout,
-    #{pool_name := PoolName} = State
-) ->
+on_sql_query(InstId, SQLFunc, SQLOrKey, Params, Timeout, #{pool_name := PoolName} = State) ->
     LogMeta = #{connector => InstId, sql => SQLOrKey, state => State},
     ?TRACE("QUERY", "mysql_connector_received", LogMeta),
     ChannelID = maps:get(channel_id, State, no_channel),
@@ -534,9 +541,10 @@ on_sql_query(
 do_sql_query(SQLFunc, Conn, SQLOrKey, Params, Timeout, LogMeta) ->
     try mysql:SQLFunc(Conn, SQLOrKey, Params, no_filtermap_fun, Timeout) of
         {error, disconnected} ->
-            ?SLOG(
+            ?tp(
                 error,
-                LogMeta#{msg => "mysql_connector_do_sql_query_failed", reason => disconnected}
+                "mysql_connector_do_sql_query_failed",
+                LogMeta#{reason => disconnected}
             ),
             %% kill the pool worker to trigger reconnection
             _ = exit(Conn, restart),
@@ -553,15 +561,17 @@ do_sql_query(SQLFunc, Conn, SQLOrKey, Params, Timeout, LogMeta) ->
             Error;
         {error, {1053, <<"08S01">>, Reason}} ->
             %% mysql sql server shutdown in progress
-            ?SLOG(
+            ?tp(
                 error,
-                LogMeta#{msg => "mysql_connector_do_sql_query_failed", reason => Reason}
+                "mysql_connector_do_sql_query_failed",
+                LogMeta#{reason => Reason}
             ),
             {error, {recoverable_error, Reason}};
         {error, Reason} ->
-            ?SLOG(
+            ?tp(
                 error,
-                LogMeta#{msg => "mysql_connector_do_sql_query_failed", reason => Reason}
+                "mysql_connector_do_sql_query_failed",
+                LogMeta#{reason => Reason}
             ),
             {error, {unrecoverable_error, Reason}};
         Result ->

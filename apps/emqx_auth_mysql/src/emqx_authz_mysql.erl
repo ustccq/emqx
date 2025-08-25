@@ -1,23 +1,8 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_mysql).
-
--include_lib("emqx/include/logger.hrl").
--include_lib("emqx/include/emqx_placeholder.hrl").
 
 -behaviour(emqx_authz_source).
 
@@ -25,65 +10,54 @@
 
 %% AuthZ Callbacks
 -export([
-    description/0,
     create/1,
-    update/1,
+    update/2,
     destroy/1,
     authorize/4
 ]).
+
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_auth/include/emqx_authz.hrl").
+-include("emqx_auth_mysql.hrl").
 
 -ifdef(TEST).
 -compile(export_all).
 -compile(nowarn_export_all).
 -endif.
 
--define(ALLOWED_VARS, [
-    ?VAR_USERNAME,
-    ?VAR_CLIENTID,
-    ?VAR_PEERHOST,
-    ?VAR_CERT_CN_NAME,
-    ?VAR_CERT_SUBJECT,
-    ?VAR_NS_CLIENT_ATTRS
-]).
+-define(ALLOWED_VARS, ?AUTHZ_DEFAULT_ALLOWED_VARS).
 
-description() ->
-    "AuthZ with Mysql".
+create(Source) ->
+    ResourceId = emqx_authz_utils:make_resource_id(?AUTHZ_TYPE),
+    State = new_state(ResourceId, Source),
+    ok = emqx_authz_utils:create_resource(emqx_mysql, State),
+    State.
 
-create(#{query := SQL} = Source0) ->
-    {PrepareSQL, TmplToken} = emqx_auth_utils:parse_sql(SQL, '?', ?ALLOWED_VARS),
-    ResourceId = emqx_authz_utils:make_resource_id(?MODULE),
-    Source = Source0#{prepare_statement => #{?PREPARE_KEY => PrepareSQL}},
-    {ok, _Data} = emqx_authz_utils:create_resource(ResourceId, emqx_mysql, Source),
-    Source#{annotations => #{id => ResourceId, tmpl_token => TmplToken}}.
+update(#{resource_id := ResourceId} = _State, Source) ->
+    State = new_state(ResourceId, Source),
+    ok = emqx_authz_utils:update_resource(emqx_mysql, State),
+    State.
 
-update(#{query := SQL} = Source0) ->
-    {PrepareSQL, TmplToken} = emqx_auth_utils:parse_sql(SQL, '?', ?ALLOWED_VARS),
-    Source = Source0#{prepare_statement => #{?PREPARE_KEY => PrepareSQL}},
-    case emqx_authz_utils:update_resource(emqx_mysql, Source) of
-        {error, Reason} ->
-            error({load_config_error, Reason});
-        {ok, Id} ->
-            Source#{annotations => #{id => Id, tmpl_token => TmplToken}}
-    end.
-
-destroy(#{annotations := #{id := Id}}) ->
-    emqx_authz_utils:remove_resource(Id).
+destroy(#{resource_id := ResourceId}) ->
+    emqx_authz_utils:remove_resource(ResourceId).
 
 authorize(
     Client,
     Action,
     Topic,
     #{
-        annotations := #{
-            id := ResourceID,
-            tmpl_token := TmplToken
-        }
+        resource_id := ResourceId,
+        tmpl_token := TmplToken,
+        cache_key_template := CacheKeyTemplate
     }
 ) ->
     Vars = emqx_authz_utils:vars_for_rule_query(Client, Action),
-    RenderParams = emqx_auth_utils:render_sql_params(TmplToken, Vars),
+    RenderParams = emqx_auth_template:render_sql_params(TmplToken, Vars),
+    CacheKey = emqx_auth_template:cache_key(Vars, CacheKeyTemplate),
     case
-        emqx_resource:simple_sync_query(ResourceID, {prepared_query, ?PREPARE_KEY, RenderParams})
+        emqx_authz_utils:cached_simple_sync_query(
+            CacheKey, ResourceId, {prepared_query, ?PREPARE_KEY, RenderParams}
+        )
     of
         {ok, ColumnNames, Rows} ->
             do_authorize(Client, Action, Topic, ColumnNames, Rows);
@@ -93,27 +67,35 @@ authorize(
                 reason => Reason,
                 tmpl_token => TmplToken,
                 params => RenderParams,
-                resource_id => ResourceID
+                resource_id => ResourceId
             }),
             nomatch
     end.
 
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+
+new_state(ResourceId, #{query := SQL} = Source0) ->
+    {Vars, PrepareSQL, TmplToken} = emqx_auth_template:parse_sql(SQL, '?', ?ALLOWED_VARS),
+    CacheKeyTemplate = emqx_auth_template:cache_key_template(Vars),
+    Source = Source0#{prepare_statement => #{?PREPARE_KEY => PrepareSQL}},
+    ResourceConfig = emqx_authz_utils:cleanup_resource_config(
+        [query], Source
+    ),
+    emqx_authz_utils:init_state(Source, #{
+        resource_config => ResourceConfig,
+        resource_id => ResourceId,
+        tmpl_token => TmplToken,
+        cache_key_template => CacheKeyTemplate
+    }).
+
 do_authorize(_Client, _Action, _Topic, _ColumnNames, []) ->
     nomatch;
 do_authorize(Client, Action, Topic, ColumnNames, [Row | Tail]) ->
-    try
-        emqx_authz_rule:match(
-            Client, Action, Topic, emqx_authz_utils:parse_rule_from_row(ColumnNames, Row)
-        )
-    of
-        {matched, Permission} -> {matched, Permission};
-        nomatch -> do_authorize(Client, Action, Topic, ColumnNames, Tail)
-    catch
-        error:Reason ->
-            ?SLOG(error, #{
-                msg => "match_rule_error",
-                reason => Reason,
-                rule => Row
-            }),
-            do_authorize(Client, Action, Topic, ColumnNames, Tail)
+    case emqx_authz_utils:authorize_with_row(mysql, Client, Action, Topic, ColumnNames, Row) of
+        nomatch ->
+            do_authorize(Client, Action, Topic, ColumnNames, Tail);
+        {matched, Permission} ->
+            {matched, Permission}
     end.

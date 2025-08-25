@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_machine).
@@ -51,7 +39,7 @@ start() ->
     ok = start_sysmon(),
     configure_shard_transports(),
     set_mnesia_extra_diagnostic_checks(),
-    emqx_otel_app:configure_otel_deps(),
+    ok = configure_otel_deps(),
     %% Register mria callbacks that help to check compatibility of the
     %% replicant with the core node. Currently they rely on the exact
     %% match of the version of EMQX OTP application:
@@ -116,6 +104,14 @@ set_mnesia_extra_diagnostic_checks() ->
     Checks = [{check_open_ports, ok, fun ?MODULE:open_ports_check/0}],
     mria_config:set_extra_mnesia_diagnostic_checks(Checks),
     ok.
+
+-if(?EMQX_RELEASE_EDITION == ee).
+configure_otel_deps() ->
+    emqx_otel_app:configure_otel_deps().
+-else.
+configure_otel_deps() ->
+    ok.
+-endif.
 
 -define(PORT_PROBE_TIMEOUT, 10_000).
 open_ports_check() ->
@@ -241,6 +237,8 @@ mria_lb_custom_info() ->
     get_emqx_vsn().
 
 %% Note: this function is stored in the Mria's application environment
+%% This function is only evaluated by replicant nodes.
+%% Should return `true' if the input node version may be connected to by the current node.
 mria_lb_custom_info_check(undefined) ->
     false;
 mria_lb_custom_info_check(OtherVsn) ->

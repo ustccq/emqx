@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_jwt_schema).
@@ -100,6 +88,15 @@ fields(jwt_jwks) ->
     [
         {use_jwks, sc(hoconsc:enum([true]), #{required => true, desc => ?DESC(use_jwks)})},
         {endpoint, fun endpoint/1},
+        {headers,
+            sc(
+                typerefl:alias("map", emqx_schema:binary_kv()),
+                #{
+                    default => #{<<"Accept">> => <<"application/json">>},
+                    validator => fun validate_headers/1,
+                    desc => ?DESC("jwks_headers")
+                }
+            )},
         {pool_size, fun emqx_connector_schema_lib:pool_size/1},
         {refresh_interval, fun refresh_interval/1},
         {ssl, #{
@@ -235,3 +232,26 @@ to_binary(B) when is_binary(B) ->
     B.
 
 sc(Type, Meta) -> hoconsc:mk(Type, Meta).
+
+validate_headers(undefined) ->
+    ok;
+validate_headers(Headers) ->
+    BadKeys0 =
+        lists:filter(
+            fun(K) ->
+                re:run(K, <<"[^-0-9a-zA-Z_ ]">>, [{capture, none}]) =:= match
+            end,
+            maps:keys(Headers)
+        ),
+    case BadKeys0 of
+        [] ->
+            ok;
+        _ ->
+            BadKeys = lists:join(", ", BadKeys0),
+            Msg0 = io_lib:format(
+                "headers should contain only characters matching [-0-9a-zA-Z_ ]; bad headers: ~s",
+                [BadKeys]
+            ),
+            Msg = iolist_to_binary(Msg0),
+            {error, Msg}
+    end.

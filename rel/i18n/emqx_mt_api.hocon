@@ -1,0 +1,94 @@
+emqx_mt_api {
+    ns_list {
+        desc: """~
+            List all namespaces
+            The namespaces are sorted in lexicographical order,
+            so this API can be used for prefix based fuzzy search.~"""
+        label: "List Namespaces"
+    }
+    ns_list_details {
+        desc: """~
+            List all namespaces, along with some extra details.
+            The namespaces are sorted in lexicographical order,
+            so this API can be used for prefix based fuzzy search.~"""
+        label: "List Namespaces with extra details"
+    }
+    client_list {
+        desc: "List all clients in a namespace"
+        label: "List Clients"
+    }
+    client_count {
+        desc: "Count all clients in a namespace"
+        label: "Count Clients"
+    }
+    last_ns_in_query {
+        desc: """~
+            The last namespace from the previous page.
+            For the first page, use empty string.~"""
+        label: "Last Namespace"
+    }
+    limit_in_query {
+        desc: "The number of items to return"
+        label: "Limit"
+    }
+    last_client_in_query {
+        desc: """~
+            The last client from the previous page.
+            For the first page, use empty string.~"""
+        label: "Last Client ID"
+    }
+    managed_ns_list {
+        desc: """~
+            List all managed namespaces
+            The namespaces are sorted in lexicographical order,
+            so this API can be used for prefix based fuzzy search.~"""
+        label: "List managed namespaces"
+    }
+    managed_ns_list_details {
+        desc: """~
+            List all managed namespaces with extra details.
+            The namespaces are sorted in lexicographical order,
+            so this API can be used for prefix based fuzzy search.~"""
+        label: "List managed namespaces with extra details"
+    }
+    create_managed_ns {
+        desc: "Create managed namespace"
+        label: "Create managed namespace"
+    }
+    delete_ns {
+        desc: "Delete namespace. This will cause all the clients under this namespace to be kicked out asynchronously."
+        label: "Delete namespace"
+    }
+    get_managed_ns_config {
+        desc: "Get managed namespace configuration"
+        label: "Get managed namespace configuration"
+    }
+    update_managed_ns_config {
+        desc: "Update managed namespace configuration"
+        label: "Update managed namespace configuration"
+    }
+    bulk_import_configs {
+        desc: "Upsert namespace configurations in bulk"
+        label: "Upsert namespace configurations in bulk"
+    }
+    bulk_export_ns_configs {
+        desc: "Export one or more namespaced configurations."
+        label: "Bulk Export Namespaced Configurations"
+    }
+    bulk_import_ns_configs {
+        desc: "Import one or more namespaced configurations."
+        label: "Build Import Namespaced Configs"
+    }
+    kick_all_clients {
+        desc: "Kick all clients in namespace (async)"
+        label: "Kick all clients in namespace (async)"
+    }
+    bulk_delete_ns {
+        desc: "Bulk delete namespaces"
+        label: "Bulk delete namespaces"
+    }
+    bulk_config_bad_request {
+        desc: "Invalid configurations"
+        label: "Invalid configurations"
+    }
+}

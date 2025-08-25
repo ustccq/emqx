@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_rbac_SUITE).
@@ -7,8 +7,9 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include("emqx_dashboard.hrl").
+-include("../../emqx_dashboard/include/emqx_dashboard.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 
 -import(emqx_dashboard_api_test_helpers, [request/4, uri/1]).
 
@@ -16,19 +17,47 @@
 -define(DEFAULT_SUPERUSER_PASS, <<"admin_password">>).
 -define(ADD_DESCRIPTION, <<>>).
 
+-define(global_superuser, global_superuser).
+-define(global_viewer, global_viewer).
+-define(namespaced_superuser, namespaced_superuser).
+-define(namespaced_viewer, namespaced_viewer).
+
 all() ->
-    emqx_common_test_helpers:all(?MODULE).
+    emqx_common_test_helpers:all_with_matrix(?MODULE).
+
+groups() ->
+    emqx_common_test_helpers:groups_with_matrix(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard(),
+            emqx_dashboard_rbac
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 end_per_testcase(_, _Config) ->
     All = emqx_dashboard_admin:all_users(),
     [emqx_dashboard_admin:remove_user(Name) || #{username := Name} <- All].
+
+role_of(TCConfig) ->
+    Alternatives = [
+        ?global_superuser,
+        ?global_viewer,
+        ?namespaced_superuser,
+        ?namespaced_viewer
+    ],
+    emqx_common_test_helpers:get_matrix_prop(TCConfig, Alternatives, ?global_superuser).
 
 t_create_bad_role(_) ->
     ?assertEqual(
@@ -67,7 +96,7 @@ t_permission(_) ->
             <<"role">> := ?ROLE_VIEWER,
             <<"description">> := ?ADD_DESCRIPTION
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     %% add by viewer
@@ -110,7 +139,7 @@ t_update_role(_) ->
             <<"role">> := ?ROLE_VIEWER,
             <<"description">> := ?ADD_DESCRIPTION
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     %% update role by viewer
@@ -135,29 +164,45 @@ t_clean_token(_) ->
     Desc = <<"desc">>,
     NewDesc = <<"new desc">>,
     {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, Desc),
-    {ok, _Role, Token} = emqx_dashboard_admin:sign_token(Username, Password),
-    FakePath = erlang:list_to_binary(emqx_dashboard_swagger:relative_uri("/fake")),
-    FakeReq = #{method => <<"GET">>, path => FakePath},
-    {ok, Username} = emqx_dashboard_admin:verify_token(FakeReq, Token),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
+    FakeReq = #{},
+    FakeHandlerInfo = #{method => get, module => any, function => any},
+    {ok, #{actor := Username}} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token),
     %% change description
     {ok, _} = emqx_dashboard_admin:update_user(Username, ?ROLE_SUPERUSER, NewDesc),
     timer:sleep(5),
-    {ok, Username} = emqx_dashboard_admin:verify_token(FakeReq, Token),
+    {ok, #{actor := Username}} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token),
     %% change role
     {ok, _} = emqx_dashboard_admin:update_user(Username, ?ROLE_VIEWER, NewDesc),
     timer:sleep(5),
-    {error, not_found} = emqx_dashboard_admin:verify_token(FakeReq, Token),
+    {error, not_found} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token),
     ok.
 
-t_login_out(_) ->
+t_logout() ->
+    [{matrix, true}].
+t_logout(matrix) ->
+    [
+        [?global_superuser],
+        [?global_viewer],
+        [?namespaced_superuser],
+        [?namespaced_viewer]
+    ];
+t_logout(TCConfig) when is_list(TCConfig) ->
     Username = <<"admin_token">>,
     Password = <<"public_www1">>,
     Desc = <<"desc">>,
-    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, ?ROLE_SUPERUSER, Desc),
-    {ok, _Role, Token} = emqx_dashboard_admin:sign_token(Username, Password),
-    FakePath = erlang:list_to_binary(emqx_dashboard_swagger:relative_uri("/logout")),
-    FakeReq = #{method => <<"POST">>, path => FakePath},
-    {ok, Username} = emqx_dashboard_admin:verify_token(FakeReq, Token),
+    Role =
+        case role_of(TCConfig) of
+            ?global_superuser -> ?ROLE_SUPERUSER;
+            ?global_viewer -> ?ROLE_VIEWER;
+            ?namespaced_superuser -> <<"ns:ns1::", ?ROLE_SUPERUSER/binary>>;
+            ?namespaced_viewer -> <<"ns:ns1::", ?ROLE_VIEWER/binary>>
+        end,
+    {ok, _} = emqx_dashboard_admin:add_user(Username, Password, Role, Desc),
+    {ok, #{token := Token}} = emqx_dashboard_admin:sign_token(Username, Password),
+    FakeReq = #{},
+    FakeHandlerInfo = #{method => post, function => logout, module => emqx_dashboard_api},
+    {ok, #{actor := Username}} = emqx_dashboard_admin:verify_token(FakeReq, FakeHandlerInfo, Token),
     ok.
 
 t_change_pwd(_) ->
@@ -169,24 +214,69 @@ t_change_pwd(_) ->
     {ok, _} = emqx_dashboard_admin:add_user(Viewer1, Password, ?ROLE_VIEWER, Desc),
     {ok, _} = emqx_dashboard_admin:add_user(Viewer2, Password, ?ROLE_VIEWER, Desc),
     {ok, _} = emqx_dashboard_admin:add_user(SuperUser, Password, ?ROLE_SUPERUSER, Desc),
-    {ok, ?ROLE_VIEWER, Viewer1Token} = emqx_dashboard_admin:sign_token(Viewer1, Password),
-    {ok, ?ROLE_SUPERUSER, SuperToken} = emqx_dashboard_admin:sign_token(SuperUser, Password),
+    {ok, #{role := ?ROLE_VIEWER, token := Viewer1Token}} = emqx_dashboard_admin:sign_token(
+        Viewer1, Password
+    ),
+    {ok, #{role := ?ROLE_SUPERUSER, token := SuperToken}} = emqx_dashboard_admin:sign_token(
+        SuperUser, Password
+    ),
     %% viewer can change own password
-    ?assertEqual({ok, Viewer1}, change_pwd(Viewer1Token, Viewer1)),
+    ?assertMatch({ok, #{actor := Viewer1}}, change_pwd(Viewer1Token, Viewer1)),
     %% viewer can't change other's password
     ?assertEqual({error, unauthorized_role}, change_pwd(Viewer1Token, Viewer2)),
     ?assertEqual({error, unauthorized_role}, change_pwd(Viewer1Token, SuperUser)),
     %% superuser can change other's password
-    ?assertEqual({ok, SuperUser}, change_pwd(SuperToken, Viewer1)),
-    ?assertEqual({ok, SuperUser}, change_pwd(SuperToken, Viewer2)),
-    ?assertEqual({ok, SuperUser}, change_pwd(SuperToken, SuperUser)),
+    ?assertMatch({ok, #{actor := SuperUser}}, change_pwd(SuperToken, Viewer1)),
+    ?assertMatch({ok, #{actor := SuperUser}}, change_pwd(SuperToken, Viewer2)),
+    ?assertMatch({ok, #{actor := SuperUser}}, change_pwd(SuperToken, SuperUser)),
     ok.
 
 change_pwd(Token, Username) ->
-    Path = "/users/" ++ binary_to_list(Username) ++ "/change_pwd",
-    Path1 = erlang:list_to_binary(emqx_dashboard_swagger:relative_uri(Path)),
-    Req = #{method => <<"POST">>, path => Path1},
-    emqx_dashboard_admin:verify_token(Req, Token).
+    Req = #{bindings => #{username => Username}},
+    HandlerInfo = #{method => post, function => change_pwd, module => emqx_dashboard_api},
+    emqx_dashboard_admin:verify_token(Req, HandlerInfo, Token).
+
+t_setup_mfa(_) ->
+    test_mfa(fun setup_mfa/2).
+
+t_delete_mfa(_) ->
+    test_mfa(fun delete_mfa/2).
+
+test_mfa(VerifyFn) ->
+    Viewer1 = <<"viewermfa1">>,
+    Viewer2 = <<"viewermfa2">>,
+    SuperUser = <<"adminmfa">>,
+    Password = <<"xyz124abc">>,
+    Desc = <<"desc">>,
+    {ok, _} = emqx_dashboard_admin:add_user(Viewer1, Password, ?ROLE_VIEWER, Desc),
+    {ok, _} = emqx_dashboard_admin:add_user(Viewer2, Password, ?ROLE_VIEWER, Desc),
+    {ok, _} = emqx_dashboard_admin:add_user(SuperUser, Password, ?ROLE_SUPERUSER, Desc),
+    {ok, #{role := ?ROLE_VIEWER, token := Viewer1Token}} = emqx_dashboard_admin:sign_token(
+        Viewer1, Password
+    ),
+    {ok, #{role := ?ROLE_SUPERUSER, token := SuperToken}} = emqx_dashboard_admin:sign_token(
+        SuperUser, Password
+    ),
+    %% viewer can change own password
+    ?assertMatch({ok, #{actor := Viewer1}}, VerifyFn(Viewer1Token, Viewer1)),
+    %% viewer can't change other's password
+    ?assertEqual({error, unauthorized_role}, VerifyFn(Viewer1Token, Viewer2)),
+    ?assertEqual({error, unauthorized_role}, VerifyFn(Viewer1Token, SuperUser)),
+    %% superuser can change other's password
+    ?assertMatch({ok, #{actor := SuperUser}}, VerifyFn(SuperToken, Viewer1)),
+    ?assertMatch({ok, #{actor := SuperUser}}, VerifyFn(SuperToken, Viewer2)),
+    ?assertMatch({ok, #{actor := SuperUser}}, VerifyFn(SuperToken, SuperUser)),
+    ok.
+
+delete_mfa(Token, Username) ->
+    Req = #{bindings => #{username => Username}},
+    HandlerInfo = #{method => delete, module => emqx_dashboard_api, function => change_mfa},
+    emqx_dashboard_admin:verify_token(Req, HandlerInfo, Token).
+
+setup_mfa(Token, Username) ->
+    Req = #{bindings => #{username => Username}},
+    HandlerInfo = #{method => post, module => emqx_dashboard_api, function => change_mfa},
+    emqx_dashboard_admin:verify_token(Req, HandlerInfo, Token).
 
 add_default_superuser() ->
     {ok, _NewUser} = emqx_dashboard_admin:add_user(

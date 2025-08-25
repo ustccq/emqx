@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_api_mnesia_SUITE).
@@ -18,6 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
+-include_lib("emqx/include/logger.hrl").
 -include_lib("emqx_auth/include/emqx_authz.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -36,7 +26,7 @@ init_per_suite(Config) ->
             {emqx_conf,
                 "authorization.cache { enable = false },"
                 "authorization.no_match = deny,"
-                "authorization.sources = [{type = built_in_database}]"},
+                "authorization.sources = [{type = built_in_database, max_rules = 7}]"},
             emqx,
             emqx_auth,
             emqx_auth_mnesia,
@@ -64,6 +54,14 @@ t_api(_) ->
             post,
             uri(["authorization", "sources", "built_in_database", "rules", "users"]),
             [?USERNAME_RULES_EXAMPLE]
+        ),
+
+    %% check length limit
+    {ok, 400, _} =
+        request(
+            post,
+            uri(["authorization", "sources", "built_in_database", "rules", "users"]),
+            [dup_rules_example(?USERNAME_RULES_EXAMPLE)]
         ),
 
     {ok, 409, _} =
@@ -126,8 +124,18 @@ t_api(_) ->
         request(
             put,
             uri(["authorization", "sources", "built_in_database", "rules", "users", "user1"]),
-            ?USERNAME_RULES_EXAMPLE#{rules => []}
+            maps:merge(?USERNAME_RULES_EXAMPLE, #{rules => []})
         ),
+
+    %% check length limit
+
+    {ok, 400, _} =
+        request(
+            put,
+            uri(["authorization", "sources", "built_in_database", "rules", "users", "user1"]),
+            dup_rules_example2(?USERNAME_RULES_EXAMPLE)
+        ),
+
     {ok, 200, Request3} =
         request(
             get,
@@ -171,6 +179,13 @@ t_api(_) ->
             [?CLIENTID_RULES_EXAMPLE]
         ),
 
+    {ok, 400, _} =
+        request(
+            post,
+            uri(["authorization", "sources", "built_in_database", "rules", "clients"]),
+            [dup_rules_example(?CLIENTID_RULES_EXAMPLE)]
+        ),
+
     {ok, 409, _} =
         request(
             post,
@@ -202,8 +217,18 @@ t_api(_) ->
         request(
             put,
             uri(["authorization", "sources", "built_in_database", "rules", "clients", "client1"]),
-            ?CLIENTID_RULES_EXAMPLE#{rules => []}
+            maps:merge(?CLIENTID_RULES_EXAMPLE, #{rules => []})
         ),
+
+    {ok, 400, _} =
+        request(
+            put,
+            uri(["authorization", "sources", "built_in_database", "rules", "clients", "client1"]),
+            dup_rules_example2(
+                ?CLIENTID_RULES_EXAMPLE
+            )
+        ),
+
     {ok, 200, Request6} =
         request(
             get,
@@ -238,6 +263,14 @@ t_api(_) ->
             uri(["authorization", "sources", "built_in_database", "rules", "all"]),
             ?ALL_RULES_EXAMPLE
         ),
+
+    {ok, 400, _} =
+        request(
+            post,
+            uri(["authorization", "sources", "built_in_database", "rules", "all"]),
+            dup_rules_example(?ALL_RULES_EXAMPLE)
+        ),
+
     {ok, 200, Request7} =
         request(
             get,
@@ -491,3 +524,13 @@ replace_parts(Parts, Replacements) ->
         end,
         Parts
     ).
+
+dup_rules_example(#{username := _, rules := Rules}) ->
+    #{username => user2, rules => Rules ++ Rules};
+dup_rules_example(#{clientid := _, rules := Rules}) ->
+    #{clientid => client2, rules => Rules ++ Rules};
+dup_rules_example(#{rules := Rules}) ->
+    #{rules => Rules ++ Rules}.
+
+dup_rules_example2(#{rules := Rules} = Example) ->
+    Example#{rules := Rules ++ Rules}.

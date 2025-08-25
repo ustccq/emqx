@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_greptimedb_SUITE).
 
@@ -50,18 +50,15 @@ init_per_suite(Config) ->
     Config.
 
 end_per_suite(_Config) ->
-    delete_all_bridges(),
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_connector_test_helpers:stop_apps([
-        emqx_conf, emqx_bridge, emqx_resource, emqx_rule_engine
-    ]),
-    _ = application:stop(emqx_connector),
     ok.
 
 init_per_group(GreptimedbType, Config0) when
     GreptimedbType =:= grpcv1_tcp;
     GreptimedbType =:= grpcv1_tls
 ->
+    ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
+    ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     #{
         host := GreptimedbHost,
         port := GreptimedbPort,
@@ -89,13 +86,18 @@ init_per_group(GreptimedbType, Config0) when
         end,
     case emqx_common_test_helpers:is_tcp_server_available(GreptimedbHost, GreptimedbHttpPort) of
         true ->
-            ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
-            ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
-            emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            ok = start_apps(),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            {ok, _} = application:ensure_all_started(greptimedb),
-            emqx_mgmt_api_test_util:init_suite(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_greptimedb,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
             Config = [{use_tls, UseTLS} | Config0],
             {Name, ConfigString, GreptimedbConfig} = greptimedb_config(
                 grpcv1, GreptimedbHost, GreptimedbPort, Config
@@ -116,6 +118,7 @@ init_per_group(GreptimedbType, Config0) when
             ],
             {ok, _} = ehttpc_sup:start_pool(EHttpcPoolName, EHttpcPoolOpts),
             [
+                {group_apps, Apps},
                 {proxy_host, ProxyHost},
                 {proxy_port, ProxyPort},
                 {proxy_name, ProxyName},
@@ -150,18 +153,21 @@ end_per_group(Group, Config) when
     Group =:= grpcv1_tcp;
     Group =:= grpcv1_tls
 ->
+    Apps = ?config(group_apps, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     EHttpcPoolName = ?config(ehttpc_pool_name, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     ehttpc_sup:stop_pool(EHttpcPoolName),
-    delete_bridge(Config),
-    _ = application:stop(greptimedb),
+    emqx_cth_suite:stop(Apps),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(_Testcase, Config) ->
+    ProxyHost = ?config(proxy_host, Config),
+    ProxyPort = ?config(proxy_port, Config),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     delete_all_rules(),
     delete_all_bridges(),
     Config.
@@ -178,14 +184,6 @@ end_per_testcase(_Testcase, Config) ->
 %%------------------------------------------------------------------------------
 %% Helper fns
 %%------------------------------------------------------------------------------
-
-start_apps() ->
-    %% some configs in emqx_conf app are mandatory
-    %% we want to make sure they are loaded before
-    %% ekka start in emqx_common_test_helpers:start_apps/1
-    emqx_common_test_helpers:render_and_load_app_config(emqx_conf),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:start_apps([emqx_resource, emqx_bridge, emqx_rule_engine]).
 
 example_write_syntax() ->
     %% N.B.: this single space character is relevant
@@ -209,12 +207,14 @@ greptimedb_config(grpcv1 = Type, GreptimedbHost, GreptimedbPort, Config) ->
             "  dbname = public\n"
             "  username = greptime_user\n"
             "  password = greptime_pwd\n"
+            "  ttl      = \"3 years\"\n"
             "  precision = ns\n"
             "  write_syntax = \"~s\"\n"
             "  resource_opts = {\n"
             "    request_ttl = 1s\n"
             "    query_mode = ~s\n"
             "    batch_size = ~b\n"
+            "    health_check_interval = 5s\n"
             "  }\n"
             "  ssl {\n"
             "    enable = ~p\n"
@@ -251,7 +251,7 @@ create_bridge(Config, Overrides) ->
     Name = ?config(greptimedb_name, Config),
     GreptimedbConfig0 = ?config(greptimedb_config, Config),
     GreptimedbConfig = emqx_utils_maps:deep_merge(GreptimedbConfig0, Overrides),
-    emqx_bridge:create(Type, Name, GreptimedbConfig).
+    emqx_bridge_testlib:create_bridge_api(Type, Name, GreptimedbConfig).
 
 delete_bridge(Config) ->
     Type = greptimedb_type_bin(?config(greptimedb_type, Config)),
@@ -259,20 +259,10 @@ delete_bridge(Config) ->
     emqx_bridge:remove(Type, Name).
 
 delete_all_bridges() ->
-    lists:foreach(
-        fun(#{name := Name, type := Type}) ->
-            emqx_bridge:remove(Type, Name)
-        end,
-        emqx_bridge:list()
-    ).
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors().
 
 delete_all_rules() ->
-    lists:foreach(
-        fun(#{id := RuleId}) ->
-            ok = emqx_rule_engine:delete_rule(RuleId)
-        end,
-        emqx_rule_engine:get_rules()
-    ).
+    emqx_bridge_v2_testlib:delete_all_rules().
 
 create_rule_and_action_http(Config) ->
     create_rule_and_action_http(Config, _Overrides = #{}).
@@ -290,7 +280,7 @@ create_rule_and_action_http(Config, Overrides) ->
     Path = emqx_mgmt_api_test_util:api_path(["rules"]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -302,6 +292,10 @@ send_message(Config, Payload) ->
     Resp.
 
 query_by_clientid(Topic, ClientId, Config) ->
+    Sql = <<"select * from \"", Topic/binary, "\" where clientid='", ClientId/binary, "'">>,
+    query_by_sql(Config, Sql).
+
+query_by_sql(Config, Sql) ->
     GreptimedbHost = ?config(greptimedb_host, Config),
     GreptimedbPort = ?config(greptimedb_http_port, Config),
     EHttpcPoolName = ?config(ehttpc_pool_name, Config),
@@ -323,7 +317,7 @@ query_by_clientid(Topic, ClientId, Config) ->
         {"Authorization", "Basic Z3JlcHRpbWVfdXNlcjpncmVwdGltZV9wd2Q="},
         {"Content-Type", "application/x-www-form-urlencoded"}
     ],
-    Body = <<"sql=select * from \"", Topic/binary, "\" where clientid='", ClientId/binary, "'">>,
+    Body = <<"sql=", Sql/binary>>,
     {ok, StatusCode, _Headers, RawBody0} =
         ehttpc:request(
             EHttpcPoolName,
@@ -333,7 +327,7 @@ query_by_clientid(Topic, ClientId, Config) ->
             _Retry = 0
         ),
 
-    case emqx_utils_json:decode(RawBody0, [return_maps]) of
+    case emqx_utils_json:decode(RawBody0) of
         #{
             <<"output">> := [
                 #{
@@ -386,13 +380,14 @@ assert_persisted_data(ClientId, Expected, PersistedData) ->
             (int_value, ExpectedValue) ->
                 ?assertMatch(
                     ExpectedValue,
-                    maps:get(ClientIdIntKey, PersistedData)
+                    maps:get(ClientIdIntKey, PersistedData, not_found),
+                    #{persisted => PersistedData}
                 );
             (Key, ExpectedValue) ->
                 ?assertMatch(
                     ExpectedValue,
-                    maps:get(atom_to_binary(Key), PersistedData),
-                    #{expected => ExpectedValue}
+                    maps:get(atom_to_binary(Key), PersistedData, not_found),
+                    #{persisted => PersistedData}
                 )
         end,
         Expected
@@ -436,7 +431,8 @@ t_start_ok(Config) ->
                 sync ->
                     ?assertMatch({ok, _}, send_message(Config, SentData))
             end,
-            PersistedData = query_by_clientid(atom_to_binary(?FUNCTION_NAME), ClientId, Config),
+            Topic = atom_to_binary(?FUNCTION_NAME),
+            PersistedData = query_by_clientid(Topic, ClientId, Config),
             Expected = #{
                 bool => true,
                 int_value => -123,
@@ -445,6 +441,13 @@ t_start_ok(Config) ->
                 payload => emqx_utils_json:encode(Payload)
             },
             assert_persisted_data(ClientId, Expected, PersistedData),
+
+            %% assert table options
+            Sql =
+                <<"SELECT create_options FROM information_schema.tables WHERE table_name='",
+                    Topic/binary, "'">>,
+            TableOpts = query_by_sql(Config, Sql),
+            ?assertEqual(<<"ttl=3years">>, maps:get(<<"create_options">>, TableOpts)),
             ok
         end,
         fun(Trace0) ->
@@ -692,6 +695,12 @@ t_boolean_variants(Config) ->
         {ok, _},
         create_bridge(Config)
     ),
+    ResourceId = resource_id(Config),
+    ?retry(
+        _Sleep1 = 1_000,
+        _Attempts1 = 10,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+    ),
     BoolVariants = #{
         true => true,
         false => false,
@@ -728,14 +737,22 @@ t_boolean_variants(Config) ->
                 async -> ct:sleep(500);
                 sync -> ok
             end,
-            PersistedData = query_by_clientid(atom_to_binary(?FUNCTION_NAME), ClientId, Config),
-            Expected = #{
-                bool => Translation,
-                int_value => -123,
-                uint_value => 123,
-                payload => emqx_utils_json:encode(Payload)
-            },
-            assert_persisted_data(ClientId, Expected, PersistedData),
+            ?retry(
+                _Sleep2 = 500,
+                _Attempts2 = 20,
+                begin
+                    PersistedData = query_by_clientid(
+                        atom_to_binary(?FUNCTION_NAME), ClientId, Config
+                    ),
+                    Expected = #{
+                        bool => Translation,
+                        int_value => -123,
+                        uint_value => 123,
+                        payload => emqx_utils_json:encode(Payload)
+                    },
+                    assert_persisted_data(ClientId, Expected, PersistedData)
+                end
+            ),
             ok
         end,
         BoolVariants
@@ -841,6 +858,11 @@ t_get_status(Config) ->
     emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
         ?assertEqual({ok, disconnected}, emqx_resource_manager:health_check(ResourceId))
     end),
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 10,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
+    ),
     ok.
 
 t_create_disconnected(Config) ->
@@ -858,6 +880,12 @@ t_create_disconnected(Config) ->
             ),
             ok
         end
+    ),
+    ResourceId = resource_id(Config),
+    ?retry(
+        _Sleep = 1_000,
+        _Attempts = 10,
+        ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
     ),
     ok.
 
@@ -978,25 +1006,8 @@ t_authentication_error_on_send_message(Config0) ->
         end,
     Config = lists:keyreplace(greptimedb_config, 1, Config0, {greptimedb_config, GreptimeConfig}),
 
-    % Fake initialization to simulate credential update after bridge was created.
-    emqx_common_test_helpers:with_mock(
-        greptimedb,
-        check_auth,
-        fun(_) ->
-            ok
-        end,
-        fun() ->
-            {ok, _} = create_bridge(Config),
-            ResourceId = resource_id(Config0),
-            ?retry(
-                _Sleep = 1_000,
-                _Attempts = 10,
-                ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
-            )
-        end
-    ),
+    {ok, _} = create_bridge(Config),
 
-    % Now back to wrong credentials
     ClientId = emqx_guid:to_hexstr(emqx_guid:gen()),
     Payload = #{
         int_key => -123,

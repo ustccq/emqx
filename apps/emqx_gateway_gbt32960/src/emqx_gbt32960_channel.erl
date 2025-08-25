@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gbt32960_channel).
@@ -20,6 +20,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_timeout/3,
     terminate/2,
@@ -138,7 +139,7 @@ set_conn_state(ConnState, Channel) ->
 
 init(
     ConnInfo = #{
-        peername := {PeerHost, _Port},
+        peername := {PeerHost, _Port} = PeerName,
         sockname := {_Host, SockPort}
     },
     Options
@@ -160,6 +161,7 @@ init(
             listener => ListenerId,
             protocol => gbt32960,
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             clientid => undefined,
             username => undefined,
@@ -217,8 +219,9 @@ handle_in(
     case
         emqx_utils:pipeline(
             [
-                fun enrich_clientinfo/2,
                 fun enrich_conninfo/2,
+                fun run_conn_hooks/2,
+                fun enrich_clientinfo/2,
                 fun set_log_meta/2,
                 %% TODO: How to implement the banned in the gateway instance?
                 %, fun check_banned/2
@@ -270,8 +273,11 @@ handle_in(Frame = #frame{cmd = Cmd}, Channel = #channel{inflight = Inflight}) ->
     _ = upstreaming(Frame, NChannel),
     {ok, [{outgoing, Outgoings}], NChannel};
 handle_in(Frame, Channel) ->
-    log(warning, #{msg => "unexcepted_frame", frame => Frame}, Channel),
+    log(warning, #{msg => "unexpected_gbt32960_frame", frame => Frame}, Channel),
     {ok, Channel}.
+
+handle_frame_error(Reason, Channel) ->
+    shutdown(Reason, Channel).
 
 %%--------------------------------------------------------------------
 %% Handle out
@@ -334,7 +340,7 @@ split_by_pos([E | L], N, A1) ->
 msgs2frame(Messages, Vin, Channel) ->
     lists:filtermap(
         fun(#message{payload = Payload}) ->
-            case emqx_utils_json:safe_decode(Payload, [return_maps]) of
+            case emqx_utils_json:safe_decode(Payload) of
                 {ok, Maps} ->
                     case msg2frame(Maps, Vin) of
                         {error, Reason} ->
@@ -506,7 +512,7 @@ clean_timer(Name, Channel = #channel{timers = Timers}) ->
     Channel#channel{timers = maps:remove(Name, Timers)}.
 
 interval(alive_timer, #channel{keepalive = KeepAlive}) ->
-    emqx_keepalive:info(interval, KeepAlive);
+    emqx_keepalive:info(check_interval, KeepAlive);
 interval(retry_timer, #channel{retx_interval = RetxIntv}) ->
     RetxIntv.
 
@@ -561,6 +567,19 @@ enrich_conninfo(
         username => Username
     },
     {ok, Channel#channel{conninfo = NConnInfo}}.
+
+run_conn_hooks(
+    Packet,
+    Channel = #channel{
+        ctx = Ctx,
+        conninfo = ConnInfo
+    }
+) ->
+    ConnProps = #{},
+    case run_hooks(Ctx, 'client.connect', [ConnInfo], ConnProps) of
+        Error = {error, _Reason} -> Error;
+        _NConnProps -> {ok, Packet, Channel}
+    end.
 
 set_log_meta(_Packet, #channel{clientinfo = #{clientid := ClientId}}) ->
     emqx_logger:set_metadata_clientid(ClientId),
@@ -686,6 +705,10 @@ ensure_disconnected(
 run_hooks(Ctx, Name, Args) ->
     emqx_gateway_ctx:metrics_inc(Ctx, Name),
     emqx_hooks:run(Name, Args).
+
+run_hooks(Ctx, Name, Args, Acc) ->
+    emqx_gateway_ctx:metrics_inc(Ctx, Name),
+    emqx_hooks:run_fold(Name, Args, Acc).
 
 reply(Reply, Channel) ->
     {reply, Reply, Channel}.

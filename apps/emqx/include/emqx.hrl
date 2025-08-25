@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -ifndef(EMQX_HRL).
@@ -44,7 +32,6 @@
 %%--------------------------------------------------------------------
 -define(ACTIVATED_ALARM, emqx_activated_alarm).
 -define(DEACTIVATED_ALARM, emqx_deactivated_alarm).
--define(TRIE, emqx_trie).
 
 %%--------------------------------------------------------------------
 %% Message and Delivery
@@ -65,9 +52,20 @@
 %% Route
 %%--------------------------------------------------------------------
 
+-record(share_dest, {
+    session_id :: emqx_session:session_id(),
+    group :: emqx_types:group()
+}).
+
 -record(route, {
     topic :: binary(),
-    dest :: node() | {binary(), node()} | emqx_session:session_id()
+    dest ::
+        node()
+        | {binary(), node()}
+        | emqx_session:session_id()
+        %% One session can also have multiple subscriptions to the same topic through different groups
+        | #share_dest{}
+        | emqx_external_broker:dest()
 }).
 
 %%--------------------------------------------------------------------
@@ -92,7 +90,24 @@
     by :: binary(),
     reason :: binary(),
     at :: integer(),
-    until :: integer()
+    until :: integer() | infinity
 }).
+
+%%--------------------------------------------------------------------
+%% Configurations
+%%--------------------------------------------------------------------
+-define(KIND_REPLICATE, replicate).
+-define(KIND_INITIATE, initiate).
+
+%%--------------------------------------------------------------------
+%% Client Attributes
+%%--------------------------------------------------------------------
+-define(CLIENT_ATTR_NAME_TNS, <<"tns">>).
+
+%%--------------------------------------------------------------------
+%% Metrics
+%%--------------------------------------------------------------------
+
+-define(ACCESS_CONTROL_METRICS_WORKER, access_control_metrics).
 
 -endif.

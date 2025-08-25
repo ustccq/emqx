@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_config_SUITE).
@@ -72,8 +60,8 @@ t_fill_default_values(C) when is_list(C) ->
                     <<"enable_session_registry">> := true,
                     <<"perf">> :=
                         #{
-                            <<"route_lock_type">> := <<"key">>,
-                            <<"trie_compaction">> := true
+                            <<"async_fanout_shard_dispatch">> := false,
+                            <<"route_lock_type">> := <<"key">>
                         },
                     <<"route_batch_clean">> := false,
                     <<"session_history_retain">> := <<"0s">>
@@ -92,7 +80,7 @@ t_init_load(C) when is_list(C) ->
     emqx_config:erase_all(),
     {ok, DeprecatedFile} = application:get_env(emqx, cluster_override_conf_file),
     ?assertEqual(false, filelib:is_regular(DeprecatedFile), DeprecatedFile),
-    %% Don't has deprecated file
+    %% Don't have deprecated file
     ok = emqx_config:init_load(emqx_schema, [ConfFile]),
     ?assertEqual(ExpectRootNames, lists:sort(emqx_config:get_root_names())),
     ?assertMatch({ok, #{raw_config := 256}}, emqx:update_config([mqtt, max_topic_levels], 256)),
@@ -102,7 +90,34 @@ t_init_load(C) when is_list(C) ->
     ok = emqx_config:init_load(emqx_schema, [ConfFile]),
     ?assertEqual(ExpectRootNames, lists:sort(emqx_config:get_root_names())),
     ?assertMatch({ok, #{raw_config := 128}}, emqx:update_config([mqtt, max_topic_levels], 128)),
+    emqx_config_backup_manager:flush(),
     ok = file:delete(DeprecatedFile).
+
+t_init_load_with_base_hocon(C) when is_list(C) ->
+    BaseHocon = emqx_config:base_hocon_file(),
+    ClusterHocon = emqx_config:cluster_hocon_file(),
+    ConfFile = "./test_emqx_2.conf",
+    ok = filelib:ensure_dir(BaseHocon),
+    ok = file:write_file(
+        BaseHocon,
+        "mqtt.max_topic_levels = 123\n"
+        "mqtt.max_clientid_len=12\n"
+        "mqtt.max_inflight=12\n"
+    ),
+    ok = file:write_file(
+        ClusterHocon,
+        "mqtt.max_clientid_len = 123\n"
+        "mqtt.max_inflight=22\n"
+    ),
+    ok = file:write_file(ConfFile, "mqtt.max_inflight = 123\n"),
+    ok = emqx_config:init_load(emqx_schema, [ConfFile]),
+    ?assertEqual(123, emqx:get_config([mqtt, max_topic_levels])),
+    ?assertEqual(123, emqx:get_config([mqtt, max_clientid_len])),
+    ?assertEqual(123, emqx:get_config([mqtt, max_inflight])),
+    emqx_config:erase_all(),
+    ok = file:delete(BaseHocon),
+    ok = file:delete(ClusterHocon),
+    ok.
 
 t_unknown_root_keys(C) when is_list(C) ->
     ?check_trace(
@@ -123,6 +138,7 @@ t_unknown_root_keys(C) when is_list(C) ->
     ok.
 
 t_cluster_hocon_backup({init, C}) ->
+    emqx_config:put([config_backup_interval], 1),
     C;
 t_cluster_hocon_backup({'end', _C}) ->
     File = "backup-test.hocon",
@@ -130,9 +146,9 @@ t_cluster_hocon_backup({'end', _C}) ->
     lists:foreach(fun file:delete/1, Files);
 t_cluster_hocon_backup(C) when is_list(C) ->
     Write = fun(Path, Content) ->
+        emqx_config:backup_and_write(Path, Content),
         %% avoid name clash
-        timer:sleep(1),
-        emqx_config:backup_and_write(Path, Content)
+        timer:sleep(10)
     end,
     File = "backup-test.hocon",
     %% write 12 times, 10 backups should be kept
@@ -150,6 +166,7 @@ t_cluster_hocon_backup(C) when is_list(C) ->
         InputContents
     ),
     LatestContent = integer_to_binary(N),
+    emqx_config_backup_manager:flush(),
     ?assertEqual({ok, LatestContent}, file:read_file(File)),
     Re = "\\.[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{3}\\.bak$",
     Files = filelib:wildcard(File ++ ".*.bak"),
@@ -393,6 +410,51 @@ t_init_zone_with_global_defaults(Config) when is_list(Config) ->
     %% Then others are defaults
     ?assertEqual(ExpectedOthers, Others).
 
+%% Checks that, if multiple backup requests are made close in time, they are coalesced
+%% into a single backup file.
+t_coalesce_multiple_backups({init, Config}) ->
+    PrivDir = ?config(priv_dir, Config),
+    ClusterHocon = filename:join([PrivDir, ?FUNCTION_NAME, "cluster.hocon"]),
+    BackupDir = filename:dirname(ClusterHocon),
+    ok = filelib:ensure_path(BackupDir),
+    application:set_env(emqx, cluster_hocon_file, ClusterHocon),
+    %% Set update in memory for faster test
+    emqx_config:put([config_backup_interval], 5_000),
+    [{backup_dir, BackupDir} | Config];
+t_coalesce_multiple_backups({'end', _Config}) ->
+    application:unset_env(emqx, cluster_hocon_file),
+    ok;
+t_coalesce_multiple_backups(Config) when is_list(Config) ->
+    BackupDir = ?config(backup_dir, Config),
+    %% At this point, there is no cluster.hocon file, which will be created with this
+    %% update.  So this does not enqueued any backups.
+    Value1 = 1_500,
+    ?assertMatch({ok, _}, emqx:update_config([config_backup_interval], Value1)),
+    %% We now have a cluster.hocon file.  This will trigger a backup request containing
+    %% the first value.
+    Value2 = 1_300,
+    ?assertMatch({ok, _}, emqx:update_config([config_backup_interval], Value2)),
+    %% We now have a cluster.hocon file.  This will trigger a backup request, but the
+    %% previous request was already enqueued.
+    Value3 = 1_000,
+    ?assertMatch({ok, _}, emqx:update_config([config_backup_interval], Value3)),
+    %% Two files: current `cluster.hocon' and its backup.
+    ?retry(500, 10, ?assertMatch({ok, [_, _]}, file:list_dir(BackupDir))),
+    Wildcard = filename:join([BackupDir, "*.bak"]),
+    [BackupFile0] = filelib:wildcard(Wildcard),
+    BackupFile = filename:join([BackupDir, BackupFile0]),
+    %% Oldest state is backed up.
+    ?assertMatch({ok, #{<<"config_backup_interval">> := Value1}}, hocon:files([BackupFile])),
+    ?retry(
+        500,
+        10,
+        ?assertMatch(
+            #{<<"config_backup_interval">> := Value3},
+            emqx_config:read_override_conf(#{override_to => cluster})
+        )
+    ),
+    ok.
+
 %%%
 %%% Helpers
 %%%
@@ -428,6 +490,7 @@ zone_global_defaults() ->
                 ignore_loop_deliver => false,
                 keepalive_backoff => 0.75,
                 keepalive_multiplier => 1.5,
+                keepalive_check_interval => 30000,
                 max_awaiting_rel => 100,
                 max_clientid_len => 65535,
                 max_inflight => 32,
@@ -444,17 +507,19 @@ zone_global_defaults() ->
                 peer_cert_as_username => disabled,
                 response_information => [],
                 retain_available => true,
-                retry_interval => 30000,
+                retry_interval => infinity,
                 message_expiry_interval => infinity,
                 server_keepalive => disabled,
                 session_expiry_interval => 7200000,
                 shared_subscription => true,
                 shared_subscription_strategy => round_robin,
+                shared_subscription_initial_sticky_pick => random,
                 strict_mode => false,
                 upgrade_qos => false,
                 use_username_as_clientid => false,
                 wildcard_subscription => true,
-                client_attrs_init => []
+                client_attrs_init => [],
+                clientid_override => disabled
             },
         overload_protection =>
             #{
@@ -470,12 +535,11 @@ zone_global_defaults() ->
                 enable => false,
                 batch_size => 100,
                 force_persistence => false,
-                idle_poll_interval => 100,
-                heartbeat_interval => 5000,
+                checkpoint_interval => 5000,
+                commit_timeout => 5000,
+                commit_retries => 10,
+                commit_retry_interval => 1000,
                 message_retention_period => 86400000,
-                renew_streams_interval => 5000,
-                session_gc_batch_size => 100,
-                session_gc_interval => 600000,
                 subscription_count_refresh_interval => 5000,
                 disconnected_session_count_refresh_interval => 5000
             }

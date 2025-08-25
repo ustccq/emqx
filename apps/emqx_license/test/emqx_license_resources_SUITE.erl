@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_resources_SUITE).
@@ -42,7 +42,7 @@ t_connection_count(_Config) ->
                 #{?snk_kind := emqx_license_resources_updated},
                 1000
             ),
-            emqx_license_resources:connection_count()
+            emqx_license_resources:cached_connection_count()
         end,
         fun(ConnCount, Trace) ->
             ?assertEqual(0, ConnCount),
@@ -51,14 +51,14 @@ t_connection_count(_Config) ->
     ),
 
     meck:new(emqx_cm, [passthrough]),
-    meck:expect(emqx_cm, get_connected_client_count, fun() -> 10 end),
+    meck:expect(emqx_cm, get_sessions_count, fun() -> 10 end),
 
     meck:new(emqx_license_proto_v2, [passthrough]),
     meck:expect(
         emqx_license_proto_v2,
         remote_connection_counts,
-        fun(_Nodes) ->
-            [{ok, 5}, {error, some_error}]
+        fun(Nodes) ->
+            [{ok, 5}, {error, some_error}] ++ meck:passthrough([Nodes])
         end
     ),
 
@@ -69,7 +69,7 @@ t_connection_count(_Config) ->
                 #{?snk_kind := emqx_license_resources_updated},
                 1000
             ),
-            emqx_license_resources:connection_count()
+            emqx_license_resources:cached_connection_count()
         end,
         fun(ConnCount, _Trace) ->
             ?assertEqual(15, ConnCount)

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_prometheus).
@@ -35,19 +23,9 @@
 -include("emqx_prometheus.hrl").
 
 -include_lib("public_key/include/public_key.hrl").
--include_lib("prometheus/include/prometheus_model.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_instr.hrl").
 -include_lib("emqx_durable_storage/include/emqx_ds_metrics.hrl").
-
--import(
-    prometheus_model_helpers,
-    [
-        create_mf/5,
-        gauge_metric/1,
-        gauge_metrics/1,
-        counter_metrics/1
-    ]
-).
 
 %% APIs
 -export([start_link/1, info/0]).
@@ -78,19 +56,30 @@
     do_stop/0
 ]).
 
+-ifdef(TEST).
+-export([cert_expiry_at_from_path/1]).
+-endif.
+
 %%--------------------------------------------------------------------
 %% Macros
 %%--------------------------------------------------------------------
 
 -define(MG(K, MAP), maps:get(K, MAP)).
 -define(MG(K, MAP, DEFAULT), maps:get(K, MAP, DEFAULT)).
--define(MG0(K, MAP), maps:get(K, MAP, 0)).
 
 -define(C(K, L), proplists:get_value(K, L, 0)).
 
 -define(TIMER_MSG, '#interval').
 
 -define(HTTP_OPTIONS, [{autoredirect, true}, {timeout, 60000}]).
+
+-define(SAFELY(EXPR, ELSE),
+    (try
+        EXPR
+    catch
+        _:_ -> ELSE
+    end)
+).
 
 %%--------------------------------------------------------------------
 %% APIs
@@ -127,8 +116,8 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({timeout, Timer, ?TIMER_MSG}, State = #{timer := Timer, opts := Opts}) ->
-    #{interval := Interval, headers := Headers, url := Server} = Opts,
-    PushRes = push_to_push_gateway(Server, Headers),
+    #{interval := Interval, headers := Headers, url := Server, method := Method} = Opts,
+    PushRes = push_to_push_gateway(Method, Server, Headers),
     NewTimer = ensure_timer(Interval),
     NewState = maps:update_with(PushRes, fun(C) -> C + 1 end, 1, State#{timer => NewTimer}),
     %% Data is too big, hibernate for saving memory and stop system monitor warning.
@@ -139,9 +128,11 @@ handle_info({update, Conf}, State = #{timer := Timer}) ->
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-push_to_push_gateway(Url, Headers) when is_list(Headers) ->
-    Data = prometheus_text_format:format(?PROMETHEUS_DEFAULT_REGISTRY),
-    case httpc:request(post, {Url, Headers, "text/plain", Data}, ?HTTP_OPTIONS, []) of
+push_to_push_gateway(Method, Url, Headers) when
+    is_list(Headers) andalso (Method =:= put orelse Method =:= post)
+->
+    Data = push_metrics_data(),
+    case httpc:request(Method, {Url, Headers, "text/plain", Data}, ?HTTP_OPTIONS, []) of
         {ok, {{"HTTP/1.1", 200, _}, _RespHeaders, _RespBody}} ->
             ok;
         Error ->
@@ -153,6 +144,10 @@ push_to_push_gateway(Url, Headers) when is_list(Headers) ->
             }),
             failed
     end.
+
+push_metrics_data() ->
+    Rows = [prometheus_text_format:format(Registry) || Registry <- ?PROMETHEUS_ALL_REGISTRIES],
+    iolist_to_binary(Rows).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -166,17 +161,30 @@ ensure_timer(Interval) ->
 %%--------------------------------------------------------------------
 %% prometheus callbacks
 %%--------------------------------------------------------------------
-opts(#{interval := Interval, headers := Headers, job_name := JobName, push_gateway_server := Url}) ->
-    #{interval => Interval, headers => Headers, url => join_url(Url, JobName)};
+opts(
+    Conf = #{
+        interval := Interval, headers := Headers, job_name := JobName, push_gateway_server := Url
+    }
+) ->
+    #{
+        interval => Interval,
+        headers => Headers,
+        url => join_url(Url, JobName),
+        method => ?MG(method, Conf, put)
+    };
 opts(#{push_gateway := #{url := Url, job_name := JobName} = PushGateway}) ->
-    maps:put(url, join_url(Url, JobName), PushGateway).
+    PushGateway#{
+        url => join_url(Url, JobName),
+        method => ?MG(method, PushGateway, put)
+    }.
 
 join_url(Url, JobName0) ->
+    ClusterName = atom_to_binary(emqx:get_config([cluster, name], emqxcl)),
     [Name, Ip] = string:tokens(atom_to_list(node()), "@"),
     % NOTE: allowing errors here to keep rough backward compatibility
     {JobName1, Errors} = emqx_template:render(
         emqx_template:parse(JobName0),
-        #{<<"name">> => Name, <<"host">> => Ip}
+        #{<<"name">> => Name, <<"host">> => Ip, <<"cluster_name">> => ClusterName}
     ),
     _ =
         Errors == [] orelse
@@ -211,7 +219,10 @@ collect_mf(?PROMETHEUS_DEFAULT_REGISTRY, Callback) ->
     ok = add_collect_family(Callback, acl_metric_meta(), ?MG(emqx_acl_data, RawData)),
     ok = add_collect_family(Callback, authn_metric_meta(), ?MG(emqx_authn_data, RawData)),
 
+    ok = collect_broker_instr_family(Callback, ?MG(emqx_broker_instr_data, RawData)),
+
     ok = add_collect_family(Callback, cert_metric_meta(), ?MG(cert_data, RawData)),
+    ok = add_collect_family(Callback, cluster_rpc_meta(), ?MG(cluster_rpc, RawData)),
     ok = add_collect_family(Callback, mria_metric_meta(), ?MG(mria_data, RawData)),
     ok = maybe_add_ds_collect_family(Callback, RawData),
     ok = maybe_license_add_collect_family(Callback, RawData),
@@ -224,6 +235,13 @@ maybe_add_ds_collect_family(Callback, RawData) ->
         true ->
             add_collect_family(
                 Callback, emqx_ds_builtin_metrics:prometheus_meta(), ?MG(ds_data, RawData)
+            ),
+            DSRaftPrefix = <<"emqx_ds_raft_">>,
+            prefix_collect_helpful_family(
+                Callback, DSRaftPrefix, ds_raft_node_meta(), ?MG(ds_raft_node_data, RawData)
+            ),
+            prefix_collect_helpful_family(
+                Callback, DSRaftPrefix, ds_raft_cluster_meta(), ?MG(ds_raft_cluster_data, RawData)
             );
         false ->
             ok
@@ -232,10 +250,33 @@ maybe_add_ds_collect_family(Callback, RawData) ->
 maybe_collect_ds_data(Mode) ->
     case emqx_persistent_message:is_persistence_enabled() of
         true ->
-            #{ds_data => emqx_ds_builtin_metrics:prometheus_collect(Mode)};
+            #{
+                ds_data => emqx_ds_builtin_metrics:prometheus_collect(with_node_label(Mode, [])),
+                ds_raft_node_data => collect_ds_raft_node_data(Mode)
+            };
         false ->
             #{}
     end.
+
+maybe_collect_ds_cluster_data(Acc) ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            Acc#{
+                ds_raft_cluster_data => collect_ds_raft_cluster_data()
+            };
+        false ->
+            Acc
+    end.
+
+collect_ds_raft_node_data(Mode) ->
+    Labels0 = with_node_label(Mode, []),
+    Acc = emqx_ds_builtin_raft_metrics:local_dbs(Labels0),
+    maps:merge(emqx_ds_builtin_raft_metrics:local_shards(Labels0), Acc).
+
+collect_ds_raft_cluster_data() ->
+    Acc1 = emqx_ds_builtin_raft_metrics:cluster(),
+    Acc2 = maps:merge(emqx_ds_builtin_raft_metrics:dbs(), Acc1),
+    maps:merge(emqx_ds_builtin_raft_metrics:shards(), Acc2).
 
 %% @private
 collect(<<"json">>) ->
@@ -248,13 +289,14 @@ collect(<<"json">>) ->
         packets => collect_json_data(?MG(emqx_packet_data, RawData)),
         messages => collect_json_data(?MG(emqx_message_data, RawData)),
         delivery => collect_json_data(?MG(emqx_delivery_data, RawData)),
-        client => collect_json_data(?MG(emqx_client_data, RawData)),
+        client => collect_client_json_data(?MG(emqx_client_data, RawData)),
         session => collect_json_data(?MG(emqx_session_data, RawData)),
         cluster => collect_json_data(?MG(cluster_data, RawData)),
         olp => collect_json_data(?MG(emqx_olp_data, RawData)),
         acl => collect_json_data(?MG(emqx_acl_data, RawData)),
         authn => collect_json_data(?MG(emqx_authn_data, RawData)),
-        certs => collect_cert_json_data(?MG(cert_data, RawData))
+        certs => collect_cert_json_data(?MG(cert_data, RawData)),
+        cluster_rpc => collect_json_data(?MG(cluster_rpc, RawData))
     };
 collect(<<"prometheus">>) ->
     prometheus_text_format:format(?PROMETHEUS_DEFAULT_REGISTRY).
@@ -267,7 +309,19 @@ add_collect_family(Callback, MetricWithType, Data) ->
     ok.
 
 add_collect_family(Name, Data, Callback, Type) ->
-    Callback(create_mf(Name, _Help = <<"">>, Type, ?MODULE, Data)).
+    Callback(prometheus_model_helpers:create_mf(Name, _Help = <<"">>, Type, ?MODULE, Data)).
+
+prefix_collect_helpful_family(Callback, Prefix, MetricsTypeAndHelp, Metrics) ->
+    lists:foreach(
+        fun({Name, Type, Help}) ->
+            %% Using `create_mf/4` that doesn't call back into `collect_metrics/2.`
+            PromName = [Prefix, atom_to_binary(Name)],
+            Callback(
+                prometheus_model_helpers:create_mf(PromName, Help, Type, ?MG(Name, Metrics, []))
+            )
+        end,
+        MetricsTypeAndHelp
+    ).
 
 %% behaviour
 fetch_from_local_node(Mode) ->
@@ -279,34 +333,40 @@ fetch_from_local_node(Mode) ->
         emqx_packet_data => emqx_metric_data(emqx_packet_metric_meta(), Mode),
         emqx_message_data => emqx_metric_data(message_metric_meta(), Mode),
         emqx_delivery_data => emqx_metric_data(delivery_metric_meta(), Mode),
-        emqx_client_data => emqx_metric_data(client_metric_meta(), Mode),
+        emqx_client_data => client_metric_data(Mode),
         emqx_session_data => emqx_metric_data(session_metric_meta(), Mode),
         emqx_olp_data => emqx_metric_data(olp_metric_meta(), Mode),
         emqx_acl_data => emqx_metric_data(acl_metric_meta(), Mode),
         emqx_authn_data => emqx_metric_data(authn_metric_meta(), Mode),
+        emqx_broker_instr_data => emqx_broker_instr_data(Mode),
+        cluster_rpc => cluster_rpc_data(Mode),
         mria_data => mria_data(Mode)
     }}.
 
 fetch_cluster_consistented_data() ->
-    (maybe_license_fetch_data())#{
+    Acc1 = maybe_license_fetch_data(),
+    Acc = maybe_collect_ds_cluster_data(Acc1),
+    Acc#{
         stats_data_cluster_consistented => stats_data_cluster_consistented(),
         cert_data => cert_data()
     }.
 
 aggre_or_zip_init_acc() ->
-    #{
-        stats_data => maps:from_keys(metrics_name(stats_metric_meta()), []),
-        vm_data => maps:from_keys(metrics_name(vm_metric_meta()), []),
-        cluster_data => maps:from_keys(metrics_name(cluster_metric_meta()), []),
-        emqx_packet_data => maps:from_keys(metrics_name(emqx_packet_metric_meta()), []),
-        emqx_message_data => maps:from_keys(metrics_name(message_metric_meta()), []),
-        emqx_delivery_data => maps:from_keys(metrics_name(delivery_metric_meta()), []),
-        emqx_client_data => maps:from_keys(metrics_name(client_metric_meta()), []),
-        emqx_session_data => maps:from_keys(metrics_name(session_metric_meta()), []),
-        emqx_olp_data => maps:from_keys(metrics_name(olp_metric_meta()), []),
-        emqx_acl_data => maps:from_keys(metrics_name(acl_metric_meta()), []),
-        emqx_authn_data => maps:from_keys(metrics_name(authn_metric_meta()), []),
-        mria_data => maps:from_keys(metrics_name(mria_metric_meta()), [])
+    (maybe_add_ds_meta())#{
+        stats_data => meta_to_init_from(stats_metric_meta()),
+        vm_data => meta_to_init_from(vm_metric_meta()),
+        cluster_data => meta_to_init_from(cluster_metric_meta()),
+        emqx_packet_data => meta_to_init_from(emqx_packet_metric_meta()),
+        emqx_message_data => meta_to_init_from(message_metric_meta()),
+        emqx_delivery_data => meta_to_init_from(delivery_metric_meta()),
+        emqx_client_data => meta_to_init_from(client_metric_meta()),
+        emqx_session_data => meta_to_init_from(session_metric_meta()),
+        emqx_olp_data => meta_to_init_from(olp_metric_meta()),
+        emqx_acl_data => meta_to_init_from(acl_metric_meta()),
+        emqx_authn_data => meta_to_init_from(authn_metric_meta()),
+        emqx_broker_instr_data => emqx_broker_instr_init(),
+        cluster_rpc => meta_to_init_from(cluster_rpc_meta()),
+        mria_data => meta_to_init_from(mria_metric_meta())
     }.
 
 logic_sum_metrics() ->
@@ -357,6 +417,8 @@ emqx_collect(K = emqx_vm_run_queue, D) -> gauge_metrics(?MG(K, D));
 emqx_collect(K = emqx_vm_process_messages_in_queues, D) -> gauge_metrics(?MG(K, D));
 emqx_collect(K = emqx_vm_total_memory, D) -> gauge_metrics(?MG(K, D));
 emqx_collect(K = emqx_vm_used_memory, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_mnesia_tm_mailbox_size, D) -> gauge_metrics(?MG(K, D));
+emqx_collect(K = emqx_vm_broker_pool_max_mailbox_size, D) -> gauge_metrics(?MG(K, D));
 %%--------------------------------------------------------------------
 %% Cluster Info
 emqx_collect(K = emqx_cluster_nodes_running, D) -> gauge_metrics(?MG(K, D));
@@ -388,7 +450,6 @@ emqx_collect(K = emqx_packets_publish_sent, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_packets_publish_inuse, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_packets_publish_error, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_packets_publish_auth_error, D) -> counter_metrics(?MG(K, D));
-emqx_collect(K = emqx_packets_publish_dropped, D) -> counter_metrics(?MG(K, D));
 %% puback
 emqx_collect(K = emqx_packets_puback_received, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_packets_puback_sent, D) -> counter_metrics(?MG(K, D));
@@ -432,6 +493,8 @@ emqx_collect(K = emqx_messages_publish, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_messages_dropped, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_messages_dropped_expired, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_messages_dropped_no_subscribers, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped_quota_exceeded, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_messages_dropped_receive_maximum, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_messages_forward, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_messages_retained, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_messages_delayed, D) -> counter_metrics(?MG(K, D));
@@ -456,6 +519,7 @@ emqx_collect(K = emqx_client_authorize, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_client_subscribe, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_client_unsubscribe, D) -> counter_metrics(?MG(K, D));
 emqx_collect(K = emqx_client_disconnected, D) -> counter_metrics(?MG(K, D));
+emqx_collect(K = emqx_client_disconnected_reason, D) -> counter_metrics(?MG(K, D));
 %%--------------------------------------------------------------------
 %% Metrics - session
 emqx_collect(K = emqx_session_created, D) -> counter_metrics(?MG(K, D));
@@ -491,6 +555,8 @@ emqx_collect(K = emqx_license_expiry_at, D) -> gauge_metric(?MG(K, D));
 %%--------------------------------------------------------------------
 %% Certs
 emqx_collect(K = emqx_cert_expiry_at, D) -> gauge_metrics(?MG(K, D));
+%% Cluster RPC
+emqx_collect(K = emqx_conf_sync_txid, D) -> gauge_metrics(?MG(K, D));
 %% Mria
 %% ========== core
 emqx_collect(K = emqx_mria_last_intercepted_trans, D) -> gauge_metrics(?MG(K, D, []));
@@ -504,17 +570,37 @@ emqx_collect(K = emqx_mria_bootstrap_num_keys, D) -> gauge_metrics(?MG(K, D, [])
 emqx_collect(K = emqx_mria_message_queue_len, D) -> gauge_metrics(?MG(K, D, []));
 emqx_collect(K = emqx_mria_replayq_len, D) -> gauge_metrics(?MG(K, D, []));
 %% DS
-emqx_collect(K = ?DS_EGRESS_BATCHES, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_EGRESS_BATCHES_RETRY, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_EGRESS_BATCHES_FAILED, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_EGRESS_MESSAGES, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_EGRESS_BYTES, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_EGRESS_FLUSH_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BATCHES, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BATCHES_RETRY, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BATCHES_FAILED, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_MESSAGES, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_BYTES, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_FLUSH_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BUFFER_LATENCY, D) -> gauge_metrics(?MG(K, D, []));
 emqx_collect(K = ?DS_STORE_BATCH_TIME, D) -> gauge_metrics(?MG(K, D, []));
 emqx_collect(K = ?DS_BUILTIN_NEXT_TIME, D) -> gauge_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_LTS_SEEK_COUNTER, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_LTS_NEXT_COUNTER, D) -> counter_metrics(?MG(K, D, []));
-emqx_collect(K = ?DS_LTS_COLLISION_COUNTER, D) -> counter_metrics(?MG(K, D, [])).
+emqx_collect(K = ?DS_BITFIELD_LTS_SEEK_COUNTER, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BITFIELD_LTS_NEXT_COUNTER, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_BITFIELD_LTS_COLLISION_COUNTER, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_SEEK, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_NEXT, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_HASH_COLLISION, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_HIT, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_MISS, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_FUTURE, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SKIPSTREAM_LTS_EOS, D) -> counter_metrics(?MG(K, D, []));
+%% DS beamformer:
+emqx_collect(K = ?DS_SUBS_FANOUT_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_STUCK_TOTAL, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_UNSTUCK_TOTAL, D) -> counter_metrics(?MG(K, D, []));
+%% DS beamformer worker:
+emqx_collect(K = ?DS_SUBS, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_HANDOVER, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_PROCESS_COMMANDS_TIME, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_BEAMS_SENT_TOTAL, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_REQUEST_SHARING, D) -> gauge_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_FULFILL_TIME, D) -> counter_metrics(?MG(K, D, []));
+emqx_collect(K = ?DS_SUBS_SCAN_TIME, D) -> counter_metrics(?MG(K, D, [])).
 
 %%--------------------------------------------------------------------
 %% Indicators
@@ -597,7 +683,9 @@ vm_metric_meta() ->
         {emqx_vm_run_queue, gauge, 'run_queue'},
         {emqx_vm_process_messages_in_queues, gauge, 'process_total_messages'},
         {emqx_vm_total_memory, gauge, 'total_memory'},
-        {emqx_vm_used_memory, gauge, 'used_memory'}
+        {emqx_vm_used_memory, gauge, 'used_memory'},
+        {emqx_vm_mnesia_tm_mailbox_size, gauge, 'mnesia_tm_mailbox_size'},
+        {emqx_vm_broker_pool_max_mailbox_size, gauge, 'broker_pool_max_mailbox_size'}
     ].
 
 vm_data(Mode) ->
@@ -606,7 +694,7 @@ vm_data(Mode) ->
         fun({Name, _Type, MetricKAtom}, AccIn) ->
             Labels =
                 case Mode of
-                    node ->
+                    ?PROM_DATA_MODE__NODE ->
                         [];
                     _ ->
                         [{node, node(self())}]
@@ -647,14 +735,75 @@ do_cluster_data(Labels) ->
 %%========================================
 
 emqx_metric_data(MetricNameTypeKeyL, Mode) ->
+    emqx_metric_data(MetricNameTypeKeyL, Mode, _Acc = #{}).
+
+emqx_metric_data(MetricNameTypeKeyL, Mode, Acc) ->
     Metrics = emqx_metrics:all(),
     lists:foldl(
-        fun({Name, _Type, MetricKAtom}, AccIn) ->
-            AccIn#{Name => [{with_node_label(Mode, []), ?C(MetricKAtom, Metrics)}]}
+        fun
+            ({_Name, _Type, undefined}, AccIn) ->
+                AccIn;
+            ({Name, _Type, MetricKAtom}, AccIn) ->
+                AccIn#{Name => [{with_node_label(Mode, []), ?C(MetricKAtom, Metrics)}]}
         end,
-        #{},
+        Acc,
         MetricNameTypeKeyL
     ).
+
+client_metric_data(Mode) ->
+    Acc = listener_shutdown_counts(Mode),
+    emqx_metric_data(client_metric_meta(), Mode, Acc).
+
+listener_shutdown_counts(Mode) ->
+    Data =
+        lists:flatmap(
+            fun(Listener) ->
+                get_listener_shutdown_counts_with_labels(Listener, Mode)
+            end,
+            emqx_listeners:list()
+        ),
+    #{emqx_client_disconnected_reason => Data}.
+
+get_listener_shutdown_counts_with_labels({Id, #{bind := Bind, running := true}}, Mode) ->
+    {ok, #{type := Type, name := Name}} = emqx_listeners:parse_listener_id(Id),
+    AddLabels = fun({Reason, Count}) ->
+        Labels = [
+            {listener_type, Type},
+            {listener_name, Name},
+            {reason, Reason}
+        ],
+        {with_node_label(Mode, Labels), Count}
+    end,
+    case emqx_listeners:shutdown_count(Id, Bind) of
+        {error, _} ->
+            [];
+        Counts ->
+            lists:map(AddLabels, Counts)
+    end;
+get_listener_shutdown_counts_with_labels({_Id, #{running := false}}, _Mode) ->
+    [].
+
+%%==========
+%% Durable Storage
+maybe_add_ds_meta() ->
+    case emqx_persistent_message:is_persistence_enabled() of
+        true ->
+            #{
+                ds_data => meta_to_init_from(emqx_ds_builtin_metrics:prometheus_meta()),
+                ds_raft_node_data => meta_to_init_from(ds_raft_node_meta())
+            };
+        false ->
+            #{}
+    end.
+
+ds_raft_node_meta() ->
+    emqx_ds_builtin_raft_metrics:local_dbs_meta() ++
+        emqx_ds_builtin_raft_metrics:local_shards_meta().
+
+ds_raft_cluster_meta() ->
+    emqx_ds_builtin_raft_metrics:cluster_meta() ++
+        emqx_ds_builtin_raft_metrics:dbs_meta() ++
+        emqx_ds_builtin_raft_metrics:shards_meta().
 
 %%==========
 %% Bytes && Packets
@@ -684,7 +833,6 @@ emqx_packet_metric_meta() ->
         {emqx_packets_publish_inuse, counter, 'packets.publish.inuse'},
         {emqx_packets_publish_error, counter, 'packets.publish.error'},
         {emqx_packets_publish_auth_error, counter, 'packets.publish.auth_error'},
-        {emqx_packets_publish_dropped, counter, 'packets.publish.dropped'},
         %% puback
         {emqx_packets_puback_received, counter, 'packets.puback.received'},
         {emqx_packets_puback_sent, counter, 'packets.puback.sent'},
@@ -731,6 +879,8 @@ message_metric_meta() ->
         {emqx_messages_dropped, counter, 'messages.dropped'},
         {emqx_messages_dropped_expired, counter, 'messages.dropped.await_pubrel_timeout'},
         {emqx_messages_dropped_no_subscribers, counter, 'messages.dropped.no_subscribers'},
+        {emqx_messages_dropped_quota_exceeded, counter, 'messages.dropped.quota_exceeded'},
+        {emqx_messages_dropped_receive_maximum, counter, 'messages.dropped.receive_maximum'},
         {emqx_messages_forward, counter, 'messages.forward'},
         {emqx_messages_retained, counter, 'messages.retained'},
         {emqx_messages_delayed, counter, 'messages.delayed'},
@@ -762,7 +912,8 @@ client_metric_meta() ->
         {emqx_client_authorize, counter, 'client.authorize'},
         {emqx_client_subscribe, counter, 'client.subscribe'},
         {emqx_client_unsubscribe, counter, 'client.unsubscribe'},
-        {emqx_client_disconnected, counter, 'client.disconnected'}
+        {emqx_client_disconnected, counter, 'client.disconnected'},
+        {emqx_client_disconnected_reason, counter, undefined}
     ].
 
 %%==========
@@ -931,10 +1082,8 @@ cert_expiry_at_from_path(Path0) ->
             {ok, PemBin} ->
                 [CertEntry | _] = public_key:pem_decode(PemBin),
                 Cert = public_key:pem_entry_decode(CertEntry),
-                %% TODO: Not fully tested for all certs type
-                {'utcTime', NotAfterUtc} =
-                    Cert#'Certificate'.'tbsCertificate'#'TBSCertificate'.validity#'Validity'.'notAfter',
-                utc_time_to_epoch(NotAfterUtc);
+                %% XXX: Only pem cert supported by listeners
+                not_after_epoch(Cert);
             {error, Reason} ->
                 ?SLOG(error, #{
                     msg => "read_cert_file_failed",
@@ -957,21 +1106,24 @@ cert_expiry_at_from_path(Path0) ->
             0
     end.
 
-utc_time_to_epoch(UtcTime) ->
-    date_to_expiry_epoch(utc_time_to_datetime(UtcTime)).
-
-utc_time_to_datetime(Str) ->
-    {ok, [Year, Month, Day, Hour, Minute, Second], _} = io_lib:fread(
-        "~2d~2d~2d~2d~2d~2dZ", Str
-    ),
-    %% Always Assuming YY is in 2000
-    {{2000 + Year, Month, Day}, {Hour, Minute, Second}}.
-
 %% 62167219200 =:= calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}).
 -define(EPOCH_START, 62167219200).
--spec date_to_expiry_epoch(calendar:datetime()) -> Seconds :: non_neg_integer().
-date_to_expiry_epoch(DateTime) ->
-    calendar:datetime_to_gregorian_seconds(DateTime) - ?EPOCH_START.
+not_after_epoch(#'Certificate'{
+    'tbsCertificate' = #'TBSCertificate'{
+        validity =
+            #'Validity'{'notAfter' = NotAfter}
+    }
+}) ->
+    pubkey_cert:'time_str_2_gregorian_sec'(NotAfter) - ?EPOCH_START;
+not_after_epoch(_) ->
+    0.
+
+%%========================================
+%% Cluster RPC
+%%========================================
+
+cluster_rpc_meta() ->
+    [{emqx_conf_sync_txid, gauge, undefined}].
 
 %%========================================
 %% Mria
@@ -996,6 +1148,17 @@ mria_metric_meta(replicant) ->
         {emqx_mria_replayq_len, gauge, replayq_len}
     ].
 
+cluster_rpc_data(Mode) ->
+    Labels =
+        case Mode of
+            ?PROM_DATA_MODE__NODE -> [];
+            _ -> [{node, node()}]
+        end,
+    Value = ?SAFELY(emqx_cluster_rpc:get_current_tnx_id(), undefined),
+    #{
+        emqx_conf_sync_txid => [{Labels, Value}]
+    }.
+
 mria_data(Mode) ->
     case mria_rlog:backend() of
         rlog ->
@@ -1008,10 +1171,7 @@ mria_data(Role, Mode) ->
     lists:foldl(
         fun({Name, _Type, MetricK}, AccIn) ->
             %% TODO: only report shards that are up
-            DataFun = fun() -> get_shard_metrics(Mode, MetricK) end,
-            AccIn#{
-                Name => catch_all(DataFun)
-            }
+            AccIn#{Name => ?SAFELY(get_shard_metrics(Mode, MetricK), [])}
         end,
         #{},
         mria_metric_meta(Role)
@@ -1020,10 +1180,8 @@ mria_data(Role, Mode) ->
 get_shard_metrics(Mode, MetricK) ->
     Labels =
         case Mode of
-            node ->
-                [];
-            _ ->
-                [{node, node(self())}]
+            ?PROM_DATA_MODE__NODE -> [];
+            _ -> [{node, node()}]
         end,
     [
         {[{shard, Shard} | Labels], get_shard_metric(MetricK, Shard)}
@@ -1040,12 +1198,38 @@ get_shard_metric(Metric, Shard) ->
             undefined
     end.
 
-catch_all(DataFun) ->
-    try
-        DataFun()
-    catch
-        _:_ -> undefined
-    end.
+%%========================================
+%% Broker Instrumentation
+%%========================================
+
+emqx_broker_instr_data(_Mode) ->
+    maps:map(
+        fun(N, _) ->
+            maps:to_list(emqx_metrics_worker:get_hists(?BROKER_INSTR_METRICS_WORKER, N))
+        end,
+        emqx_broker_instr_init()
+    ).
+
+emqx_broker_instr_init() ->
+    maps:from_keys(?BROKER_INSTR_METRICS, []).
+
+collect_broker_instr_family(Callback, Metrics) ->
+    maps:foreach(
+        fun(Id, Ms) ->
+            lists:foreach(
+                fun({Name, M}) ->
+                    collect_hist_family(Callback, Id, Name, M)
+                end,
+                Ms
+            )
+        end,
+        Metrics
+    ).
+
+collect_hist_family(Callback, Id, Name, #{count := Count, sum := Sum, bucket_counts := Buckets}) ->
+    MName = [<<"emqx_instr_">>, atom_to_binary(Id), <<"_">>, atom_to_binary(Name)],
+    Metric = prometheus_model_helpers:histogram_metric([{node, node()}], Buckets, Count, Sum),
+    Callback(prometheus_model_helpers:create_mf(MName, <<>>, histogram, Metric)).
 
 %%--------------------------------------------------------------------
 %% Collect functions
@@ -1068,6 +1252,13 @@ collect_stats_json_data(StatsData, StatsClData) ->
 %% always return json array
 collect_cert_json_data(Data) ->
     collect_json_data_(Data).
+
+collect_client_json_data(Data0) ->
+    ShutdownCounts = maps:with([emqx_client_disconnected_reason], Data0),
+    Data = maps:without([emqx_client_disconnected_reason], Data0),
+    JSON0 = collect_json_data(Data),
+    JSON1 = collect_json_data_(ShutdownCounts),
+    lists:flatten([JSON0 | JSON1]).
 
 collect_vm_json_data(Data) ->
     DataListPerNode = collect_json_data_(Data),
@@ -1104,9 +1295,9 @@ collect_json_data_(Data) ->
 
 zip_json_prom_stats_metrics(Key, Points, [] = _AccIn) ->
     lists:foldl(
-        fun({Lables, Metric}, AccIn2) ->
-            LablesKVMap = maps:from_list(Lables),
-            Point = LablesKVMap#{Key => Metric},
+        fun({Labels, Metric}, AccIn2) ->
+            LabelsKVMap = maps:from_list(Labels),
+            Point = LabelsKVMap#{Key => Metric},
             [Point | AccIn2]
         end,
         [],
@@ -1116,6 +1307,9 @@ zip_json_prom_stats_metrics(Key, Points, AllResultedAcc) ->
     ThisKeyResult = lists:foldl(emqx_prometheus_cluster:point_to_map_fun(Key), [], Points),
     lists:zipwith(fun maps:merge/2, AllResultedAcc, ThisKeyResult).
 
+meta_to_init_from(Meta) ->
+    maps:from_keys(metrics_name(Meta), []).
+
 metrics_name(MetricsAll) ->
     [Name || {Name, _, _} <- MetricsAll].
 
@@ -1124,7 +1318,7 @@ with_node_label(?PROM_DATA_MODE__NODE, Labels) ->
 with_node_label(?PROM_DATA_MODE__ALL_NODES_AGGREGATED, Labels) ->
     Labels;
 with_node_label(?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, Labels) ->
-    [{node, node(self())} | Labels].
+    [{node, node()} | Labels].
 
 %%--------------------------------------------------------------------
 %% bpapi
@@ -1136,3 +1330,15 @@ do_start() ->
 %% deprecated_since 5.0.10, remove this when 5.1.x
 do_stop() ->
     emqx_prometheus_sup:stop_child(?APP).
+
+%%--------------------------------------------------------------------
+%% prometheus_model_helpers proxy
+%%
+gauge_metric(Metric) ->
+    prometheus_model_helpers:gauge_metric(Metric).
+
+gauge_metrics(Values) ->
+    prometheus_model_helpers:gauge_metrics(Values).
+
+counter_metrics(Specs) ->
+    prometheus_model_helpers:counter_metrics(Specs).

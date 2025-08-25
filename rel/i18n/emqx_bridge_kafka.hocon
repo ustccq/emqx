@@ -38,18 +38,6 @@ socket_receive_buffer.desc:
 socket_receive_buffer.label:
 """Socket Receive Buffer Size"""
 
-socket_tcp_keepalive.desc:
-"""Enable TCP keepalive.
-The value is three comma separated numbers in the format of 'Idle,Interval,Probes'
- - Idle: The number of seconds a connection needs to be idle before the server begins to send out keep-alive probes (Linux default 7200).
- - Interval: The number of seconds between TCP keep-alive probes (Linux default 75).
- - Probes: The maximum number of TCP keep-alive probes to send before giving up and killing the connection if no response is obtained from the other end (Linux default 9).
-For example "240,30,5" means: TCP keepalive probes are sent after the connection is idle for 240 seconds, and the probes are sent every 30 seconds until a response is received, if it misses 5 consecutive responses, the connection should be closed.
-Default: 'none'"""
-
-socket_tcp_keepalive.label:
-"""TCP keepalive options"""
-
 desc_name.desc:
 """Action name, used as a human-readable identifier."""
 
@@ -63,7 +51,10 @@ consumer_offset_commit_interval_seconds.label:
 """Offset Commit Interval"""
 
 consumer_max_batch_bytes.desc:
-"""Set how many bytes to pull from Kafka in each fetch request. Please note that if the configured value is smaller than the message size in Kafka, it may negatively impact the fetch performance."""
+"""Set how many bytes to pull from Kafka in each fetch request.
+Messages are fetched in batches by the consumer, and if the first record batch in the first non-empty
+partition of the fetch is larger than this value, the record batch will still be returned to ensure
+that the consumer can make progress. As such, this is not an absolute maximum. Set `1` for minimal latency."""
 
 consumer_max_batch_bytes.label:
 """Fetch Bytes"""
@@ -81,7 +72,7 @@ producer_kafka_opts.label:
 """Kafka Producer"""
 
 kafka_topic.desc:
-"""Kafka topic name"""
+"""Kafka topic name.  Supports templates (e.g.: `t-${payload.t}`)."""
 
 kafka_topic.label:
 """Kafka Topic Name"""
@@ -147,7 +138,7 @@ consumer_mqtt_opts.label:
 """MQTT publish"""
 
 auth_kerberos_principal.desc:
-"""SASL GSSAPI authentication Kerberos principal. For example <code>client_name@MY.KERBEROS.REALM.MYDOMAIN.COM</code>, NOTE: The realm in use has to be configured in /etc/krb5.conf in EMQX nodes."""
+"""SASL GSSAPI authentication Kerberos principal. For example <code>kafka/node1.example.com@EXAMPLE.COM</code>, NOTE: The realm in use has to be configured in /etc/krb5.conf in EMQX nodes."""
 
 auth_kerberos_principal.label:
 """Kerberos Principal"""
@@ -177,6 +168,17 @@ discovered partitions into account when dispatching messages per <code>partition
 
 partition_count_refresh_interval.label:
 """Partition Count Refresh Interval"""
+
+max_linger_time.desc:
+"""Maximum duration for a per-partition producer to wait for messages in order to collect a batch to buffer.
+The default value `0` means no wait. For non-memory buffer mode, it's advised to configure at least `5ms` for less IOPS."""
+
+max_linger_time.label: "Max Linger Time"
+
+max_linger_bytes.desc:
+"""Maximum number of bytes for a per-partition producer to wait for messages in order to collect a batch to buffer."""
+
+max_linger_bytes.label: "Max Linger Bytes"
 
 max_batch_bytes.desc:
 """Maximum bytes to collect in a Kafka message batch. Most of the Kafka brokers default to a limit of 1 MB batch size. EMQX's default value is less than 1 MB in order to compensate Kafka message encoding overheads (especially when each individual message is very small). When a single message is over the limit, it is still sent (as a single element batch)."""
@@ -252,8 +254,12 @@ socket_nodelay.desc:
 socket_nodelay.label:
 """No Delay"""
 
-authentication.desc:
-"""Authentication configs."""
+authentication.desc: """~
+Authentication configs.
+- <code>none</code>: No authentication.
+- <code>msk_iam</code>: Use [MSK IAM authentication](https://docs.aws.amazon.com/msk/latest/developerguide/security-iam.html).  Note: This only works when EMQX is running on an EC2 instance.
+- <code>basic auth</code>: Simple username and password authentication.
+- <code>kerberos</code>: Use Kerberos GSSAPI authentication.~"""
 
 authentication.label:
 """Authentication"""

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_api_SUITE).
@@ -61,7 +49,6 @@ init_per_suite(Conf) ->
     [{suite_apps, Apps} | Conf].
 
 end_per_suite(Conf) ->
-    _ = emqx_common_test_http:delete_default_app(),
     ok = emqx_cth_suite:stop(proplists:get_value(suite_apps, Conf)).
 
 init_per_testcase(t_gateway_fail, Config) ->
@@ -377,18 +364,30 @@ t_authn_data_mgmt(_) ->
         ["gateways", "stomp", "authentication", "import_users"]
     ),
 
-    Dir = code:lib_dir(emqx_auth, test),
-    JSONFileName = filename:join([Dir, <<"data/user-credentials.json">>]),
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
     {ok, JSONData} = file:read_file(JSONFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.json", JSONData}
-    ]),
+    {ok, 200, ImportedResults} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.json", JSONData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults)
+    ),
 
-    CSVFileName = filename:join([Dir, <<"data/user-credentials.csv">>]),
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
     {ok, CSVData} = file:read_file(CSVFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.csv", CSVData}
-    ]),
+    {ok, 200, ImportedResults2} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.csv", CSVData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults2)
+    ),
 
     {204, _} = request(delete, "/gateways/stomp/authentication"),
     {204, _} = request(get, "/gateways/stomp/authentication"),
@@ -396,7 +395,7 @@ t_authn_data_mgmt(_) ->
 
 t_listeners_tcp(_) ->
     {204, _} = request(put, "/gateways/stomp", #{}),
-    {404, _} = request(get, "/gateways/stomp/listeners"),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
     LisConf = #{
         name => <<"def">>,
         type => <<"tcp">>,
@@ -425,7 +424,7 @@ t_listeners_tcp(_) ->
 
 t_listeners_max_conns(_) ->
     {204, _} = request(put, "/gateways/stomp", #{}),
-    {404, _} = request(get, "/gateways/stomp/listeners"),
+    {200, []} = request(get, "/gateways/stomp/listeners"),
     LisConf = #{
         name => <<"def">>,
         type => <<"tcp">>,
@@ -582,18 +581,30 @@ t_listeners_authn_data_mgmt(_) ->
         ["gateways", "stomp", "listeners", "stomp:tcp:def", "authentication", "import_users"]
     ),
 
-    Dir = code:lib_dir(emqx_auth, test),
-    JSONFileName = filename:join([Dir, <<"data/user-credentials.json">>]),
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
     {ok, JSONData} = file:read_file(JSONFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.json", JSONData}
-    ]),
+    {ok, 200, ImportedResults} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.json", JSONData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults)
+    ),
 
-    CSVFileName = filename:join([Dir, <<"data/user-credentials.csv">>]),
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
     {ok, CSVData} = file:read_file(CSVFileName),
-    {ok, 204, _} = emqx_dashboard_api_test_helpers:multipart_formdata_request(ImportUri, [], [
-        {filename, "user-credentials.csv", CSVData}
-    ]),
+    {ok, 200, ImportedResults2} = emqx_dashboard_api_test_helpers:multipart_formdata_request(
+        ImportUri, [], [
+            {filename, "user-credentials.csv", CSVData}
+        ]
+    ),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2},
+        emqx_utils_json:decode(ImportedResults2)
+    ),
 
     ok.
 
@@ -628,7 +639,7 @@ t_clients(_) ->
     {404, _} = request(delete, MyClientSubscriptions ++ "/test%2Ftopic"),
 
     {204, _} = request(delete, MyClient),
-    {404, _} = request(delete, MyClient),
+    ?retry(500, 10, {404, _} = request(delete, MyClient)),
     {404, _} = request(get, MyClient),
     {404, _} = request(get, MyClientSubscriptions),
     {404, _} = request(post, MyClientSubscriptions, #{topic => <<"foo">>}),
@@ -680,6 +691,15 @@ t_authn_fuzzy_search(_) ->
 
     {204, _} = request(delete, "/gateways/stomp/authentication"),
     {204, _} = request(get, "/gateways/stomp/authentication"),
+    ok.
+
+t_cluster_status_if_gateway_sup_is_not_running(_) ->
+    application:stop(emqx_gateway),
+    ?assertEqual(
+        [#{node => node(), status => unloaded}],
+        emqx_gateway_http:cluster_gateway_status(<<"stomp">>)
+    ),
+    application:start(emqx_gateway),
     ok.
 
 %%--------------------------------------------------------------------

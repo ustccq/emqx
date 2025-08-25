@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_authn_SUITE).
@@ -57,7 +45,6 @@ init_per_group(AuthName, Conf) ->
     Apps = emqx_cth_suite:start(
         [
             emqx_conf,
-            emqx_auth,
             emqx_auth_http,
             emqx_management,
             {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"},
@@ -73,6 +60,7 @@ init_per_group(AuthName, Conf) ->
 end_per_group(AuthName, Conf) ->
     ok = emqx_gateway_auth_ct:stop_auth(AuthName),
     _ = emqx_common_test_http:delete_default_app(),
+    emqx_config:delete_override_conf_files(),
     ok = emqx_cth_suite:stop(?config(group_apps, Conf)),
     Conf.
 
@@ -92,6 +80,7 @@ end_per_suite(Config) ->
 %%------------------------------------------------------------------------------
 
 t_case_coap(_) ->
+    emqx_coap_SUITE:update_coap_with_connection_mode(false),
     Login = fun(URI, Checker) ->
         Action = fun(Channel) ->
             Req = emqx_coap_SUITE:make_req(post),
@@ -264,17 +253,17 @@ t_case_exproto(_) ->
                 ConnBin = SvrMod:frame_connect(Client, Password),
 
                 Mod:send(Sock, ConnBin),
-                {ok, Recv} = Mod:recv(Sock, 5000),
-                C = ?FUNCTOR(Bin, emqx_utils_json:decode(Bin, [return_maps])),
+                {ok, Recv} = Mod:recv(Sock, 15000),
+                C = ?FUNCTOR(Bin, emqx_utils_json:decode(Bin)),
                 ?assertEqual(C(Expect), C(Recv))
             end
         )
     end,
     Login(<<"admin">>, <<"public">>, SvrMod:frame_connack(0)),
-    Login(<<"bad">>, <<"bad">>, SvrMod:frame_connack(1)),
+    Login(<<"bad">>, <<"bad-password-1">>, SvrMod:frame_connack(1)),
 
     disable_authn(exproto, tcp, default),
-    Login(<<"bad">>, <<"bad">>, SvrMod:frame_connack(0)),
+    Login(<<"bad">>, <<"bad-password-2">>, SvrMod:frame_connack(0)),
 
     SvrMod:stop(Svrs),
     ok.

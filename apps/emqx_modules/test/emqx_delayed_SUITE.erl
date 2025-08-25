@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_delayed_SUITE).
@@ -40,12 +28,19 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:load_config(emqx_modules_schema, ?BASE_CONF),
-    emqx_common_test_helpers:start_apps([emqx_conf, emqx_modules]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            {emqx_modules, #{config => ?BASE_CONF}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_) ->
-    emqx_common_test_helpers:stop_apps([emqx_modules, emqx_conf]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(t_load_case, Config) ->
     Config;
@@ -122,7 +117,8 @@ t_delayed_message_abs_time(_) ->
         ets:tab2list(emqx_delayed)
     ),
 
-    Ts1 = integer_to_binary(erlang:system_time(second) + 10000000),
+    %% later than max allowed interval
+    Ts1 = integer_to_binary(erlang:system_time(second) + 42949670 + 100),
     DelayedMsg1 = emqx_message:make(
         ?MODULE, 1, <<"$delayed/", Ts1/binary, "/publish">>, <<"delayed_abs">>
     ),

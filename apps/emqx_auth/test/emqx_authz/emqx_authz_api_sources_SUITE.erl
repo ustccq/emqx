@@ -1,22 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_api_sources_SUITE).
 
 -compile(nowarn_export_all).
 -compile(export_all).
+-compile(nowarn_update_literal).
 
 -import(emqx_mgmt_api_test_util, [request/3, uri/1]).
 
@@ -180,7 +170,7 @@ t_api(_) ->
     {ok, 404, ErrResult} = request(get, uri(["authorization", "sources", "http"]), []),
     ?assertMatch(
         #{<<"code">> := <<"NOT_FOUND">>, <<"message">> := <<"Not found: http">>},
-        emqx_utils_json:decode(ErrResult, [return_maps])
+        emqx_utils_json:decode(ErrResult)
     ),
 
     [
@@ -216,7 +206,7 @@ t_api(_) ->
     {ok, 200, Result3} = request(get, uri(["authorization", "sources", "http"]), []),
     ?assertMatch(
         #{<<"type">> := <<"http">>, <<"enable">> := false},
-        emqx_utils_json:decode(Result3, [return_maps])
+        emqx_utils_json:decode(Result3)
     ),
 
     Keyfile = emqx_common_test_helpers:app_path(
@@ -254,7 +244,7 @@ t_api(_) ->
             <<"total">> := 0,
             <<"nomatch">> := 0
         }
-    } = emqx_utils_json:decode(Status4, [return_maps]),
+    } = emqx_utils_json:decode(Status4),
     ?assertMatch(
         #{
             <<"type">> := <<"mongodb">>,
@@ -266,7 +256,7 @@ t_api(_) ->
                 <<"verify">> := <<"verify_none">>
             }
         },
-        emqx_utils_json:decode(Result4, [return_maps])
+        emqx_utils_json:decode(Result4)
     ),
 
     {ok, Cacert} = file:read_file(Cacertfile),
@@ -298,7 +288,7 @@ t_api(_) ->
                 <<"verify">> := <<"verify_none">>
             }
         },
-        emqx_utils_json:decode(Result5, [return_maps])
+        emqx_utils_json:decode(Result5)
     ),
 
     {ok, 200, Status5_1} = request(get, uri(["authorization", "sources", "mongodb", "status"]), []),
@@ -309,15 +299,17 @@ t_api(_) ->
             <<"total">> := 0,
             <<"nomatch">> := 0
         }
-    } = emqx_utils_json:decode(Status5_1, [return_maps]),
+    } = emqx_utils_json:decode(Status5_1),
 
     #{
-        ssl := #{
-            cacertfile := SavedCacertfile,
-            certfile := SavedCertfile,
-            keyfile := SavedKeyfile
+        config := #{
+            ssl := #{
+                cacertfile := SavedCacertfile,
+                certfile := SavedCertfile,
+                keyfile := SavedKeyfile
+            }
         }
-    } = emqx_authz:lookup(mongodb),
+    } = emqx_authz:lookup_state(mongodb),
 
     ?assert(filelib:is_file(SavedCacertfile)),
     ?assert(filelib:is_file(SavedCertfile)),
@@ -356,7 +348,7 @@ t_api(_) ->
             <<"code">> := <<"BAD_REQUEST">>,
             <<"message">> := <<"Type mismatch", _/binary>>
         },
-        emqx_utils_json:decode(TypeMismatch, [return_maps])
+        emqx_utils_json:decode(TypeMismatch)
     ),
 
     lists:foreach(
@@ -444,7 +436,7 @@ t_api(_) ->
                     <<"total">> := 1,
                     <<"nomatch">> := 0
                 }
-            } = emqx_utils_json:decode(Status5, [return_maps])
+            } = emqx_utils_json:decode(Status5)
         end
     ),
 
@@ -470,7 +462,7 @@ t_api(_) ->
                     <<"total">> := 2,
                     <<"nomatch">> := 0
                 }
-            } = emqx_utils_json:decode(Status6, [return_maps])
+            } = emqx_utils_json:decode(Status6)
         end
     ),
 
@@ -496,7 +488,7 @@ t_api(_) ->
                     <<"total">> := 3,
                     <<"nomatch">> := 0
                 }
-            } = emqx_utils_json:decode(Status7, [return_maps])
+            } = emqx_utils_json:decode(Status7)
         end
     ),
     ok.
@@ -513,7 +505,7 @@ t_source_move(_) ->
             #{type := postgresql},
             #{type := redis}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, 204, _} = request(
@@ -529,7 +521,7 @@ t_source_move(_) ->
             #{type := mysql},
             #{type := redis}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, 204, _} = request(
@@ -545,7 +537,7 @@ t_source_move(_) ->
             #{type := redis},
             #{type := http}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, 204, _} = request(
@@ -561,7 +553,7 @@ t_source_move(_) ->
             #{type := redis},
             #{type := http}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, 204, _} = request(
@@ -577,7 +569,7 @@ t_source_move(_) ->
             #{type := http},
             #{type := mongodb}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     ok.
@@ -596,7 +588,7 @@ t_sources_reorder(_) ->
             #{type := postgresql},
             #{type := redis}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     OrderUri = uri(["authorization", "sources", "order"]),
@@ -621,7 +613,7 @@ t_sources_reorder(_) ->
             #{type := mysql},
             #{type := mongodb, enable := false}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     %% Invalid moves
@@ -741,12 +733,6 @@ t_aggregate_metrics(_) ->
     ).
 
 get_sources(Result) ->
-    maps:get(<<"sources">>, emqx_utils_json:decode(Result, [return_maps])).
+    maps:get(<<"sources">>, emqx_utils_json:decode(Result)).
 
 data_dir() -> emqx:data_dir().
-
-start_apps(Apps) ->
-    lists:foreach(fun application:ensure_all_started/1, Apps).
-
-stop_apps(Apps) ->
-    lists:foreach(fun application:stop/1, Apps).

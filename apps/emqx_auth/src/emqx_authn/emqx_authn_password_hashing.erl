@@ -1,22 +1,11 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_password_hashing).
 
 -include_lib("typerefl/include/types.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
 
 -type simple_algorithm_name() :: plain | md5 | sha | sha256 | sha512.
 -type salt_position() :: disable | prefix | suffix.
@@ -81,19 +70,28 @@ fields(bcrypt_rw_api) ->
             {salt_rounds, fun bcrypt_salt_rounds_api/1}
         ];
 fields(bcrypt) ->
-    [{name, sc(bcrypt, #{required => true, desc => "BCRYPT password hashing."})}];
+    [{name, sc(bcrypt, #{required => true, desc => ?DESC("bcrypt_name")})}];
 fields(pbkdf2) ->
     [
-        {name, sc(pbkdf2, #{required => true, desc => "PBKDF2 password hashing."})},
+        {name,
+            sc(
+                pbkdf2, #{
+                    required => true,
+                    desc => ?DESC("pbkdf2_name")
+                }
+            )},
         {mac_fun,
             sc(
                 hoconsc:enum([md4, md5, ripemd160, sha, sha224, sha256, sha384, sha512]),
-                #{required => true, desc => "Specifies mac_fun for PBKDF2 hashing algorithm."}
+                #{
+                    required => true,
+                    desc => ?DESC("pbkdf2_mac_fun")
+                }
             )},
         {iterations,
             sc(
                 pos_integer(),
-                #{required => true, desc => "Iteration count for PBKDF2 hashing algorithm."}
+                #{required => true, desc => ?DESC("pbkdf2_iterations")}
             )},
         {dk_length, fun dk_length/1}
     ];
@@ -102,7 +100,7 @@ fields(simple) ->
         {name,
             sc(
                 hoconsc:enum([plain, md5, sha, sha256, sha512]),
-                #{required => true, desc => "Simple password hashing algorithm."}
+                #{required => true, desc => ?DESC("simple")}
             )},
         {salt_position, fun salt_position/1}
     ].
@@ -113,7 +111,7 @@ bcrypt_salt_rounds(Option) -> bcrypt_salt_rounds_api(Option).
 bcrypt_salt_rounds_api(type) -> range(?SALT_ROUNDS_MIN, ?SALT_ROUNDS_MAX);
 bcrypt_salt_rounds_api(default) -> ?SALT_ROUNDS_MAX;
 bcrypt_salt_rounds_api(example) -> ?SALT_ROUNDS_MAX;
-bcrypt_salt_rounds_api(desc) -> "Work factor for BCRYPT password generation.";
+bcrypt_salt_rounds_api(desc) -> ?DESC("bcrypt_salt_rounds");
 bcrypt_salt_rounds_api(_) -> undefined.
 
 salt_rounds_converter(undefined, _) ->
@@ -124,30 +122,29 @@ salt_rounds_converter(X, _) ->
     X.
 
 desc(bcrypt_rw) ->
-    "Settings for bcrypt password hashing algorithm (for DB backends with write capability).";
+    ?DESC("bcrypt_rw");
 desc(bcrypt_rw_api) ->
-    desc(bcrypt_rw);
+    desc("bcrypt_rw");
 desc(bcrypt) ->
-    "Settings for bcrypt password hashing algorithm.";
+    ?DESC("bcrypt");
 desc(pbkdf2) ->
-    "Settings for PBKDF2 password hashing algorithm.";
+    ?DESC("pbkdf2");
 desc(simple) ->
-    "Settings for simple algorithms.";
+    ?DESC("simple");
 desc(_) ->
     undefined.
 
 salt_position(type) -> {enum, [disable, prefix, suffix]};
 salt_position(default) -> prefix;
-salt_position(desc) -> "Salt position for PLAIN, MD5, SHA, SHA256 and SHA512 algorithms.";
+salt_position(desc) -> ?DESC("salt_position");
 salt_position(_) -> undefined.
 
 dk_length(type) ->
-    integer();
+    pos_integer();
 dk_length(required) ->
     false;
 dk_length(desc) ->
-    "Derived length for PBKDF2 hashing algorithm. If not specified, "
-    "calculated automatically based on `mac_fun`.";
+    ?DESC("dk_length");
 dk_length(_) ->
     undefined.
 
@@ -155,7 +152,7 @@ dk_length(_) ->
 type_rw(type) ->
     hoconsc:union(rw_refs());
 type_rw(desc) ->
-    "Options for password hash creation and verification.";
+    ?DESC("type_rw");
 type_rw(Option) ->
     type_ro(Option).
 
@@ -163,7 +160,7 @@ type_rw(Option) ->
 type_rw_api(type) ->
     hoconsc:union(api_refs());
 type_rw_api(desc) ->
-    "Options for password hash creation and verification through API.";
+    ?DESC("type_rw");
 type_rw_api(_) ->
     undefined.
 
@@ -173,7 +170,7 @@ type_ro(type) ->
 type_ro(default) ->
     #{<<"name">> => sha256, <<"salt_position">> => prefix};
 type_ro(desc) ->
-    "Options for password hash verification.";
+    ?DESC("type_ro");
 type_ro(_) ->
     undefined.
 

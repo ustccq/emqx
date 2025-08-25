@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% Define the default actions.
@@ -20,7 +8,7 @@
 -include("rule_engine.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx.hrl").
--include_lib("emqtt/include/emqtt.hrl").
+-include_lib("snabbkaffe/include/trace.hrl").
 
 %% APIs
 -export([parse_action/1]).
@@ -34,6 +22,9 @@
     republish/3
 ]).
 
+%% Internal exports
+-export([pre_process_args/3]).
+
 -optional_callbacks([pre_process_action_args/2]).
 
 -callback pre_process_action_args(FuncName :: atom(), action_fun_args()) -> action_fun_args().
@@ -44,19 +35,13 @@
 %% APIs
 %%--------------------------------------------------------------------
 parse_action(BridgeId) when is_binary(BridgeId) ->
-    {Type, Name} = emqx_bridge_resource:parse_bridge_id(BridgeId),
+    #{
+        type := Type,
+        name := Name
+    } = emqx_bridge_resource:parse_bridge_id(BridgeId),
     case emqx_bridge_v2:is_bridge_v2_type(Type) of
         true ->
-            %% Could be an old bridge V1 type that should be converted to a V2 type
-            try emqx_bridge_v2:bridge_v1_type_to_bridge_v2_type(Type) of
-                BridgeV2Type ->
-                    {bridge_v2, BridgeV2Type, Name}
-            catch
-                _:_ ->
-                    %% We got a bridge v2 type that is not also a bridge v1
-                    %% type
-                    {bridge_v2, Type, Name}
-            end;
+            {bridge_v2, Type, Name};
         false ->
             {bridge, Type, Name, emqx_bridge_resource:resource_id(Type, Name)}
     end;
@@ -83,7 +68,8 @@ pre_process_action_args(
         retain := Retain,
         payload := Payload,
         mqtt_properties := MQTTProperties,
-        user_properties := UserProperties
+        user_properties := UserProperties,
+        direct_dispatch := DirectDispatch
     } = Args
 ) ->
     Args#{
@@ -93,7 +79,8 @@ pre_process_action_args(
             retain => parse_simple_var(Retain),
             payload => parse_payload(Payload),
             mqtt_properties => parse_mqtt_properties(MQTTProperties),
-            user_properties => parse_user_properties(UserProperties)
+            user_properties => parse_user_properties(UserProperties),
+            direct_dispatch => parse_simple_var(DirectDispatch)
         }
     };
 pre_process_action_args(_, Args) ->
@@ -134,7 +121,15 @@ republish(
     },
     _Args
 ) ->
-    ?SLOG(error, #{msg => "recursive_republish_detected", topic => Topic});
+    ?SLOG(
+        error,
+        #{
+            msg => "recursive_republish_detected",
+            topic => Topic,
+            rule_id => RuleId
+        },
+        #{tag => ?TAG}
+    );
 republish(
     Selected,
     #{metadata := #{rule_id := RuleId}} = Env,
@@ -145,7 +140,8 @@ republish(
             topic := TopicTemplate,
             payload := PayloadTemplate,
             mqtt_properties := MQTTPropertiesTemplate,
-            user_properties := UserPropertiesTemplate
+            user_properties := UserPropertiesTemplate,
+            direct_dispatch := DirectDispatchTemplate
         }
     }
 ) ->
@@ -156,6 +152,25 @@ republish(
     Payload = iolist_to_binary(PayloadString),
     QoS = render_simple_var(QoSTemplate, Selected, 0),
     Retain = render_simple_var(RetainTemplate, Selected, false),
+    DirectDispatch0 = render_simple_var(DirectDispatchTemplate, Selected, false),
+    DirectDispatch =
+        case is_boolean(DirectDispatch0) of
+            true ->
+                DirectDispatch0;
+            false ->
+                ?tp("bad_direct_dispatch_resolved_value", #{}),
+                ?SLOG(
+                    error,
+                    #{
+                        msg => "bad_direct_dispatch_resolved_value",
+                        value => DirectDispatch0,
+                        hint => <<"will use default value: false">>,
+                        rule_id => RuleId
+                    },
+                    #{tag => ?TAG}
+                ),
+                false
+        end,
     %% 'flags' is set for message re-publishes or message related
     %% events such as message.acked and message.dropped
     Flags0 = maps:get(flags, Env, #{}),
@@ -167,7 +182,8 @@ republish(
         flags => Flags,
         topic => Topic,
         payload => Payload,
-        pub_props => PubProps
+        pub_props => PubProps,
+        direct_dispatch => DirectDispatch
     },
     case logger:get_process_metadata() of
         #{action_id := ActionID} ->
@@ -182,7 +198,7 @@ republish(
         "republish_message",
         TraceInfo
     ),
-    safe_publish(RuleId, Topic, QoS, Flags, Payload, PubProps).
+    safe_publish(RuleId, Topic, QoS, Flags, Payload, PubProps, DirectDispatch).
 
 %%--------------------------------------------------------------------
 %% internal functions
@@ -224,7 +240,7 @@ pre_process_args(Mod, Func, Args) ->
         false -> Args
     end.
 
-safe_publish(RuleId, Topic, QoS, Flags, Payload, PubProps) ->
+safe_publish(RuleId, Topic, QoS, Flags, Payload, PubProps, DirectDispatch) ->
     Msg = #message{
         id = emqx_guid:gen(),
         qos = QoS,
@@ -238,8 +254,19 @@ safe_publish(RuleId, Topic, QoS, Flags, Payload, PubProps) ->
         payload = Payload,
         timestamp = erlang:system_time(millisecond)
     },
-    _ = emqx_broker:safe_publish(Msg),
-    emqx_metrics:inc_msg(Msg).
+    case
+        emqx_broker:safe_publish(Msg, #{
+            bypass_hook => DirectDispatch, hook_prohibition_as_error => true
+        })
+    of
+        Routes when is_list(Routes) ->
+            emqx_metrics:inc_msg(Msg),
+            ok;
+        disconnect ->
+            error;
+        {blocked, _Msg} ->
+            error
+    end.
 
 parse_simple_var(Data) when is_binary(Data) ->
     emqx_template:parse(Data);
@@ -286,6 +313,8 @@ render_simple_var([{var, _Name, Accessor}], Data, Default) ->
         %% cannot find the variable from Data
         {error, _} -> Default
     end;
+render_simple_var([Val], _Data, _Default) ->
+    Val;
 render_simple_var({const, Val}, _Data, _Default) ->
     Val.
 
@@ -306,7 +335,10 @@ render_pub_props(UserPropertiesTemplate, Selected, Env) ->
 -define(BADPROP(K, REASON, ENV, DATA),
     ?SLOG(
         debug,
-        DATA#{
+        (begin
+            DATA
+        end)#{
+            tag => ?TAG,
             msg => "bad_mqtt_property_value_ignored",
             rule_id => emqx_utils_maps:deep_get([metadata, rule_id], ENV, undefined),
             reason => REASON,

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_broker).
@@ -20,12 +8,14 @@
 
 -include("emqx.hrl").
 -include("emqx_router.hrl").
+-include("emqx_external_trace.hrl").
 
 -include("logger.hrl").
+-include("emqx_instr.hrl").
 -include("types.hrl").
 -include("emqx_mqtt.hrl").
 
--export([start_link/2]).
+-export([start_link/2, create_tabs/0, init_config/0]).
 
 %% PubSub
 -export([
@@ -36,11 +26,16 @@
 
 -export([unsubscribe/1]).
 
--export([subscriber_down/1]).
+-export([
+    subscriber_down/1,
+    purge_node/1
+]).
 
 -export([
     publish/1,
-    safe_publish/1
+    publish/2,
+    safe_publish/1,
+    safe_publish/2
 ]).
 
 -export([dispatch/2]).
@@ -51,6 +46,11 @@
     subscriptions_via_topic/1,
     subscribers/1,
     subscribed/2
+]).
+
+%% Folds
+-export([
+    foldl_topics/2
 ]).
 
 -export([
@@ -70,8 +70,6 @@
     code_change/3
 ]).
 
--import(emqx_utils_ets, [lookup_value/2, lookup_value/3]).
-
 -ifdef(TEST).
 -compile(export_all).
 -compile(nowarn_export_all).
@@ -81,6 +79,8 @@
 
 %% Guards
 -define(IS_SUBID(Id), (is_binary(Id) orelse is_atom(Id))).
+
+-define(PT_FLAG_ASYNC_SHARD_DISPATCH, '$emqx_broker__async_fanout_shard_dispatch').
 
 -define(cast_or_eval(PICK, Msg, Expr),
     case PICK of
@@ -92,9 +92,16 @@
     end
 ).
 
+-type publish_opts() :: #{
+    %% Whether to return a disinguishing value `{blocked, #message{}}' when a hook from
+    %% `'message.publish''` returns `allow_publish => false'.  Defaults to `false'.
+    hook_prohibition_as_error => boolean(),
+    %% do not call message.publish hook point if true
+    bypass_hook => boolean()
+}.
+
 -spec start_link(atom(), pos_integer()) -> startlink_ret().
 start_link(Pool, Id) ->
-    ok = create_tabs(),
     gen_server:start_link(
         {local, emqx_utils:proc_name(?BROKER, Id)},
         ?MODULE,
@@ -111,15 +118,27 @@ create_tabs() ->
     TabOpts = [public, {read_concurrency, true}, {write_concurrency, true}],
 
     %% SubOption: {TopicFilter, SubPid} -> SubOption
+    %% NOTE: `foldl_topics/2` relies on it being ordered.
     ok = emqx_utils_ets:new(?SUBOPTION, [ordered_set | TabOpts]),
 
     %% Subscription: SubPid -> TopicFilter1, TopicFilter2, TopicFilter3, ...
-    %% duplicate_bag: o(1) insert
+    %% duplicate_bag: O(1) insert
     ok = emqx_utils_ets:new(?SUBSCRIPTION, [duplicate_bag | TabOpts]),
 
-    %% Subscriber: Topic -> SubPid1, SubPid2, SubPid3, ...
-    %% bag: o(n) insert:(
+    %% Subscriber: Topic -> SubPid1, SubPid2, SubPid3, ..., ShardPid1, ...
+    %% bag: O(n) insert
+    %% However, the factor is small: high-fanout topics are _sharded_ into
+    %% buckets of constant length (e.g. 1024).
     ok = emqx_utils_ets:new(?SUBSCRIBER, [bag | TabOpts]).
+
+-spec init_config() -> ok.
+init_config() ->
+    %% NOTE
+    %% Cache in persistent term, to avoid `emqx:get_config/2` in hot paths.
+    persistent_term:put(
+        ?PT_FLAG_ASYNC_SHARD_DISPATCH,
+        emqx:get_config([broker, perf, async_fanout_shard_dispatch], false)
+    ).
 
 %%------------------------------------------------------------------------------
 %% Subscribe API
@@ -162,9 +181,7 @@ with_subid(SubId, SubOpts) ->
     maps:put(subid, SubId, SubOpts).
 
 do_subscribe(Topic, SubPid, SubOpts) when is_binary(Topic) ->
-    %% FIXME: subscribe shard bug
-    %% https://emqx.atlassian.net/browse/EMQX-10214
-    I = emqx_broker_helper:get_sub_shard(SubPid, Topic),
+    I = emqx_broker_helper:assign_sub_shard(Topic),
     true = ets:insert(?SUBOPTION, {{Topic, SubPid}, with_shard_idx(I, SubOpts)}),
     Sync = call(pick({Topic, I}), {subscribe, Topic, SubPid, I}),
     case Sync of
@@ -204,33 +221,44 @@ unsubscribe(Topic) when ?IS_TOPIC(Topic) ->
 do_unsubscribe(Topic, SubPid, SubOpts) ->
     true = ets:delete(?SUBOPTION, {Topic, SubPid}),
     true = ets:delete_object(?SUBSCRIPTION, {SubPid, Topic}),
-    do_unsubscribe2(Topic, SubPid, SubOpts).
+    case Topic of
+        B when is_binary(B) ->
+            do_unsubscribe_regular(Topic, SubPid, SubOpts);
+        #share{group = Group, topic = RealTopic} ->
+            emqx_shared_sub:unsubscribe(Group, RealTopic, SubPid)
+    end.
 
--spec do_unsubscribe2(emqx_types:topic() | emqx_types:share(), pid(), emqx_types:subopts()) ->
+-spec do_unsubscribe_regular(emqx_types:topic(), pid(), emqx_types:subopts()) ->
     ok.
-do_unsubscribe2(Topic, SubPid, SubOpts) when
-    is_binary(Topic), is_pid(SubPid), is_map(SubOpts)
-->
-    _ = emqx_broker_helper:reclaim_seq(Topic),
+do_unsubscribe_regular(Topic, SubPid, SubOpts) ->
     I = maps:get(shard, SubOpts, 0),
+    _ = emqx_broker_helper:unassign_sub_shard(Topic, I),
     case I of
         0 -> emqx_exclusive_subscription:unsubscribe(Topic, SubOpts);
         _ -> ok
     end,
-    cast(pick({Topic, I}), {unsubscribed, Topic, SubPid, I});
-do_unsubscribe2(#share{group = Group, topic = Topic}, SubPid, _SubOpts) when
-    is_binary(Group), is_binary(Topic), is_pid(SubPid)
-->
-    emqx_shared_sub:unsubscribe(Group, Topic, SubPid).
+    cast(pick({Topic, I}), {unsubscribed, Topic, SubPid, I}).
 
 %%--------------------------------------------------------------------
 %% Publish
 %%--------------------------------------------------------------------
 
 -spec publish(emqx_types:message()) -> emqx_types:publish_result().
-publish(Msg) when is_record(Msg, message) ->
+publish(#message{} = Msg) ->
+    publish(#message{} = Msg, _Opts = #{}).
+
+-spec publish(emqx_types:message(), publish_opts()) -> emqx_types:publish_result().
+publish(#message{} = Msg, Opts) ->
     _ = emqx_trace:publish(Msg),
     emqx_message:is_sys(Msg) orelse emqx_metrics:inc('messages.publish'),
+    case maps:get(bypass_hook, Opts, false) of
+        true ->
+            do_publish(Msg);
+        false ->
+            eval_hook_and_publish(Msg, Opts)
+    end.
+
+eval_hook_and_publish(Msg, Opts) ->
     case emqx_hooks:run_fold('message.publish', [], emqx_message:clean_dup(Msg)) of
         #message{headers = #{should_disconnect := true}, topic = Topic} ->
             ?TRACE("MQTT", "msg_publish_not_allowed_disconnect", #{
@@ -238,16 +266,34 @@ publish(Msg) when is_record(Msg, message) ->
                 topic => Topic
             }),
             disconnect;
-        #message{headers = #{allow_publish := false}, topic = Topic} ->
+        #message{headers = #{allow_publish := false}, topic = Topic} = Message ->
             ?TRACE("MQTT", "msg_publish_not_allowed", #{
                 message => emqx_message:to_log_map(Msg),
                 topic => Topic
             }),
-            [];
-        Msg1 = #message{topic = Topic} ->
-            PersistRes = persist_publish(Msg1),
-            route(aggre(emqx_router:match_routes(Topic)), delivery(Msg1), PersistRes)
+            case maps:get(hook_prohibition_as_error, Opts, false) of
+                true ->
+                    {blocked, Message};
+                false ->
+                    []
+            end;
+        Msg1 = #message{} ->
+            do_publish(Msg1);
+        Msgs when is_list(Msgs) ->
+            do_publish_many(Msgs)
     end.
+
+do_publish_many([]) ->
+    [];
+do_publish_many([Msg | T]) ->
+    do_publish(Msg) ++ do_publish_many(T).
+
+do_publish(#message{topic = Topic} = Msg) ->
+    PersistRes = persist_publish(Msg),
+    Routes = aggre(emqx_router:match_routes(Topic)),
+    Delivery = delivery(Msg),
+    RouteRes = route(Routes, Delivery, PersistRes),
+    do_forward_external(Delivery, RouteRes).
 
 persist_publish(Msg) ->
     case emqx_persistent_message:persist(Msg) of
@@ -264,9 +310,13 @@ persist_publish(Msg) ->
 
 %% Called internally
 -spec safe_publish(emqx_types:message()) -> emqx_types:publish_result().
-safe_publish(Msg) when is_record(Msg, message) ->
+safe_publish(Msg) ->
+    safe_publish(Msg, _Opts = #{}).
+
+-spec safe_publish(emqx_types:message(), publish_opts()) -> emqx_types:publish_result().
+safe_publish(#message{} = Msg, Opts) ->
     try
-        publish(Msg)
+        publish(Msg, Opts)
     catch
         Error:Reason:Stk ->
             ?SLOG(
@@ -290,57 +340,117 @@ delivery(Msg) -> #delivery{sender = self(), message = Msg}.
 %% Route
 %%--------------------------------------------------------------------
 
--spec route([emqx_types:route_entry()], emqx_types:delivery(), nil() | [persisted]) ->
+route(Routes, Delivery = #delivery{message = _Msg}, PersistRes) ->
+    ?EXT_TRACE_MSG_ROUTE(
+        ?EXT_TRACE_ATTR((emqx_otel_trace:msg_attrs(_Msg))#{
+            'route.from' => node(),
+            'route.matched_result' => emqx_utils_json:encode([
+                route_result({TF, RouteTo})
+             || {TF, RouteTo} <- Routes
+            ]),
+            'client.clientid' => _Msg#message.from
+        }),
+        fun(DeliveryWithTrace) -> do_route(Routes, DeliveryWithTrace, PersistRes) end,
+        [Delivery]
+    ).
+
+-if(?EMQX_RELEASE_EDITION == ee).
+route_result({TF, Node}) when is_atom(Node) ->
+    #{node => Node, route => TF};
+route_result({TF, Group}) ->
+    #{group => Group, route => TF}.
+
+-else.
+-endif.
+
+-spec do_route([emqx_types:route_entry()], emqx_types:delivery(), nil() | [persisted]) ->
     emqx_types:publish_result().
-route([], #delivery{message = Msg}, _PersistRes = []) ->
+do_route([], #delivery{message = Msg}, _PersistRes = []) ->
     ok = emqx_hooks:run('message.dropped', [Msg, #{node => node()}, no_subscribers]),
     ok = inc_dropped_cnt(Msg),
+    ?EXT_TRACE_ADD_ATTRS(
+        begin
+            case Msg of
+                #message{flags = #{sys := true}} ->
+                    ok;
+                _ ->
+                    #{
+                        'route.dropped.node' => node(),
+                        'route.dropped.reason' => no_subscribers
+                    }
+            end
+        end
+    ),
     [];
-route([], _Delivery, PersistRes = [_ | _]) ->
+do_route([], _Delivery, PersistRes = [_ | _]) ->
     PersistRes;
-route(Routes, Delivery, PersistRes) ->
+do_route(Routes, Delivery, PersistRes) ->
     lists:foldl(
         fun(Route, Acc) ->
-            [do_route(Route, Delivery) | Acc]
+            [do_route2(Route, Delivery) | Acc]
         end,
         PersistRes,
         Routes
     ).
 
-do_route({To, Node}, Delivery) when Node =:= node() ->
-    {Node, To, dispatch(To, Delivery)};
-do_route({To, Node}, Delivery) when is_atom(Node) ->
+do_route2({To, Node}, Delivery) when Node =:= node() ->
+    {Node, To, do_dispatch(To, Delivery)};
+do_route2({To, Node}, Delivery) when is_atom(Node) ->
     {Node, To, forward(Node, To, Delivery, emqx:get_config([rpc, mode]))};
-do_route({To, Group}, Delivery) when is_tuple(Group); is_binary(Group) ->
+do_route2({To, Group}, Delivery) when is_tuple(Group); is_binary(Group) ->
     {share, To, emqx_shared_sub:dispatch(Group, To, Delivery)}.
 
 aggre([]) ->
     [];
 aggre([#route{topic = To, dest = Node}]) when is_atom(Node) ->
-    [{To, Node}];
+    [{To, Node} || emqx_router_helper:is_routable(Node)];
 aggre([#route{topic = To, dest = {Group, _Node}}]) ->
     [{To, Group}];
 aggre(Routes) ->
     aggre(Routes, false, []).
 
 aggre([#route{topic = To, dest = Node} | Rest], Dedup, Acc) when is_atom(Node) ->
-    aggre(Rest, Dedup, [{To, Node} | Acc]);
-aggre([#route{topic = To, dest = {Group, _Node}} | Rest], _Dedup, Acc) ->
-    aggre(Rest, true, [{To, Group} | Acc]);
+    case emqx_router_helper:is_routable(Node) of
+        true -> NAcc = [{To, Node} | Acc];
+        false -> NAcc = Acc
+    end,
+    aggre(Rest, Dedup, NAcc);
+aggre([#route{topic = To, dest = {Group, Node}} | Rest], Dedup, Acc) ->
+    case emqx_router_helper:is_routable(Node) of
+        true -> aggre(Rest, true, [{To, Group} | Acc]);
+        false -> aggre(Rest, Dedup, Acc)
+    end;
 aggre([], false, Acc) ->
     Acc;
 aggre([], true, Acc) ->
     lists:usort(Acc).
 
+do_forward_external(Delivery, RouteRes) ->
+    emqx_external_broker:forward(Delivery) ++ RouteRes.
+
+forward(Node, To, Delivery = #delivery{message = _Msg}, RpcMode) ->
+    ?EXT_TRACE_MSG_FORWARD(
+        ?EXT_TRACE_ATTR((emqx_otel_trace:msg_attrs(_Msg))#{
+            'forward.from' => node(),
+            'forward.to' => Node,
+            'client.clientid' => _Msg#message.from
+        }),
+        fun(NDelivery) -> do_forward(Node, To, NDelivery, RpcMode) end,
+        [Delivery]
+    ).
+
 %% @doc Forward message to another node.
--spec forward(
-    node(), emqx_types:topic() | emqx_types:share(), emqx_types:delivery(), RpcMode :: sync | async
+-spec do_forward(
+    node(),
+    emqx_types:topic() | emqx_types:share(),
+    emqx_types:delivery(),
+    RpcMode :: sync | async
 ) ->
     emqx_types:deliver_result().
-forward(Node, To, Delivery, async) ->
+do_forward(Node, To, Delivery, async) ->
     true = emqx_broker_proto_v1:forward_async(Node, To, Delivery),
     emqx_metrics:inc('messages.forward');
-forward(Node, To, Delivery, sync) ->
+do_forward(Node, To, Delivery, sync) ->
     case emqx_broker_proto_v1:forward(Node, To, Delivery) of
         {Err, Reason} when Err =:= badrpc; Err =:= badtcp ->
             ?SLOG(
@@ -358,12 +468,28 @@ forward(Node, To, Delivery, sync) ->
             Result
     end.
 
--spec dispatch(emqx_types:topic() | emqx_types:share(), emqx_types:delivery()) ->
+%% Handle message forwarding form remote nodes by
+%% `emqx_broker_proto_v1:forward/3` or
+%% `emqx_broker_proto_v1:forward_async/3`
+dispatch(Topic, Delivery = #delivery{sender = _Sender, message = _Msg}) ->
+    ?EXT_TRACE_MSG_HANDLE_FORWARD(
+        ?EXT_TRACE_ATTR((emqx_otel_trace:msg_attrs(_Msg))#{
+            %%% XXX: Pid not checked
+            'forward.from' => erlang:node(_Sender),
+            'forward.to' => node(),
+            'client.clientid' => _Msg#message.from
+        }),
+        fun(NDelivery) -> do_dispatch(Topic, NDelivery) end,
+        [Delivery]
+    ).
+
+%% @doc Dispatch message to local subscribers.
+-spec do_dispatch(emqx_types:topic() | emqx_types:share(), emqx_types:delivery()) ->
     emqx_types:deliver_result().
-dispatch(Topic, Delivery = #delivery{}) when is_binary(Topic) ->
+do_dispatch(Topic, Delivery = #delivery{}) when is_binary(Topic) ->
     case emqx:is_running() of
         true ->
-            do_dispatch(Topic, Delivery);
+            do_dispatch2(Topic, Delivery);
         false ->
             %% In a rare case emqx_router_helper process may delay
             %% cleanup of the routing table and the peers will
@@ -404,8 +530,7 @@ subscriber_down(SubPid) ->
         fun(Topic) ->
             case lookup_value(?SUBOPTION, {Topic, SubPid}) of
                 SubOpts when is_map(SubOpts) ->
-                    true = ets:delete(?SUBOPTION, {Topic, SubPid}),
-                    do_unsubscribe2(Topic, SubPid, SubOpts);
+                    do_unsubscribe_down(Topic, SubPid, SubOpts);
                 undefined ->
                     ok
             end
@@ -413,6 +538,25 @@ subscriber_down(SubPid) ->
         lookup_value(?SUBSCRIPTION, SubPid, [])
     ),
     ets:delete(?SUBSCRIPTION, SubPid).
+
+do_unsubscribe_down(Topic, SubPid, SubOpts) ->
+    true = ets:delete(?SUBOPTION, {Topic, SubPid}),
+    case Topic of
+        B when is_binary(B) ->
+            do_unsubscribe_regular(Topic, SubPid, SubOpts);
+        #share{group = Group, topic = RealTopic} ->
+            emqx_shared_sub:unsubscribe_down(Group, RealTopic, SubPid)
+    end.
+
+%%--------------------------------------------------------------------
+%% Node Cleanup APIs
+%%--------------------------------------------------------------------
+
+-spec purge_node(node()) -> ok.
+purge_node(Node) ->
+    ok = emqx_router:cleanup_routes(Node),
+    _ = emqx_shared_sub:purge_node(Node),
+    ok.
 
 %%--------------------------------------------------------------------
 %% Management APIs
@@ -472,6 +616,18 @@ set_subopts(SubPid, Topic, NewOpts) ->
             false
     end.
 
+-spec foldl_topics(fun((emqx_types:topic() | emqx_types:share(), Acc) -> Acc), Acc) ->
+    Acc.
+foldl_topics(FoldFun, Acc) ->
+    First = ets:first(?SUBOPTION),
+    foldl_topics(FoldFun, Acc, First).
+
+foldl_topics(FoldFun, Acc, {Topic, _SubPid}) ->
+    Next = ets:next(?SUBOPTION, {Topic, _GreaterThanAnyPid = []}),
+    foldl_topics(FoldFun, FoldFun(Topic, Acc), Next);
+foldl_topics(_FoldFun, Acc, '$end_of_table') ->
+    Acc.
+
 -spec topics() -> [emqx_types:topic() | emqx_types:share()].
 topics() ->
     emqx_router:topics().
@@ -530,7 +686,7 @@ handle_call({subscribe, Topic, SubPid, I}, _From, State) ->
                     {subscribed, Topic, shard, I},
                     sync_route(add, Topic, #{})
                 ),
-                [{Topic, {shard, I}} | Recs];
+                [{{shard, Topic}, I} | Recs];
             true ->
                 Recs
         end,
@@ -540,6 +696,12 @@ handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", call => Req}),
     {reply, ignored, State}.
 
+handle_cast({dispatch, Topic, I, Msg}, State) ->
+    ?BROKER_INSTR_TS(TDisp),
+    _ = do_dispatch_chans({deliver, Topic, Msg}, subscribers({shard, Topic, I}), 0),
+    ?BROKER_INSTR_OBSERVE_HIST(broker, dispatch_shard_delay_us, ?US(TDisp - Msg#message.extra)),
+    ?BROKER_INSTR_OBSERVE_HIST(broker, dispatch_shard_lat_us, ?US_SINCE(TDisp)),
+    {noreply, State};
 handle_cast({subscribed, Topic, shard, _I}, State) ->
     %% Do not need to 'maybe add' (i.e. to check if the route exists).
     %% It was already checked that this shard is newely added.
@@ -556,7 +718,7 @@ handle_cast({unsubscribed, Topic, SubPid, I}, State) ->
     true = ets:delete_object(?SUBSCRIBER, {{shard, Topic, I}, SubPid}),
     case ets:member(?SUBSCRIBER, {shard, Topic, I}) of
         false ->
-            ets:delete_object(?SUBSCRIBER, {Topic, {shard, I}}),
+            ets:delete_object(?SUBSCRIBER, {{shard, Topic}, I}),
             %% Do not attempt to delete any routes here,
             %% let it be handled only by the same pool worker per topic (0 shard),
             %% so that all route deletes are serialized.
@@ -587,16 +749,22 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %%--------------------------------------------------------------------
 
--spec do_dispatch(emqx_types:topic() | emqx_types:share(), emqx_types:delivery()) ->
+-spec do_dispatch2(emqx_types:topic() | emqx_types:share(), emqx_types:delivery()) ->
     emqx_types:deliver_result().
-do_dispatch(Topic, #delivery{message = Msg}) ->
-    DispN = lists:foldl(
-        fun(Sub, N) ->
-            N + do_dispatch(Sub, Topic, Msg)
-        end,
-        0,
-        subscribers(Topic)
-    ),
+do_dispatch2(Topic, #delivery{message = MsgIn}) ->
+    ?BROKER_INSTR_TS(T0),
+    ?BROKER_INSTR_BIND(Msg, MsgIn, MsgIn#message{extra = T0}),
+    AsyncDispatch = persistent_term:get(?PT_FLAG_ASYNC_SHARD_DISPATCH, false),
+    Deliver = {deliver, Topic, Msg},
+    Shards = lookup_value(?SUBSCRIBER, {shard, Topic}, []),
+    case AsyncDispatch of
+        false ->
+            DispN0 = do_dispatch_shards(Topic, Deliver, Shards, 0);
+        true ->
+            DispN0 = do_dispatch_shards_async(Topic, Msg, Shards, 0)
+    end,
+    DispN = do_dispatch_chans(Deliver, subscribers(Topic), DispN0),
+    ?BROKER_INSTR_OBSERVE_HIST(broker, dispatch_total_lat_us, ?US_SINCE(T0)),
     case DispN of
         0 ->
             ok = emqx_hooks:run('message.dropped', [Msg, #{node => node()}, no_subscribers]),
@@ -608,22 +776,28 @@ do_dispatch(Topic, #delivery{message = Msg}) ->
 
 %% Don't dispatch to share subscriber here.
 %% we do it in `emqx_shared_sub.erl` with configured strategy
-do_dispatch(SubPid, Topic, Msg) when is_pid(SubPid) ->
-    case erlang:is_process_alive(SubPid) of
-        true ->
-            SubPid ! {deliver, Topic, Msg},
-            1;
-        false ->
-            0
-    end;
-do_dispatch({shard, I}, Topic, Msg) ->
-    lists:foldl(
-        fun(SubPid, N) ->
-            N + do_dispatch(SubPid, Topic, Msg)
-        end,
-        0,
-        subscribers({shard, Topic, I})
-    ).
+do_dispatch_chans(Deliver, [SubPid | Rest], N) ->
+    SubPid ! Deliver,
+    do_dispatch_chans(Deliver, Rest, N + 1);
+do_dispatch_chans(_Deliver, [], N) ->
+    N.
+
+do_dispatch_shards(Topic, Deliver, [I | Rest], N0) ->
+    N = do_dispatch_chans(Deliver, subscribers({shard, Topic, I}), N0),
+    do_dispatch_shards(Topic, Deliver, Rest, N);
+do_dispatch_shards(_Topic, _Deliver, [], N) ->
+    N.
+
+do_dispatch_shards_async(Topic, Msg, [I | Rest], N) ->
+    %% Dispatching to sharded subscribers concurrently + asynchronously.
+    %% Ordering guarantees should still hold:
+    %% * Each subscriber is part of exactly one shard.
+    %% * Each topic-shard is always dispatched through the same process.
+    cast(pick({Topic, I}), {dispatch, Topic, I, Msg}),
+    %% Assuming shard is non-empty.
+    do_dispatch_shards_async(Topic, Msg, Rest, N + 1);
+do_dispatch_shards_async(_Topic, _Msg, [], N) ->
+    N.
 
 %%
 
@@ -643,19 +817,27 @@ maybe_delete_route(Topic) ->
 
 sync_route(Action, Topic, ReplyTo) ->
     EnabledOn = emqx_config:get([broker, routing, batch_sync, enable_on]),
-    case EnabledOn of
-        all ->
-            push_sync_route(Action, Topic, ReplyTo);
-        none ->
-            regular_sync_route(Action, Topic);
-        Role ->
-            case Role =:= mria_config:whoami() of
-                true ->
-                    push_sync_route(Action, Topic, ReplyTo);
-                false ->
-                    regular_sync_route(Action, Topic)
-            end
-    end.
+    Res =
+        case EnabledOn of
+            all ->
+                push_sync_route(Action, Topic, ReplyTo);
+            none ->
+                regular_sync_route(Action, Topic);
+            Role ->
+                case Role =:= mria_config:whoami() of
+                    true ->
+                        push_sync_route(Action, Topic, ReplyTo);
+                    false ->
+                        regular_sync_route(Action, Topic)
+                end
+        end,
+    _ = external_sync_route(Action, Topic),
+    Res.
+
+external_sync_route(add, Topic) ->
+    emqx_external_broker:add_route(Topic);
+external_sync_route(delete, Topic) ->
+    emqx_external_broker:delete_route(Topic).
 
 push_sync_route(Action, Topic, Opts) ->
     emqx_router_syncer:push(Action, Topic, node(), Opts).
@@ -664,3 +846,13 @@ regular_sync_route(add, Topic) ->
     emqx_router:do_add_route(Topic, node());
 regular_sync_route(delete, Topic) ->
     emqx_router:do_delete_route(Topic, node()).
+
+%%
+
+-compile({inline, [lookup_value/2, lookup_value/3]}).
+
+lookup_value(Tab, Key) ->
+    ets:lookup_element(Tab, Key, 2, undefined).
+
+lookup_value(Tab, Key, Def) ->
+    ets:lookup_element(Tab, Key, 2, Def).

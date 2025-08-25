@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_rule_raw_SUITE).
@@ -27,22 +16,40 @@ all() ->
 init_per_testcase(_TestCase, Config) ->
     Config.
 end_per_testcase(_TestCase, _Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, true),
     ok.
 
 t_parse_ok(_Config) ->
     lists:foreach(
         fun({Expected, RuleRaw}) ->
-            _ = emqx_authz:set_feature_available(rich_actions, true),
-            ?assertEqual({ok, Expected}, emqx_authz_rule_raw:parse_rule(RuleRaw)),
-            _ = emqx_authz:set_feature_available(rich_actions, false),
-            ?assertEqual({ok, simple_rule(Expected)}, emqx_authz_rule_raw:parse_rule(RuleRaw))
+            ct:pal("Raw rule: ~p~nExpected: ~p~n", [RuleRaw, Expected]),
+            ?assertEqual({ok, Expected}, emqx_authz_rule_raw:parse_rule(RuleRaw))
         end,
         ok_cases()
     ).
 
+t_composite_who(_Config) ->
+    {ok, {allow, {'and', Who}, {all, [{qos, [0, 1, 2]}, {retain, all}]}, []}} =
+        emqx_authz_rule_raw:parse_rule(
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"topics">> => [],
+                <<"action">> => <<"all">>,
+                <<"clientid_re">> => <<"^x+$">>,
+                <<"username_re">> => <<"^x+$">>,
+                <<"ipaddr">> => <<"192.168.1.0/24">>
+            }
+        ),
+
+    ?assertEqual(
+        [
+            {clientid, {re, <<"^x+$">>}},
+            {ipaddr, "192.168.1.0/24"},
+            {username, {re, <<"^x+$">>}}
+        ],
+        lists:sort(Who)
+    ).
+
 t_parse_error(_Config) ->
-    emqx_authz:set_feature_available(rich_actions, true),
     lists:foreach(
         fun(RuleRaw) ->
             ?assertMatch(
@@ -51,30 +58,70 @@ t_parse_error(_Config) ->
             )
         end,
         error_cases() ++ error_rich_action_cases()
-    ),
-
-    %% without rich actions some fields are not parsed, so they are not errors when invalid
-    _ = emqx_authz:set_feature_available(rich_actions, false),
-    lists:foreach(
-        fun(RuleRaw) ->
-            ?assertMatch(
-                {error, _},
-                emqx_authz_rule_raw:parse_rule(RuleRaw)
-            )
-        end,
-        error_cases()
-    ),
-    lists:foreach(
-        fun(RuleRaw) ->
-            ?assertMatch(
-                {ok, _},
-                emqx_authz_rule_raw:parse_rule(RuleRaw)
-            )
-        end,
-        error_rich_action_cases()
     ).
 
 t_format(_Config) ->
+    ?assertEqual(
+        #{
+            action => subscribe,
+            permission => allow,
+            qos => [1, 2],
+            retain => true,
+            topic => [<<"a/b/c">>]
+        },
+        emqx_authz_rule_raw:format_rule(
+            {allow, all, {subscribe, [{qos, [1, 2]}, {retain, true}]}, [<<"a/b/c">>]}
+        )
+    ),
+    ?assertEqual(
+        #{
+            action => publish,
+            permission => allow,
+            topic => [<<"a/b/c">>]
+        },
+        emqx_authz_rule_raw:format_rule(
+            {allow, all, publish, [<<"a/b/c">>]}
+        )
+    ),
+    ?assertEqual(
+        #{
+            action => all,
+            permission => allow,
+            topic => [],
+            ipaddr => <<"192.168.1.0/24">>,
+            username_re => <<"^u+$">>,
+            clientid_re => <<"^c+$">>
+        },
+        emqx_authz_rule_raw:format_rule(
+            {
+                allow,
+                {'and', [
+                    {clientid, {re, <<"^c+$">>}},
+                    {ipaddr, "192.168.1.0/24"},
+                    {username, {re, <<"^u+$">>}}
+                ]},
+                all,
+                []
+            }
+        )
+    ),
+    ?assertEqual(
+        #{
+            action => all,
+            permission => allow,
+            topic => [],
+            username_re => <<"^u+$">>
+        },
+        emqx_authz_rule_raw:format_rule(
+            {
+                allow,
+                {username, {re, <<"^u+$">>}},
+                all,
+                []
+            }
+        )
+    ),
+    %% Legacy rule (without `who' field)
     ?assertEqual(
         #{
             action => subscribe,
@@ -89,23 +136,132 @@ t_format(_Config) ->
     ),
     ?assertEqual(
         #{
-            action => publish,
+            action => all,
             permission => allow,
-            topic => [<<"a/b/c">>]
+            topic => [],
+            zone => <<"zone1">>
         },
         emqx_authz_rule_raw:format_rule(
-            {allow, publish, [<<"a/b/c">>]}
+            {
+                allow,
+                {zone, <<"zone1">>},
+                all,
+                []
+            }
         )
+    ),
+    ?assertEqual(
+        #{
+            action => all,
+            permission => allow,
+            topic => [],
+            zone_re => <<"^zone-[0-9]+$">>
+        },
+        emqx_authz_rule_raw:format_rule(
+            {
+                allow,
+                {zone, {re, <<"^zone-[0-9]+$">>}},
+                all,
+                []
+            }
+        )
+    ),
+    ?assertEqual(
+        #{
+            action => all,
+            permission => allow,
+            topic => [],
+            listener => <<"tcp:default">>
+        },
+        emqx_authz_rule_raw:format_rule(
+            {
+                allow,
+                {listener, <<"tcp:default">>},
+                all,
+                []
+            }
+        )
+    ),
+    ?assertEqual(
+        #{
+            action => all,
+            permission => allow,
+            topic => [],
+            listener_re => <<"^tcp:.*$">>
+        },
+        emqx_authz_rule_raw:format_rule(
+            {
+                allow,
+                {listener, {re, <<"^tcp:.*$">>}},
+                all,
+                []
+            }
+        )
+    ),
+    ok.
+
+t_invalid_regex_rules(_Config) ->
+    Assert = fun(Rule, Invalid) ->
+        ?assertMatch({error, #{reason := Invalid}}, emqx_authz_rule_raw:parse_rule(Rule))
+    end,
+    Assert(
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"topics">> => [],
+            <<"action">> => <<"all">>,
+            <<"username_re">> => <<"(unmatched">>
+        },
+        invalid_username_re
+    ),
+    Assert(
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"topics">> => [],
+            <<"action">> => <<"all">>,
+            <<"clientid_re">> => <<"a{invalid)">>
+        },
+        invalid_clientid_re
+    ),
+    Assert(
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"topics">> => [],
+            <<"action">> => <<"all">>,
+            <<"zone_re">> => <<"[invalid">>
+        },
+        invalid_zone_re
+    ),
+    Assert(
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"topics">> => [],
+            <<"action">> => <<"all">>,
+            <<"listener_re">> => <<"">>
+        },
+        invalid_listener_re
     ).
 
-t_format_no_rich_action(_Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, false),
-
-    Rule = {allow, {subscribe, [{qos, [1, 2]}, {retain, true}]}, [<<"a/b/c">>]},
-
-    ?assertEqual(
-        #{action => subscribe, permission => allow, topic => [<<"a/b/c">>]},
-        emqx_authz_rule_raw:format_rule(Rule)
+t_invalid_string_rules(_Config) ->
+    Assert = fun(Rule, Invalid) ->
+        ?assertMatch({error, #{reason := Invalid}}, emqx_authz_rule_raw:parse_rule(Rule))
+    end,
+    Assert(
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"topics">> => [],
+            <<"action">> => <<"all">>,
+            <<"zone">> => <<"">>
+        },
+        invalid_zone
+    ),
+    Assert(
+        #{
+            <<"permission">> => <<"allow">>,
+            <<"topics">> => [],
+            <<"action">> => <<"all">>,
+            <<"listener">> => <<"">>
+        },
+        invalid_listener
     ).
 
 %%--------------------------------------------------------------------
@@ -115,7 +271,7 @@ t_format_no_rich_action(_Config) ->
 ok_cases() ->
     [
         {
-            {allow, {publish, [{qos, [0, 1, 2]}, {retain, all}]}, [<<"a/b/c">>]},
+            {allow, all, {publish, [{qos, [0, 1, 2]}, {retain, all}]}, [<<"a/b/c">>]},
             #{
                 <<"permission">> => <<"allow">>,
                 <<"topic">> => <<"a/b/c">>,
@@ -123,7 +279,7 @@ ok_cases() ->
             }
         },
         {
-            {deny, {subscribe, [{qos, [1, 2]}]}, [{eq, <<"a/b/c">>}]},
+            {deny, all, {subscribe, [{qos, [1, 2]}]}, [{eq, <<"a/b/c">>}]},
             #{
                 <<"permission">> => <<"deny">>,
                 <<"topic">> => <<"eq a/b/c">>,
@@ -133,7 +289,7 @@ ok_cases() ->
             }
         },
         {
-            {allow, {publish, [{qos, [0, 1, 2]}, {retain, all}]}, [<<"a">>, <<"b">>]},
+            {allow, all, {publish, [{qos, [0, 1, 2]}, {retain, all}]}, [<<"a">>, <<"b">>]},
             #{
                 <<"permission">> => <<"allow">>,
                 <<"topics">> => [<<"a">>, <<"b">>],
@@ -141,11 +297,38 @@ ok_cases() ->
             }
         },
         {
-            {allow, {all, [{qos, [0, 1, 2]}, {retain, all}]}, []},
+            {allow, all, {all, [{qos, [0, 1, 2]}, {retain, all}]}, []},
             #{
                 <<"permission">> => <<"allow">>,
                 <<"topics">> => [],
                 <<"action">> => <<"all">>
+            }
+        },
+        {
+            {allow, {ipaddr, "192.168.1.0/24"}, {all, [{qos, [0, 1, 2]}, {retain, all}]}, []},
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"topics">> => [],
+                <<"action">> => <<"all">>,
+                <<"ipaddr">> => <<"192.168.1.0/24">>
+            }
+        },
+        {
+            {allow, {username, {re, <<"^x+$">>}}, {all, [{qos, [0, 1, 2]}, {retain, all}]}, []},
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"topics">> => [],
+                <<"action">> => <<"all">>,
+                <<"username_re">> => <<"^x+$">>
+            }
+        },
+        {
+            {allow, {clientid, {re, <<"^x+$">>}}, {all, [{qos, [0, 1, 2]}, {retain, all}]}, []},
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"topics">> => [],
+                <<"action">> => <<"all">>,
+                <<"clientid_re">> => <<"^x+$">>
             }
         },
         %% Retain
@@ -272,7 +455,7 @@ error_rich_action_cases() ->
     ].
 
 expected_rule_with_qos_retain(QoS, Retain) ->
-    {allow, {publish, [{qos, QoS}, {retain, Retain}]}, []}.
+    {allow, all, {publish, [{qos, QoS}, {retain, Retain}]}, []}.
 
 rule_with_raw_qos_retain(Overrides) ->
     maps:merge(base_raw_rule(), Overrides).
@@ -284,5 +467,5 @@ base_raw_rule() ->
         <<"action">> => <<"publish">>
     }.
 
-simple_rule({Pemission, {Action, _Opts}, Topics}) ->
-    {Pemission, Action, Topics}.
+simple_rule({Pemission, Who, {Action, _Opts}, Topics}) ->
+    {Pemission, Who, Action, Topics}.

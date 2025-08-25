@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_enterprise_schema).
@@ -11,12 +11,19 @@
 
 -export([namespace/0, roots/0, fields/1, translations/0, translation/1, desc/1, validations/0]).
 -export([upgrade_raw_conf/1]).
+-export([injected_fields/0]).
 
+%% DO NOT REMOVE.  This is used in other repositories.
+-define(EXTRA_SCHEMA_MODULES, []).
 -define(EE_SCHEMA_MODULES, [
     emqx_license_schema,
     emqx_schema_registry_schema,
     emqx_schema_validation_schema,
-    emqx_ft_schema
+    emqx_message_transformation_schema,
+    emqx_ft_schema,
+    emqx_ds_shared_sub_schema,
+    emqx_mt_schema,
+    emqx_ai_completion_schema
 ]).
 
 %% Callback to upgrade config after loaded from config file but before validation.
@@ -52,7 +59,6 @@ fields("log_audit_handler") ->
                     importance => ?IMPORTANCE_HIDDEN
                 }
             )},
-
         {"path",
             hoconsc:mk(
                 string(),
@@ -60,11 +66,7 @@ fields("log_audit_handler") ->
                     desc => ?DESC(emqx_conf_schema, "audit_file_handler_path"),
                     default => <<"${EMQX_LOG_DIR}/audit.log">>,
                     importance => ?IMPORTANCE_HIGH,
-                    converter => fun(Path, Opts) ->
-                        emqx_schema:naive_env_interpolation(
-                            emqx_conf_schema:ensure_unicode_path(Path, Opts)
-                        )
-                    end
+                    converter => fun emqx_conf_schema:log_file_path_converter/2
                 }
             )},
         {"rotation_count",
@@ -106,7 +108,7 @@ fields("log_audit_handler") ->
             )}
     ] ++ CommonConfs1;
 fields(Name) ->
-    ee_delegate(fields, ?EE_SCHEMA_MODULES, Name).
+    ee_delegate(fields, ee_mods(), Name).
 
 translations() ->
     emqx_conf_schema:translations().
@@ -121,10 +123,15 @@ translation(Name) ->
 desc("log_audit_handler") ->
     ?DESC(emqx_conf_schema, "desc_audit_log_handler");
 desc(Name) ->
-    ee_delegate(desc, ?EE_SCHEMA_MODULES, Name).
+    ee_delegate(desc, ee_mods(), Name).
 
 validations() ->
     emqx_conf_schema:validations() ++ emqx_license_schema:validations().
+
+injected_fields() ->
+    #{
+        'node.role' => [replicant]
+    }.
 
 %%------------------------------------------------------------------------------
 %% helpers
@@ -135,8 +142,10 @@ ee_roots() ->
         fun(Module) ->
             apply(Module, roots, [])
         end,
-        ?EE_SCHEMA_MODULES
+        ee_mods()
     ).
+
+ee_mods() -> ?EXTRA_SCHEMA_MODULES ++ ?EE_SCHEMA_MODULES.
 
 ee_delegate(Method, [EEMod | EEMods], Name) ->
     case lists:member(Name, apply(EEMod, roots, [])) of
@@ -196,6 +205,7 @@ audit_log_conf() ->
 
 tr_prometheus_collectors(Conf) ->
     [
-        {'/prometheus/schema_validation', emqx_prometheus_schema_validation}
+        {'/prometheus/schema_validation', emqx_prometheus_schema_validation},
+        {'/prometheus/message_transformation', emqx_prometheus_message_transformation}
         | emqx_conf_schema:tr_prometheus_collectors(Conf)
     ].

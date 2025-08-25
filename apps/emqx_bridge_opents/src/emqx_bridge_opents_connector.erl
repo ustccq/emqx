@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_opents_connector).
@@ -18,6 +18,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -114,6 +115,8 @@ connector_example_values() ->
 
 -define(HTTP_CONNECT_TIMEOUT, 1000).
 
+resource_type() -> opents.
+
 callback_mode() -> always_sync.
 
 on_start(
@@ -182,15 +185,13 @@ on_format_query_result(Result) ->
     Result.
 
 on_get_status(_InstanceId, #{server := Server}) ->
-    Result =
-        case opentsdb_connectivity(Server) of
-            ok ->
-                connected;
-            {error, Reason} ->
-                ?SLOG(error, #{msg => "opents_lost_connection", reason => Reason}),
-                connecting
-        end,
-    Result.
+    case opentsdb_connectivity(Server) of
+        ok ->
+            ?status_connected;
+        {error, Reason} ->
+            ?SLOG(error, #{msg => "opents_lost_connection", reason => Reason}),
+            ?status_connecting
+    end.
 
 on_add_channel(
     _InstanceId,

@@ -1,23 +1,13 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_api_settings).
 
 -behaviour(minirest_api).
 
+-include_lib("emqx_authz.hrl").
+-include_lib("emqx/include/logger.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 
 -export([
@@ -66,21 +56,25 @@ ref_authz_schema() ->
 
 settings(get, _Params) ->
     {200, authorization_settings()};
-settings(put, #{
-    body := #{
+settings(put, #{body := Body}) ->
+    #{
         <<"no_match">> := NoMatch,
         <<"deny_action">> := DenyAction,
         <<"cache">> := Cache
-    }
-}) ->
+        %% We do not pass the body to emqx_conf:update_config/3 which
+        %% fills the defaults. So we need to fill the defaults here
+    } = emqx_schema:fill_defaults(ref_authz_schema(), Body),
+
+    %% TODO
+    %% This should be fixed, updating individual keys bypassing
+    %% emqx_conf:update_config/3 is error-prone.
     {ok, _} = emqx_authz_utils:update_config([authorization, no_match], NoMatch),
     {ok, _} = emqx_authz_utils:update_config(
         [authorization, deny_action], DenyAction
     ),
     {ok, _} = emqx_authz_utils:update_config([authorization, cache], Cache),
+
     {200, authorization_settings()}.
 
 authorization_settings() ->
-    C = maps:remove(<<"sources">>, emqx:get_raw_config([authorization], #{})),
-    Schema = emqx_hocon:make_schema(emqx_schema:authz_fields()),
-    hocon_tconf:make_serializable(Schema, C, #{}).
+    emqx_schema:fill_defaults(ref_authz_schema(), emqx_config:get_raw([authorization], #{})).

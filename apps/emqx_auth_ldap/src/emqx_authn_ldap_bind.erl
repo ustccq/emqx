@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_ldap_bind).
@@ -27,30 +15,62 @@
 %%------------------------------------------------------------------------------
 %% APIs
 %%------------------------------------------------------------------------------
+
 authenticate(
-    #{password := _Password} = Credential,
+    Credential,
+    #{cache_key_template := CacheKeyTemplate} = State
+) ->
+    CacheKey = emqx_auth_template:cache_key(Credential, CacheKeyTemplate),
+    emqx_auth_cache:with_cache(?AUTHN_CACHE, CacheKey, fun() ->
+        case do_authenticate(Credential, State) of
+            {error, _} = Error ->
+                {nocache, Error};
+            Result ->
+                {cache, Result}
+        end
+    end).
+
+%%------------------------------------------------------------------------------
+%% Internal functions
+%%------------------------------------------------------------------------------
+
+do_authenticate(
+    Credential,
     #{
         query_timeout := Timeout,
-        resource_id := ResourceId
-    } = _State
+        resource_id := ResourceId,
+        password_template := PasswordTemplate,
+        base_dn_template := BaseDNTemplate,
+        filter_template := FilterTemplate,
+        method := #{
+            is_superuser_attribute := IsSuperuserAttribute,
+            clientid_override_attribute := ClientIdOverrideAttribute
+        }
+    } = State
 ) ->
-    case
-        emqx_resource:simple_sync_query(
-            ResourceId,
-            {query, Credential, [], Timeout}
-        )
-    of
+    BaseDN = emqx_auth_ldap_utils:render_base_dn(BaseDNTemplate, Credential),
+    Filter = emqx_auth_ldap_utils:render_filter(FilterTemplate, Credential),
+    AclAttributes = emqx_auth_ldap_acl:acl_attributes(State),
+    Result = emqx_resource:simple_sync_query(
+        ResourceId,
+        {query, BaseDN, Filter, [
+            {attributes, [IsSuperuserAttribute, ClientIdOverrideAttribute | AclAttributes]},
+            {timeout, Timeout}
+        ]}
+    ),
+    case Result of
         {ok, []} ->
             ignore;
-        {ok, [Entry]} ->
+        {ok, [#eldap_entry{object_name = ObjectName} = Entry]} ->
+            Password = emqx_auth_ldap_utils:render_password(PasswordTemplate, Credential),
             case
                 emqx_resource:simple_sync_query(
                     ResourceId,
-                    {bind, Entry#eldap_entry.object_name, Credential}
+                    {bind, ObjectName, Password}
                 )
             of
                 {ok, #{result := ok}} ->
-                    {ok, #{is_superuser => false}};
+                    format_authentication_result(State, Entry);
                 {ok, #{result := 'invalidCredentials'}} ->
                     ?TRACE_AUTHN_PROVIDER(info, "ldap_bind_failed", #{
                         resource => ResourceId,
@@ -71,4 +91,37 @@ authenticate(
                 reason => Reason
             }),
             ignore
+    end.
+
+format_authentication_result(
+    #{
+        resource_id := ResourceId,
+        method := #{
+            is_superuser_attribute := IsSuperuserAttribute
+        }
+    } = State,
+    Entry
+) ->
+    IsSuperuser = emqx_auth_ldap_utils:get_bool_attribute(
+        IsSuperuserAttribute, Entry, false
+    ),
+    case emqx_auth_ldap_acl:acl_from_entry(State, Entry) of
+        {ok, AclFields} ->
+            AuthResult0 = AclFields#{is_superuser => IsSuperuser},
+            AuthResult = maps:merge(AuthResult0, clientid_override(Entry, State)),
+            {ok, AuthResult};
+        {error, Reason} ->
+            ?TRACE_AUTHN_PROVIDER(error, "ldap_bind_invalid_acl_rules", #{
+                resource => ResourceId,
+                reason => Reason
+            }),
+            {error, bad_username_or_password}
+    end.
+
+clientid_override(Entry, #{method := #{clientid_override_attribute := Attr}} = _State) ->
+    case emqx_auth_ldap_utils:get_bin_attribute(Attr, Entry, undefined) of
+        ClientIdOverride when is_binary(ClientIdOverride), ClientIdOverride /= <<"">> ->
+            #{clientid_override => ClientIdOverride};
+        _ ->
+            #{}
     end.

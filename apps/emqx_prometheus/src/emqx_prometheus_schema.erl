@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_prometheus_schema).
 
@@ -68,7 +56,9 @@ fields(recommend_setting) ->
                 required => false,
                 importance => ?IMPORTANCE_LOW,
                 desc => ?DESC(collectors)
-            })}
+            })},
+        {latency_buckets,
+            emqx_schema:latency_histogram_buckets_sc(#{desc => ?DESC(latency_buckets)})}
     ];
 fields(push_gateway) ->
     [
@@ -78,7 +68,17 @@ fields(push_gateway) ->
                 #{
                     default => false,
                     required => true,
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(push_gateway_enable)
+                }
+            )},
+        {method,
+            ?HOCON(
+                hoconsc:enum([put, post]),
+                #{
+                    default => put,
+                    required => true,
+                    desc => ?DESC(push_gateway_method)
                 }
             )},
         {url,
@@ -229,6 +229,7 @@ fields(legacy_deprecated_setting) ->
                 #{
                     default => false,
                     required => true,
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(legacy_enable)
                 }
             )},

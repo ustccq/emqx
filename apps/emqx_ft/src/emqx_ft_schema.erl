@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ft_schema).
@@ -66,6 +54,7 @@ fields(file_transfer) ->
                 boolean(),
                 #{
                     desc => ?DESC("enable"),
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     required => false,
                     default => false
                 }
@@ -242,6 +231,7 @@ common_backend_fields() ->
             mk(
                 boolean(), #{
                     desc => ?DESC("backend_enable"),
+                    importance => ?IMPORTANCE_NO_DOC,
                     required => false,
                     default => true
                 }
@@ -356,7 +346,7 @@ emit_enabled(Type, BConf = #{enable := Enabled}) ->
     Enabled andalso throw({Type, BConf}).
 
 decode(SchemaName, Payload) when is_binary(Payload) ->
-    case emqx_utils_json:safe_decode(Payload, [return_maps]) of
+    case emqx_utils_json:safe_decode(Payload) of
         {ok, Map} ->
             decode(SchemaName, Map);
         {error, Error} ->

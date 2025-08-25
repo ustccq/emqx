@@ -6,7 +6,7 @@ the message without further processing, or to disconnect the offending client as
 
 # Documentation
 
-Refer to [Message
+Refer to [Schema
 Validation](https://docs.emqx.com/en/enterprise/latest/data-integration/schema-validation.html)
 for more information about the semantics and checks available.
 
@@ -23,7 +23,3 @@ for more detailed information.
 # Contributing
 
 Please see our [contributing.md](../../CONTRIBUTING.md).
-
-# License
-
-EMQ Business Source License 1.1, refer to [LICENSE](BSL.txt).

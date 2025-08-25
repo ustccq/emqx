@@ -1,11 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_cassandra_connector).
 
 -behaviour(emqx_resource).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include("emqx_bridge_cassandra.hrl").
 -include_lib("typerefl/include/types.hrl").
@@ -19,6 +20,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -43,7 +45,7 @@
 %% callbacks for query executing
 -export([query/4, prepared_query/4, batch_query/3]).
 
--export([do_get_status/1]).
+-export([do_get_status/1, get_reconnect_callback_signature/1]).
 
 -type state() ::
     #{
@@ -94,6 +96,7 @@ desc("connector") ->
 
 %%--------------------------------------------------------------------
 %% callbacks for emqx_resource
+resource_type() -> cassandra.
 
 callback_mode() -> async_if_possible.
 
@@ -354,8 +357,8 @@ exec(PoolName, Query) ->
 
 on_get_status(_InstId, #{pool_name := PoolName}) ->
     case emqx_resource_pool:health_check_workers(PoolName, fun ?MODULE:do_get_status/1) of
-        true -> connected;
-        false -> connecting
+        true -> ?status_connected;
+        false -> ?status_connecting
     end.
 
 do_get_status(Conn) ->
@@ -406,6 +409,12 @@ conn_opts([{password, Password} | Opts], Acc) ->
     conn_opts(Opts, [{password, emqx_secret:unwrap(Password)} | Acc]);
 conn_opts([Opt | Opts], Acc) ->
     conn_opts(Opts, [Opt | Acc]).
+
+%% this callback accepts the arg list provided to
+%% ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn, [Templates]})
+%% so ecpool_worker can de-duplicate the callbacks based on the signature.
+get_reconnect_callback_signature([#{prepare_key := PrepareKey}]) ->
+    PrepareKey.
 
 %%--------------------------------------------------------------------
 %% prepare

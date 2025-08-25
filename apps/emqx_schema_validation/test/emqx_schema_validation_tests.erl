@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_validation_tests).
 
@@ -115,6 +115,19 @@ schema_test_() ->
                         [sql_check()],
                         #{<<"topics">> => [<<"t/1">>]}
                     )
+                ])
+            )},
+        {"topics must be non-empty",
+            ?_assertThrow(
+                {_Schema, [
+                    #{
+                        reason := <<"at least one topic filter must be defined", _/binary>>,
+                        value := [],
+                        kind := validation_error
+                    }
+                ]},
+                parse_and_check([
+                    validation(<<"foo">>, [sql_check()], #{<<"topics">> => []})
                 ])
             )},
         {"foreach expression is not allowed",

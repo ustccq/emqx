@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_events_SUITE).
@@ -20,7 +8,6 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
--include_lib("emqx/include/emqx_mqtt.hrl").
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
@@ -33,43 +20,14 @@ t_mod_hook_fun(_) ->
         Events
     ),
     ?assertEqual(
-        fun emqx_rule_events:on_bridge_message_received/2,
+        fun emqx_rule_events:on_bridge_message_received/3,
         emqx_rule_events:hook_fun(<<"$bridges/foo">>)
     ),
-    ?assertError({invalid_event, foo}, emqx_rule_events:hook_fun(foo)).
-
-t_printable_maps(_) ->
-    Headers = #{
-        peerhost => {127, 0, 0, 1},
-        peername => {{127, 0, 0, 1}, 9980},
-        sockname => {{127, 0, 0, 1}, 1883},
-        redispatch_to => ?REDISPATCH_TO(<<"group">>, <<"sub/topic/+">>),
-        shared_dispatch_ack => {self(), ref}
-    },
-    Converted = emqx_rule_events:printable_maps(Headers),
-    ?assertMatch(
-        #{
-            peerhost := <<"127.0.0.1">>,
-            peername := <<"127.0.0.1:9980">>,
-            sockname := <<"127.0.0.1:1883">>
-        },
-        Converted
+    ?assertEqual(
+        fun emqx_rule_events:on_bridge_message_received/3,
+        emqx_rule_events:hook_fun(<<"$sources/foo">>)
     ),
-    ?assertNot(maps:is_key(redispatch_to, Converted)),
-    ?assertNot(maps:is_key(shared_dispatch_ack, Converted)),
-    ok.
-
-t_event_name_topic_conversion(_) ->
-    Events = emqx_rule_events:event_names() -- ['message.publish'],
-    Topics = [atom_to_binary(A) || A <- emqx_rule_events:event_topics_enum()],
-    Zip = lists:zip(Events, Topics),
-    lists:foreach(
-        fun({Event, Topic}) ->
-            ?assertEqual(Event, emqx_rule_events:event_name(Topic)),
-            ?assertEqual(Topic, emqx_rule_events:event_topic(Event))
-        end,
-        Zip
-    ).
+    ?assertError({invalid_event, foo}, emqx_rule_events:hook_fun(foo)).
 
 t_special_events_name_topic_conversion(_) ->
     Bridge = <<"$bridges/foo:bar">>,
@@ -79,3 +37,42 @@ t_special_events_name_topic_conversion(_) ->
     ?assertEqual('message.publish', emqx_rule_events:event_name(AdHoc)),
     ?assertEqual('message.publish', emqx_rule_events:event_name(NonExisting)),
     ?assertEqual(NonExisting, emqx_rule_events:event_topic('message.publish')).
+
+%% Checks that `emqx_rule_events:event_topics_enum`, `_:event_names` and `_:event_info`
+%% are consistent amongst themselves.
+t_event_topics_enum_and_names_consistency(_Config) ->
+    EventInfos = emqx_rule_events:event_info(),
+    EventNames = emqx_rule_events:event_names(),
+    %% Note: these contain only new (namespaced) topics in them.
+    EventTopics = lists:map(fun atom_to_binary/1, emqx_rule_events:event_topics_enum()),
+    EITopics0 = lists:map(fun(#{event := Topic}) -> Topic end, EventInfos),
+    %% Explicitly absent; not handled when matching events for common hooks.
+    EITopics = EITopics0 -- [<<"$bridges/mqtt:*">>, <<"$events/message_publish">>],
+    EINames = lists:map(fun emqx_rule_events:event_name/1, EITopics),
+    MissingFromEventTopics = EITopics -- EventTopics,
+    MissingFromEventNames = EINames -- EventNames,
+    MissingNamesFromEventInfos = EventNames -- (EINames ++ ['message.publish']),
+    LegacyEventTopics = [
+        <<"$events/client_connected">>,
+        <<"$events/client_disconnected">>,
+        <<"$events/client_connack">>,
+        <<"$events/client_check_authn_complete">>,
+        <<"$events/client_check_authz_complete">>,
+        <<"$events/session_subscribed">>,
+        <<"$events/session_unsubscribed">>,
+        <<"$events/message_delivered">>,
+        <<"$events/message_acked">>,
+        <<"$events/message_dropped">>,
+        <<"$events/delivery_dropped">>,
+        <<"$events/message_transformation_failed">>,
+        <<"$events/schema_validation_failed">>
+    ],
+    MissingTopicsFromEventInfos = EventTopics -- (EITopics ++ LegacyEventTopics),
+    Missing = #{
+        missing_from_event_topics => MissingFromEventTopics,
+        missing_from_event_names => MissingFromEventNames,
+        missing_from_event_info_names => MissingNamesFromEventInfos,
+        missing_from_event_info_topics => MissingTopicsFromEventInfos
+    },
+    ?assertEqual(#{}, maps:filter(fun(_, M) -> length(M) > 0 end, Missing)),
+    ok.

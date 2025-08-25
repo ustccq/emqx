@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@
 -compile(export_all).
 -compile(nowarn_export_all).
 
--include_lib("emqx/include/emqx_placeholder.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 all() -> emqx_common_test_helpers:all(?MODULE).
@@ -82,9 +81,13 @@ t_render_this(_) ->
     Context = #{a => <<"a">>, b => [1, 2, 3]},
     Template = emqx_template:parse(<<"this:${} / also:${.}">>),
     ?assertEqual(ok, emqx_template:validate(["."], Template)),
-    ?assertEqual(
-        % NOTE: order of the keys in the JSON object depends on the JSON encoder
-        <<"this:{\"b\":[1,2,3],\"a\":\"a\"} / also:{\"b\":[1,2,3],\"a\":\"a\"}">>,
+    ?assertMatch(
+        % NOTE
+        % Order of the keys in the JSON object depends on the JSON encoder.
+        % Moreover, under Erlang/OTP 27 traversal order seems to be unpredicatble.
+        S when
+            S == <<"this:{\"b\":[1,2,3],\"a\":\"a\"} / also:{\"b\":[1,2,3],\"a\":\"a\"}">>;
+            S == <<"this:{\"a\":\"a\",\"b\":[1,2,3]} / also:{\"a\":\"a\",\"b\":[1,2,3]}">>,
         render_strict_string(Template, Context)
     ).
 
@@ -126,6 +129,18 @@ t_render_custom_bindings(_) ->
             {"c", undefined}
         ]},
         render_string(Template, {?MODULE, []})
+    ).
+
+t_placeholders(_) ->
+    TString = <<"a:${a},b:${b},c:$${c},d:{${d.d1}},e:${$}{e},lit:${$}{$}">>,
+    Template = emqx_template:parse(TString),
+    ?assertEqual(
+        ["a", "b", "c", "d.d1"],
+        emqx_template:placeholders(Template)
+    ),
+    ?assertEqual(
+        {["a", "b", "d.d1"], ["c"]},
+        emqx_template:placeholders(["a", "b", "d.d1", "e"], Template)
     ).
 
 t_unparse(_) ->
@@ -336,6 +351,16 @@ t_unparse_tmpl_deep(_) ->
     Term = #{<<"${a}">> => [<<"$${b}">>, "c", 2, 3.0, '${d}', {[<<"${c}">>], <<"${$}{d}">>, 0}]},
     Template = emqx_template:parse_deep(Term),
     ?assertEqual(Term, emqx_template:unparse(Template)).
+
+t_allow_this(_) ->
+    ?assertEqual(
+        {error, [{"", disallowed}]},
+        emqx_template:validate(["d"], emqx_template:parse(<<"this:${}">>))
+    ),
+    ?assertEqual(
+        {error, [{"", disallowed}]},
+        emqx_template:validate(["d"], emqx_template:parse(<<"this:${.}">>))
+    ).
 
 t_allow_var_by_namespace(_) ->
     Context = #{d => #{d1 => <<"hi">>}},

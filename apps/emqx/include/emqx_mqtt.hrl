@@ -1,35 +1,11 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -ifndef(EMQX_MQTT_HRL).
 -define(EMQX_MQTT_HRL, true).
 
 -define(UINT_MAX, 16#FFFFFFFF).
-
-%%--------------------------------------------------------------------
-%% MQTT SockOpts
-%%--------------------------------------------------------------------
-
--define(MQTT_SOCKOPTS, [
-    binary,
-    {packet, raw},
-    {reuseaddr, true},
-    {backlog, 512},
-    {nodelay, true}
-]).
 
 %%--------------------------------------------------------------------
 %% MQTT Protocol Version and Names
@@ -322,6 +298,15 @@ end).
 }).
 
 %%--------------------------------------------------------------------
+%% MQTT Implementation Internal
+%%--------------------------------------------------------------------
+
+%% Propagate extra data in MQTT Packets
+%% Use it in properties and should never be serialized
+%% See also emqx_frame:serialize_property/3
+-define(MQTT_INTERNAL_EXTRA, 'internal_extra').
+
+%%--------------------------------------------------------------------
 %% MQTT Control Packet
 %%--------------------------------------------------------------------
 
@@ -331,6 +316,9 @@ end).
         #mqtt_packet_connect{}
         | #mqtt_packet_connack{}
         | #mqtt_packet_publish{}
+        %% QoS=1: PUBACK,
+        %% QoS=2: PUBREC, PUBREL, PUBCOMP
+        %% all used #mqtt_packet_puback{}
         | #mqtt_packet_puback{}
         | #mqtt_packet_subscribe{}
         | #mqtt_packet_suback{}
@@ -360,6 +348,21 @@ end).
 %%--------------------------------------------------------------------
 %% MQTT Packet Match
 %%--------------------------------------------------------------------
+
+-define(PACKET(Type), #mqtt_packet{
+    header = #mqtt_packet_header{type = Type}
+}).
+
+-define(PACKET(Type, Var), #mqtt_packet{
+    header = #mqtt_packet_header{type = Type},
+    variable = Var
+}).
+
+-define(PACKET(Type, Var, Payload), #mqtt_packet{
+    header = #mqtt_packet_header{type = Type},
+    variable = Var,
+    payload = Payload
+}).
 
 -define(CONNECT_PACKET(), #mqtt_packet{header = #mqtt_packet_header{type = ?CONNECT}}).
 
@@ -669,8 +672,6 @@ end).
     }
 }).
 
--define(PACKET(Type), #mqtt_packet{header = #mqtt_packet_header{type = Type}}).
-
 -define(SHARE, "$share").
 -define(QUEUE, "$queue").
 
@@ -683,11 +684,8 @@ end).
 
 -define(FRAME_PARSE_ERROR, frame_parse_error).
 -define(FRAME_SERIALIZE_ERROR, frame_serialize_error).
+
 -define(THROW_FRAME_ERROR(Reason), erlang:throw({?FRAME_PARSE_ERROR, Reason})).
 -define(THROW_SERIALIZE_ERROR(Reason), erlang:throw({?FRAME_SERIALIZE_ERROR, Reason})).
-
--define(MAX_PAYLOAD_FORMAT_SIZE, 1024).
--define(TRUNCATED_PAYLOAD_SIZE, 100).
--define(MAX_PAYLOAD_FORMAT_LIMIT(Bin), (byte_size(Bin) =< ?MAX_PAYLOAD_FORMAT_SIZE)).
 
 -endif.

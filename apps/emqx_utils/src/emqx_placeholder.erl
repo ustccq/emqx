@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 -export([
     preproc_tmpl/1,
     preproc_tmpl/2,
+    proc_nullable_tmpl/2,
     proc_tmpl/2,
     proc_tmpl/3,
     preproc_cmd/1,
@@ -28,22 +29,27 @@
     preproc_sql/1,
     preproc_sql/2,
     proc_sql/2,
-    proc_sql_param_str/2,
+    proc_sqlserver_param_str/2,
+    proc_sqlserver_param_str2/2,
     proc_cql_param_str/2,
     proc_param_str/3,
     preproc_tmpl_deep/1,
     preproc_tmpl_deep/2,
     proc_tmpl_deep/2,
     proc_tmpl_deep/3,
-
     bin/1,
-    sql_data/1
+    nullable_bin/1,
+    sql_data/1,
+    lookup_var/2
 ]).
 
 -export([
     quote_sql/1,
+    quote_sql2/1,
     quote_cql/1,
-    quote_mysql/1
+    quote_cql2/1,
+    quote_mysql/1,
+    quote_mysql2/1
 ]).
 
 -export_type([tmpl_token/0]).
@@ -110,6 +116,10 @@ preproc_tmpl(Str, Opts) ->
     Tokens = re:split(Str, RE, [{return, binary}, group, trim]),
     do_preproc_tmpl(Opts, Tokens, []).
 
+proc_nullable_tmpl(Tokens, Data) ->
+    Opts = #{return => full_binary, var_trans => fun nullable_bin/1},
+    proc_tmpl(Tokens, Data, Opts).
+
 -spec proc_tmpl(tmpl_token(), map()) -> binary().
 proc_tmpl(Tokens, Data) ->
     proc_tmpl(Tokens, Data, #{return => full_binary}).
@@ -173,13 +183,13 @@ preproc_sql(Sql, Opts) ->
 proc_sql(Tokens, Data) ->
     proc_tmpl(Tokens, Data, #{return => rawlist, var_trans => fun sql_data/1}).
 
--spec proc_sql_param_str(tmpl_token(), map()) -> binary().
-proc_sql_param_str(Tokens, Data) ->
-    % NOTE
-    % This is a bit misleading: currently, escaping logic in `quote_sql/1` likely
-    % won't work with pgsql since it does not support C-style escapes by default.
-    % https://www.postgresql.org/docs/14/sql-syntax-lexical.html#SQL-SYNTAX-CONSTANTS
-    proc_param_str(Tokens, Data, fun quote_sql/1).
+-spec proc_sqlserver_param_str(tmpl_token(), map()) -> binary().
+proc_sqlserver_param_str(Tokens, Data) ->
+    proc_param_str(Tokens, Data, fun quote_sqlserver/1).
+
+-spec proc_sqlserver_param_str2(tmpl_token(), map()) -> binary().
+proc_sqlserver_param_str2(Tokens, Data) ->
+    proc_param_str(Tokens, Data, fun quote_sqlserver2/1).
 
 -spec proc_cql_param_str(tmpl_token(), map()) -> binary().
 proc_cql_param_str(Tokens, Data) ->
@@ -237,6 +247,10 @@ proc_tmpl_deep({tmpl, Tokens}, Data, Opts) ->
 proc_tmpl_deep({tuple, Elements}, Data, Opts) ->
     list_to_tuple([proc_tmpl_deep(El, Data, Opts) || El <- Elements]).
 
+nullable_bin(undefined) -> <<"null">>;
+nullable_bin(null) -> <<"null">>;
+nullable_bin(Var) -> bin(Var).
+
 -spec sql_data(term()) -> term().
 sql_data(undefined) -> null;
 sql_data(List) when is_list(List) -> List;
@@ -253,23 +267,48 @@ bin(Val) -> emqx_utils_conv:bin(Val).
 quote_sql(Str) ->
     emqx_utils_sql:to_sql_string(Str, #{escaping => sql, undefined => <<"undefined">>}).
 
+-spec quote_sql2(_Value) -> iolist().
+quote_sql2(Str) ->
+    emqx_utils_sql:to_sql_string(Str, #{escaping => sql}).
+
 -spec quote_cql(_Value) -> iolist().
 quote_cql(Str) ->
     emqx_utils_sql:to_sql_string(Str, #{escaping => cql, undefined => <<"undefined">>}).
+
+-spec quote_cql2(_Value) -> iolist().
+quote_cql2(Str) ->
+    emqx_utils_sql:to_sql_string(Str, #{escaping => cql}).
 
 -spec quote_mysql(_Value) -> iolist().
 quote_mysql(Str) ->
     emqx_utils_sql:to_sql_string(Str, #{escaping => mysql, undefined => <<"undefined">>}).
 
+-spec quote_mysql2(_Value) -> iolist().
+quote_mysql2(Str) ->
+    emqx_utils_sql:to_sql_string(Str, #{escaping => mysql}).
+
+-spec quote_sqlserver(_Str) -> iolist().
+quote_sqlserver(Str) ->
+    emqx_utils_sql:to_sql_string(Str, #{escaping => sqlserver, undefined => <<"undefined">>}).
+
+-spec quote_sqlserver2(_Str) -> iolist().
+quote_sqlserver2(Str) ->
+    emqx_utils_sql:to_sql_string(Str, #{escaping => sqlserver}).
+
 lookup_var(Var, Value) when Var == ?PH_VAR_THIS orelse Var == [] ->
     Value;
 lookup_var([Prop | Rest], Data0) ->
     Data =
-        case emqx_utils_json:safe_decode(Data0, [return_maps]) of
-            {ok, Data1} ->
-                Data1;
-            {error, _} ->
-                Data0
+        case is_map(Data0) of
+            true ->
+                Data0;
+            false ->
+                case emqx_utils_json:safe_decode(Data0) of
+                    {ok, Data1} ->
+                        Data1;
+                    {error, _} ->
+                        Data0
+                end
         end,
     case lookup(Prop, Data) of
         {ok, Value} ->
@@ -293,12 +332,10 @@ lookup(Prop, Data) when is_binary(Prop) ->
     end.
 
 do_one_lookup(Key, Data) ->
-    try
-        {ok, maps:get(Key, Data)}
-    catch
-        error:{badkey, _} ->
-            {error, undefined};
-        error:{badmap, _} ->
+    case Data of
+        #{Key := Value} ->
+            {ok, Value};
+        _ ->
             {error, undefined}
     end.
 

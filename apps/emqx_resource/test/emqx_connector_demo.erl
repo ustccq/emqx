@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_connector_demo).
@@ -24,6 +12,8 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
+    query_mode/1,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -41,17 +31,54 @@
 
 -export([counter_loop/0, set_callback_mode/1]).
 
+%% Since we want to emulate an external configuration source (`emqx_config'), especially
+%% when calling `on_get_channels', we must update this "external" source independently
+%% from calling `on_{add,remove}_channel' to have a more accurate model of `emqx_config'.
+-export([
+    add_channel_emulate_config/4,
+    remove_channel_emulate_config/3,
+    clear_emulated_config/1
+]).
+
 %% callbacks for emqx_resource config schema
 -export([roots/0]).
 
 -define(CM_KEY, {?MODULE, callback_mode}).
 -define(PT_CHAN_KEY(CONN_RES_ID), {?MODULE, chans, CONN_RES_ID}).
 
+-define(IS_STATUS(ST),
+    ST =:= ?status_connecting; ST =:= ?status_connected; ST =:= ?status_disconnected
+).
+
 roots() ->
     [
         {name, fun name/1},
         {register, fun register/1}
     ].
+
+add_channel_emulate_config(ConnResId, ChanId, ChanConfig, Mode) ->
+    %% Update "external config"
+    do_add_channel(ConnResId, ChanId, ChanConfig),
+    case Mode of
+        sync ->
+            emqx_resource_manager:add_channel(ConnResId, ChanId, ChanConfig);
+        async ->
+            emqx_resource_manager:add_channel_async(ConnResId, ChanId, ChanConfig)
+    end.
+
+remove_channel_emulate_config(ConnResId, ChanId, Mode) ->
+    %% Update "external config"
+    do_remove_channel(ConnResId, ChanId),
+    case Mode of
+        sync ->
+            emqx_resource_manager:remove_channel(ConnResId, ChanId);
+        async ->
+            emqx_resource_manager:remove_channel_async(ConnResId, ChanId)
+    end.
+
+clear_emulated_config(ConnResId) ->
+    _ = persistent_term:erase(?PT_CHAN_KEY(ConnResId)),
+    ok.
 
 name(type) -> atom();
 name(required) -> true;
@@ -62,29 +89,78 @@ register(required) -> true;
 register(default) -> false;
 register(_) -> undefined.
 
+resource_type() -> demo.
+
+query_mode(#{force_query_mode := QM} = _Config) ->
+    QM;
+query_mode(Config) ->
+    emqx_utils_maps:deep_get([resource_opts, query_mode], Config, sync).
+
 callback_mode() ->
     persistent_term:get(?CM_KEY).
 
 set_callback_mode(Mode) ->
     persistent_term:put(?CM_KEY, Mode).
 
-on_start(_InstId, #{create_error := true}) ->
+on_start(_ConnResId, #{create_error := true}) ->
     ?tp(connector_demo_start_error, #{}),
     error("some error");
-on_start(InstId, #{name := Name} = Opts) ->
+on_start(ConnResId, #{create_error := {delay, Delay, Agent}} = Opts) ->
+    ?tp(connector_demo_start_delay, #{}),
+    case emqx_utils_agent:get_and_update(Agent, fun(St) -> {St, called} end) of
+        not_called ->
+            emqx_resource:allocate_resource(ConnResId, ?MODULE, i_should_be_deallocated, yep),
+            timer:sleep(Delay),
+            do_on_start(ConnResId, Opts);
+        called ->
+            do_on_start(ConnResId, Opts)
+    end;
+on_start(ConnResId, #{start_resource_agent := Agent} = Opts) ->
+    case get_agent_action(Agent, start_resource) of
+        {ask, Pid} ->
+            Alias = alias([reply]),
+            ct:pal("~s on_start asking ~p how to proceed", [ConnResId, Pid]),
+            Pid ! {waiting_start_resource_result, Alias, ConnResId},
+            receive
+                {Alias, continue} ->
+                    ct:pal("~s on_start will continue", [ConnResId]),
+                    do_on_start(ConnResId, Opts);
+                {Alias, {error, _} = Error} ->
+                    ct:pal("~ps on_start will return ~p", [ConnResId, Error]),
+                    Error
+            end;
+        {notify, Pid, {error, _} = Error} ->
+            Pid ! {attempted_to_start_resource, ConnResId, Error},
+            Error;
+        continue ->
+            do_on_start(ConnResId, Opts);
+        {error, _} = Error ->
+            Error
+    end;
+on_start(ConnResId, Opts) ->
+    do_on_start(ConnResId, Opts).
+
+do_on_start(ConnResId, #{name := Name} = Opts) ->
     Register = maps:get(register, Opts, false),
     StopError = maps:get(stop_error, Opts, false),
     {ok, Opts#{
-        id => InstId,
+        id => ConnResId,
         stop_error => StopError,
         channels => #{},
         pid => spawn_counter_process(Name, Register)
     }}.
 
+on_stop(_InstId, undefined) ->
+    ?tp(connector_demo_free_resources_without_state, #{}),
+    ok;
 on_stop(_InstId, #{stop_error := true}) ->
     {error, stop_error};
-on_stop(InstId, #{pid := Pid}) ->
-    persistent_term:erase(?PT_CHAN_KEY(InstId)),
+on_stop(InstId, #{stop_error := {ask, HowToStop}} = State) ->
+    case HowToStop() of
+        continue ->
+            on_stop(InstId, maps:remove(stop_error, State))
+    end;
+on_stop(_InstId, #{pid := Pid}) ->
     stop_counter_process(Pid).
 
 on_query(_InstId, get_state, State) ->
@@ -167,7 +243,17 @@ on_query(_InstId, {sleep_before_reply, For}, #{pid := Pid}) ->
 on_query(_InstId, {sync_sleep_before_reply, SleepFor}, _State) ->
     %% This simulates a slow sync call
     timer:sleep(SleepFor),
-    {ok, slept}.
+    {ok, slept};
+on_query(_InstId, {_ChanId, #{q := ask, fn := _, ctx := _}} = Query, #{pid := Pid}) ->
+    ReqRef = make_ref(),
+    From = {self(), ReqRef},
+    Pid ! {From, Query},
+    receive
+        {ReqRef, Result} ->
+            Result
+    after 1_000 ->
+        {error, timeout}
+    end.
 
 on_query_async(_InstId, block, ReplyFun, #{pid := Pid}) ->
     Pid ! {block, ReplyFun},
@@ -193,11 +279,13 @@ on_query_async(_InstId, {individual_reply, IsSuccess}, ReplyFun, #{pid := Pid}) 
 on_query_async(_InstId, {sleep_before_reply, For}, ReplyFun, #{pid := Pid}) ->
     ?tp(connector_demo_sleep, #{mode => async, for => For}),
     Pid ! {{sleep_before_reply, For}, ReplyFun},
+    {ok, Pid};
+on_query_async(_InstId, {_ChanId, #{q := ask, fn := _, ctx := _}} = Query, ReplyFun, #{pid := Pid}) ->
+    Pid ! {Query, ReplyFun},
     {ok, Pid}.
 
 on_batch_query(InstId, BatchReq, State) ->
-    %% Requests can be either 'get_counter' or 'inc_counter', but
-    %% cannot be mixed.
+    %% Requests of different types cannot be mixed.
     case hd(BatchReq) of
         {inc_counter, _} ->
             batch_inc_counter(sync, InstId, BatchReq, State);
@@ -207,9 +295,13 @@ on_batch_query(InstId, BatchReq, State) ->
             batch_big_payload(sync, InstId, BatchReq, State);
         {individual_reply, _IsSuccess} ->
             batch_individual_reply(sync, InstId, BatchReq, State);
-        {random_reply, Num} ->
+        {_ChanId, #{q := ask, fn := _Fn, ctx := _Ctx}} ->
+            batch_ask_reply(sync, InstId, BatchReq, State);
+        {random_reply, Num, ReplyTab} ->
             %% async batch retried
-            make_random_reply(Num)
+            Result = make_random_reply(Num),
+            ets:insert(ReplyTab, {erlang:monotonic_time(), [Result]}),
+            Result
     end.
 
 on_batch_query_async(InstId, BatchReq, ReplyFunAndArgs, #{pid := Pid} = State) ->
@@ -225,9 +317,11 @@ on_batch_query_async(InstId, BatchReq, ReplyFunAndArgs, #{pid := Pid} = State) -
             batch_big_payload({async, ReplyFunAndArgs}, InstId, BatchReq, State);
         {individual_reply, _IsSuccess} ->
             batch_individual_reply({async, ReplyFunAndArgs}, InstId, BatchReq, State);
-        {random_reply, Num} ->
+        {_ChanId, #{q := ask, fn := _Fn, ctx := _Ctx}} ->
+            batch_ask_reply({async, ReplyFunAndArgs}, InstId, BatchReq, State);
+        {random_reply, Num, ReplyTab} ->
             %% only take the first Num in the batch should be random enough
-            Pid ! {{random_reply, Num}, ReplyFunAndArgs},
+            Pid ! {{random_reply, Num, ReplyTab}, ReplyFunAndArgs},
             {ok, Pid}
     end.
 
@@ -283,18 +377,57 @@ batch_individual_reply({async, ReplyFunAndArgs}, InstId, Batch, State) ->
     end),
     {ok, Pid}.
 
+batch_ask_reply(sync, InstId, Batch, State) ->
+    emqx_utils:pmap(
+        fun(Req = {_ChanId, #{q := ask, fn := _, ctx := _}}) ->
+            on_query(InstId, Req, State)
+        end,
+        Batch,
+        infinity
+    );
+batch_ask_reply({async, ReplyFunAndArgs}, InstId, Batch, State) ->
+    Pid = spawn(fun() ->
+        Results = lists:map(
+            fun(Req = {_ChanId, #{q := ask, fn := _, ctx := _}}) ->
+                on_query(InstId, Req, State)
+            end,
+            Batch
+        ),
+        apply_reply(ReplyFunAndArgs, Results)
+    end),
+    {ok, Pid}.
+
 on_get_status(_InstId, #{health_check_error := true}) ->
     ?tp(connector_demo_health_check_error, #{}),
     ?status_disconnected;
-on_get_status(_InstId, State = #{health_check_error := {msg, Message}}) ->
+on_get_status(_InstId, _State = #{health_check_error := {msg, Message}}) ->
     ?tp(connector_demo_health_check_error, #{}),
-    {?status_disconnected, State, Message};
+    {?status_disconnected, Message};
 on_get_status(_InstId, #{pid := Pid, health_check_error := {delay, Delay}}) ->
     ?tp(connector_demo_health_check_delay, #{}),
     timer:sleep(Delay),
     case is_process_alive(Pid) of
         true -> ?status_connected;
         false -> ?status_disconnected
+    end;
+on_get_status(ConnResId, #{health_check_agent := Agent}) ->
+    case get_agent_action(Agent, resource_health_check) of
+        {ask, Pid} ->
+            Alias = alias([reply]),
+            ct:pal("~s on_get_status asking ~p how to proceed", [ConnResId, Pid]),
+            Pid ! {waiting_health_check_result, Alias, resource, ConnResId},
+            receive
+                {Alias, Result} ->
+                    ct:pal("~s on_get_status will return ~p", [ConnResId, Result]),
+                    Result
+            end;
+        {notify, Pid, Status} when ?IS_STATUS(Status) ->
+            Pid ! {returning_resource_health_check_result, ConnResId, Status},
+            Status;
+        {Status, Msg} when ?IS_STATUS(Status) ->
+            {Status, Msg};
+        Status when ?IS_STATUS(Status) ->
+            Status
     end;
 on_get_status(_InstId, #{pid := Pid}) ->
     timer:sleep(300),
@@ -303,19 +436,69 @@ on_get_status(_InstId, #{pid := Pid}) ->
         false -> ?status_disconnected
     end.
 
+on_add_channel(ConnResId, #{add_channel_agent := Agent} = ConnSt0, ChanId, ChanCfg) ->
+    case get_agent_action(Agent, add_channel) of
+        {notify, Pid, continue} ->
+            Pid ! {attempted_to_add_channel, ConnResId, ChanId, ChanCfg},
+            do_on_add_channel(ConnResId, ConnSt0, ChanId, ChanCfg);
+        continue ->
+            do_on_add_channel(ConnResId, ConnSt0, ChanId, ChanCfg)
+    end;
 on_add_channel(ConnResId, ConnSt0, ChanId, ChanCfg) ->
+    do_on_add_channel(ConnResId, ConnSt0, ChanId, ChanCfg).
+
+do_on_add_channel(_ConnResId, ConnSt0, ChanId, ChanCfg) ->
     ConnSt = emqx_utils_maps:deep_put([channels, ChanId], ConnSt0, ChanCfg),
-    do_add_channel(ConnResId, ChanId, ChanCfg),
+    ?tp(added_channel, #{}),
     {ok, ConnSt}.
 
+on_remove_channel(ConnResId, #{remove_channel_agent := Agent} = ConnSt0, ChanId) ->
+    case get_agent_action(Agent, remove_channel) of
+        {ask, Pid} ->
+            Alias = alias([reply]),
+            Pid ! {waiting_remove_channel_result, Alias, ConnResId, ChanId},
+            receive
+                {Alias, continue} ->
+                    do_on_remove_channel(ConnResId, ConnSt0, ChanId);
+                {Alias, Result} ->
+                    Result
+            end;
+        {notify, Pid, {error, _} = Result} ->
+            Pid ! {attempted_to_remove_channel, ConnResId, ChanId},
+            Result;
+        {notify, Pid, continue} ->
+            Pid ! {attempted_to_remove_channel, ConnResId, ChanId},
+            do_on_remove_channel(ConnResId, ConnSt0, ChanId);
+        continue ->
+            do_on_remove_channel(ConnResId, ConnSt0, ChanId);
+        {error, _} = Result ->
+            Result
+    end;
 on_remove_channel(ConnResId, ConnSt0, ChanId) ->
+    do_on_remove_channel(ConnResId, ConnSt0, ChanId).
+
+do_on_remove_channel(_ConnResId, ConnSt0, ChanId) ->
     ConnSt = emqx_utils_maps:deep_remove([channels, ChanId], ConnSt0),
-    do_remove_channel(ConnResId, ChanId),
     {ok, ConnSt}.
 
 on_get_channels(ConnResId) ->
     persistent_term:get(?PT_CHAN_KEY(ConnResId), []).
 
+on_get_channel_status(ConnResId, ChanId, #{health_check_agent := Agent}) ->
+    case get_agent_action(Agent, channel_health_check) of
+        {ask, Pid} ->
+            Alias = alias([reply]),
+            Pid ! {waiting_health_check_result, Alias, channel, ConnResId, ChanId},
+            receive
+                {Alias, Result} ->
+                    Result
+            end;
+        {notify, Pid, Status} when ?IS_STATUS(Status) ->
+            Pid ! {returning_channel_health_check_result, ConnResId, ChanId, Status},
+            Status;
+        Result ->
+            Result
+    end;
 on_get_channel_status(_ConnResId, ChanId, #{channels := Chans}) ->
     case Chans of
         #{ChanId := #{health_check_delay := Delay}} ->
@@ -389,7 +572,6 @@ counter_loop(
                 apply_reply(ReplyFun, {error, {recoverable_error, blocked}}),
                 State;
             {{FromPid, ReqRef}, {inc, N}} when Status == running ->
-                %ct:pal("sync counter recv: ~p", [{inc, N}]),
                 FromPid ! {ReqRef, ok},
                 State#{counter => Num + N};
             {{FromPid, ReqRef}, {inc, _N}} when Status == blocked ->
@@ -426,7 +608,7 @@ counter_loop(
                     end,
                 apply_reply(ReplyFun, Res),
                 State;
-            {{random_reply, RandNum}, ReplyFun} ->
+            {{random_reply, RandNum, ReplyTab}, ReplyFun} ->
                 %% usually a behaving  connector should reply once and only once for
                 %% each (batch) request
                 %% but we try to reply random results a random number of times
@@ -434,6 +616,8 @@ counter_loop(
                 %% drain the buffer (and inflights table)
                 ReplyCount = 1 + (RandNum rem 3),
                 Results = make_random_replies(ReplyCount),
+                %% To track expected state.
+                ets:insert(ReplyTab, {erlang:monotonic_time(), Results}),
                 %% add a delay to trigger inflight full
                 lists:foreach(
                     fun(Result) ->
@@ -448,11 +632,23 @@ counter_loop(
                 State;
             {{FromPid, ReqRef}, {sleep_before_reply, _} = SleepQ} ->
                 FromPid ! {ReqRef, handle_query(sync, SleepQ, Status)},
+                State;
+            {{_ChanId, #{q := ask, fn := _, ctx := _}} = Query, ReplyFun} ->
+                apply_reply(ReplyFun, handle_query(async, Query, Status, #{reply_fn => ReplyFun})),
+                State;
+            {{FromPid, ReqRef}, {_ChanId, #{q := ask, fn := _, ctx := _}} = Query} ->
+                FromPid ! {ReqRef, handle_query(sync, Query, Status)},
                 State
         end,
     counter_loop(NewState).
 
-handle_query(Mode, {sleep_before_reply, For} = Query, Status) ->
+handle_query(Mode, Query, Status) ->
+    handle_query(Mode, Query, Status, _Opts = #{}).
+
+handle_query(Mode, {ChanId, #{q := ask, fn := Fn, ctx := Ctx}}, Status, Opts) ->
+    ReplyFn = maps:get(reply_fn, Opts, undefined),
+    Fn(Ctx#{id => ChanId, mode => Mode, status => Status, reply_fn => ReplyFn});
+handle_query(Mode, {sleep_before_reply, For} = Query, Status, _Opts) ->
     ok = timer:sleep(For),
     Result =
         case Status of
@@ -490,9 +686,22 @@ make_random_reply(N) ->
     end.
 
 do_add_channel(ConnResId, ChanId, ChanCfg) ->
-    Chans = persistent_term:get(?PT_CHAN_KEY(ConnResId), []),
-    persistent_term:put(?PT_CHAN_KEY(ConnResId), [{ChanId, ChanCfg} | Chans]).
+    Chans0 = persistent_term:get(?PT_CHAN_KEY(ConnResId), []),
+    Chans = [{ChanId, ChanCfg} | lists:keydelete(ChanId, 1, Chans0)],
+    persistent_term:put(?PT_CHAN_KEY(ConnResId), Chans).
 
 do_remove_channel(ConnResId, ChanId) ->
     Chans = persistent_term:get(?PT_CHAN_KEY(ConnResId), []),
     persistent_term:put(?PT_CHAN_KEY(ConnResId), proplists:delete(ChanId, Chans)).
+
+get_agent_action(Agent, Key) ->
+    emqx_utils_agent:get_and_update(Agent, fun(Old) ->
+        case Old of
+            #{Key := [Action]} ->
+                {Action, Old};
+            #{Key := [Action | Actions]} ->
+                {Action, Old#{Key := Actions}};
+            #{Key := Action} when not is_list(Action) ->
+                {Action, Old}
+        end
+    end).

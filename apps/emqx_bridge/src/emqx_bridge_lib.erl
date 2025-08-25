@@ -1,22 +1,13 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_lib).
 
+-include_lib("emqx/include/emqx_config.hrl").
+
 -export([
-    maybe_withdraw_rule_action/3,
+    maybe_withdraw_rule_action/4,
+    external_ids/4,
     upgrade_type/1,
     downgrade_type/2,
     get_conf/2
@@ -26,11 +17,13 @@
 %% The bridge-ID in rule-engine's world is the action-ID.
 %% This function is to remove a bridge (action) from all rules
 %% using it if the `rule_actions' is included in `DeleteDeps' list
-maybe_withdraw_rule_action(BridgeType, BridgeName, DeleteDeps) ->
-    BridgeIds = external_ids(BridgeType, BridgeName),
+%% **N.B.**: helper for deprecated bridge v1 API
+maybe_withdraw_rule_action(ConfRootKey, BridgeType, BridgeName, DeleteDeps) ->
+    BridgeIds = external_ids(?global_ns, ConfRootKey, BridgeType, BridgeName),
     DeleteActions = lists:member(rule_actions, DeleteDeps),
     maybe_withdraw_rule_action_loop(BridgeIds, DeleteActions).
 
+%% **N.B.**: helper for deprecated bridge v1 API
 maybe_withdraw_rule_action_loop([], _DeleteActions) ->
     ok;
 maybe_withdraw_rule_action_loop([BridgeId | More], DeleteActions) ->
@@ -40,7 +33,7 @@ maybe_withdraw_rule_action_loop([BridgeId | More], DeleteActions) ->
         RuleIds when DeleteActions ->
             lists:foreach(
                 fun(R) ->
-                    emqx_rule_engine:ensure_action_removed(R, BridgeId)
+                    emqx_rule_engine:ensure_action_removed(?global_ns, R, BridgeId)
                 end,
                 RuleIds
             ),
@@ -71,8 +64,8 @@ downgrade_type(Type, Conf) when is_list(Type) ->
 
 %% A rule might be referencing an old version bridge type name
 %% i.e. 'kafka' instead of 'kafka_producer' so we need to try both
-external_ids(Type, Name) ->
-    case downgrade_type(Type, get_conf(Type, Name)) of
+external_ids(Namespace, ConfRootKey, Type, Name) ->
+    case downgrade_type(Type, get_conf(Namespace, ConfRootKey, Type, Name)) of
         Type ->
             [external_id(Type, Name)];
         Type0 ->
@@ -80,20 +73,36 @@ external_ids(Type, Name) ->
     end.
 
 get_conf(BridgeType, BridgeName) ->
+    get_conf(?global_ns, _ConfRootKey = undefined, BridgeType, BridgeName).
+
+get_conf(Namespace, ConfRootKey, BridgeType, BridgeName) ->
     case emqx_bridge_v2:is_bridge_v2_type(BridgeType) of
         true ->
-            ConfRootName = emqx_bridge_v2:get_conf_root_key_if_only_one(BridgeType, BridgeName),
-            emqx_conf:get_raw([ConfRootName, BridgeType, BridgeName]);
+            ConfRootKey1 =
+                case ConfRootKey of
+                    undefined ->
+                        emqx_bridge_v2:get_conf_root_key_if_only_one(
+                            Namespace, BridgeType, BridgeName
+                        );
+                    _ ->
+                        ConfRootKey
+                end,
+            get_raw_config(Namespace, [ConfRootKey1, BridgeType, BridgeName]);
         false ->
             undefined
     end.
 
 %% Creates the external id for the bridge_v2 that is used by the rule actions
 %% to refer to the bridge_v2
-external_id(BridgeType, BridgeName) ->
-    Name = bin(BridgeName),
-    Type = bin(BridgeType),
+external_id(Type0, Name0) ->
+    Name = bin(Name0),
+    Type = bin(Type0),
     <<Type/binary, ":", Name/binary>>.
 
 bin(Bin) when is_binary(Bin) -> Bin;
 bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8).
+
+get_raw_config(Namespace, KeyPath) when is_binary(Namespace) ->
+    emqx:get_raw_namespaced_config(Namespace, KeyPath);
+get_raw_config(?global_ns, KeyPath) ->
+    emqx:get_raw_config(KeyPath).

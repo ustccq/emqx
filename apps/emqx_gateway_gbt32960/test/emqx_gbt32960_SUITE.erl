@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gbt32960_SUITE).
@@ -60,6 +60,13 @@ init_per_testcase(_, Config) ->
 end_per_testcase(_, _Config) ->
     snabbkaffe:stop(),
     ok.
+
+update_gbt32960_with_idle_timeout(IdleTimeout) ->
+    Conf = emqx:get_raw_config([gateway, gbt32960]),
+    emqx_gateway_conf:update_gateway(
+        gbt32960,
+        Conf#{<<"idle_timeout">> => IdleTimeout}
+    ).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% helper functions %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -155,14 +162,21 @@ login_first() ->
             <<"Length">> := 1,
             <<"Id">> := <<"C">>
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     % vehicle login success
     Time = <<12, 12, 29, 12, 19, 20>>,
     {ok, Socket}.
 
 t_case01_login(_Config) ->
+    emqx_gateway_test_utils:meck_emqx_hook_calls(),
     % send VEHICLE LOGIN
     {ok, Socket} = login_first(),
+
+    ?assertMatch(
+        ['client.connect' | _],
+        emqx_gateway_test_utils:collect_emqx_hooks_calls()
+    ),
+
     ok = gen_tcp:close(Socket).
 
 t_case01_login_channel_info(_Config) ->
@@ -201,6 +215,27 @@ t_case01_auth_expire(_Config) ->
         },
         5000
     ).
+
+t_case01_update_not_restart_listener(_Config) ->
+    {ok, Socket} = login_first(),
+
+    update_gbt32960_with_idle_timeout(<<"20s">>),
+
+    % REPORT data
+    % - if auth success, not send ack, but will forward to emqx
+    %
+    Time = <<16, 1, 1, 2, 59, 0>>,
+    VehicleState =
+        <<1:?BYTE, 1:?BYTE, 1:?BYTE, 2000:?WORD, 999999:?DWORD, 5000:?WORD, 15000:?WORD, 50:?BYTE,
+            1:?BYTE, 5:?BYTE, 6000:?WORD, 90:?BYTE, 0:?BYTE>>,
+    Data = <<Time/binary, 16#01, VehicleState/binary>>,
+    Packet = encode(?CMD_INFO_REPORT, <<"1G1BL52P7TR115520">>, Data),
+    ok = gen_tcp:send(Socket, Packet),
+    timer:sleep(200),
+    %% assert: message can be published after gateway update
+    {<<"gbt32960/1G1BL52P7TR115520/upstream/info">>, _PubMsg} = get_published_msg(),
+
+    ok.
 
 t_case02_reportinfo_0x01(_Config) ->
     % send VEHICLE LOGIN
@@ -250,7 +285,7 @@ t_case02_reportinfo_0x01(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case03_reportinfo_0x02(_Config) ->
@@ -310,7 +345,7 @@ t_case03_reportinfo_0x02(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case04_reportinfo_0x03(_Config) ->
@@ -360,7 +395,7 @@ t_case04_reportinfo_0x03(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case05_reportinfo_0x04(_Config) ->
@@ -399,7 +434,7 @@ t_case05_reportinfo_0x04(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case06_reportinfo_0x05(_Config) ->
@@ -438,7 +473,7 @@ t_case06_reportinfo_0x05(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case07_reportinfo_0x06(_Config) ->
@@ -486,7 +521,7 @@ t_case07_reportinfo_0x06(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case08_reportinfo_0x07(_Config) ->
@@ -534,7 +569,7 @@ t_case08_reportinfo_0x07(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case09_reportinfo_0x08(_Config) ->
@@ -592,7 +627,7 @@ t_case09_reportinfo_0x08(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case10_reportinfo_0x09(_Config) ->
@@ -642,7 +677,7 @@ t_case10_reportinfo_0x09(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case11_retx_report0x01(_Config) ->
@@ -693,7 +728,7 @@ t_case11_retx_report0x01(_Config) ->
                 }
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case12_vihecle_logout(_Config) ->
@@ -725,7 +760,7 @@ t_case12_vihecle_logout(_Config) ->
             },
             <<"Seq">> := 1
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     ok.
 
 t_case13_platform_login(_Config) ->
@@ -842,7 +877,7 @@ t_case17_param_query(_Config) ->
                 #{<<"0x02">> := 10}
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
 
     %
     % send PARAM QUERY - Query all of feild
@@ -942,7 +977,7 @@ t_case17_param_query(_Config) ->
             <<"Total">> := 16,
             <<"Params">> := RespMapRecved
         }
-    } = emqx_utils_json:decode(PubedMsg1, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg1),
     ?assertEqual(RespMap, RespMapRecved),
     ok.
 
@@ -1011,7 +1046,7 @@ t_case18_param_setting(_Config) ->
                 #{<<"0x02">> := 200}
             ]
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
     %
     % send PARAM SETTING Request
     %
@@ -1090,7 +1125,7 @@ t_case18_param_setting(_Config) ->
             <<"Total">> := 16,
             <<"Params">> := ParamsMapRecved
         }
-    } = emqx_utils_json:decode(PubedMsg1, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg1),
     ?assertEqual(ParamsMap, ParamsMapRecved),
     ok.
 
@@ -1151,7 +1186,7 @@ t_case19_terminal_ctrl(_Config) ->
             },
             <<"Command">> := 2
         }
-    } = emqx_utils_json:decode(PubedMsg, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg),
 
     %
     % send TERMINAL CTRL - REMOTE UPGRADE
@@ -1224,7 +1259,7 @@ t_case19_terminal_ctrl(_Config) ->
             <<"Command">> := 1,
             <<"Param">> := UpgradeMapsRecved
         }
-    } = emqx_utils_json:decode(PubedMsg1, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg1),
 
     ?assertEqual(UpgradeMaps, UpgradeMapsRecved),
 
@@ -1289,7 +1324,7 @@ t_case19_terminal_ctrl(_Config) ->
             <<"Command">> := 6,
             <<"Param">> := AlarmMapsRecved
         }
-    } = emqx_utils_json:decode(PubedMsg2, [return_maps]),
+    } = emqx_utils_json:decode(PubedMsg2),
 
     ?assertEqual(AlarmMaps, AlarmMapsRecved),
     ok.

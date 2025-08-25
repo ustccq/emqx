@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_chains_SUITE).
@@ -68,6 +56,10 @@ authenticate(#{username := <<"emqx_authn_ignore_for_hook_good">>}, _State) ->
     ignore;
 authenticate(#{username := <<"emqx_authn_ignore_for_hook_bad">>}, _State) ->
     ignore;
+authenticate(#{username := <<"authn_clientid_override">>}, _State) ->
+    {ok, #{clientid_override => <<"overridden_clientid">>}};
+authenticate(#{username := <<"hook_clientid_override">>}, _State) ->
+    ignore;
 authenticate(#{username := _}, _State) ->
     {error, bad_username_or_password}.
 
@@ -83,6 +75,8 @@ hook_authenticate(#{username := <<"emqx_authn_ignore_for_hook_good">>}, _AuthRes
     {ok, {ok, ?NOT_SUPERUSER}};
 hook_authenticate(#{username := <<"emqx_authn_ignore_for_hook_bad">>}, _AuthResult) ->
     {stop, {error, invalid_username}};
+hook_authenticate(#{username := <<"hook_clientid_override">>}, _AuthResult) ->
+    {ok, {ok, #{clientid_override => <<"overridden_clientid">>}}};
 hook_authenticate(_ClientId, AuthResult) ->
     {ok, AuthResult}.
 
@@ -101,10 +95,12 @@ init_per_suite(Config) ->
         ],
         #{work_dir => ?config(priv_dir)}
     ),
+    ok = emqx_access_control:set_default_authn_restrictive(),
     ok = deregister_providers(),
     [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
+    ok = emqx_access_control:set_default_authn_permissive(),
     emqx_cth_suite:stop(?config(apps)),
     ok.
 
@@ -164,7 +160,7 @@ t_authenticator(Config) when is_list(Config) ->
     % Create an authenticator when the provider does not exist
 
     ?assertEqual(
-        {error, {no_available_provider_for, {password_based, built_in_database}}},
+        {error, #{cause => "no_available_provider", type => {password_based, built_in_database}}},
         ?AUTHN:create_authenticator(ChainName, AuthenticatorConfig1)
     ),
 
@@ -191,7 +187,16 @@ t_authenticator(Config) when is_list(Config) ->
         ?AUTHN:update_authenticator(ChainName, ID1, AuthenticatorConfig1)
     ),
 
+    %% delete an unknown authenticator is allowed, do not epxect not_found
+    ?assertEqual(ok, ?AUTHN:delete_authenticator(ChainName, <<"password_based:http">>)),
+    %% the deletion of the last authenticator in the chain should result in
+    %% an implict deletion of the chain
     ?assertEqual(ok, ?AUTHN:delete_authenticator(ChainName, ID1)),
+    %% expected not_found for the chain
+    ?assertEqual(
+        {error, {not_found, {chain, test}}},
+        ?AUTHN:update_authenticator(ChainName, ID1, AuthenticatorConfig1)
+    ),
 
     ?assertEqual(
         {error, {not_found, {chain, test}}},
@@ -549,6 +554,16 @@ t_combine_authn_and_callback(Config) when is_list(Config) ->
     ?assertAuthFailureForUser(hook_user_finally_bad),
     ?assertAuthFailureForUser(hook_user_good),
     ?assertAuthFailureForUser(hook_user_bad),
+
+    %% clientid override in authn results
+    ?assertMatch(
+        {ok, #{clientid_override := <<"overridden_clientid">>}},
+        emqx_access_control:authenticate(ClientInfo#{username => <<"authn_clientid_override">>})
+    ),
+    ?assertMatch(
+        {ok, #{clientid_override := <<"overridden_clientid">>}},
+        emqx_access_control:authenticate(ClientInfo#{username => <<"hook_clientid_override">>})
+    ),
 
     ok = unhook();
 t_combine_authn_and_callback({'end', Config}) ->

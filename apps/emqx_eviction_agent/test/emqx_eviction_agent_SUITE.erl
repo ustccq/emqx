@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent_SUITE).
@@ -52,14 +52,16 @@ init_per_testcase(Case, Config) ->
     ok = snabbkaffe:start_trace(),
     start_peer(Case, Config).
 
-start_peer(t_explicit_session_takeover, Config) ->
+start_peer(Case, Config) when
+    Case =:= t_explicit_session_takeover; Case =:= t_evict_phantom_session
+->
     NodeNames =
         [
-            t_explicit_session_takeover_donor,
-            t_explicit_session_takeover_recipient
+            session_donor_node,
+            session_recipient_node
         ],
     ClusterNodes = emqx_eviction_agent_test_helpers:start_cluster(
-        Config,
+        [{tc_name, Case} | Config],
         NodeNames,
         [emqx_conf, emqx, emqx_eviction_agent]
     ),
@@ -73,7 +75,9 @@ end_per_testcase(TestCase, Config) ->
     ok = snabbkaffe:stop(),
     stop_peer(TestCase, Config).
 
-stop_peer(t_explicit_session_takeover, Config) ->
+stop_peer(Case, Config) when
+    Case =:= t_explicit_session_takeover; Case =:= t_evict_phantom_session
+->
     emqx_eviction_agent_test_helpers:stop_cluster(
         ?config(evacuate_nodes, Config)
     );
@@ -227,12 +231,12 @@ t_explicit_session_takeover(Config) ->
         begin
             ok = rpc:call(Node1, emqx_eviction_agent, evict_connections, [1]),
             receive
-                {'EXIT', C0, {disconnected, ?RC_USE_ANOTHER_SERVER, _}} -> ok
+                {'EXIT', C0, {shutdown, {disconnected, ?RC_USE_ANOTHER_SERVER, _}}} -> ok
             after 1000 ->
                 ?assert(false, "Connection not evicted")
             end
         end,
-        #{?snk_kind := emqx_cm_connected_client_count_dec_done, chan_pid := ChanPid},
+        #{?snk_kind := emqx_cm_connected_client_count_dec, chan_pid := ChanPid},
         2000
     ),
 
@@ -306,6 +310,53 @@ t_explicit_session_takeover(Config) ->
     ),
     ok = emqtt:disconnect(C3).
 
+t_evict_lost_session(_Config) ->
+    _ = erlang:process_flag(trap_exit, true),
+    ok = restart_emqx(),
+
+    %% Make a session
+    {ok, C0} = emqtt_connect([
+        {clientid, <<"client_with_session">>},
+        {clean_start, false}
+    ]),
+    {ok, _, _} = emqtt:subscribe(C0, <<"t1">>),
+    ok = emqtt:disconnect(C0),
+    ok = emqx_eviction_agent:enable(test_eviction, undefined),
+    ?assertEqual(1, emqx_eviction_agent:session_count()),
+
+    %% Emulate lost session
+    [ChanPid] = emqx_cm:lookup_channels(<<"client_with_session">>),
+    emqx_cm_registry:unregister_channel({<<"client_with_session">>, ChanPid}),
+    %% unregister is async, wait for it
+    ct:sleep(100),
+    ok = emqx_eviction_agent:evict_sessions(1, node()),
+    ?retry(_Sleep = 10, _Retries = 20, ?assertEqual(0, emqx_eviction_agent:session_count())).
+
+%% By phantom session we mean a session that has a record in `emqx_cm`
+%% but the session process is not running for some reason.
+t_evict_phantom_session(Config) ->
+    [{Node1, Port1}, {Node2, _Port2}] = ?config(evacuate_nodes, Config),
+
+    %% Make a session
+    {ok, C0} = emqtt_connect([
+        {clientid, <<"client_phantom_session">>},
+        {clean_start, false},
+        {port, Port1}
+    ]),
+    {ok, _, _} = emqtt:subscribe(C0, <<"t1">>),
+    ChanInfos = rpc:call(Node1, ets, tab2list, [?CHAN_INFO_TAB]),
+    ?assertEqual(1, length(ChanInfos)),
+    ok = emqtt:disconnect(C0),
+    ct:sleep(100),
+    %% We restore saved channel info to emulate the situation
+    %% when we have a record about actually missing session.
+    rpc:call(Node1, ets, insert, [?CHAN_INFO_TAB, ChanInfos]),
+    ?assertEqual(1, rpc:call(Node1, emqx_eviction_agent, session_count, [])),
+
+    ok = rpc:call(Node1, emqx_eviction_agent, enable, [test_eviction, undefined]),
+    ok = rpc:call(Node1, emqx_eviction_agent, evict_sessions, [1, Node2]),
+    ?assertEqual(0, rpc:call(Node1, emqx_eviction_agent, session_count, [])).
+
 t_disable_on_restart(_Config) ->
     ok = emqx_eviction_agent:enable(test_eviction, undefined),
 
@@ -343,9 +394,13 @@ t_session_serialization(_Config) ->
 
     ok = emqx_eviction_agent:disable(test_eviction),
 
-    ?assertEqual(
-        1,
-        emqx_eviction_agent:session_count()
+    ?retry(
+        200,
+        10,
+        ?assertEqual(
+            1,
+            emqx_eviction_agent:session_count()
+        )
     ),
 
     ?assertMatch(
@@ -439,7 +494,7 @@ t_ws_conn(_Config) ->
 
     ?assertWaitEvent(
         ok = emqx_eviction_agent:evict_connections(1),
-        #{?snk_kind := emqx_cm_connected_client_count_dec_done},
+        #{?snk_kind := emqx_cm_connected_client_count_dec},
         1000
     ),
 
@@ -474,7 +529,7 @@ t_quic_conn(_Config) ->
 
     ?assertWaitEvent(
         ok = emqx_eviction_agent:evict_connections(1),
-        #{?snk_kind := emqx_cm_connected_client_count_dec_done},
+        #{?snk_kind := emqx_cm_connected_client_count_dec},
         1000
     ),
 

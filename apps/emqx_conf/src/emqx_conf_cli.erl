@@ -1,35 +1,36 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_conf_cli).
+
 -include("emqx_conf.hrl").
 -include_lib("emqx_auth/include/emqx_authn_chains.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_schema.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
+%% Deprecated RPC target (`emqx_conf_proto_v{3,4}`)
+-deprecated({get_config, 0, "use get_config_namespaced/1 instead"}).
+%% Deprecated RPC target (`emqx_conf_proto_v{3,4}`)
+-deprecated({get_config, 1, "use get_config_namespaced/2 instead"}).
 
 -export([
     load/0,
     admins/1,
     conf/1,
     audit/3,
-    unload/0
+    unload/0,
+    mark_fix_log/2
 ]).
 
--export([keys/0, get_config/0, get_config/1, load_config/2]).
+%% Deprecated RPC targets (`emqx_conf_proto_v{3,4}`)
+-export([get_config/0, get_config/1]).
+
+-export([keys/0, get_config_namespaced/1, get_config_namespaced/2, load_config/3]).
 
 -include_lib("hocon/include/hoconsc.hrl").
+
+-define(BPAPI_NAME, emqx_conf).
 
 %% kept cluster_call for compatibility
 -define(CLUSTER_CALL, cluster_call).
@@ -37,16 +38,27 @@
 -define(AUDIT_MOD, audit).
 -define(UPDATE_READONLY_KEYS_PROHIBITED, <<"Cannot update read-only key '~s'.">>).
 -define(SCHEMA_VALIDATION_CONF_ROOT_BIN, <<"schema_validation">>).
+-define(MESSAGE_TRANSFORMATION_CONF_ROOT_BIN, <<"message_transformation">>).
+-define(CONNECTORS_CONF_ROOT_BIN, <<"connectors">>).
+-define(LOCAL_OPTIONS, #{rawconf_with_defaults => true, persistent => false}).
 
--dialyzer({no_match, [load/0]}).
+-define(key, key).
+-define(mode, mode).
+-define(namespace, namespace).
+-define(path, path).
+-define(raw_config, raw_config).
+-define(single_arg, single_arg).
+-define(vararg, vararg).
+
+%% All 'cluster.*' keys, except for 'cluster.link', should also be treated as read-only.
+-define(READONLY_ROOT_KEYS, [rpc, node]).
+
+-define(OPTIONS, #{rawconf_with_defaults => true, override_to => cluster}).
 
 load() ->
     emqx_ctl:register_command(?CLUSTER_CALL, {?MODULE, admins}, [hidden]),
     emqx_ctl:register_command(?CONF, {?MODULE, conf}, []),
-    case emqx_release:edition() of
-        ee -> emqx_ctl:register_command(?AUDIT_MOD, {?MODULE, audit}, [hidden]);
-        ce -> ok
-    end,
+    emqx_ctl:register_command(?AUDIT_MOD, {?MODULE, audit}, [hidden]),
     ok.
 
 unload() ->
@@ -56,16 +68,35 @@ unload() ->
 
 conf(["show_keys" | _]) ->
     print_keys(keys());
-conf(["show"]) ->
-    print_hocon(get_config());
-conf(["show", Key]) ->
-    print_hocon(get_config(list_to_binary(Key)));
-conf(["load", "--replace", Path]) ->
-    load_config(Path, #{mode => replace});
-conf(["load", "--merge", Path]) ->
-    load_config(Path, #{mode => merge});
-conf(["load", Path]) ->
-    load_config(Path, #{mode => merge});
+conf(["show" | Args]) ->
+    case show_args(Args) of
+        {ok, #{?key := all, ?namespace := Namespace}} ->
+            print_hocon(get_config_namespaced(Namespace));
+        {ok, #{?key := Key, ?namespace := Namespace}} ->
+            print_hocon(get_config_namespaced(Namespace, Key));
+        {error, Reason} = Error ->
+            print_error(Reason),
+            conf_usage(),
+            Error
+    end;
+conf(["load" | Args]) ->
+    case load_args(Args) of
+        {ok, #{?raw_config := RawConfig, ?namespace := Namespace, ?mode := Mode}} ->
+            load_config_from_raw(Namespace, RawConfig, #{mode => Mode});
+        {error, Reason} = Error ->
+            print_error(Reason),
+            conf_usage(),
+            Error
+    end;
+conf(["remove" | Args]) ->
+    case remove_args(Args) of
+        {ok, #{?path := Path, ?namespace := Namespace}} ->
+            remove_config(Namespace, Path);
+        {error, Reason} = Error ->
+            print_error(Reason),
+            conf_usage(),
+            Error
+    end;
 conf(["cluster_sync" | Args]) ->
     admins(Args);
 conf(["reload", "--merge"]) ->
@@ -75,47 +106,132 @@ conf(["reload", "--replace"]) ->
 conf(["reload"]) ->
     conf(["reload", "--merge"]);
 conf(_) ->
+    conf_usage().
+
+conf_usage() ->
     emqx_ctl:usage(usage_conf() ++ usage_sync()).
 
 admins(["status"]) ->
     status();
-admins(["skip"]) ->
-    status(),
-    Nodes = mria:running_nodes(),
-    lists:foreach(fun emqx_cluster_rpc:skip_failed_commit/1, Nodes),
-    status();
-admins(["skip", Node0]) ->
-    status(),
-    Node = list_to_existing_atom(Node0),
-    emqx_cluster_rpc:skip_failed_commit(Node),
-    status();
-admins(["tnxid", TnxId0]) ->
-    %% changed to 'inspect' in 5.6
-    %% TODO: delete this clause in 5.7
-    admins(["inspect", TnxId0]);
-admins(["inspect", TnxId0]) ->
-    TnxId = list_to_integer(TnxId0),
-    print(emqx_cluster_rpc:query(TnxId));
-admins(["fast_forward"]) ->
-    status(),
-    Nodes = mria:running_nodes(),
-    TnxId = emqx_cluster_rpc:latest_tnx_id(),
-    lists:foreach(fun(N) -> emqx_cluster_rpc:fast_forward_to_commit(N, TnxId) end, Nodes),
-    status();
-admins(["fast_forward", ToTnxId]) ->
-    status(),
-    Nodes = mria:running_nodes(),
-    TnxId = list_to_integer(ToTnxId),
-    lists:foreach(fun(N) -> emqx_cluster_rpc:fast_forward_to_commit(N, TnxId) end, Nodes),
-    status();
-admins(["fast_forward", Node0, ToTnxId]) ->
-    status(),
-    TnxId = list_to_integer(ToTnxId),
-    Node = list_to_existing_atom(Node0),
-    emqx_cluster_rpc:fast_forward_to_commit(Node, TnxId),
-    status();
+admins(["skip" | Args]) ->
+    case Args of
+        [] ->
+            status(),
+            Nodes = emqx:running_nodes(),
+            lists:foreach(fun emqx_cluster_rpc:skip_failed_commit/1, Nodes),
+            status();
+        [Node0] ->
+            status(),
+            Node = list_to_existing_atom(Node0),
+            emqx_cluster_rpc:skip_failed_commit(Node),
+            status();
+        _ ->
+            Reason = vararg_len_error_msg({0, 1}, length(Args)),
+            print_error(Reason),
+            {error, Reason}
+    end;
+admins(["inspect", TxId0]) ->
+    TxId = list_to_integer(TxId0),
+    print(emqx_cluster_rpc:query(TxId));
+admins(["fix"]) ->
+    {atomic, Status} = emqx_cluster_rpc:status(),
+    case mria_rlog:role() of
+        core ->
+            #{stopped_nodes := StoppedNodes} = emqx_mgmt_cli:cluster_info(),
+            maybe_fix_lagging(Status, #{fix => true}),
+            StoppedNodes =/= [] andalso
+                emqx_ctl:warning("Found stopped nodes: ~p~n", [StoppedNodes]),
+            ok;
+        Role ->
+            Leader = emqx_cluster_rpc:find_leader(),
+            emqx_ctl:print("Run fix command on ~p(core) node, but current is ~p~n", [
+                Leader, Role
+            ])
+    end;
+admins(["fast_forward" | Args]) ->
+    case Args of
+        [] ->
+            status(),
+            Nodes = emqx:running_nodes(),
+            TxId = emqx_cluster_rpc:latest_tnx_id(),
+            lists:foreach(fun(N) -> emqx_cluster_rpc:fast_forward_to_commit(N, TxId) end, Nodes),
+            status();
+        [ToTxId] ->
+            status(),
+            Nodes = emqx:running_nodes(),
+            TxId = list_to_integer(ToTxId),
+            lists:foreach(fun(N) -> emqx_cluster_rpc:fast_forward_to_commit(N, TxId) end, Nodes),
+            status();
+        [Node0, ToTxId] ->
+            status(),
+            TxId = list_to_integer(ToTxId),
+            Node = list_to_existing_atom(Node0),
+            emqx_cluster_rpc:fast_forward_to_commit(Node, TxId),
+            status();
+        _ ->
+            Reason = vararg_len_error_msg({0, 2}, length(Args)),
+            print_error(Reason),
+            {error, Reason}
+    end;
 admins(_) ->
     emqx_ctl:usage(usage_sync()).
+
+fix_lagging_with_raw(ToTxId, Node, Keys) ->
+    Confs = lists:foldl(
+        fun(Key, Acc) ->
+            KeyRaw = atom_to_binary(Key),
+            Acc#{KeyRaw => emqx_conf_proto_v5:get_raw_config(Node, ?global_ns, [Key])}
+        end,
+        #{},
+        Keys
+    ),
+    case mark_fix_begin(Node, ToTxId) of
+        ok ->
+            maybe
+                ok ?= load_config_from_raw(?global_ns, Confs, #{mode => replace}),
+                ok ?= reload_all_namespaced_configs(),
+                waiting_for_fix_finish()
+            end;
+        {error, Reason} ->
+            emqx_ctl:warning("mark fix begin failed: ~s~n", [Reason])
+    end.
+
+mark_fix_begin(Node, TxId) ->
+    {atomic, Status} = emqx_cluster_rpc:status(),
+    MFA = {?MODULE, mark_fix_log, [Status]},
+    emqx_cluster_rpc:update_mfa(Node, MFA, TxId).
+
+mark_fix_log(Status, Opts) ->
+    ?SLOG(warning, #{
+        msg => cluster_config_sync_triggered,
+        status => emqx_utils:redact(Status),
+        opts => Opts
+    }),
+    ok.
+
+%% While the raw configuration is guaranteed to be in sync by mnesia, the checked
+%% configuration (in persistent term) and the pre/post configuration side-effects might
+%% still be lagging and need to be evaluated if a node is lagging.
+reload_all_namespaced_configs() ->
+    Errors =
+        maps:fold(
+            fun(Namespace, RawConfig, Errors) ->
+                case load_config_from_raw(Namespace, RawConfig, #{mode => replace}) of
+                    ok ->
+                        Errors;
+                    Error ->
+                        Errors#{Namespace => Error}
+                end
+            end,
+            #{},
+            emqx_config:get_all_raw_namespaced_configs()
+        ),
+    case map_size(Errors) == 0 of
+        true ->
+            ok;
+        false ->
+            {error, Errors}
+    end.
 
 audit(Level, From, Log) ->
     ?AUDIT(Level, redact(Log#{from => From})).
@@ -129,22 +245,41 @@ redact(Logs = #{cmd := license, args := [<<"update">>, _License]}) ->
 redact(Logs) ->
     Logs.
 
+print_error(Reason) ->
+    case io_lib:printable_unicode_list(Reason) of
+        true ->
+            emqx_ctl:warning("~ts~n", [Reason]);
+        false ->
+            emqx_ctl:warning("~p~n", [Reason])
+    end.
+
 usage_conf() ->
+    NamespaceOptLine = {"", "Set `--namespace <ns>` to narrow the scope to a specific namespace."},
     [
-        {"conf reload --replace|--merge", "reload etc/emqx.conf on local node"},
+        {"conf reload [--namespace <ns>] --replace|--merge", "reload etc/emqx.conf on local node"},
         {"", "The new configuration values will be overlaid on the existing values by default."},
         {"", "use the --replace flag to replace existing values with the new ones instead."},
+        NamespaceOptLine,
         {"----------------------------------", "------------"},
         {"conf show_keys", "print all the currently used configuration keys."},
-        {"conf show [<key>]",
+        {"----------------------------------", "------------"},
+        {"conf show [--namespace <ns>] [<key>]",
             "Print in-use configs (including default values) under the given key."},
         {"", "Print ALL keys if key is not provided"},
-        {"conf load --replace|--merge <path>", "Load a HOCON format config file."},
+        NamespaceOptLine,
+        {"----------------------------------", "------------"},
+        {"conf load [--namespace <ns>] --replace|--merge <path>",
+            "Load a HOCON format config file."},
         {"", "The new configuration values will be overlaid on the existing values by default."},
         {"", "use the --replace flag to replace existing values with the new ones instead."},
         {"", "The current node will initiate a cluster wide config change"},
         {"", "transaction to sync the changes to other nodes in the cluster. "},
         {"", "NOTE: do not make runtime config changes during rolling upgrade."},
+        NamespaceOptLine,
+        {"----------------------------------", "------------"},
+        {"conf remove [--namespace <ns>] <conf-path>",
+            "Removes a config path (e.g. `a.b.c`) from the current config."},
+        NamespaceOptLine,
         {"----------------------------------", "------------"}
     ].
 
@@ -158,44 +293,107 @@ usage_sync() ->
             "WARNING: This results in inconsistent configs among the clustered nodes."},
         {"conf cluster_sync fast_forward [node] <ID>",
             "Fast-forward config change to the given commit ID on the given node.\n"
-            "WARNING: This results in inconsistent configs among the clustered nodes."}
+            "WARNING: This results in inconsistent configs among the clustered nodes."},
+        {"conf cluster_sync fix",
+            "Sync the node with the most comprehensive configuration to other node.\n"
+            "WARNING: typically the config leader(with the highest tnxid)."}
     ].
 
 status() ->
-    emqx_ctl:print("-----------------------------------------------\n"),
     {atomic, Status} = emqx_cluster_rpc:status(),
-    lists:foreach(
-        fun(S) ->
-            #{
-                node := Node,
-                tnx_id := TnxId,
-                mfa := {M, F, A},
-                created_at := CreatedAt
-            } = S,
-            emqx_ctl:print(
-                "~p:[~w] CreatedAt:~p ~p:~p/~w\n",
-                [Node, TnxId, CreatedAt, M, F, length(A)]
-            )
-        end,
-        Status
-    ),
+    status(Status).
+
+status(Status) ->
+    emqx_ctl:print("-----------------------------------------------\n"),
+    #{stopped_nodes := StoppedNodes} = emqx_mgmt_cli:cluster_info(),
+    maybe_fix_lagging(Status, #{fix => false}),
+    StoppedNodes =/= [] andalso emqx_ctl:warning("Found stopped nodes: ~p~n", [StoppedNodes]),
     emqx_ctl:print("-----------------------------------------------\n").
+
+maybe_fix_lagging(Status, #{fix := Fix}) ->
+    %% find inconsistent in conf, but fix in raw way.
+    %% because the raw conf is hard to be compared. (e.g, 1000ms vs 1s)
+    AllConfs = find_running_confs(),
+    case find_lagging(Status, AllConfs) of
+        {inconsistent_tnx_id_key, ToTxId, Target, InconsistentKeys} when Fix ->
+            _ = fix_lagging_with_raw(ToTxId, Target, InconsistentKeys),
+            ok;
+        {inconsistent_tnx_id_key, _ToTxId, Target, InconsistentKeys} ->
+            emqx_ctl:warning("Inconsistent keys: ~p~n", [InconsistentKeys]),
+            print_inconsistent_conf(InconsistentKeys, Target, Status, AllConfs);
+        {inconsistent_tnx_id, ToTxId, Target} when Fix ->
+            print_tx_id_status(Status),
+            maybe
+                ok ?= mark_fix_begin(Target, ToTxId),
+                ok ?= reload_all_namespaced_configs(),
+                waiting_for_fix_finish(),
+                emqx_ctl:print("Forward tnxid to ~w successfully~n", [ToTxId + 1])
+            end;
+        {inconsistent_tnx_id, _ToTxId, _Target} ->
+            print_tx_id_status(Status),
+            Leader = emqx_cluster_rpc:find_leader(),
+            emqx_ctl:print(?SUGGESTION(Leader));
+        {inconsistent_key, ToTxId, InconsistentKeys} ->
+            [{Target, _} | _] = AllConfs,
+            print_inconsistent_conf(InconsistentKeys, Target, Status, AllConfs),
+            emqx_ctl:warning("All configuration synchronized(tnx_id=~w)~n", [
+                ToTxId
+            ]),
+            emqx_ctl:warning(
+                "but inconsistent keys were found: ~p, which come from environment variables or etc/emqx.conf.~n",
+                [InconsistentKeys]
+            ),
+            emqx_ctl:warning(
+                "Configuring different values (excluding node.name) through environment variables and etc/emqx.conf"
+                " is allowed but not recommended.~n"
+            ),
+            Fix andalso emqx_ctl:warning("So this fix will not make any changes.~n"),
+            ok;
+        {consistent, Msg} ->
+            emqx_ctl:print(Msg)
+    end.
+
+print_tx_id_status(List0) ->
+    emqx_ctl:print("No inconsistent configuration found but has inconsistent tnxId ~n"),
+    List1 = lists:map(fun(#{node := Node, tnx_id := TxId}) -> {Node, TxId} end, List0),
+    emqx_ctl:print("~p~n", [List1]).
 
 print_keys(Keys) ->
     SortKeys = lists:sort(Keys),
     emqx_ctl:print("~1p~n", [[binary_to_existing_atom(K) || K <- SortKeys]]).
 
 print(Json) ->
-    emqx_ctl:print("~ts~n", [emqx_logger_jsonfmt:best_effort_json(Json)]).
+    emqx_ctl:print("~ts~n", [emqx_utils_json:best_effort_json(Json)]).
 
 print_hocon(Hocon) when is_map(Hocon) ->
     emqx_ctl:print("~ts~n", [hocon_pp:do(Hocon, #{})]);
+print_hocon(undefined) ->
+    emqx_ctl:print("No value~n", []);
 print_hocon({error, Error}) ->
     emqx_ctl:warning("~ts~n", [Error]).
 
+%% Deprecated RPC target (`emqx_conf_proto_v{3,4}`)
 get_config() ->
-    AllConf = fill_defaults(emqx:get_raw_config([])),
+    get_config_namespaced(?global_ns).
+
+%% Deprecated RPC target (`emqx_conf_proto_v{3,4}`)
+get_config(Key) ->
+    get_config_namespaced(?global_ns, Key).
+
+get_config_namespaced(Namespace) ->
+    AllConf = fill_defaults(get_raw_config(Namespace, [], #{})),
     drop_hidden_roots(AllConf).
+
+get_config_namespaced(Namespace, Key) ->
+    case get_raw_config(Namespace, [Key], undefined) of
+        undefined -> {error, "key_not_found"};
+        Value -> fill_defaults(#{Key => Value})
+    end.
+
+get_raw_config(Namespace, KeyPath, Default) when is_binary(Namespace) ->
+    emqx:get_raw_namespaced_config(Namespace, KeyPath, Default);
+get_raw_config(?global_ns, KeyPath, Default) ->
+    emqx:get_raw_config(KeyPath, Default).
 
 keys() ->
     emqx_config:get_root_names() -- hidden_roots().
@@ -208,62 +406,71 @@ hidden_roots() ->
         <<"trace">>,
         <<"stats">>,
         <<"broker">>,
-        <<"persistent_session_store">>,
-        <<"durable_sessions">>,
         <<"plugins">>,
         <<"zones">>
     ].
 
-get_config(Key) ->
-    case emqx:get_raw_config([Key], undefined) of
-        undefined -> {error, "key_not_found"};
-        Value -> fill_defaults(#{Key => Value})
-    end.
-
--define(OPTIONS, #{rawconf_with_defaults => true, override_to => cluster}).
-load_config(Path, Opts) when is_list(Path) ->
+read_hocon_file(Path) ->
     case hocon:files([Path]) of
         {ok, RawConf} when RawConf =:= #{} ->
-            emqx_ctl:warning("load ~ts is empty~n", [Path]),
-            {error, empty_hocon_file};
+            case filelib:is_regular(Path) of
+                true ->
+                    emqx_ctl:warning("load ~ts is empty~n", [Path]),
+                    {error, #{cause => empty_hocon_file, path => Path}};
+                false ->
+                    emqx_ctl:warning("~ts file is not found~n", [Path]),
+                    {error, #{cause => not_a_file, path => Path}}
+            end;
         {ok, RawConf} ->
-            load_config_from_raw(RawConf, Opts);
+            {ok, RawConf};
         {error, Reason} ->
             emqx_ctl:warning("load ~ts failed~n~p~n", [Path, Reason]),
             {error, bad_hocon_file}
-    end;
-load_config(Bin, Opts) when is_binary(Bin) ->
+    end.
+
+load_config(Namespace, Bin, Opts) when is_binary(Bin) ->
     case hocon:binary(Bin) of
         {ok, RawConf} ->
-            load_config_from_raw(RawConf, Opts);
+            load_config_from_raw(Namespace, RawConf, Opts);
+        %% Type is scan_error, parse_error...
+        {error, {Type, Meta = #{reason := Reason}}} ->
+            {error, Meta#{
+                reason => unicode:characters_to_binary(Reason),
+                type => Type
+            }};
         {error, Reason} ->
             {error, Reason}
     end.
 
-load_config_from_raw(RawConf0, Opts) ->
+load_config_from_raw(Namespace, RawConf0, Opts) ->
+    case Namespace of
+        ?global_ns ->
+            emqx_ctl:print("loading config for global namespace~n", []);
+        _ ->
+            emqx_ctl:print("loading config for namespace \"~s\"~n", [Namespace])
+    end,
     SchemaMod = emqx_conf:schema_module(),
     RawConf1 = emqx_config:upgrade_raw_conf(SchemaMod, RawConf0),
     case check_config(RawConf1, Opts) of
         {ok, RawConf} ->
-            %% It has been ensured that the connector is always the first configuration to be updated.
-            %% However, when deleting the connector, we need to clean up the dependent actions/sources first;
-            %% otherwise, the deletion will fail.
-            %% notice: we can't create a action/sources before connector.
-            uninstall(<<"actions">>, RawConf, Opts),
-            uninstall(<<"sources">>, RawConf, Opts),
-            Error =
-                lists:filtermap(
-                    fun({K, V}) ->
-                        case update_config_cluster(K, V, Opts) of
-                            ok -> false;
-                            {error, Msg} -> {true, Msg}
-                        end
-                    end,
-                    to_sorted_list(RawConf)
-                ),
-            case iolist_to_binary(Error) of
-                <<"">> -> ok;
-                ErrorBin -> {error, ErrorBin}
+            case update_cluster_links(cluster, RawConf, Namespace, Opts) of
+                ok ->
+                    %% It has been ensured that the connector is always the first
+                    %% configuration to be updated.
+                    %%
+                    %% However, when deleting the connector, we need to clean up the
+                    %% dependent actions/sources first; otherwise, the deletion will fail.
+                    %%
+                    %% Note: we can't create action/sources before connector.
+                    uninstall(<<"actions">>, RawConf, Namespace, Opts),
+                    uninstall(<<"sources">>, RawConf, Namespace, Opts),
+                    Error = update_config_cluster(Namespace, Opts, RawConf),
+                    case iolist_to_binary(Error) of
+                        <<"">> -> ok;
+                        ErrorBin -> {error, ErrorBin}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
             end;
         {error, ?UPDATE_READONLY_KEYS_PROHIBITED, ReadOnlyKeyStr} ->
             Reason = iolist_to_binary(
@@ -290,15 +497,50 @@ load_config_from_raw(RawConf0, Opts) ->
             {error, Errors}
     end.
 
-uninstall(ActionOrSource, Conf, #{mode := replace}) ->
+update_config_cluster(Namespace, Opts, RawConf) ->
+    lists:filtermap(
+        fun({K, V}) ->
+            case update_config_cluster(K, V, Namespace, Opts) of
+                ok -> false;
+                {error, Msg} -> {true, Msg}
+            end
+        end,
+        to_sorted_list(RawConf)
+    ).
+
+update_cluster_links(cluster, #{<<"cluster">> := #{<<"links">> := Links}}, Namespace, Opts) ->
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    Res = emqx_conf:update([<<"cluster">>, <<"links">>], Links, UpdateOpts),
+    check_res(<<"cluster.links">>, Res, Links, Opts);
+update_cluster_links(local, #{<<"cluster">> := #{<<"links">> := Links}}, Namespace, Opts) ->
+    UpdateOpts = with_namespace(?LOCAL_OPTIONS, Namespace),
+    Res = emqx:update_config([<<"cluster">>, <<"links">>], Links, UpdateOpts),
+    check_res(node(), <<"cluster.links">>, Res, Links, Opts);
+update_cluster_links(_, _, _, _) ->
+    ok.
+
+remove_config(Namespace, ConfPathStr) ->
+    ConfPath = hocon_util:split_path(ConfPathStr),
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    Res = emqx_conf:remove(ConfPath, UpdateOpts),
+    case Res of
+        {error, #{reason := {badkey, BadRootKey}}} ->
+            emqx_ctl:warning("Root key ~s not found ~n", [BadRootKey]);
+        {error, Reason} ->
+            emqx_ctl:warning("Error: ~p~n", [Reason]);
+        {ok, _} ->
+            emqx_ctl:print("ok~n")
+    end.
+
+uninstall(ActionOrSource, Conf, Namespace, #{mode := replace}) ->
     case maps:find(ActionOrSource, Conf) of
         {ok, New} ->
-            Old = emqx_conf:get_raw([ActionOrSource], #{}),
+            Old = get_raw_config(Namespace, [ActionOrSource], #{}),
             ActionOrSourceAtom = binary_to_existing_atom(ActionOrSource),
             #{removed := Removed} = emqx_bridge_v2:diff_confs(New, Old),
             maps:foreach(
                 fun({Type, Name}, _) ->
-                    case emqx_bridge_v2:remove(ActionOrSourceAtom, Type, Name) of
+                    case emqx_bridge_v2:remove(Namespace, ActionOrSourceAtom, Type, Name) of
                         ok ->
                             ok;
                         {error, Reason} ->
@@ -316,32 +558,64 @@ uninstall(ActionOrSource, Conf, #{mode := replace}) ->
             ok
     end;
 %% we don't delete things when in merge mode or without actions/sources key.
-uninstall(_, _RawConf, _) ->
+uninstall(_, _RawConf, _Namespace, _) ->
     ok.
 
 update_config_cluster(
     ?EMQX_AUTHORIZATION_CONFIG_ROOT_NAME_BINARY = Key,
     Conf,
+    _Namespace,
     #{mode := merge} = Opts
 ) ->
+    %% Currently, authn/authz are not namespaced roots.
     check_res(Key, emqx_authz:merge(Conf), Conf, Opts);
 update_config_cluster(
     ?EMQX_AUTHENTICATION_CONFIG_ROOT_NAME_BINARY = Key,
     Conf,
+    _Namespace,
     #{mode := merge} = Opts
 ) ->
+    %% Currently, authn/authz are not namespaced roots.
     check_res(Key, emqx_authn:merge_config(Conf), Conf, Opts);
-update_config_cluster(?SCHEMA_VALIDATION_CONF_ROOT_BIN = Key, NewConf, #{mode := merge} = Opts) ->
-    check_res(Key, emqx_conf:update([Key], {merge, NewConf}, ?OPTIONS), NewConf, Opts);
-update_config_cluster(?SCHEMA_VALIDATION_CONF_ROOT_BIN = Key, NewConf, #{mode := replace} = Opts) ->
-    check_res(Key, emqx_conf:update([Key], {replace, NewConf}, ?OPTIONS), NewConf, Opts);
-update_config_cluster(Key, NewConf, #{mode := merge} = Opts) ->
+update_config_cluster(
+    ?SCHEMA_VALIDATION_CONF_ROOT_BIN = Key, NewConf, Namespace, #{mode := merge} = Opts
+) ->
+    %% Currently not a namespaced root, but nevertheless adding the option for consistency.
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    check_res(Key, emqx_conf:update([Key], {merge, NewConf}, UpdateOpts), NewConf, Opts);
+update_config_cluster(
+    ?SCHEMA_VALIDATION_CONF_ROOT_BIN = Key, NewConf, Namespace, #{mode := replace} = Opts
+) ->
+    %% Currently not a namespaced root, but nevertheless adding the option for consistency.
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    check_res(Key, emqx_conf:update([Key], {replace, NewConf}, UpdateOpts), NewConf, Opts);
+update_config_cluster(
+    ?MESSAGE_TRANSFORMATION_CONF_ROOT_BIN = Key, NewConf, Namespace, #{mode := merge} = Opts
+) ->
+    %% Currently not a namespaced root, but nevertheless adding the option for consistency.
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    check_res(Key, emqx_conf:update([Key], {merge, NewConf}, UpdateOpts), NewConf, Opts);
+update_config_cluster(
+    ?MESSAGE_TRANSFORMATION_CONF_ROOT_BIN = Key, NewConf, Namespace, #{mode := replace} = Opts
+) ->
+    %% Currently not a namespaced root, but nevertheless adding the option for consistency.
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    check_res(Key, emqx_conf:update([Key], {replace, NewConf}, UpdateOpts), NewConf, Opts);
+update_config_cluster(?CONNECTORS_CONF_ROOT_BIN = Key, NewConf, Namespace, #{mode := merge} = Opts) ->
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
     Merged = merge_conf(Key, NewConf),
-    check_res(Key, emqx_conf:update([Key], Merged, ?OPTIONS), NewConf, Opts);
-update_config_cluster(Key, Value, #{mode := replace} = Opts) ->
-    check_res(Key, emqx_conf:update([Key], Value, ?OPTIONS), Value, Opts).
+    check_res(Key, emqx_conf:update([Key], {async_start, Merged}, UpdateOpts), NewConf, Opts);
+update_config_cluster(?CONNECTORS_CONF_ROOT_BIN = Key, Value, Namespace, #{mode := replace} = Opts) ->
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    check_res(Key, emqx_conf:update([Key], {async_start, Value}, UpdateOpts), Value, Opts);
+update_config_cluster(Key, NewConf, Namespace, #{mode := merge} = Opts) ->
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    Merged = merge_conf(Key, NewConf),
+    check_res(Key, emqx_conf:update([Key], Merged, UpdateOpts), NewConf, Opts);
+update_config_cluster(Key, Value, Namespace, #{mode := replace} = Opts) ->
+    UpdateOpts = with_namespace(?OPTIONS, Namespace),
+    check_res(Key, emqx_conf:update([Key], Value, UpdateOpts), Value, Opts).
 
--define(LOCAL_OPTIONS, #{rawconf_with_defaults => true, persistent => false}).
 update_config_local(
     ?EMQX_AUTHORIZATION_CONFIG_ROOT_NAME_BINARY = Key,
     Conf,
@@ -401,21 +675,20 @@ suggest_msg(_, _) ->
     <<"">>.
 
 check_config(Conf0, Opts) ->
-    case check_keys_is_not_readonly(Conf0, Opts) of
-        {ok, Conf1} ->
-            Conf = emqx_config:fill_defaults(Conf1),
-            case check_config_schema(Conf) of
-                ok -> {ok, Conf};
-                {error, Reason} -> {error, Reason}
-            end;
-        Error ->
-            Error
+    maybe
+        {ok, Conf1} ?= check_keys_is_not_readonly(Conf0, Opts),
+        {ok, Conf2} ?= check_cluster_keys(Conf1, Opts),
+        Conf3 = emqx_config:fill_defaults(Conf2),
+        ok ?= check_config_schema(Conf3),
+        {ok, Conf3}
+    else
+        Error -> Error
     end.
 
 check_keys_is_not_readonly(Conf, Opts) ->
     IgnoreReadonly = maps:get(ignore_readonly, Opts, false),
     Keys = maps:keys(Conf),
-    ReadOnlyKeys = [atom_to_binary(K) || K <- ?READONLY_KEYS],
+    ReadOnlyKeys = [atom_to_binary(K) || K <- ?READONLY_ROOT_KEYS],
     case lists:filter(fun(K) -> lists:member(K, Keys) end, ReadOnlyKeys) of
         [] ->
             {ok, Conf};
@@ -426,6 +699,22 @@ check_keys_is_not_readonly(Conf, Opts) ->
             BadKeysStr = lists:join(<<",">>, BadKeys),
             {error, ?UPDATE_READONLY_KEYS_PROHIBITED, BadKeysStr}
     end.
+
+check_cluster_keys(Conf = #{<<"cluster">> := Cluster}, Opts) ->
+    IgnoreReadonly = maps:get(ignore_readonly, Opts, false),
+    case maps:keys(Cluster) -- [<<"links">>] of
+        [] ->
+            {ok, Conf};
+        Keys when IgnoreReadonly ->
+            ?SLOG(info, #{msg => "readonly_root_keys_ignored", keys => Keys}),
+            {ok, Conf#{<<"cluster">> => maps:with([<<"links">>], Cluster)}};
+        Keys ->
+            BadKeys = [<<"cluster.", K/binary>> || K <- Keys],
+            BadKeysStr = lists:join(<<",">>, BadKeys),
+            {error, ?UPDATE_READONLY_KEYS_PROHIBITED, BadKeysStr}
+    end;
+check_cluster_keys(Conf, _Opts) ->
+    {ok, Conf}.
 
 check_config_schema(Conf) ->
     SchemaMod = emqx_conf:schema_module(),
@@ -485,8 +774,7 @@ filter_readonly_config(Raw) ->
     try
         RawDefault = fill_defaults(Raw),
         _ = emqx_config:check_config(SchemaMod, RawDefault),
-        ReadOnlyKeys = [atom_to_binary(K) || K <- ?READONLY_KEYS],
-        {ok, maps:without(ReadOnlyKeys, Raw)}
+        {ok, maps:without([atom_to_binary(K) || K <- ?READONLY_ROOT_KEYS], Raw)}
     catch
         throw:Error ->
             ?SLOG(error, #{
@@ -497,23 +785,31 @@ filter_readonly_config(Raw) ->
     end.
 
 reload_config(AllConf, Opts) ->
-    uninstall(<<"actions">>, AllConf, Opts),
-    uninstall(<<"sources">>, AllConf, Opts),
-    Fold = fun({Key, Conf}, Acc) ->
-        case update_config_local(Key, Conf, Opts) of
-            ok ->
-                Acc;
-            Error ->
-                ?SLOG(error, #{
-                    msg => "failed_to_reload_etc_config",
-                    key => Key,
-                    value => Conf,
-                    error => Error
-                }),
-                [{Key, Error} | Acc]
-        end
-    end,
-    sorted_fold(Fold, AllConf).
+    %% Since the reload operation is about reading "etc/emqx.conf", it pertains to the
+    %% global namespace.
+    Namespace = ?global_ns,
+    case update_cluster_links(local, AllConf, Namespace, Opts) of
+        ok ->
+            uninstall(<<"actions">>, AllConf, Namespace, Opts),
+            uninstall(<<"sources">>, AllConf, Namespace, Opts),
+            Fold = fun({Key, Conf}, Acc) ->
+                case update_config_local(Key, Conf, Opts) of
+                    ok ->
+                        Acc;
+                    Error ->
+                        ?SLOG(error, #{
+                            msg => "failed_to_reload_etc_config",
+                            key => Key,
+                            value => Conf,
+                            error => Error
+                        }),
+                        [{Key, Error} | Acc]
+                end
+            end,
+            sorted_fold(Fold, AllConf);
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 sorted_fold(Func, Conf) ->
     case lists:foldl(Func, [], to_sorted_list(Conf)) of
@@ -522,10 +818,11 @@ sorted_fold(Func, Conf) ->
     end.
 
 to_sorted_list(Conf0) ->
-    %% connectors > actions/bridges > rule_engine
-    Keys = [<<"connectors">>, <<"actions">>, <<"bridges">>, <<"rule_engine">>],
-    {HighPriorities, Conf1} = split_high_priority_conf(Keys, Conf0, []),
-    HighPriorities ++ lists:keysort(1, maps:to_list(Conf1)).
+    Conf1 = maps:remove(<<"cluster">>, Conf0),
+    %% connectors > actions/bridges/sources > rule_engine
+    Keys = [<<"connectors">>, <<"actions">>, <<"sources">>, <<"bridges">>, <<"rule_engine">>],
+    {HighPriorities, Conf2} = split_high_priority_conf(Keys, Conf1, []),
+    HighPriorities ++ lists:keysort(1, maps:to_list(Conf2)).
 
 split_high_priority_conf([], Conf0, Acc) ->
     {lists:reverse(Acc), Conf0};
@@ -573,3 +870,313 @@ warning(_, Format, Args) -> emqx_ctl:warning(Format, Args).
 
 print(#{log := none}, _, _) -> ok;
 print(_, Format, Args) -> emqx_ctl:print(Format, Args).
+
+waiting_for_fix_finish() ->
+    timer:sleep(1000),
+    waiting_for_sync_finish(1).
+
+waiting_for_sync_finish(10) ->
+    emqx_ctl:warning(
+        "Config is still not in sync after 10s.~n"
+        "It may need more time, and check the logs in the lagging nodes.~n"
+    );
+waiting_for_sync_finish(Sec) ->
+    {atomic, Status} = emqx_cluster_rpc:status(),
+    case lists:usort([TxId || #{tnx_id := TxId} <- Status]) of
+        [_] ->
+            emqx_ctl:warning("sync successfully in ~ws ~n", [Sec]);
+        _ ->
+            Res = lists:sort([{TxId, Node} || #{node := Node, tnx_id := TxId} <- Status]),
+            emqx_ctl:warning("sync status: ~p~n", [Res]),
+            timer:sleep(1000),
+            waiting_for_sync_finish(Sec + 1)
+    end.
+
+find_lagging(Status, AllConfs) ->
+    case find_highest_node(Status) of
+        {same_tnx_id, TxId} ->
+            %% check the conf is the same or not
+            [{_, TargetConf} | OtherConfs] = AllConfs,
+            case find_inconsistent_key(TargetConf, OtherConfs) of
+                [] ->
+                    Msg =
+                        <<"All configuration synchronized(tnx_id=",
+                            (integer_to_binary(TxId))/binary, ") successfully\n">>,
+                    {consistent, Msg};
+                InconsistentKeys ->
+                    {inconsistent_key, TxId, InconsistentKeys}
+            end;
+        {ok, TargetId, Target} ->
+            {value, {_, TargetConf}, OtherConfs} = lists:keytake(Target, 1, AllConfs),
+            case find_inconsistent_key(TargetConf, OtherConfs) of
+                [] -> {inconsistent_tnx_id, TargetId, Target};
+                ChangedKeys -> {inconsistent_tnx_id_key, TargetId, Target, ChangedKeys}
+            end
+    end.
+
+find_inconsistent_key(TargetConf, OtherConfs) ->
+    lists:usort(
+        lists:foldl(
+            fun({_Node, OtherConf}, Changed) ->
+                lists:filtermap(
+                    fun({K, V}) -> changed(K, V, TargetConf) end,
+                    maps:to_list(OtherConf)
+                ) ++ Changed
+            end,
+            [],
+            OtherConfs
+        )
+    ).
+
+find_highest_node([]) ->
+    {same_tnx_id, 0};
+find_highest_node(Status) ->
+    Ids = [{Id, Node} || #{tnx_id := Id, node := Node} <- Status],
+    case lists:usort(fun({A, _}, {B, _}) -> A >= B end, Ids) of
+        [{TxId, _}] ->
+            {same_tnx_id, TxId};
+        [{TxId, Target} | _] ->
+            {ok, TxId, Target}
+    end.
+
+changed(K, V, Conf) ->
+    case maps:find(K, Conf) of
+        {ok, V1} when V =:= V1 -> false;
+        _ -> {true, K}
+    end.
+
+%% We only need to consult the global config for individual nodes, as namespaced raw
+%% config is already replicated by mnesia (the checked configuration and the pre/post
+%% config update side effects might still be lagging, though).
+find_running_confs() ->
+    lists:map(
+        fun(Node) ->
+            Conf = emqx_conf_proto_v5:get_config(Node, ?global_ns, []),
+            {Node, maps:without(?READONLY_ROOT_KEYS, Conf)}
+        end,
+        emqx_bpapi:nodes_supporting_bpapi_version(?BPAPI_NAME, 5)
+    ).
+
+print_inconsistent_conf(Keys, Target, Status, AllConfs) ->
+    {value, {_, TargetConf}, OtherConfs} = lists:keytake(Target, 1, AllConfs),
+    TargetTxId = get_tnx_id(Target, Status),
+    lists:foreach(
+        fun(Key) ->
+            lists:foreach(
+                fun({Node, OtherConf}) ->
+                    TargetV = maps:get(Key, TargetConf, undefined),
+                    PrevV = maps:get(Key, OtherConf, undefined),
+                    NodeTxId = get_tnx_id(Node, Status),
+                    Options = #{
+                        key => Key,
+                        node => {Node, NodeTxId},
+                        target => {Target, TargetTxId}
+                    },
+                    print_inconsistent_conf(TargetV, PrevV, Options)
+                end,
+                OtherConfs
+            )
+        end,
+        Keys
+    ).
+
+get_tnx_id(Node, Status) ->
+    case lists:filter(fun(#{node := Node0}) -> Node0 =:= Node end, Status) of
+        [] -> 0;
+        [#{tnx_id := TxId}] -> TxId
+    end.
+
+print_inconsistent_conf(SameConf, SameConf, _Options) ->
+    ok;
+print_inconsistent_conf(New = #{}, Old = #{}, Options) ->
+    #{
+        added := Added,
+        removed := Removed,
+        changed := Changed
+    } = emqx_utils_maps:diff_maps(New, Old),
+    RemovedFmt = "~ts(~w)'s ~s has deleted certain keys, but they are still present on ~ts(~w).~n",
+    print_inconsistent(Removed, RemovedFmt, Options),
+    AddedFmt = "~ts(~w)'s ~s has new setting, but it has not been applied to ~ts(~w).~n",
+    print_inconsistent(Added, AddedFmt, Options),
+    ChangedFmt =
+        "~ts(~w)'s ~s has been updated, but the changes have not been applied to ~ts(~w).~n",
+    print_inconsistent(Changed, ChangedFmt, Options);
+%% authentication rewrite topic_metrics is list(not map).
+print_inconsistent_conf(New, Old, Options) ->
+    #{
+        key := Key,
+        target := {Target, TargetTxId},
+        node := {Node, NodeTxId}
+    } = Options,
+    emqx_ctl:print("~ts(tnx_id=~w)'s ~s is different from ~ts(tnx_id=~w).~n", [
+        Node, NodeTxId, Key, Target, TargetTxId
+    ]),
+    emqx_ctl:print("~ts:~n", [Node]),
+    print_hocon(Old),
+    emqx_ctl:print("~ts:~n", [Target]),
+    print_hocon(New).
+
+print_inconsistent(Conf, Fmt, Options) when Conf =/= #{} ->
+    #{
+        key := Key,
+        target := {Target, TargetTxId},
+        node := {Node, NodeTxId}
+    } = Options,
+    emqx_ctl:warning(Fmt, [Target, TargetTxId, Key, Node, NodeTxId]),
+    NodeRawConf = emqx_conf_proto_v5:get_raw_config(Node, ?global_ns, [Key]),
+    TargetRawConf = emqx_conf_proto_v5:get_raw_config(Target, ?global_ns, [Key]),
+    {NodeConf, TargetConf} =
+        maps:fold(
+            fun(SubKey, _, {NewAcc, OldAcc}) ->
+                SubNew0 = maps:get(atom_to_binary(SubKey), NodeRawConf, undefined),
+                SubOld0 = maps:get(atom_to_binary(SubKey), TargetRawConf, undefined),
+                {SubNew1, SubOld1} = remove_identical_value(SubNew0, SubOld0),
+                {NewAcc#{SubKey => SubNew1}, OldAcc#{SubKey => SubOld1}}
+            end,
+            {#{}, #{}},
+            Conf
+        ),
+    %% zones.default is a virtual zone. It will be changed when mqtt changes,
+    %% so we can't retrieve the raw data for zones.default(always undefined).
+    case TargetConf =:= NodeConf of
+        true -> ok;
+        false -> print_hocon(#{Target => #{Key => TargetConf}, Node => #{Key => NodeConf}})
+    end;
+print_inconsistent(_Conf, _Format, _Options) ->
+    ok.
+
+remove_identical_value(New = #{}, Old = #{}) ->
+    maps:fold(
+        fun(K, NewV, {Acc1, Acc2}) ->
+            case maps:find(K, Old) of
+                {ok, NewV} ->
+                    {maps:remove(K, Acc1), maps:remove(K, Acc2)};
+                {ok, OldV} ->
+                    {NewV1, OldV1} = remove_identical_value(NewV, OldV),
+                    {maps:put(K, NewV1, Acc1), maps:put(K, OldV1, Acc2)}
+            end
+        end,
+        {New, Old},
+        New
+    );
+remove_identical_value(New, Old) ->
+    {New, Old}.
+
+show_args(Args) ->
+    maybe
+        {ok, Collected} ?= collect_conf_args(Args),
+        case Collected of
+            #{?single_arg := Key} ->
+                Namespace = maps:get("--namespace", Collected, ?global_ns),
+                {ok, #{?key => Key, ?namespace => Namespace}};
+            #{} ->
+                Namespace = maps:get("--namespace", Collected, ?global_ns),
+                {ok, #{?key => all, ?namespace => Namespace}}
+        end
+    end.
+
+load_args(Args) ->
+    maybe
+        {ok, Collected} ?= collect_conf_args(Args),
+        #{?single_arg := Path} = Collected,
+        Namespace = maps:get("--namespace", Collected, ?global_ns),
+        Mode = maps:get(?mode, Collected, merge),
+        {ok, RawConf} ?= read_hocon_file(Path),
+        {ok, #{?raw_config => RawConf, ?namespace => Namespace, ?mode => Mode}}
+    end.
+
+remove_args(Args) ->
+    maybe
+        {ok, Collected} ?= collect_conf_args(Args),
+        #{?single_arg := Path} = Collected,
+        Namespace = maps:get("--namespace", Collected, ?global_ns),
+        {ok, #{?path => Path, ?namespace => Namespace}}
+    end.
+
+collect_conf_args(Args) ->
+    do_collect_conf_args(Args, #{}).
+
+do_collect_conf_args([], Acc) ->
+    {ok, Acc};
+%% Load/reload
+do_collect_conf_args(["--merge" | Rest], Acc) ->
+    do_collect_conf_args(Rest, Acc#{?mode => merge});
+do_collect_conf_args(["--replace" | Rest], Acc) ->
+    do_collect_conf_args(Rest, Acc#{?mode => replace});
+%% Common
+do_collect_conf_args([KeyOrPath], Acc) when KeyOrPath /= "--namespace" ->
+    do_collect_conf_args([], Acc#{?single_arg => bin(KeyOrPath)});
+do_collect_conf_args(["--namespace", Namespace | Rest], Acc) ->
+    do_collect_conf_args(Rest, Acc#{"--namespace" => bin(Namespace)});
+do_collect_conf_args(Args, _Acc) ->
+    {error, lists:flatten(io_lib:format("bad arguments: ~p", [Args]))}.
+
+vararg_len_error_msg({Min, Max}, VarargLen) ->
+    lists:flatten(
+        io_lib:format(
+            "expected ~b - ~b positional arguments, got ~b",
+            [Min, Max, VarargLen]
+        )
+    ).
+
+bin(X) -> emqx_utils_conv:bin(X).
+
+with_namespace(UpdateOpts, ?global_ns) ->
+    UpdateOpts;
+with_namespace(UpdateOpts, Namespace) when is_binary(Namespace) ->
+    UpdateOpts#{namespace => Namespace}.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+find_inconsistent_test() ->
+    Status = [
+        #{node => 'node1', tnx_id => 1},
+        #{node => 'node2', tnx_id => 3},
+        #{node => 'node3', tnx_id => 2}
+    ],
+    Stats = #{<<"enable">> => false},
+
+    %% chose the highest tnx_id node
+    Mqtt = #{
+        <<"await_rel_timeout">> => <<"300s">>,
+        <<"exclusive_subscription">> => false,
+        <<"idle_timeout">> => <<"15s">>
+    },
+    TargetMqtt1 = Mqtt#{<<"idle_timeout">> => <<"16s">>},
+    Confs0 = [
+        {node1, #{<<"mqtt">> => Mqtt#{<<"idle_timeout">> => <<"11s">>}, <<"stats">> => Stats}},
+        {node3, #{<<"mqtt">> => Mqtt#{<<"idle_timeout">> => <<"17s">>}, <<"stats">> => Stats}},
+        {node2, #{<<"mqtt">> => TargetMqtt1, <<"stats">> => Stats}}
+    ],
+    ?assertEqual(
+        {inconsistent_tnx_id_key, 3, node2, [<<"mqtt">>]}, find_lagging(Status, Confs0)
+    ),
+
+    %% conf is the same, no changed
+    NoDiffConfs = [
+        {node1, #{<<"mqtt">> => Mqtt, <<"stats">> => Stats}},
+        {node2, #{<<"mqtt">> => Mqtt, <<"stats">> => Stats}},
+        {node3, #{<<"mqtt">> => Mqtt, <<"stats">> => Stats}}
+    ],
+    ?assertEqual({inconsistent_tnx_id, 3, node2}, find_lagging(Status, NoDiffConfs)),
+
+    %% same tnx_id
+    SameStatus = [
+        #{node => 'node1', tnx_id => 3},
+        #{node => 'node2', tnx_id => 3},
+        #{node => 'node3', tnx_id => 3}
+    ],
+    %% same conf
+    ?assertEqual(
+        {consistent, <<"All configuration synchronized(tnx_id=3) successfully\n">>},
+        find_lagging(SameStatus, NoDiffConfs)
+    ),
+    %% diff conf same tnx_id use the first one
+    ?assertEqual(
+        {inconsistent_key, 3, [<<"mqtt">>]},
+        find_lagging(SameStatus, Confs0)
+    ),
+    ok.
+
+-endif.

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_schema).
@@ -28,7 +16,6 @@
 
 -export([
     authz_fields/0,
-    api_authz_fields/0,
     api_source_type/0,
     source_types/0
 ]).
@@ -39,7 +26,9 @@
 
 -export([
     default_authz/0,
-    authz_common_fields/1
+    authz_common_fields/1,
+    sources_fields/0,
+    node_cache_fields/0
 ]).
 
 -ifdef(TEST).
@@ -53,10 +42,11 @@
 %%--------------------------------------------------------------------
 
 -type schema_ref() :: ?R_REF(module(), hocon_schema:name()).
-
+-type source_refs_type() :: source_refs | api_source_refs.
 -callback type() -> emqx_authz_source:source_type().
 -callback source_refs() -> [schema_ref()].
--callback select_union_member(emqx_config:raw_config()) -> schema_ref() | undefined | no_return().
+-callback select_union_member(emqx_config:raw_config(), source_refs_type()) ->
+    schema_ref() | undefined | no_return().
 -callback fields(hocon_schema:name()) -> [hocon_schema:field()].
 -callback api_source_refs() -> [schema_ref()].
 
@@ -88,6 +78,7 @@ fields("metrics_status_fields") ->
 fields("metrics") ->
     [
         {"total", ?HOCON(integer(), #{desc => ?DESC("metrics_total")})},
+        {"ignore", ?HOCON(integer(), #{desc => ?DESC("ignore")})},
         {"allow", ?HOCON(integer(), #{desc => ?DESC("allow")})},
         {"deny", ?HOCON(integer(), #{desc => ?DESC("deny")})},
         {"nomatch", ?HOCON(float(), #{desc => ?DESC("nomatch")})}
@@ -133,13 +124,24 @@ injected_fields(AuthzSchemaMods) ->
     }.
 
 authz_fields() ->
+    sources_fields() ++ node_cache_fields().
+
+sources_fields() ->
     AuthzSchemaMods = source_schema_mods(),
     AllTypes = lists:concat([Mod:source_refs() || Mod <- AuthzSchemaMods]),
     UnionMemberSelector =
         fun
-            (all_union_members) -> AllTypes;
+            (all_union_members) ->
+                AllTypes;
             %% must return list
-            ({value, Value}) -> [select_union_member(Value, AuthzSchemaMods)]
+            ({value, Value}) ->
+                [
+                    select_union_member(
+                        Value,
+                        AuthzSchemaMods,
+                        source_refs
+                    )
+                ]
         end,
     [
         {sources,
@@ -157,19 +159,47 @@ authz_fields() ->
             )}
     ].
 
-api_authz_fields() ->
-    [{sources, ?HOCON(?ARRAY(api_source_type()), #{desc => ?DESC(sources)})}].
+node_cache_fields() ->
+    [
+        {node_cache,
+            ?HOCON(
+                ?R_REF(emqx_auth_cache_schema, config),
+                #{
+                    desc => ?DESC("node_cache"),
+                    importance => ?IMPORTANCE_LOW,
+                    default => emqx_auth_cache_schema:default_config()
+                }
+            )}
+    ].
 
 api_source_type() ->
-    hoconsc:union(api_authz_refs()).
-
-api_authz_refs() ->
-    lists:concat([api_source_refs(Mod) || Mod <- source_schema_mods()]).
+    AuthzSchemaMods = source_schema_mods(),
+    AllTypes = lists:concat([api_source_refs(Mod) || Mod <- AuthzSchemaMods]),
+    UnionMemberSelector =
+        fun
+            (all_union_members) ->
+                AllTypes;
+            %% must return list
+            ({value, Value}) ->
+                [
+                    select_union_member(
+                        Value,
+                        AuthzSchemaMods,
+                        api_source_refs
+                    )
+                ]
+        end,
+    hoconsc:union(UnionMemberSelector).
 
 authz_common_fields(Type) ->
     [
         {type, ?HOCON(Type, #{required => true, desc => ?DESC(type)})},
-        {enable, ?HOCON(boolean(), #{default => true, desc => ?DESC(enable)})}
+        {enable,
+            ?HOCON(boolean(), #{
+                default => true,
+                importance => ?IMPORTANCE_NO_DOC,
+                desc => ?DESC(enable)
+            })}
     ].
 
 source_types() ->
@@ -180,10 +210,10 @@ source_types() ->
 %%--------------------------------------------------------------------
 
 api_source_refs(Mod) ->
-    try
-        Mod:api_source_refs()
-    catch
-        error:undef ->
+    case erlang:function_exported(Mod, api_source_refs, 0) of
+        true ->
+            Mod:api_source_refs();
+        _ ->
             Mod:source_refs()
     end.
 
@@ -211,19 +241,19 @@ array(Ref) -> array(Ref, Ref).
 array(Ref, DescId) ->
     ?HOCON(?ARRAY(?R_REF(Ref)), #{desc => ?DESC(DescId)}).
 
-select_union_member(#{<<"type">> := Type}, []) ->
+select_union_member(#{<<"type">> := Type}, [], _Type) ->
     throw(#{
         reason => "unknown_authz_type",
         got => Type
     });
-select_union_member(#{<<"type">> := _} = Value, [Mod | Mods]) ->
-    case Mod:select_union_member(Value) of
+select_union_member(#{<<"type">> := _} = Value, [Mod | Mods], Type) ->
+    case Mod:select_union_member(Value, Type) of
         undefined ->
-            select_union_member(Value, Mods);
+            select_union_member(Value, Mods, Type);
         Member ->
             Member
     end;
-select_union_member(_Value, _Mods) ->
+select_union_member(_Value, _Mods, _Type) ->
     throw("missing_type_field").
 
 default_authz() ->

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -87,7 +87,7 @@ mk_meta_fun(#s{api = API, version = Vsn, targets = Targets}) ->
     Line = 0,
     Calls = [{From, To} || {call, From, To} <- Targets],
     Casts = [{From, To} || {cast, From, To} <- Targets],
-    Ret = typerefl_quote:const(Line, #{
+    Ret = erlang_qq:const(Line, #{
         api => API,
         version => Vsn,
         calls => Calls,

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %%--------------------------------------------------------------------
@@ -87,8 +75,9 @@
     deliver/3,
     replay/3,
     handle_timeout/3,
+    handle_info/3,
     disconnect/2,
-    terminate/2
+    terminate/3
 ]).
 
 -export([
@@ -103,7 +92,12 @@
     enqueue/3,
     dequeue/2,
     replay/2,
-    dedup/4
+    dedup/2
+]).
+
+%% Eviction agent channel
+-export([
+    replay_enqueue/4
 ]).
 
 %% Will message handling
@@ -131,7 +125,7 @@
 }).
 
 -type session() :: #session{}.
--type replayctx() :: [emqx_types:message()].
+-type replayctx() :: _TakeoverState.
 
 -type message() :: emqx_types:message().
 -type clientinfo() :: emqx_types:clientinfo().
@@ -216,15 +210,10 @@ open(ClientInfo = #{clientid := ClientId}, ConnInfo, _MaybeWillMsg, Conf) ->
     case emqx_cm:takeover_session_begin(ClientId) of
         {ok, SessionRemote, TakeoverState} ->
             Session0 = resume(ClientInfo, SessionRemote),
-            case emqx_cm:takeover_session_end(TakeoverState) of
-                {ok, Pendings} ->
-                    Session1 = resize_inflight(ConnInfo, Session0),
-                    Session = apply_conf(Conf, Session1),
-                    clean_session(ClientInfo, Session, Pendings);
-                {error, _} ->
-                    % TODO log error?
-                    false
-            end;
+            Session1 = resize_inflight(ConnInfo, Session0),
+            Session2 = apply_conf(Conf, Session1),
+            Session = fliter_remote_session(Session2),
+            {true, Session, TakeoverState};
         none ->
             false
     end.
@@ -243,12 +232,9 @@ apply_conf(Conf, Session = #session{}) ->
         await_rel_timeout = maps:get(await_rel_timeout, Conf)
     }.
 
-clean_session(ClientInfo, Session = #session{mqueue = Q}, Pendings) ->
+fliter_remote_session(Session = #session{mqueue = Q}) ->
     Q1 = emqx_mqueue:filter(fun emqx_session:should_keep/1, Q),
-    Session1 = Session#session{mqueue = Q1},
-    Pendings1 = emqx_session:enrich_delivers(ClientInfo, Pendings, Session),
-    Pendings2 = lists:filter(fun emqx_session:should_keep/1, Pendings1),
-    {true, Session1, Pendings2}.
+    Session#session{mqueue = Q1}.
 
 %%--------------------------------------------------------------------
 %% Info, Stats
@@ -404,11 +390,13 @@ is_awaiting_full(#session{
     | {error, emqx_types:reason_code()}.
 puback(ClientInfo, PacketId, Session = #session{inflight = Inflight}) ->
     case emqx_inflight:lookup(PacketId, Inflight) of
-        {value, #inflight_data{phase = wait_ack, message = Msg}} ->
+        {value, #inflight_data{phase = wait_ack, message = #message{qos = ?QOS_1} = Msg}} ->
             Inflight1 = emqx_inflight:delete(PacketId, Inflight),
             Session1 = Session#session{inflight = Inflight1},
             {ok, Replies, Session2} = dequeue(ClientInfo, Session1),
             {ok, without_inflight_insert_ts(Msg), Replies, Session2};
+        {value, #inflight_data{phase = wait_ack, message = _DifferentQoSMsg}} ->
+            {error, ?RC_PROTOCOL_ERROR};
         {value, _} ->
             {error, ?RC_PACKET_IDENTIFIER_IN_USE};
         none ->
@@ -424,10 +412,12 @@ puback(ClientInfo, PacketId, Session = #session{inflight = Inflight}) ->
     | {error, emqx_types:reason_code()}.
 pubrec(PacketId, Session = #session{inflight = Inflight}) ->
     case emqx_inflight:lookup(PacketId, Inflight) of
-        {value, #inflight_data{phase = wait_ack, message = Msg} = Data} ->
+        {value, #inflight_data{phase = wait_ack, message = #message{qos = ?QOS_2} = Msg} = Data} ->
             Update = Data#inflight_data{phase = wait_comp},
             Inflight1 = emqx_inflight:update(PacketId, Update, Inflight),
             {ok, without_inflight_insert_ts(Msg), Session#session{inflight = Inflight1}};
+        {value, #inflight_data{phase = wait_ack, message = _DifferentQoSMsg}} ->
+            {error, ?RC_PROTOCOL_ERROR};
         {value, _} ->
             {error, ?RC_PACKET_IDENTIFIER_IN_USE};
         none ->
@@ -459,11 +449,13 @@ pubrel(PacketId, Session = #session{awaiting_rel = AwaitingRel}) ->
     | {error, emqx_types:reason_code()}.
 pubcomp(ClientInfo, PacketId, Session = #session{inflight = Inflight}) ->
     case emqx_inflight:lookup(PacketId, Inflight) of
-        {value, #inflight_data{phase = wait_comp, message = Msg}} ->
+        {value, #inflight_data{phase = wait_comp, message = #message{qos = ?QOS_2} = Msg}} ->
             Inflight1 = emqx_inflight:delete(PacketId, Inflight),
             Session1 = Session#session{inflight = Inflight1},
             {ok, Replies, Session2} = dequeue(ClientInfo, Session1),
             {ok, without_inflight_insert_ts(Msg), Replies, Session2};
+        {value, #inflight_data{message = #message{qos = QoS}}} when QoS =/= ?QOS_2 ->
+            {error, ?RC_PROTOCOL_ERROR};
         {value, _Other} ->
             {error, ?RC_PACKET_IDENTIFIER_IN_USE};
         none ->
@@ -557,23 +549,24 @@ enqueue(ClientInfo, Msgs, Session) when is_list(Msgs) ->
         Msgs
     ).
 
-enqueue_msg(ClientInfo, #message{qos = QOS} = Msg, Session = #session{mqueue = Q}) ->
+enqueue_msg(ClientInfo, #message{qos = QoS} = Msg, Session = #session{mqueue = Q}) ->
     {Dropped, NQ} = emqx_mqueue:in(Msg, Q),
+    NewSession = Session#session{mqueue = NQ},
     case Dropped of
         undefined ->
-            Session#session{mqueue = NQ};
+            NewSession;
         _Msg ->
             NQInfo = emqx_mqueue:info(NQ),
             Reason =
                 case NQInfo of
-                    #{store_qos0 := false} when QOS =:= ?QOS_0 -> qos0_msg;
+                    #{store_qos0 := false} when QoS =:= ?QOS_0 -> qos0_msg;
                     _ -> queue_full
                 end,
             _ = emqx_session_events:handle_event(
                 ClientInfo,
                 {dropped, Dropped, #{reason => Reason, logctx => #{queue => NQInfo}}}
             ),
-            Session
+            NewSession
     end.
 
 maybe_ack(Msg) ->
@@ -598,13 +591,24 @@ handle_timeout(ClientInfo, expire_awaiting_rel, Session) ->
     expire(ClientInfo, Session).
 
 %%--------------------------------------------------------------------
+%% Geneic messages
+%%--------------------------------------------------------------------
+
+-spec handle_info(term(), session(), clientinfo()) -> session().
+handle_info({'DOWN', _Ref, _Kind, _Pid, _Reason}, Session, _ClientInfo) ->
+    Session;
+handle_info(Msg, Session, _ClientInfo) ->
+    ?SLOG(warning, #{msg => emqx_session_mem_unknown_message, message => Msg}),
+    Session.
+
+%%--------------------------------------------------------------------
 %% Retry Delivery
 %%--------------------------------------------------------------------
 
 -spec retry(clientinfo(), session()) ->
-    {ok, replies(), session()}.
-retry(ClientInfo, Session = #session{inflight = Inflight}) ->
-    case emqx_inflight:is_empty(Inflight) of
+    {ok, replies(), session()} | {ok, replies(), timeout(), session()}.
+retry(ClientInfo, Session = #session{inflight = Inflight, retry_interval = Interval}) ->
+    case emqx_inflight:is_empty(Inflight) orelse Interval =:= infinity of
         true ->
             {ok, [], Session};
         false ->
@@ -627,7 +631,8 @@ retry_delivery(
     Now,
     Session = #session{retry_interval = Interval, inflight = Inflight}
 ) ->
-    case (Age = age(Now, Ts)) >= Interval of
+    Age = age(Now, Ts),
+    case Age >= Interval of
         true ->
             {Acc1, Inflight1} = do_retry_delivery(ClientInfo, PacketId, Data, Now, Acc, Inflight),
             retry_delivery(ClientInfo, More, Acc1, Now, Session#session{inflight = Inflight1});
@@ -712,25 +717,54 @@ resume(ClientInfo = #{clientid := ClientId}, Session = #session{subscriptions = 
 
 -spec replay(emqx_types:clientinfo(), replayctx(), session()) ->
     {ok, replies(), session()}.
-replay(ClientInfo, Pendings, Session) ->
-    %% NOTE
-    %% Here, `Pendings` is a list messages that were pending delivery in the remote
-    %% session, see `clean_session/3`. It's a replay context that gets passed back
-    %% here after the remote session is taken over by `open/2`. When we have a set
-    %% of remote deliveries and a set of local deliveries, some publishes might actually
-    %% be in both sets, because there's a tiny amount of time when both remote and local
-    %% sessions were subscribed to the same set of topics simultaneously (i.e. after
-    %% local session calls `resume/2` but before remote session calls `takeover/1`
-    %% through `emqx_channel:handle_call({takeover, 'end'}, Channel)`).
-    %% We basically need to:
-    %% 1. Combine and deduplicate remote and local pending messages, so that no message
-    %%    is delivered twice.
-    %% 2. Replay deliveries of the inflight messages, this time to the new channel.
-    %% 3. Deliver the combined pending messages, following the same logic as `deliver/3`.
-    PendingsAll = dedup(ClientInfo, Pendings, emqx_utils:drain_deliver(), Session),
-    {ok, PubsResendQueued, Session1} = replay(ClientInfo, Session),
-    {ok, PubsPending, Session2} = deliver(ClientInfo, PendingsAll, Session1),
-    {ok, append(PubsResendQueued, PubsPending), Session2}.
+replay(ClientInfo, TakeoverState, Session) ->
+    replay(ClientInfo, emqx_utils:drain_deliver(), TakeoverState, Session).
+
+replay(ClientInfo, DeliversLocal, TakeoverState, Session) ->
+    case emqx_cm:takeover_session_end(TakeoverState) of
+        {ok, PendingsRemote0} ->
+            %% NOTE
+            %% Here, `Pendings` is a list messages that were pending delivery in the remote
+            %% session, see `emqx_channel:handle_call({takeover, 'end'}, Channel)`. When we
+            %% have a set of remote deliveries and a set of local deliveries, some publishes
+            %% might actually be in both sets, because there's a tiny amount of time when
+            %% both remote and local sessions were subscribed to the same set of topics
+            %% simultaneously (i.e. after local session calls `resume/2` but before remote
+            %% session calls `takeover/1`.
+            %% We basically need to:
+            %% 1. Combine and deduplicate remote and local pending messages, so that no message
+            %%    is delivered twice.
+            %% 2. Replay deliveries of the inflight messages, this time to the new channel.
+            %% 3. Deliver the combined pending messages, following the same logic as `deliver/3`.
+            PendingsLocal = emqx_session:enrich_delivers(ClientInfo, DeliversLocal, Session),
+            PendingsRemote = filter_remote_pendings(ClientInfo, Session, PendingsRemote0),
+            PendingsAll = dedup(PendingsRemote, PendingsLocal),
+            {ok, PubsResendQueued, Session1} = replay(ClientInfo, Session),
+            {ok, PubsPending, Session2} = deliver(ClientInfo, PendingsAll, Session1),
+            {ok, append(PubsResendQueued, PubsPending), Session2};
+        {error, _} ->
+            % TODO log error?
+            replay(ClientInfo, Session)
+    end.
+
+-spec replay_enqueue(emqx_types:clientinfo(), [emqx_types:deliver()], replayctx(), session()) ->
+    session().
+replay_enqueue(ClientInfo, DeliversLocal, TakeoverState, Session) ->
+    case emqx_cm:takeover_session_end(TakeoverState) of
+        {ok, PendingsRemote0} ->
+            PendingsLocal = emqx_session:enrich_delivers(ClientInfo, DeliversLocal, Session),
+            PendingsRemote = filter_remote_pendings(ClientInfo, Session, PendingsRemote0),
+            PendingsAll = dedup(PendingsRemote, PendingsLocal),
+            enqueue(ClientInfo, PendingsAll, Session);
+        {error, _} ->
+            % TODO log error?
+            PendingsLocal = emqx_session:enrich_delivers(ClientInfo, DeliversLocal, Session),
+            enqueue(ClientInfo, PendingsLocal, Session)
+    end.
+
+filter_remote_pendings(ClientInfo, Session, Pendings) ->
+    Pendings1 = emqx_session:enrich_delivers(ClientInfo, Pendings, Session),
+    lists:filter(fun emqx_session:should_keep/1, Pendings1).
 
 -spec replay(emqx_types:clientinfo(), session()) ->
     {ok, replies(), session()}.
@@ -747,15 +781,14 @@ replay(ClientInfo, Session) ->
     {ok, More, Session1} = dequeue(ClientInfo, Session),
     {ok, append(PubsResend, More), Session1}.
 
--spec dedup(clientinfo(), [emqx_types:message()], [emqx_types:deliver()], session()) ->
+-spec dedup([emqx_types:message()], [emqx_types:message()]) ->
     [emqx_types:message()].
-dedup(ClientInfo, Pendings, DeliversLocal, Session) ->
-    PendingsLocal1 = emqx_session:enrich_delivers(ClientInfo, DeliversLocal, Session),
-    PendingsLocal2 = lists:filter(
+dedup(Pendings, PendingsLocal) ->
+    PendingsLocal1 = lists:filter(
         fun(Msg) -> not lists:keymember(Msg#message.id, #message.id, Pendings) end,
-        PendingsLocal1
+        PendingsLocal
     ),
-    append(Pendings, PendingsLocal2).
+    append(Pendings, PendingsLocal1).
 
 append(L1, []) -> L1;
 append(L1, L2) -> L1 ++ L2.
@@ -767,8 +800,8 @@ disconnect(Session = #session{}, _ConnInfo) ->
     % TODO: isolate expiry timer / timeout handling here?
     {idle, Session}.
 
--spec terminate(Reason :: term(), session()) -> ok.
-terminate(Reason, Session) ->
+-spec terminate(emqx_types:clientinfo(), _Reason, session()) -> ok.
+terminate(_ClienInfo, Reason, Session) ->
     maybe_redispatch_shared_messages(Reason, Session),
     ok.
 

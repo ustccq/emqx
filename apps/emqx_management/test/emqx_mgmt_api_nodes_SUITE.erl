@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_nodes_SUITE).
 
@@ -29,11 +17,10 @@ init_per_suite(Config) ->
         [
             emqx_conf,
             emqx_management,
-            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+            emqx_mgmt_api_test_util:emqx_dashboard()
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    {ok, _} = emqx_common_test_http:create_default_app(),
     [{suite_apps, Apps} | Config].
 
 end_per_suite(Config) ->
@@ -62,7 +49,7 @@ end_per_testcase(_, Config) ->
 t_nodes_api(_) ->
     NodesPath = emqx_mgmt_api_test_util:api_path(["nodes"]),
     {ok, Nodes} = emqx_mgmt_api_test_util:request_api(get, NodesPath),
-    NodesResponse = emqx_utils_json:decode(Nodes, [return_maps]),
+    NodesResponse = emqx_utils_json:decode(Nodes),
     LocalNodeInfo = hd(NodesResponse),
     Node = binary_to_atom(maps:get(<<"node">>, LocalNodeInfo), utf8),
     ?assertEqual(Node, node()),
@@ -77,7 +64,7 @@ t_nodes_api(_) ->
     NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
     {ok, NodeInfo} = emqx_mgmt_api_test_util:request_api(get, NodePath),
     NodeNameResponse =
-        binary_to_atom(maps:get(<<"node">>, emqx_utils_json:decode(NodeInfo, [return_maps])), utf8),
+        binary_to_atom(maps:get(<<"node">>, emqx_utils_json:decode(NodeInfo)), utf8),
     ?assertEqual(node(), NodeNameResponse),
 
     BadNodePath = emqx_mgmt_api_test_util:api_path(["nodes", "badnode"]),
@@ -89,7 +76,7 @@ t_nodes_api(_) ->
 t_log_path(_) ->
     NodePath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_list(node())]),
     {ok, NodeInfo} = emqx_mgmt_api_test_util:request_api(get, NodePath),
-    #{<<"log_path">> := Path} = emqx_utils_json:decode(NodeInfo, [return_maps]),
+    #{<<"log_path">> := Path} = emqx_utils_json:decode(NodeInfo),
     ?assertEqual(
         <<"log">>,
         filename:basename(Path)
@@ -99,7 +86,7 @@ t_node_stats_api(_) ->
     StatsPath = emqx_mgmt_api_test_util:api_path(["nodes", atom_to_binary(node(), utf8), "stats"]),
     SystemStats = emqx_mgmt:get_stats(),
     {ok, StatsResponse} = emqx_mgmt_api_test_util:request_api(get, StatsPath),
-    Stats = emqx_utils_json:decode(StatsResponse, [return_maps]),
+    Stats = emqx_utils_json:decode(StatsResponse),
     Fun =
         fun(Key) ->
             ?assertEqual(maps:get(Key, SystemStats), maps:get(atom_to_binary(Key, utf8), Stats))
@@ -117,7 +104,7 @@ t_node_metrics_api(_) ->
         emqx_mgmt_api_test_util:api_path(["nodes", atom_to_binary(node(), utf8), "metrics"]),
     SystemMetrics = emqx_mgmt:get_metrics(),
     {ok, MetricsResponse} = emqx_mgmt_api_test_util:request_api(get, MetricsPath),
-    Metrics = emqx_utils_json:decode(MetricsResponse, [return_maps]),
+    Metrics = emqx_utils_json:decode(MetricsResponse),
     Fun =
         fun(Key) ->
             ?assertEqual(maps:get(Key, SystemMetrics), maps:get(atom_to_binary(Key, utf8), Metrics))
@@ -132,7 +119,6 @@ t_node_metrics_api(_) ->
 
 t_multiple_nodes_api(Config) ->
     ct:timetrap({seconds, 120}),
-    snabbkaffe:fix_ct_logging(),
     Nodes =
         [Node1, Node2] = emqx_cth_cluster:start(
             [

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_file_schema).
@@ -28,7 +16,7 @@
     desc/1,
     source_refs/0,
     api_source_refs/0,
-    select_union_member/1
+    select_union_member/2
 ]).
 
 namespace() -> "authz".
@@ -77,7 +65,9 @@ source_refs() ->
 api_source_refs() ->
     [?R_REF(api_file)].
 
-select_union_member(#{<<"type">> := ?AUTHZ_TYPE_BIN}) ->
+select_union_member(#{<<"type">> := ?AUTHZ_TYPE_BIN}, source_refs) ->
     ?R_REF(file);
-select_union_member(_Value) ->
+select_union_member(#{<<"type">> := ?AUTHZ_TYPE_BIN}, api_source_refs) ->
+    ?R_REF(api_file);
+select_union_member(_Value, _) ->
     undefined.

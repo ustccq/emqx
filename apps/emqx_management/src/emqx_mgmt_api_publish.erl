@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_publish).
 
@@ -62,7 +50,8 @@ schema("/publish") ->
                 ?PARTIALLY_OK => hoconsc:mk(hoconsc:ref(?MODULE, publish_error)),
                 ?BAD_REQUEST => hoconsc:mk(hoconsc:ref(?MODULE, bad_request)),
                 ?DISPATCH_ERROR => hoconsc:mk(hoconsc:ref(?MODULE, publish_error))
-            }
+            },
+            log_meta => emqx_dashboard_audit:importance(low)
         }
     };
 schema("/publish/bulk") ->
@@ -82,7 +71,8 @@ schema("/publish/bulk") ->
                 ?DISPATCH_ERROR => hoconsc:mk(
                     hoconsc:array(hoconsc:ref(?MODULE, publish_error)), #{}
                 )
-            }
+            },
+            log_meta => emqx_dashboard_audit:importance(low)
         }
     }.
 
@@ -245,6 +235,7 @@ make_bad_req_reply(Reason) ->
 -spec is_ok_deliver({_NodeOrShare, _MatchedTopic, emqx_types:deliver_result()}) -> boolean().
 is_ok_deliver({_NodeOrShare, _MatchedTopic, ok}) -> true;
 is_ok_deliver({_NodeOrShare, _MatchedTopic, {ok, _}}) -> true;
+is_ok_deliver(persisted) -> true;
 is_ok_deliver({_NodeOrShare, _MatchedTopic, {error, _}}) -> false.
 
 %% @hidden Map MQTT publish result reason code to HTTP status code.
@@ -269,6 +260,8 @@ is_ok_deliver({_NodeOrShare, _MatchedTopic, {error, _}}) -> false.
 %% No preceding payload format indicator to compare against.
 %% Content-Type check should be done at HTTP layer but not here.
 %% 153                Payload format invalid                  400
+publish_result_to_http_reply(#message{topic = <<"$delayed/", _/binary>>} = Message, []) ->
+    {?ALL_IS_WELL, make_publish_response(Message)};
 publish_result_to_http_reply(_Message, []) ->
     %% matched no subscriber
     {?PARTIALLY_OK, make_publish_error_response(?RC_NO_MATCHING_SUBSCRIBERS)};

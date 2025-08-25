@@ -1,20 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_cli).
+
+-feature(maybe_expr, enable).
 
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/emqx_cm.hrl").
@@ -23,6 +13,7 @@
 -include_lib("emqx/include/logger.hrl").
 
 -define(DATA_BACKUP_OPTS, #{print_fun => fun emqx_ctl:print/2}).
+-define(EXCLUSIVE_TAB, emqx_exclusive_subscription).
 
 -export([load/0]).
 
@@ -44,7 +35,9 @@
     pem_cache/1,
     olp/1,
     data/1,
-    ds/1
+    ds/1,
+    cluster_info/0,
+    exclusive/1
 ]).
 
 -spec load() -> ok.
@@ -53,7 +46,7 @@ load() ->
     lists:foreach(fun(Cmd) -> emqx_ctl:register_command(Cmd, {?MODULE, Cmd}, []) end, Cmds).
 
 is_cmd(Fun) ->
-    not lists:member(Fun, [init, load, module_info]).
+    not lists:member(Fun, [init, load, module_info, cluster_info]).
 
 %%--------------------------------------------------------------------
 %% @doc Node status
@@ -94,7 +87,7 @@ broker(_) ->
 %% @doc Cluster with other nodes
 
 cluster(["join", SNode]) ->
-    case mria:join(ekka_node:parse_name(SNode)) of
+    case emqx_cluster:join(ekka_node:parse_name(SNode)) of
         ok ->
             emqx_ctl:print("Join the cluster successfully.~n"),
             %% FIXME: running status on the replicant immediately
@@ -104,31 +97,50 @@ cluster(["join", SNode]) ->
             ok;
         ignore ->
             emqx_ctl:print("Ignore.~n");
-        {error, Error} ->
-            emqx_ctl:print("Failed to join the cluster: ~0p~n", [Error])
+        {error, Reason} = Error ->
+            emqx_ctl:print("Failed to join the cluster: ~0p~n", [Reason]),
+            Error
     end;
 cluster(["leave"]) ->
-    _ = maybe_disable_autocluster(),
-    case mria:leave() of
-        ok ->
-            emqx_ctl:print("Leave the cluster successfully.~n"),
-            cluster(["status"]);
-        {error, Error} ->
-            emqx_ctl:print("Failed to leave the cluster: ~0p~n", [Error])
+    Safeguards = cluster_leave_safeguards(),
+    case length(Safeguards) of
+        0 ->
+            _ = maybe_disable_autocluster(),
+            case emqx_cluster:leave() of
+                ok ->
+                    emqx_ctl:print("Leave the cluster successfully.~n"),
+                    cluster(["status"]);
+                {error, Reason} = Error ->
+                    emqx_ctl:print("Failed to leave the cluster: ~0p~n", [Reason]),
+                    Error
+            end;
+        _ ->
+            lists:foreach(
+                fun
+                    (nonempty_ds_site) ->
+                        emqx_ctl:warning(
+                            "Operation is unsafe: "
+                            "Node is still responsible for one or more DS shard replicas. "
+                            "Consult `emqx ctl ds info' for details.~n"
+                        );
+                    (Reason) ->
+                        emqx_ctl:warning("Operation is unsafe: ~p.~n", [Reason])
+                end,
+                Safeguards
+            ),
+            {error, Safeguards}
     end;
 cluster(["force-leave", SNode]) ->
     Node = ekka_node:parse_name(SNode),
-    case mria:force_leave(Node) of
+    case emqx_cluster:force_leave(Node) of
         ok ->
             case emqx_cluster_rpc:force_leave_clean(Node) of
                 ok ->
                     emqx_ctl:print("Remove the node from cluster successfully.~n"),
                     cluster(["status"]);
-                {error, Reason} ->
-                    emqx_ctl:print(
-                        "Failed to remove the node from cluster_rpc.~n~p~n",
-                        [Reason]
-                    )
+                {error, Reason} = Error ->
+                    emqx_ctl:print("Failed to remove the node from cluster: ~0p~n", [Reason]),
+                    Error
             end;
         ignore ->
             emqx_ctl:print("Ignore.~n");
@@ -139,17 +151,36 @@ cluster(["status"]) ->
     emqx_ctl:print("Cluster status: ~p~n", [cluster_info()]);
 cluster(["status", "--json"]) ->
     Info = sort_map_list_fields(cluster_info()),
-    emqx_ctl:print("~ts~n", [emqx_logger_jsonfmt:best_effort_json(Info)]);
+    emqx_ctl:print("~ts~n", [emqx_utils_json:best_effort_json(Info)]);
 cluster(["discovery", "enable"]) ->
     enable_autocluster();
+cluster(["core", "rebalance", "plan"]) ->
+    Result = mria_rebalance:start(),
+    emqx_ctl:print("~p~n", [Result]);
+cluster(["core", "rebalance", "status"]) ->
+    Result = mria_rebalance:status(),
+    emqx_ctl:print("~p~n", [Result]);
+cluster(["core", "rebalance", "confirm"]) ->
+    Result = mria_rebalance:confirm(),
+    emqx_ctl:print("~p~n", [Result]);
+cluster(["core", "rebalance", "abort"]) ->
+    Result = mria_rebalance:abort(),
+    emqx_ctl:print("~p~n", [Result]);
 cluster(_) ->
     emqx_ctl:usage([
         {"cluster join <Node>", "Join the cluster"},
         {"cluster leave", "Leave the cluster"},
         {"cluster force-leave <Node>", "Force the node leave from cluster"},
         {"cluster status [--json]", "Cluster status"},
-        {"cluster discovery enable", "Enable and run automatic cluster discovery (if configured)"}
+        {"cluster discovery enable", "Enable and run automatic cluster discovery (if configured)"},
+        {"cluster core rebalance plan", "Plan rebalancing of replicants against cores"},
+        {"cluster core rebalance status", "Check status of replicant rebalance"},
+        {"cluster core rebalance confirm", "Execute the planned rebalance"},
+        {"cluster core rebalance abort", "Abort the ongoing rebalance"}
     ]).
+
+cluster_leave_safeguards() ->
+    ds_cluster_leave_safeguards().
 
 %% sort lists for deterministic output
 sort_map_list_fields(Map) when is_map(Map) ->
@@ -298,6 +329,10 @@ plugins(["list"]) ->
     emqx_plugins_cli:list(fun emqx_ctl:print/2);
 plugins(["describe", NameVsn]) ->
     emqx_plugins_cli:describe(NameVsn, fun emqx_ctl:print/2);
+plugins(["allow", NameVsn]) ->
+    emqx_plugins_cli:allow_installation(NameVsn, fun emqx_ctl:print/2);
+plugins(["disallow", NameVsn]) ->
+    emqx_plugins_cli:disallow_installation(NameVsn, fun emqx_ctl:print/2);
 plugins(["install", NameVsn]) ->
     emqx_plugins_cli:ensure_installed(NameVsn, fun emqx_ctl:print/2);
 plugins(["uninstall", NameVsn]) ->
@@ -324,9 +359,13 @@ plugins(_) ->
             {"plugins <command> [Name-Vsn]", "e.g. 'start emqx_plugin_template-5.0-rc.1'"},
             {"plugins list", "List all installed plugins"},
             {"plugins describe  Name-Vsn", "Describe an installed plugins"},
+            {"plugins allow     Name-Vsn",
+                "Allows installation of a plugin in the cluster from Dashboard or API"},
+            {"plugins disallow  Name-Vsn",
+                "Disallows installation of a plugin in the cluster from Dashboard or API"},
             {"plugins install   Name-Vsn",
                 "Install a plugin package placed\n"
-                "in plugin'sinstall_dir"},
+                "in plugin's install_dir"},
             {"plugins uninstall Name-Vsn",
                 "Uninstall a plugin. NOTE: it deletes\n"
                 "all files in install_dir/Name-Vsn"},
@@ -497,8 +536,7 @@ trace(["list"]) ->
             emqx_ctl:print("Trace is empty~n", []);
         Traces ->
             lists:foreach(
-                fun(Trace) ->
-                    #{type := Type, filter := Filter, level := Level, dst := Dst} = Trace,
+                fun(#{filter := {Type, Filter}, level := Level, dst := Dst}) ->
                     emqx_ctl:print("Trace(~s=~s, level=~s, destination=~0p)~n", [
                         Type, Filter, Level, Dst
                     ])
@@ -508,7 +546,7 @@ trace(["list"]) ->
     end;
 trace(["stop", Operation, Filter0]) ->
     case trace_type(Operation, Filter0, text) of
-        {ok, Type, Filter, _} -> trace_off(Type, Filter);
+        {ok, Filter, _} -> trace_off(Filter);
         error -> trace([])
     end;
 trace(["start", Operation, ClientId, LogFile]) ->
@@ -517,15 +555,8 @@ trace(["start", Operation, Filter0, LogFile, Level]) ->
     trace(["start", Operation, Filter0, LogFile, Level, text]);
 trace(["start", Operation, Filter0, LogFile, Level, Formatter0]) ->
     case trace_type(Operation, Filter0, Formatter0) of
-        {ok, Type, Filter, Formatter} ->
-            trace_on(
-                name(Filter0),
-                Type,
-                Filter,
-                list_to_existing_atom(Level),
-                LogFile,
-                Formatter
-            );
+        {ok, Filter, Formatter} ->
+            trace_on(Filter, list_to_existing_atom(Level), LogFile, Formatter);
         error ->
             trace([])
     end;
@@ -546,24 +577,33 @@ trace(_) ->
         {"trace stop  ruleid  <RuleID> ", "Stop tracing for a rule ID on local node"}
     ]).
 
-trace_on(Name, Type, Filter, Level, LogFile, Formatter) ->
-    case emqx_trace_handler:install(Name, Type, Filter, Level, LogFile, Formatter) of
+trace_on(Filter = {Type, Value}, Level, LogFile, Formatter) ->
+    Name = trace_name(Filter),
+    HandlerId = emqx_trace_handler:fallback_handler_id(?MODULE_STRING, Name),
+    case emqx_trace_handler:install(HandlerId, Name, Filter, Level, LogFile, Formatter) of
         ok ->
             emqx_trace:check(),
-            emqx_ctl:print("trace ~s ~s successfully~n", [Filter, Name]);
+            emqx_ctl:print("trace ~s ~s successfully~n", [Type, Value]);
         {error, Error} ->
-            emqx_ctl:print("[error] trace ~s ~s: ~p~n", [Filter, Name, Error])
+            emqx_ctl:print("[error] trace ~s ~s: ~p~n", [Type, Value, Error])
     end.
 
-trace_off(Type, Filter) ->
-    ?TRACE("CLI", "trace_stopping", #{Type => Filter}),
-    case emqx_trace_handler:uninstall(Type, name(Filter)) of
+trace_off(Filter = {Type, Value}) ->
+    Name = trace_name(Filter),
+    HandlerId = emqx_trace_handler:fallback_handler_id(?MODULE_STRING, Name),
+    ?TRACE("CLI", "trace_stopping", #{Type => Value}),
+    case emqx_trace_handler:uninstall(HandlerId) of
         ok ->
             emqx_trace:check(),
-            emqx_ctl:print("stop tracing ~s ~s successfully~n", [Type, Filter]);
+            emqx_ctl:print("stop tracing ~s ~s successfully~n", [Type, Value]);
         {error, Error} ->
-            emqx_ctl:print("[error] stop tracing ~s ~s: ~p~n", [Type, Filter, Error])
+            emqx_ctl:print("[error] stop tracing ~s ~s: ~p~n", [Type, Value, Error])
     end.
+
+trace_name({_Type, Filter}) ->
+    %% NOTE: Asserting the resulting name is valid UTF-8, not expected to fail.
+    Name = iolist_to_binary(["CLI-", Filter]),
+    Name = unicode:characters_to_binary(Name, utf8).
 
 %%--------------------------------------------------------------------
 %% @doc Trace Cluster Command
@@ -602,7 +642,7 @@ traces(["start", Name, Operation, Filter, DurationS]) ->
     traces(["start", Name, Operation, Filter, DurationS, text]);
 traces(["start", Name, Operation, Filter0, DurationS, Formatter0]) ->
     case trace_type(Operation, Filter0, Formatter0) of
-        {ok, Type, Filter, Formatter} -> trace_cluster_on(Name, Type, Filter, DurationS, Formatter);
+        {ok, Filter, Formatter} -> trace_cluster_on(Name, Filter, DurationS, Formatter);
         error -> traces([])
     end;
 traces(_) ->
@@ -624,24 +664,23 @@ traces(_) ->
         {"traces delete <Name>", "Delete trace in cluster"}
     ]).
 
-trace_cluster_on(Name, Type, Filter, DurationS0, Formatter) ->
+trace_cluster_on(Name, Filter = {Type, Value}, DurationS0, Formatter) ->
     Now = emqx_trace:now_second(),
     DurationS = list_to_integer(DurationS0),
     Trace = #{
         name => bin(Name),
-        type => Type,
-        Type => bin(Filter),
+        filter => Filter,
         start_at => Now,
         end_at => Now + DurationS,
         formatter => Formatter
     },
     case emqx_trace:create(Trace) of
         {ok, _} ->
-            emqx_ctl:print("cluster_trace ~p ~s ~s successfully~n", [Type, Filter, Name]);
+            emqx_ctl:print("cluster_trace ~p ~s ~s successfully~n", [Type, Value, Name]);
         {error, Error} ->
             emqx_ctl:print(
                 "[error] cluster_trace ~s ~s=~s ~p~n",
-                [Name, Type, Filter, Error]
+                [Name, Type, Value, Error]
             )
     end.
 
@@ -659,9 +698,9 @@ trace_cluster_off(Name) ->
 
 trace_type(Op, Match, "text") -> trace_type(Op, Match, text);
 trace_type(Op, Match, "json") -> trace_type(Op, Match, json);
-trace_type("client", ClientId, Formatter) -> {ok, clientid, bin(ClientId), Formatter};
-trace_type("topic", Topic, Formatter) -> {ok, topic, bin(Topic), Formatter};
-trace_type("ip_address", IP, Formatter) -> {ok, ip_address, IP, Formatter};
+trace_type("client", ClientId, Formatter) -> {ok, {clientid, bin(ClientId)}, Formatter};
+trace_type("topic", Topic, Formatter) -> {ok, {topic, bin(Topic)}, Formatter};
+trace_type("ip_address", IP, Formatter) -> {ok, {ip_address, IP}, Formatter};
 trace_type(_, _, _) -> error.
 
 %%--------------------------------------------------------------------
@@ -669,25 +708,26 @@ trace_type(_, _, _) -> error.
 
 listeners([]) ->
     lists:foreach(
-        fun({ID, Conf}) ->
+        fun({Id, Conf}) ->
             Bind = maps:get(bind, Conf),
+            Enable = maps:get(enable, Conf),
             Acceptors = maps:get(acceptors, Conf),
             ProxyProtocol = maps:get(proxy_protocol, Conf, undefined),
             Running = maps:get(running, Conf),
             case Running of
                 true ->
                     CurrentConns =
-                        case emqx_listeners:current_conns(ID, Bind) of
+                        case emqx_listeners:current_conns(Id, Bind) of
                             {error, _} -> [];
                             CC -> [{current_conn, CC}]
                         end,
                     MaxConn =
-                        case emqx_listeners:max_conns(ID, Bind) of
+                        case emqx_listeners:max_conns(Id, Bind) of
                             {error, _} -> [];
                             MC -> [{max_conns, MC}]
                         end,
                     ShutdownCount =
-                        case emqx_listeners:shutdown_count(ID, Bind) of
+                        case emqx_listeners:shutdown_count(Id, Bind) of
                             {error, _} -> [];
                             SC -> [{shutdown_count, SC}]
                         end;
@@ -701,9 +741,10 @@ listeners([]) ->
                     {listen_on, {string, emqx_listeners:format_bind(Bind)}},
                     {acceptors, Acceptors},
                     {proxy_protocol, ProxyProtocol},
+                    {enbale, Enable},
                     {running, Running}
                 ] ++ CurrentConns ++ MaxConn ++ ShutdownCount,
-            emqx_ctl:print("~ts~n", [ID]),
+            emqx_ctl:print("~ts~n", [Id]),
             lists:foreach(fun indent_print/1, Info)
         end,
         emqx_listeners:list()
@@ -744,12 +785,63 @@ listeners(["restart", ListenerId]) ->
         _ ->
             emqx_ctl:print("Invalid listener: ~0p~n", [ListenerId])
     end;
+listeners(["enable", ListenerId, Enable0]) ->
+    maybe
+        {ok, Enable, Action} ?=
+            case Enable0 of
+                "true" ->
+                    {ok, true, start};
+                "false" ->
+                    {ok, false, stop};
+                _ ->
+                    {error, badarg}
+            end,
+        {ok, #{type := Type, name := Name}} ?= emqx_listeners:parse_listener_id(ListenerId),
+        #{<<"enable">> := OldEnable} ?= RawConf = emqx_conf:get_raw(
+            [listeners, Type, Name], {error, nout_found}
+        ),
+        {ok, AtomId} = emqx_utils:safe_to_existing_atom(ListenerId),
+        ok ?=
+            case Enable of
+                OldEnable ->
+                    %% `enable` and `running` may lose synchronization due to the start/stop commands
+                    case Action of
+                        start ->
+                            emqx_listeners:start_listener(AtomId);
+                        stop ->
+                            emqx_listeners:stop_listener(AtomId)
+                    end;
+                _ ->
+                    Conf = RawConf#{<<"enable">> := Enable},
+                    case emqx_mgmt_listeners_conf:action(Type, Name, Action, Conf) of
+                        {ok, _} ->
+                            ok;
+                        Error ->
+                            Error
+                    end
+            end,
+        emqx_ctl:print("Updated 'enable' to: '~0p' successfully.~n", [Enable])
+    else
+        {error, badarg} ->
+            emqx_ctl:print("Invalid bool argument: ~0p~n", [Enable0]);
+        {error, {invalid_listener_id, _Id}} ->
+            emqx_ctl:print("Invalid listener: ~0p~n", [ListenerId]);
+        {error, not_found} ->
+            emqx_ctl:print("Not found listener: ~0p~n", [ListenerId]);
+        {error, {already_started, _Pid}} ->
+            emqx_ctl:print("Updated 'enable' to: '~0p' successfully.~n", [Enable0]);
+        {error, Reason} ->
+            emqx_ctl:print("Update listener: ~0p failed, Reason: ~0p~n", [
+                ListenerId, Reason
+            ])
+    end;
 listeners(_) ->
     emqx_ctl:usage([
         {"listeners", "List listeners"},
         {"listeners stop    <Identifier>", "Stop a listener"},
         {"listeners start   <Identifier>", "Start a listener"},
-        {"listeners restart <Identifier>", "Restart a listener"}
+        {"listeners restart <Identifier>", "Restart a listener"},
+        {"listeners enable <Identifier> <true/false>", "Enable or disable a listener"}
     ]).
 
 %%--------------------------------------------------------------------
@@ -809,16 +901,31 @@ olp(_) ->
 %%--------------------------------------------------------------------
 %% @doc data Command
 
-data(["export"]) ->
-    case emqx_mgmt_data_backup:export(?DATA_BACKUP_OPTS) of
-        {ok, #{filename := Filename}} ->
-            emqx_ctl:print("Data has been successfully exported to ~s.~n", [Filename]);
+data(["export" | Args]) ->
+    maybe
+        {ok, Opts0} ?= parse_data_export_args(Args),
+        Opts = maps:merge(?DATA_BACKUP_OPTS, Opts0),
+        {ok, #{filename := Filename}} ?= emqx_mgmt_data_backup:export(Opts),
+        emqx_ctl:print("Data has been successfully exported to ~s.~n", [Filename])
+    else
+        {error, {unknown_root_keys, UnknownKeys}} ->
+            Msg = iolist_to_binary([
+                <<"Invalid root keys: ">>,
+                lists:join(<<", ">>, UnknownKeys)
+            ]),
+            emqx_ctl:print([Msg, $\n]);
+        {error, {bad_table_sets, InvalidSetNames}} ->
+            Msg = iolist_to_binary([
+                <<"Invalid table sets: ">>,
+                lists:join(<<", ">>, InvalidSetNames)
+            ]),
+            emqx_ctl:print([Msg, $\n]);
         {error, Reason} ->
             Reason1 = emqx_mgmt_data_backup:format_error(Reason),
             emqx_ctl:print("[error] Data export failed, reason: ~p.~n", [Reason1])
     end;
 data(["import", Filename]) ->
-    case emqx_mgmt_data_backup:import(Filename, ?DATA_BACKUP_OPTS) of
+    case emqx_mgmt_data_backup:import_local(Filename, ?DATA_BACKUP_OPTS) of
         {ok, #{db_errors := DbErrs, config_errors := ConfErrs}} when
             map_size(DbErrs) =:= 0, map_size(ConfErrs) =:= 0
         ->
@@ -834,79 +941,142 @@ data(["import", Filename]) ->
 data(_) ->
     emqx_ctl:usage([
         {"data import <File>", "Import data from the specified tar archive file"},
-        {"data export", "Export data"}
+        {
+            "data export \\\n"
+            "  [--root-keys key1,key2,key3] \\\n"
+            "  [--table-sets set1,set2,set3] \\\n"
+            "  [--dir out_dir]",
+            "Export data"
+        }
     ]).
 
-%%--------------------------------------------------------------------
-%% @doc Durable storage command
+parse_data_export_args(Args) ->
+    maybe
+        {ok, Collected} ?= collect_data_export_args(Args, #{}),
+        ok ?= emqx_mgmt_data_backup:validate_export_root_keys(Collected),
+        emqx_mgmt_data_backup:parse_export_request(Collected)
+    end.
 
-ds(CMD) ->
-    case emqx_persistent_message:is_persistence_enabled() of
+collect_data_export_args([], Acc) ->
+    {ok, Acc};
+collect_data_export_args(["--root-keys", RootKeysJoined | Rest], Acc) ->
+    RootKeysStr = string:tokens(RootKeysJoined, [$,]),
+    RootKeys = lists:map(fun list_to_binary/1, RootKeysStr),
+    collect_data_export_args(Rest, Acc#{<<"root_keys">> => RootKeys});
+collect_data_export_args(["--table-sets", TableSetsJoined | Rest], Acc) ->
+    TableSetsStr = string:tokens(TableSetsJoined, [$,]),
+    TableSets = lists:map(fun list_to_binary/1, TableSetsStr),
+    collect_data_export_args(Rest, Acc#{<<"table_sets">> => TableSets});
+collect_data_export_args(["--dir", OutDir | Rest], Acc) ->
+    collect_data_export_args(Rest, Acc#{<<"out_dir">> => OutDir});
+collect_data_export_args(Args, _Acc) ->
+    {error, io_lib:format("unknown arguments: ~p", [Args])}.
+
+%%--------------------------------------------------------------------
+%% @doc Durable storage
+
+ds(Cmd) ->
+    case emqx_mgmt_api_ds:is_enabled() of
         true ->
-            do_ds(CMD);
+            do_ds(Cmd);
         false ->
             emqx_ctl:usage([{"ds", "Durable storage is disabled"}])
     end.
 
 do_ds(["info"]) ->
-    emqx_ds_replication_layer_meta:print_status();
-do_ds(["set_replicas", DBStr | SitesStr]) ->
-    case emqx_utils:safe_to_existing_atom(DBStr) of
-        {ok, DB} ->
+    emqx_ds_builtin_raft_meta:print_status(),
+    ok;
+do_ds(["set-replicas", DBStr | SitesStr]) ->
+    case string_to_ds_dbs(DBStr) of
+        [] ->
+            emqx_ctl:warning("Unknown durable storage");
+        DBs ->
             Sites = lists:map(fun list_to_binary/1, SitesStr),
-            case emqx_mgmt_api_ds:update_db_sites(DB, Sites, cli) of
-                {ok, _} ->
-                    emqx_ctl:print("ok~n");
-                {error, Description} ->
-                    emqx_ctl:print("Unable to update replicas: ~s~n", [Description])
-            end;
-        {error, _} ->
-            emqx_ctl:print("Unknown durable storage")
+            lists:foreach(
+                fun(DB) ->
+                    case emqx_mgmt_api_ds:update_db_sites(DB, Sites, cli) of
+                        {ok, _} ->
+                            emqx_ctl:print("ok~n");
+                        {error, Description} ->
+                            emqx_ctl:warning("Unable to update replicas: ~s~n", [Description])
+                    end
+                end,
+                DBs
+            )
     end;
+do_ds(["set_replicas" | Args]) ->
+    do_ds(["set-replicas" | Args]);
 do_ds(["join", DBStr, Site]) ->
-    case emqx_utils:safe_to_existing_atom(DBStr) of
-        {ok, DB} ->
-            case emqx_mgmt_api_ds:join(DB, list_to_binary(Site), cli) of
-                {ok, unchanged} ->
-                    emqx_ctl:print("unchanged~n");
-                {ok, _} ->
-                    emqx_ctl:print("ok~n");
-                {error, Description} ->
-                    emqx_ctl:print("Unable to update replicas: ~s~n", [Description])
-            end;
-        {error, _} ->
-            emqx_ctl:print("Unknown durable storage~n")
+    case string_to_ds_dbs(DBStr) of
+        [] ->
+            emqx_ctl:warning("Unknown durable storage~n");
+        DBs ->
+            lists:foreach(
+                fun(DB) ->
+                    case emqx_mgmt_api_ds:join(DB, list_to_binary(Site), cli) of
+                        {ok, unchanged} ->
+                            emqx_ctl:print("unchanged~n");
+                        {ok, _} ->
+                            emqx_ctl:print("ok~n");
+                        {error, Description} ->
+                            emqx_ctl:warning("Unable to update replicas: ~s~n", [Description])
+                    end
+                end,
+                DBs
+            )
     end;
 do_ds(["leave", DBStr, Site]) ->
-    case emqx_utils:safe_to_existing_atom(DBStr) of
-        {ok, DB} ->
-            case emqx_mgmt_api_ds:leave(DB, list_to_binary(Site), cli) of
-                {ok, unchanged} ->
-                    emqx_ctl:print("unchanged~n");
-                {ok, _} ->
-                    emqx_ctl:print("ok~n");
-                {error, Description} ->
-                    emqx_ctl:print("Unable to update replicas: ~s~n", [Description])
-            end;
-        {error, _} ->
-            emqx_ctl:print("Unknown durable storage~n")
+    case string_to_ds_dbs(DBStr) of
+        [] ->
+            emqx_ctl:warning("Unknown durable storage~n");
+        DBs ->
+            lists:foreach(
+                fun(DB) ->
+                    case emqx_mgmt_api_ds:leave(DB, list_to_binary(Site), cli) of
+                        {ok, unchanged} ->
+                            emqx_ctl:print("unchanged~n");
+                        {ok, _} ->
+                            emqx_ctl:print("ok~n");
+                        {error, Description} ->
+                            emqx_ctl:warning("Unable to update replicas: ~s~n", [Description])
+                    end
+                end,
+                DBs
+            )
     end;
 do_ds(["forget", Site]) ->
     case emqx_mgmt_api_ds:forget(list_to_binary(Site), cli) of
         ok ->
             emqx_ctl:print("ok~n");
         {error, Description} ->
-            emqx_ctl:print("Unable to forget site: ~s~n", [Description])
+            emqx_ctl:warning("Unable to forget site: ~s~n", [Description])
     end;
 do_ds(_) ->
     emqx_ctl:usage([
         {"ds info", "Show overview of the embedded durable storage state"},
-        {"ds set_replicas <storage> <site1> <site2> ...",
-            "Change the replica set of the durable storage"},
-        {"ds join <storage> <site>", "Add site to the replica set of the storage"},
-        {"ds leave <storage> <site>", "Remove site from the replica set of the storage"},
-        {"ds forget <site>", "Forcefully remove a site from the list of known sites"}
+        {"ds set-replicas <storage>|all <site1> <site2> ...",
+            "Change the replica set of the durable storage(s)"},
+        {"ds join <storage>|all <site>", "Add site to the replica set of the storage(s)"},
+        {"ds leave <storage>|all <site>", "Remove site from the replica set of the storage(s)"},
+        {"ds forget <site>", "Remove a site from the list of known sites"}
     ]).
+
+ds_cluster_leave_safeguards() ->
+    case emqx_mgmt_api_ds:is_enabled() andalso emqx_mgmt_api_ds:shards_of_this_site() of
+        [_ | _] -> [nonempty_ds_site];
+        [] -> [];
+        false -> []
+    end.
+
+string_to_ds_dbs("all") ->
+    [DB || {DB, builtin_raft} <- emqx_ds:which_dbs()];
+string_to_ds_dbs(DBStr) ->
+    case emqx_utils:safe_to_existing_atom(DBStr) of
+        {ok, DB} ->
+            [DB];
+        {error, _} ->
+            []
+    end.
 
 %%--------------------------------------------------------------------
 %% Dump ETS
@@ -1018,7 +1188,9 @@ print({?SUBOPTION, {{Topic, Pid}, Options}}) when is_pid(Pid) ->
     NL = maps:get(nl, Options, 0),
     RH = maps:get(rh, Options, 0),
     RAP = maps:get(rap, Options, 0),
-    emqx_ctl:print("~ts -> topic:~ts qos:~p nl:~p rh:~p rap:~p~n", [SubId, Topic, QoS, NL, RH, RAP]).
+    emqx_ctl:print("~ts -> topic:~ts qos:~p nl:~p rh:~p rap:~p~n", [SubId, Topic, QoS, NL, RH, RAP]);
+print({exclusive, {exclusive_subscription, Topic, ClientId}}) ->
+    emqx_ctl:print("topic:~ts -> ClientId:~ts~n", [Topic, ClientId]).
 
 format(_, undefined) ->
     undefined;
@@ -1034,9 +1206,6 @@ indent_print({Key, {string, Val}}) ->
     emqx_ctl:print("  ~-16s: ~ts~n", [Key, Val]);
 indent_print({Key, Val}) ->
     emqx_ctl:print("  ~-16s: ~w~n", [Key, Val]).
-
-name(Filter) ->
-    iolist_to_binary(["CLI-", Filter]).
 
 for_node(Fun, Node) ->
     try list_to_existing_atom(Node) of
@@ -1079,3 +1248,29 @@ safe_call_mria(Fun, Args, OnFail) ->
             }),
             OnFail
     end.
+%%--------------------------------------------------------------------
+%% @doc Exclusive topics
+exclusive(["list"]) ->
+    case ets:info(?EXCLUSIVE_TAB, size) of
+        0 -> emqx_ctl:print("No topics.~n");
+        _ -> dump(?EXCLUSIVE_TAB, exclusive)
+    end;
+exclusive(["delete", Topic0]) ->
+    Topic = erlang:iolist_to_binary(Topic0),
+    case emqx_exclusive_subscription:dirty_lookup_clientid(Topic) of
+        undefined ->
+            ok;
+        ClientId ->
+            case emqx_mgmt:unsubscribe(ClientId, Topic) of
+                {unsubscribe, _} ->
+                    ok;
+                {error, channel_not_found} ->
+                    emqx_exclusive_subscription:unsubscribe(Topic, #{is_exclusive => true})
+            end
+    end,
+    emqx_ctl:print("ok~n");
+exclusive(_) ->
+    emqx_ctl:usage([
+        {"exclusive list", "List all exclusive topics"},
+        {"exclusive delete <Topic>", "Delete an exclusive topic"}
+    ]).

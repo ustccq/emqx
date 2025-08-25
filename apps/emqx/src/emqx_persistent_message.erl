@@ -1,28 +1,23 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_persistent_message).
 
 -behaviour(emqx_config_handler).
+-behaviour(gen_server).
 
 -include("emqx.hrl").
 -include_lib("emqx/include/logger.hrl").
 
--export([init/0]).
--export([is_persistence_enabled/0, is_persistence_enabled/1, force_ds/1]).
+-export([start_link/0, init/1, terminate/2, handle_continue/2, handle_call/3, handle_cast/2]).
+-export([
+    is_persistence_enabled/0,
+    wait_readiness/1,
+    is_persistence_enabled/1,
+    force_ds/1,
+    get_db_config/0
+]).
 
 %% Config handler
 -export([add_handler/0, pre_config_update/3]).
@@ -34,45 +29,57 @@
 
 -include("emqx_persistent_message.hrl").
 
+-define(optvar_ready, emqx_persistent_message_ready).
+
 %%--------------------------------------------------------------------
 
-init() ->
-    %% Note: currently persistence can't be enabled or disabled in the
-    %% runtime. If persistence is enabled for any of the zones, we
-    %% consider durability feature to be on:
-    Zones = maps:keys(emqx_config:get([zones])),
-    IsEnabled = lists:any(fun is_persistence_enabled/1, Zones),
-    persistent_term:put(?PERSISTENCE_ENABLED, IsEnabled),
-    ?WITH_DURABILITY_ENABLED(begin
-        ?SLOG(notice, #{msg => "Session durability is enabled"}),
-        Backend = storage_backend(),
-        ok = emqx_ds:open_db(?PERSISTENT_MESSAGE_DB, Backend),
-        ok = emqx_persistent_session_ds_router:init_tables(),
-        ok = emqx_persistent_session_ds:create_tables(),
-        ok
-    end).
+-doc """
+This function returns when EMQX has finished initializing databases
+needed for durable sessions.
+
+This is a temporary solution that is meant to work around a problem
+related to the EMQX startup sequence: before cluster discovery begins,
+EMQX for some reason waits for the full startup of the applications.
+It cannot occur if the DS databases are configured to wait for a
+certain number of replicas.
+
+As a temporary solution, we let EMQX start without waiting for durable
+storages. Once EMQX startup sequence is fixed and split into
+reasonable stages, this function should be removed, and creation of
+durable storages should become a prerequisite for start of EMQX
+business applications.
+""".
+-spec wait_readiness(timeout()) -> ok | disabled | timeout.
+wait_readiness(Timeout) ->
+    case is_persistence_enabled() of
+        true ->
+            case optvar:read(?optvar_ready, Timeout) of
+                {ok, _} ->
+                    ok;
+                Err ->
+                    Err
+            end;
+        false ->
+            disabled
+    end.
 
 -spec is_persistence_enabled() -> boolean().
 is_persistence_enabled() ->
-    persistent_term:get(?PERSISTENCE_ENABLED).
+    persistent_term:get(?PERSISTENCE_ENABLED, false).
 
 -spec is_persistence_enabled(emqx_types:zone()) -> boolean().
 is_persistence_enabled(Zone) ->
     emqx_config:get_zone_conf(Zone, [durable_sessions, enable]).
 
--spec storage_backend() -> emqx_ds:create_db_opts().
-storage_backend() ->
-    storage_backend([durable_storage, messages]).
+-spec get_db_config() -> emqx_ds:create_db_opts().
+get_db_config() ->
+    emqx_ds_schema:db_config_messages().
 
 %% Dev-only option: force all messages to go through
 %% `emqx_persistent_session_ds':
 -spec force_ds(emqx_types:zone()) -> boolean().
 force_ds(Zone) ->
     emqx_config:get_zone_conf(Zone, [durable_sessions, force_persistence]).
-
-storage_backend(Path) ->
-    ConfigTree = #{'_config_handler' := {Module, Function}} = emqx_config:get(Path),
-    apply(Module, Function, [ConfigTree]).
 
 %%--------------------------------------------------------------------
 
@@ -112,4 +119,55 @@ store_message(Msg) ->
 has_subscribers(#message{topic = Topic}) ->
     emqx_persistent_session_ds_router:has_any_route(Topic).
 
-%%
+%%--------------------------------------------------------------------
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init(_) ->
+    process_flag(trap_exit, true),
+    Zones = maps:keys(emqx_config:get([zones])),
+    IsEnabled = lists:any(fun is_persistence_enabled/1, Zones),
+    persistent_term:put(?PERSISTENCE_ENABLED, IsEnabled),
+    case is_persistence_enabled() of
+        true ->
+            %% TODO: currently initialization is asynchronous. This is
+            %% done to work around a deadlock that happens when Raft
+            %% backend is used with `n_sites' > 0. During the initial
+            %% forming of the cluster, the node should be able to
+            %% proceed to the autocluster stage, which happens _after_
+            %% full start of EMQX application. As a side effect, some
+            %% durable features may become available _after_ listeners
+            %% are enabled. This may lead to transient errors.
+            %% Unfortunately, the real solution involves deep rework
+            %% of emqx_machine and autocluster.
+            {ok, undefined, {continue, real_init}};
+        false ->
+            ignore
+    end.
+
+handle_continue(real_init, State) ->
+    %% Note: currently persistence can't be enabled or disabled in the
+    %% runtime. If persistence is enabled for any of the zones, we
+    %% consider durability feature to be on:
+    ?SLOG(notice, #{msg => "Session durability is enabled"}),
+    ok = emqx_ds:open_db(?PERSISTENT_MESSAGE_DB, get_db_config()),
+    ok = emqx_persistent_session_ds_router:init_tables(),
+    ok = emqx_persistent_session_ds:create_tables(),
+    ok = emqx_persistent_session_ds_gc_timer:init(),
+    ok = emqx_durable_will:init(),
+    ok = emqx_ds:wait_db(?PERSISTENT_MESSAGE_DB, all, infinity),
+    %% FIXME:
+    ok = emqx_ds:wait_db(sessions, all, infinity),
+    emqx_persistent_session_ds_sup:on_dbs_up(),
+    optvar:set(?optvar_ready, true),
+    {noreply, State}.
+
+terminate(_, _) ->
+    optvar:unset(?optvar_ready).
+
+handle_call(_, _, State) ->
+    {reply, {error, unknown_call}, State}.
+
+handle_cast(_, State) ->
+    {noreply, State}.

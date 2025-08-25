@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_broker_SUITE).
@@ -19,9 +7,8 @@
 -compile(export_all).
 -compile(nowarn_export_all).
 
--define(APP, emqx).
-
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
@@ -128,32 +115,8 @@ end_per_testcase(Case, Config) ->
 %%--------------------------------------------------------------------
 
 t_stats_fun({init, Config}) ->
-    Parent = self(),
-    F = fun Loop() ->
-        N1 = emqx_stats:getstat('subscribers.count'),
-        N2 = emqx_stats:getstat('subscriptions.count'),
-        N3 = emqx_stats:getstat('suboptions.count'),
-        case N1 + N2 + N3 =:= 0 of
-            true ->
-                Parent ! {ready, self()},
-                exit(normal);
-            false ->
-                receive
-                    stop ->
-                        exit(normal)
-                after 100 ->
-                    Loop()
-                end
-        end
-    end,
-    Pid = spawn_link(F),
-    receive
-        {ready, P} when P =:= Pid ->
-            Config
-    after 5000 ->
-        Pid ! stop,
-        ct:fail("timedout_waiting_for_sub_stats_to_reach_zero")
-    end;
+    ok = emqx_stats:reset(),
+    Config;
 t_stats_fun(Config) when is_list(Config) ->
     ok = emqx_broker:subscribe(<<"topic">>, <<"clientid">>),
     ok = emqx_broker:subscribe(<<"topic2">>, <<"clientid">>),
@@ -376,98 +339,105 @@ t_shared_subscribe_3(_) ->
     emqtt:disconnect(ConnPid),
     emqtt:disconnect(ConnPid2).
 
-t_shard({init, Config}) ->
-    ok = meck:new(emqx_broker_helper, [passthrough, no_history]),
-    ok = meck:expect(emqx_broker_helper, get_sub_shard, fun(_, _) -> 1 end),
-    emqx_broker:subscribe(<<"topic">>, <<"clientid">>),
+t_fanout({init, Config}) ->
     Config;
-t_shard(Config) when is_list(Config) ->
-    ct:sleep(100),
+t_fanout({'end', _Config}) ->
+    emqx_stats:reset();
+t_fanout(_Config) ->
+    NSubscribers = 2500,
+    Subscribers = [
+        spawn_link(fun() ->
+            ClientID = integer_to_binary(I),
+            ok = emqx_broker:subscribe(<<"topic">>, ClientID),
+            ?assertReceive({deliver, <<"topic">>, #message{payload = <<"hello">>}}, 5000)
+        end)
+     || I <- lists:seq(1, NSubscribers)
+    ],
+    ?retry(
+        200,
+        10,
+        NSubscribers = emqx_stats:getstat('suboptions.count')
+    ),
     emqx_broker:safe_publish(emqx_message:make(ct, <<"topic">>, <<"hello">>)),
-    ?assert(
-        receive
-            {deliver, <<"topic">>, #message{payload = <<"hello">>}} ->
-                true;
-            _ ->
-                false
-        after 100 ->
-            false
-        end
-    );
-t_shard({'end', _Config}) ->
-    emqx_broker:unsubscribe(<<"topic">>),
-    ok = meck:unload(emqx_broker_helper).
+    ?retry(
+        200,
+        10,
+        false = lists:any(fun erlang:is_process_alive/1, Subscribers)
+    ).
+
+t_fanout_async_dispatch({init, Config}) ->
+    emqx_config:put([broker, perf, async_fanout_shard_dispatch], true),
+    emqx_broker:init_config(),
+    Config;
+t_fanout_async_dispatch({'end', _Config}) ->
+    emqx_config:put([broker, perf, async_fanout_shard_dispatch], false),
+    emqx_broker:init_config();
+t_fanout_async_dispatch(Config) ->
+    t_fanout(Config).
 
 %% persistent sessions, when gone, do not contribute to connected
 %% client count
 t_connected_client_count_persistent({init, Config}) ->
     ok = snabbkaffe:start_trace(),
-    process_flag(trap_exit, true),
     Config;
 t_connected_client_count_persistent(Config) when is_list(Config) ->
     ConnFun = ?config(conn_fun, Config),
     ClientID = <<"clientid">>,
+    ClientOpts = [
+        {clean_start, false},
+        {clientid, ClientID}
+        | Config
+    ],
     ?assertEqual(0, emqx_cm:get_connected_client_count()),
-    {ok, ConnPid0} = emqtt:start_link([
-        {clean_start, false},
-        {clientid, ClientID}
-        | Config
-    ]),
-    {{ok, _}, {ok, [_]}} = wait_for_events(
-        fun() -> emqtt:ConnFun(ConnPid0) end,
-        [emqx_cm_connected_client_count_inc]
-    ),
-    timer:sleep(10),
-    ?assertEqual(1, emqx_cm:get_connected_client_count()),
-    {ok, {ok, [_]}} = wait_for_events(
-        fun() -> emqtt:disconnect(ConnPid0) end,
-        [emqx_cm_connected_client_count_dec]
-    ),
-    timer:sleep(10),
-    ?assertEqual(0, emqx_cm:get_connected_client_count()),
-    %% reconnecting
-    {ok, ConnPid1} = emqtt:start_link([
-        {clean_start, false},
-        {clientid, ClientID}
-        | Config
-    ]),
-    {{ok, _}, {ok, [_]}} = wait_for_events(
-        fun() -> emqtt:ConnFun(ConnPid1) end,
-        [emqx_cm_connected_client_count_inc]
-    ),
-    ?assertEqual(1, emqx_cm:get_connected_client_count()),
-    %% taking over
-    {ok, ConnPid2} = emqtt:start_link([
-        {clean_start, false},
-        {clientid, ClientID}
-        | Config
-    ]),
-
-    {{ok, _}, {ok, [_, _]}} = wait_for_events(
-        fun() -> emqtt:ConnFun(ConnPid2) end,
-        [
-            emqx_cm_connected_client_count_inc,
-            emqx_cm_connected_client_count_dec
-        ],
-        500
-    ),
-    ?assertEqual(1, emqx_cm:get_connected_client_count()),
-    %% abnormal exit of channel process
-    ChanPids = emqx_cm:all_channels(),
-    {ok, {ok, [_, _]}} = wait_for_events(
-        fun() ->
-            lists:foreach(
-                fun(ChanPid) -> exit(ChanPid, kill) end,
-                ChanPids
-            )
+    ?check_trace(
+        #{timetrap => 10_000},
+        %% NOTE
+        %% Change in the number of clients is sometimes not reflected immediately.
+        %% That's why we have to retry test assertions.
+        begin
+            %% Connect a client.
+            T0 = timestep(),
+            {ok, ConnPid0} = emqtt:start_link(ClientOpts),
+            {ok, _} = emqtt:ConnFun(ConnPid0),
+            {ok, _} = block_until(emqx_cm_connected_client_count_inc, since(T0)),
+            ?retry(10, 3, ?assertEqual(1, emqx_cm:get_connected_client_count())),
+            %% Disconnect, should be zero again.
+            true = erlang:unlink(ConnPid0),
+            ok = emqtt:disconnect(ConnPid0),
+            {ok, _} = block_until(emqx_cm_connected_client_count_dec, since(T0)),
+            ?retry(10, 3, ?assertEqual(0, emqx_cm:get_connected_client_count())),
+            %% Reconnecting.
+            T1 = timestep(),
+            {ok, ConnPid1} = emqtt:start_link(ClientOpts),
+            {ok, _} = emqtt:ConnFun(ConnPid1),
+            {ok, _} = block_until(emqx_cm_connected_client_count_inc, since(T1)),
+            ?retry(10, 3, ?assertEqual(1, emqx_cm:get_connected_client_count())),
+            %% Take over, should be exacly 1 once the takeover is complete.
+            T2 = timestep(),
+            true = erlang:unlink(ConnPid1),
+            {ok, ConnPid2} = emqtt:start_link(ClientOpts),
+            {ok, _} = emqtt:ConnFun(ConnPid2),
+            {ok, _} = block_until(emqx_cm_connected_client_count_inc, since(T2)),
+            {ok, _} = block_until(emqx_cm_connected_client_count_dec, since(T2)),
+            ?retry(10, 3, ?assertEqual(1, emqx_cm:get_connected_client_count())),
+            %% Abnormal exit of channel process
+            T3 = timestep(),
+            true = erlang:unlink(ConnPid2),
+            ChanPids = emqx_cm:all_channels(),
+            ok = lists:foreach(fun(ChanPid) -> exit(ChanPid, kill) end, ChanPids),
+            {ok, _} = block_until(
+                {
+                    ?match_event(#{?snk_kind := emqx_cm_connected_client_count_dec}),
+                    length(ChanPids)
+                },
+                since(T3)
+            ),
+            ?retry(10, 5, ?assertEqual(0, emqx_cm:get_connected_client_count()))
         end,
-        [
-            emqx_cm_connected_client_count_dec,
-            emqx_cm_process_down
-        ]
-    ),
-    ?retry(_Sleep = 100, _Retries = 20, ?assertEqual(0, emqx_cm:get_connected_client_count())),
-    ok;
+        fun(_) ->
+            ok
+        end
+    );
 t_connected_client_count_persistent({'end', _Config}) ->
     snabbkaffe:stop(),
     ok.
@@ -502,11 +472,10 @@ t_connected_client_count_anonymous(Config) when is_list(Config) ->
     ),
     ?assertEqual(2, emqx_cm:get_connected_client_count()),
     %% when first client disconnects, shouldn't affect the second
-    {ok, {ok, [_, _]}} = wait_for_events(
+    {ok, {ok, [_]}} = wait_for_events(
         fun() -> emqtt:disconnect(ConnPid0) end,
         [
-            emqx_cm_connected_client_count_dec,
-            emqx_cm_process_down
+            emqx_cm_connected_client_count_dec
         ]
     ),
     ?assertEqual(1, emqx_cm:get_connected_client_count()),
@@ -520,17 +489,16 @@ t_connected_client_count_anonymous(Config) when is_list(Config) ->
         [emqx_cm_connected_client_count_inc]
     ),
     ?assertEqual(2, emqx_cm:get_connected_client_count()),
-    {ok, {ok, [_, _]}} = wait_for_events(
+    {ok, {ok, [_]}} = wait_for_events(
         fun() -> emqtt:disconnect(ConnPid1) end,
         [
-            emqx_cm_connected_client_count_dec,
-            emqx_cm_process_down
+            emqx_cm_connected_client_count_dec
         ]
     ),
     ?assertEqual(1, emqx_cm:get_connected_client_count()),
     %% abnormal exit of channel process
     Chans = emqx_cm:all_channels(),
-    {ok, {ok, [_, _]}} = wait_for_events(
+    {ok, {ok, [_]}} = wait_for_events(
         fun() ->
             lists:foreach(
                 fun(ChanPid) -> exit(ChanPid, kill) end,
@@ -538,8 +506,7 @@ t_connected_client_count_anonymous(Config) when is_list(Config) ->
             )
         end,
         [
-            emqx_cm_connected_client_count_dec,
-            emqx_cm_process_down
+            emqx_cm_connected_client_count_dec
         ]
     ),
     ?assertEqual(0, emqx_cm:get_connected_client_count()),
@@ -586,17 +553,16 @@ t_connected_client_count_transient_takeover(Config) when is_list(Config) ->
                         spawn(ConnectFun)
                     end,
                     lists:seq(1, NumClients)
-                ),
-                ok
+                )
             end,
             %% At least one channel acquires the lock for this client id.  We
             %% also expect a decrement event because the client dies along with
             %% the ephemeral process.
             [
                 emqx_cm_connected_client_count_inc,
-                emqx_cm_connected_client_count_dec_done
+                emqx_cm_connected_client_count_dec
             ],
-            _Timeout = 10000
+            5000
         ),
     %% Since more than one pair of inc/dec may be emitted, we need to
     %% wait for full stabilization
@@ -616,13 +582,13 @@ t_connected_client_count_transient_takeover(Config) when is_list(Config) ->
             ConnectSuccessCnt,
             [
                 emqx_cm_connected_client_count_inc,
-                emqx_cm_connected_client_count_dec_done
+                emqx_cm_connected_client_count_dec
             ]
         )
     ),
     wait_for_events(fun() -> ok end, EventsThatShouldHaveHappened, 10000, infinity),
     %% It must be 0 again because we got enough
-    %% emqx_cm_connected_client_count_dec_done events
+    %% emqx_cm_connected_client_count_dec events
     ?assertEqual(0, emqx_cm:get_connected_client_count()),
     %% connecting again
     {ok, ConnPid1} = emqtt:start_link([
@@ -634,22 +600,19 @@ t_connected_client_count_transient_takeover(Config) when is_list(Config) ->
         wait_for_events(
             fun() -> emqtt:ConnFun(ConnPid1) end,
             [emqx_cm_connected_client_count_inc],
-            _Timeout = 10000
+            1000,
+            1000
         ),
     ?assertEqual(1, emqx_cm:get_connected_client_count()),
     %% abnormal exit of channel process
     [ChanPid] = emqx_cm:all_channels(),
-    {ok, {ok, [_, _]}} =
+    {ok, {ok, [_]}} =
         wait_for_events(
             fun() ->
                 exit(ChanPid, kill),
                 ok
             end,
-            [
-                emqx_cm_connected_client_count_dec_done,
-                emqx_cm_process_down
-            ],
-            _Timeout = 10000
+            [emqx_cm_connected_client_count_dec]
         ),
     ?assertEqual(0, emqx_cm:get_connected_client_count()),
     ok;
@@ -759,7 +722,7 @@ authenticate_deny(_Credentials, _Default) ->
     {stop, {error, bad_username_or_password}}.
 
 wait_for_events(Action, Kinds) ->
-    wait_for_events(Action, Kinds, 500).
+    wait_for_events(Action, Kinds, 1000).
 
 wait_for_events(Action, Kinds, Timeout) ->
     wait_for_events(Action, Kinds, Timeout, 0).
@@ -777,6 +740,11 @@ wait_for_events(Action, Kinds, Timeout, BackInTime) ->
         {ok, Events} ->
             {Res, {ok, Events}}
     end.
+
+block_until(Kind, BackInTime) when is_atom(Kind) ->
+    block_until(?match_event(#{?snk_kind := Kind}), BackInTime);
+block_until(Predicate, BackInTime) ->
+    snabbkaffe:block_until(Predicate, infinity, BackInTime).
 
 wait_for_stats(Action, Stats) ->
     Predicate = fun
@@ -817,3 +785,11 @@ recv_msgs(Count, Msgs) ->
     after 100 ->
         Msgs
     end.
+
+timestep() ->
+    T0 = erlang:monotonic_time(millisecond),
+    ok = timer:sleep(1),
+    T0.
+
+since(T0) ->
+    erlang:monotonic_time(millisecond) - T0.

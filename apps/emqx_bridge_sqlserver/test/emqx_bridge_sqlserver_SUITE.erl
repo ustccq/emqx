@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_sqlserver_SUITE).
@@ -7,10 +7,11 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include("emqx_bridge_sqlserver/include/emqx_bridge_sqlserver.hrl").
+-include("../include/emqx_bridge_sqlserver.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 % SQL definitions
 -define(SQL_BRIDGE,
@@ -47,7 +48,7 @@
 -define(SQL_SERVER_USERNAME, "sa").
 -define(SQL_SERVER_PASSWORD, "mqtt_public1").
 -define(BATCH_SIZE, 10).
--define(REQUEST_TIMEOUT_MS, 500).
+-define(REQUEST_TIMEOUT_MS, 2_000).
 
 -define(WORKER_POOL_SIZE, 4).
 
@@ -92,18 +93,22 @@
 all() ->
     [
         {group, async},
-        {group, sync}
+        {group, sync},
+        {group, health_check}
     ].
 
 groups() ->
     TCs = emqx_common_test_helpers:all(?MODULE),
     NonBatchCases = [t_write_timeout],
     BatchingGroups = [{group, with_batch}, {group, without_batch}],
+    SyncNoBatchCases = [t_table_not_found],
     [
         {async, BatchingGroups},
         {sync, BatchingGroups},
-        {with_batch, TCs -- NonBatchCases},
-        {without_batch, TCs}
+        {with_batch, TCs -- (NonBatchCases ++ SyncNoBatchCases)},
+        {without_batch, TCs -- SyncNoBatchCases},
+        {sync_no_batch, SyncNoBatchCases},
+        {health_check, [health_check_return_error]}
     ].
 
 init_per_group(async, Config) ->
@@ -111,20 +116,33 @@ init_per_group(async, Config) ->
 init_per_group(sync, Config) ->
     [{query_mode, sync} | Config];
 init_per_group(with_batch, Config0) ->
-    Config = [{enable_batch, true} | Config0],
+    Config = [{enable_batch, true}, {pool_size, ?WORKER_POOL_SIZE} | Config0],
     common_init(Config);
 init_per_group(without_batch, Config0) ->
-    Config = [{enable_batch, false} | Config0],
+    Config = [{enable_batch, false}, {pool_size, ?WORKER_POOL_SIZE} | Config0],
+    common_init(Config);
+init_per_group(health_check, Config0) ->
+    Config = [{query_mode, async}, {enable_batch, false}, {pool_size, 1} | Config0],
+    common_init(Config);
+init_per_group(sync_no_batch, Config0) ->
+    Config = [{query_mode, sync}, {enable_batch, false}, {pool_size, 1} | Config0],
     common_init(Config);
 init_per_group(_Group, Config) ->
     Config.
 
-end_per_group(Group, Config) when Group =:= with_batch; Group =:= without_batch ->
+end_per_group(Group, Config) when
+    Group =:= with_batch;
+    Group =:= without_batch;
+    Group =:= sync_no_batch;
+    Group =:= health_check
+->
     connect_and_drop_table(Config),
     connect_and_drop_db(Config),
+    Apps = ?config(apps, Config),
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_cth_suite:stop(Apps),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
@@ -135,8 +153,6 @@ init_per_suite(Config) ->
     [{sqlserver_passfile, Passfile} | Config].
 
 end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_common_test_helpers:stop_apps([emqx_bridge, emqx_conf]),
     ok.
 
 init_per_testcase(_Testcase, Config) ->
@@ -157,8 +173,23 @@ end_per_testcase(_Testcase, Config) ->
     delete_bridge(Config),
     ok.
 
+health_check(Type, Name) ->
+    emqx_bridge_v2_testlib:force_health_check(#{
+        type => Type,
+        name => Name,
+        namespace => ?global_ns,
+        kind => action
+    }).
+
+id(Type, Name) ->
+    emqx_bridge_v2_testlib:lookup_chan_id_in_conf(#{
+        kind => action,
+        type => Type,
+        name => Name
+    }).
+
 %%------------------------------------------------------------------------------
-%% Testcases
+%% Test cases
 %%------------------------------------------------------------------------------
 
 t_setup_via_config_and_publish(Config) ->
@@ -177,6 +208,33 @@ t_setup_via_config_and_publish(Config) ->
             ),
             ?assertMatch(
                 [{Val}],
+                connect_and_get_payload(Config)
+            ),
+            ok
+        end,
+        fun(Trace0) ->
+            Trace = ?of_kind(sqlserver_connector_query_return, Trace0),
+            ?assertMatch([#{result := ok}], Trace),
+            ok
+        end
+    ),
+    ok.
+
+t_undefined_vars_as_null(Config) ->
+    ?assertMatch(
+        {ok, _},
+        create_bridge(Config, #{<<"undefined_vars_as_null">> => true})
+    ),
+    SentData = maps:put(payload, undefined, sent_data("tmp")),
+    ?check_trace(
+        begin
+            ?wait_async_action(
+                ?assertEqual(ok, send_message(Config, SentData)),
+                #{?snk_kind := sqlserver_connector_query_return},
+                10_000
+            ),
+            ?assertMatch(
+                [{null}],
                 connect_and_get_payload(Config)
             ),
             ok
@@ -251,6 +309,44 @@ t_create_disconnected(Config) ->
     end),
     timer:sleep(10_000),
     health_check_resource_ok(Config),
+    ok.
+
+health_check_return_error(Config) ->
+    %% use an ets table for mocked health-check fault injection
+    Ets = ets:new(test, [public]),
+    true = ets:insert(Ets, {result, {selected, [[]], [{1}]}}),
+    meck:new(odbc, [passthrough, no_link, no_history]),
+    meck:expect(odbc, sql_query, fun(Conn, SQL) ->
+        %% insert the latest odbc connection used in the health check calls
+        %% so we can inspect if a new connection is established after
+        %% health-check failure
+        case SQL of
+            "SELECT 1" ->
+                true = ets:insert(Ets, {conn, Conn}),
+                [{result, R}] = ets:lookup(Ets, result),
+                R;
+            _ ->
+                meck:passthrough([Conn, SQL])
+        end
+    end),
+    try
+        ?assertMatch(
+            {ok, _},
+            create_bridge(Config)
+        ),
+        health_check_resource_ok(Config),
+        [{conn, Conn1}] = ets:lookup(Ets, conn),
+        true = ets:insert(Ets, {result, {error, <<"injected failure">>}}),
+        ok = health_check_resource_down(Config),
+        %% remove injected failure
+        true = ets:insert(Ets, {result, {selected, [[]], [{1}]}}),
+        health_check_resource_ok(Config),
+        [{conn, Conn2}] = ets:lookup(Ets, conn),
+        ?assertNotEqual(Conn1, Conn2)
+    after
+        meck:unload(odbc),
+        ets:delete(Ets)
+    end,
     ok.
 
 t_create_with_invalid_password(Config) ->
@@ -354,7 +450,7 @@ t_simple_query(Config) ->
     ok.
 
 -define(MISSING_TINYINT_ERROR,
-    "[Microsoft][ODBC Driver 17 for SQL Server][SQL Server]"
+    "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"
     "Conversion failed when converting the varchar value 'undefined' to data type tinyint. SQLSTATE IS: 22018"
 ).
 
@@ -398,14 +494,72 @@ t_bad_parameter(Config) ->
     end,
     ok.
 
+%% Note: it's not possible to setup a true named instance in linux/docker; we only verify
+%% here that the notation for named instances work.  When explicitly defining the port,
+%% the ODBC driver will connect to whatever instance is running on said port, regardless
+%% of what's given as instance name.
+t_named_instance_mismatch(Config) ->
+    Host = ?config(sqlserver_host, Config),
+    Port = ?config(sqlserver_port, Config),
+    %% Note: we connect to the default instance here, despite explicitly definining an
+    %% instance name, because we're using the default instance port.
+    ServerWithInstanceName = iolist_to_binary([
+        Host,
+        $\\,
+        <<"NamedInstance">>,
+        $:,
+        integer_to_binary(Port)
+    ]),
+    ?assertMatch(
+        {ok, _},
+        create_bridge(
+            Config,
+            #{<<"server">> => ServerWithInstanceName}
+        )
+    ),
+    {ok, Res} = emqx_bridge_testlib:get_bridge_api(Config),
+    ?assertMatch(
+        #{
+            <<"status">> := <<"disconnected">>,
+            <<"status_reason">> := <<"{unhealthy_target,", _/binary>>
+        },
+        Res
+    ),
+    #{<<"status_reason">> := Msg} = Res,
+    ?assertEqual(
+        match,
+        re:run(
+            Msg,
+            <<"connected instance does not match desired instance name">>,
+            [global, {capture, none}]
+        )
+    ),
+    ok.
+
+t_table_not_found(Config) ->
+    ?assertMatch(
+        {ok, _},
+        create_bridge(
+            Config,
+            #{<<"sql">> => <<"insert into i_don_exist(id) values (${id})">>}
+        )
+    ),
+    ?assertEqual(
+        {error, {unrecoverable_error, {invalid_request, <<"table_or_view_not_found">>}}},
+        send_message(Config, #{id => <<"123">>})
+    ),
+    ok.
+
 %%------------------------------------------------------------------------------
 %% Helper fns
 %%------------------------------------------------------------------------------
 
 common_init(ConfigT) ->
+    ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
+    ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
     Host = os:getenv("SQLSERVER_HOST", "toxiproxy"),
     Port = list_to_integer(os:getenv("SQLSERVER_PORT", str(?SQLSERVER_DEFAULT_PORT))),
-
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     Config0 = [
         {sqlserver_host, Host},
         {sqlserver_port, Port},
@@ -414,27 +568,38 @@ common_init(ConfigT) ->
         {batch_size, batch_size(ConfigT)}
         | ConfigT
     ],
-
     BridgeType = proplists:get_value(bridge_type, Config0, <<"sqlserver">>),
     case emqx_common_test_helpers:is_tcp_server_available(Host, Port) of
         true ->
-            % Setup toxiproxy
-            ProxyHost = os:getenv("PROXY_HOST", "toxiproxy"),
-            ProxyPort = list_to_integer(os:getenv("PROXY_PORT", "8474")),
-            emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            % Ensure enterprise bridge module is loaded
-            ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_bridge, odbc]),
-            _ = emqx_bridge_enterprise:module_info(),
-            emqx_mgmt_api_test_util:init_suite(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx_conf,
+                    emqx_bridge_sqlserver,
+                    emqx_bridge,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config0)}
+            ),
             % Connect to sqlserver directly
             % drop old db and table, and then create new ones
+            try
+                connect_and_drop_table(Config0),
+                connect_and_drop_db(Config0)
+            catch
+                _:_ ->
+                    ok
+            end,
             connect_and_create_db_and_table(Config0),
             {Name, SQLServerConf} = sqlserver_config(BridgeType, Config0),
             Config =
                 [
+                    {apps, Apps},
                     {sqlserver_config, SQLServerConf},
                     {sqlserver_bridge_type, BridgeType},
                     {sqlserver_name, Name},
+                    {bridge_type, BridgeType},
+                    {bridge_name, Name},
                     {proxy_host, ProxyHost},
                     {proxy_port, ProxyPort}
                     | Config0
@@ -456,6 +621,7 @@ sqlserver_config(BridgeType, Config) ->
     BatchSize = batch_size(Config),
     QueryMode = ?config(query_mode, Config),
     Passfile = ?config(sqlserver_passfile, Config),
+    PoolSize = ?config(pool_size, Config),
     ConfigString =
         io_lib:format(
             "bridges.~s.~s {\n"
@@ -464,6 +630,7 @@ sqlserver_config(BridgeType, Config) ->
             "  database = ~p\n"
             "  username = ~p\n"
             "  password = ~p\n"
+            "  pool_size = ~p\n"
             "  sql = ~p\n"
             "  driver = ~p\n"
             "  resource_opts = {\n"
@@ -471,6 +638,7 @@ sqlserver_config(BridgeType, Config) ->
             "    batch_size = ~b\n"
             "    query_mode = ~s\n"
             "    worker_pool_size = ~b\n"
+            "    health_check_interval = 2s\n"
             "  }\n"
             "}",
             [
@@ -480,6 +648,7 @@ sqlserver_config(BridgeType, Config) ->
                 ?SQL_SERVER_DATABASE,
                 ?SQL_SERVER_USERNAME,
                 "file://" ++ Passfile,
+                PoolSize,
                 ?SQL_BRIDGE,
                 ?SQL_SERVER_DRIVER,
                 BatchSize,
@@ -503,7 +672,7 @@ create_bridge(Config, Overrides) ->
     Name = ?config(sqlserver_name, Config),
     SSConfig0 = ?config(sqlserver_config, Config),
     SSConfig = emqx_utils_maps:deep_merge(SSConfig0, Overrides),
-    emqx_bridge:create(BridgeType, Name, SSConfig).
+    emqx_bridge_testlib:create_bridge_api(BridgeType, Name, SSConfig).
 
 delete_bridge(Config) ->
     BridgeType = ?config(sqlserver_bridge_type, Config),
@@ -514,21 +683,25 @@ create_bridge_http(Params) ->
     Path = emqx_mgmt_api_test_util:api_path(["bridges"]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
-        Error -> Error
+        {ok, Res} ->
+            #{<<"type">> := Type, <<"name">> := Name} = Params,
+            _ = emqx_bridge_v2_testlib:kickoff_action_health_check(Type, Name),
+            {ok, emqx_utils_json:decode(Res)};
+        Error ->
+            Error
     end.
 
 send_message(Config, Payload) ->
     Name = ?config(sqlserver_name, Config),
     BridgeType = ?config(sqlserver_bridge_type, Config),
-    ActionId = emqx_bridge_v2:id(BridgeType, Name),
-    emqx_bridge_v2:query(BridgeType, Name, {ActionId, Payload}, #{}).
+    ActionId = id(BridgeType, Name),
+    emqx_bridge_v2:query(?global_ns, BridgeType, Name, {ActionId, Payload}, #{}).
 
 query_resource(Config, Request) ->
     Name = ?config(sqlserver_name, Config),
     BridgeType = ?config(sqlserver_bridge_type, Config),
-    ID = emqx_bridge_v2:id(BridgeType, Name),
-    ResID = emqx_connector_resource:resource_id(BridgeType, Name),
+    ID = id(BridgeType, Name),
+    ResID = emqx_connector_resource:resource_id(?global_ns, BridgeType, Name),
     emqx_resource:query(ID, Request, #{timeout => 1_000, connector_resource_id => ResID}).
 
 query_resource_async(Config, Request) ->
@@ -556,7 +729,7 @@ health_check_resource_ok(Config) ->
         _Attempts = 10,
         begin
             ?assertEqual({ok, connected}, emqx_resource_manager:health_check(resource_id(Config))),
-            ?assertMatch(#{status := connected}, emqx_bridge_v2:health_check(BridgeType, Name))
+            ?assertMatch(#{status := connected}, health_check(BridgeType, Name))
         end
     ).
 
@@ -589,7 +762,7 @@ connect_direct_sqlserver(Config) ->
         {username, ?SQL_SERVER_USERNAME},
         {password, ?SQL_SERVER_PASSWORD},
         {driver, ?SQL_SERVER_DRIVER},
-        {pool_size, 8}
+        {pool_size, 1}
     ],
     {ok, Con} = connect(Opts),
     Con.
@@ -647,11 +820,7 @@ batch_size(Config) ->
     end.
 
 conn_str([], Acc) ->
-    %% TODO: for msodbc 18+, we need to add "Encrypt=YES;TrustServerCertificate=YES"
-    %% but havn't tested now
-    %% we should use this for msodbcsql 18+
-    %% lists:join(";", ["Encrypt=YES", "TrustServerCertificate=YES" | Acc]);
-    lists:join(";", Acc);
+    lists:join(";", ["Encrypt=YES", "TrustServerCertificate=YES" | Acc]);
 conn_str([{driver, Driver} | Opts], Acc) ->
     conn_str(Opts, ["Driver=" ++ str(Driver) | Acc]);
 conn_str([{host, Host} | Opts], Acc) ->
@@ -684,7 +853,7 @@ gen_batch_req(Config, Count) when
 ->
     BridgeType = ?config(sqlserver_bridge_type, Config),
     Name = ?config(sqlserver_name, Config),
-    ActionId = emqx_bridge_v2:id(BridgeType, Name),
+    ActionId = id(BridgeType, Name),
     Vals = [{str(erlang:unique_integer())} || _Seq <- lists:seq(1, Count)],
     Requests = [{ActionId, sent_data(Payload)} || {Payload} <- Vals],
     {Requests, Vals};

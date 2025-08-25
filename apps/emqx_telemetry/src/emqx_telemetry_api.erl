@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_telemetry_api).
@@ -68,7 +56,7 @@ schema("/telemetry/status") ->
                 responses =>
                     #{
                         200 => status_schema(?DESC(update_telemetry_status_api)),
-                        400 => emqx_dashboard_swagger:error_codes([?BAD_REQUEST], <<"Bad Request">>)
+                        400 => emqx_dashboard_swagger:error_codes([?BAD_REQUEST])
                     }
             }
     };
@@ -83,7 +71,7 @@ schema("/telemetry/data") ->
                     #{
                         200 => mk(ref(?MODULE, telemetry), #{desc => ?DESC(get_telemetry_data_api)}),
                         404 => emqx_dashboard_swagger:error_codes(
-                            [?NOT_FOUND], <<"Telemetry is not enabled">>
+                            [?NOT_FOUND], ?DESC("telemetry_not_enabled")
                         )
                     }
             }
@@ -246,7 +234,7 @@ status(put, #{body := Body}) ->
 data(get, _Request) ->
     case is_enabled() of
         true ->
-            {200, emqx_utils_json:encode(get_telemetry_data())};
+            {200, emqx_utils_json:encode_proplist(get_telemetry_data())};
         false ->
             {404, #{
                 code => ?NOT_FOUND,

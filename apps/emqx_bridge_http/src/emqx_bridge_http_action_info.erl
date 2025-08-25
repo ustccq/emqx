@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_http_action_info).
@@ -41,11 +29,18 @@ connector_type_name() -> http.
 schema_module() -> emqx_bridge_http_schema.
 
 connector_action_config_to_bridge_v1_config(ConnectorConfig, ActionConfig) ->
-    BridgeV1Config1 = maps:remove(<<"connector">>, ActionConfig),
+    BridgeV1Config1 = maps:without(
+        [
+            <<"connector">>,
+            <<"created_at">>,
+            <<"last_modified_at">>
+        ],
+        ActionConfig
+    ),
     %% Move parameters to the top level
     ParametersMap1 = maps:get(<<"parameters">>, BridgeV1Config1, #{}),
     ParametersMap2 = maps:without([<<"path">>, <<"headers">>], ParametersMap1),
-    BridgeV1Config2 = maps:remove(<<"parameters">>, BridgeV1Config1),
+    BridgeV1Config2 = maps:without([<<"parameters">>, <<"fallback_actions">>], BridgeV1Config1),
     BridgeV1Config3 = emqx_utils_maps:deep_merge(BridgeV1Config2, ParametersMap2),
     BridgeV1Config4 = emqx_utils_maps:deep_merge(ConnectorConfig, BridgeV1Config3),
 
@@ -58,7 +53,7 @@ connector_action_config_to_bridge_v1_config(ConnectorConfig, ActionConfig) ->
     Url1 =
         case Path of
             <<>> -> Url;
-            _ -> iolist_to_binary(emqx_bridge_http_connector:join_paths(Url, Path))
+            _ -> iolist_to_binary(emqx_utils_uri:join_path(Url, Path))
         end,
 
     BridgeV1Config4#{

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_logger_fmt_SUITE).
@@ -36,11 +24,17 @@ t_text_fmt_lazy_values(_) ->
 t_text_fmt_lazy_values_only_in_debug_level_events(_) ->
     check_fmt_lazy_values_only_in_debug_level_events(emqx_logger_textfmt).
 
+t_text_payload(_) ->
+    check_fmt_payload(emqx_logger_textfmt).
+
 t_json_fmt_lazy_values(_) ->
     check_fmt_lazy_values(emqx_logger_jsonfmt).
 
 t_json_fmt_lazy_values_only_in_debug_level_events(_) ->
     check_fmt_lazy_values_only_in_debug_level_events(emqx_logger_jsonfmt).
+
+t_json_payload(_) ->
+    check_fmt_payload(emqx_logger_jsonfmt).
 
 check_fmt_lazy_values(FormatModule) ->
     LogEntryIOData = FormatModule:format(event_with_lazy_value(), conf()),
@@ -62,6 +56,17 @@ check_fmt_lazy_values_only_in_debug_level_events(FormatModule) ->
     ?assertNotEqual(nomatch, binary:match(LogEntryBin, [<<"emqx_trace_format_func_data">>])),
     ok.
 
+check_fmt_payload(FormatModule) ->
+    %% For performace reason we only search for lazy values to evaluate if log level is debug
+    WarningEvent = (event_with_lazy_value())#{level => info},
+    LogEntryIOData = FormatModule:format(WarningEvent, (conf())#{payload_encode => hidden}),
+    LogEntryBin = unicode:characters_to_binary(LogEntryIOData),
+    %% The input data for the formatting should exist
+    ?assertEqual(nomatch, binary:match(LogEntryBin, [<<"content">>])),
+    %% The lazy value should not have been evaluated
+    ?assertNotEqual(nomatch, binary:match(LogEntryBin, [<<"******">>])),
+    ok.
+
 conf() ->
     #{
         time_offset => [],
@@ -69,7 +74,8 @@ conf() ->
         depth => 100,
         single_line => true,
         template => ["[", level, "] ", msg, "\n"],
-        timestamp_format => auto
+        timestamp_format => auto,
+        payload_encode => text
     }.
 
 event_with_lazy_value() ->
@@ -84,7 +90,8 @@ event_with_lazy_value() ->
             {report, #{
                 reason =>
                     #emqx_trace_format_func_data{function = fun(Data) -> Data end, data = hej},
-                msg => hej
+                msg => hej,
+                payload => <<"content">>
             }},
         level => debug
     }.

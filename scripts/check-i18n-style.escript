@@ -23,14 +23,16 @@ main(Files) ->
     end.
 
 load_hocon() ->
-    Dir = "_build/default/lib/hocon/ebin",
-    File = filename:join([Dir, "hocon.beam"]),
-    case filelib:is_regular(File) of
-        true ->
-            code:add_path(Dir),
-            ok;
-        false ->
-            die("HOCON is not compiled in " ++ Dir ++ "~n")
+    maybe
+        [File | _] ?= filelib:wildcard("_build/*/lib/hocon/ebin/hocon.beam"),
+        true ?= filelib:is_regular(File) orelse {error, {not_compiled, File}},
+        code:add_path(filename:dirname(File)),
+        ok
+    else
+        [] ->
+            die("HOCON is not compiled in _build/* ~n");
+        {error, {not_compiled, File1}} ->
+            die("HOCON is not compiled in " ++ File1 ++ "~n")
     end.
 
 die(Msg) ->
@@ -82,7 +84,9 @@ check_desc(Name, _) ->
     die("~s: no 'desc'~n", [Name]).
 
 check_desc_string(Name, <<>>) ->
-    logerr("~s: empty string~n", [Name]);
+    logerr("~s: empty string", [Name]);
+check_desc_string(Name, <<"~", _/binary>> = Line) ->
+    logerr("~s: \"~s\" is a bad multi-line string? '~~' must be followed by NL", [Name, Line]);
 check_desc_string(Name, BinStr) ->
     Str = unicode:characters_to_list(BinStr, utf8),
     Err = fun(Reason) ->
@@ -109,6 +113,8 @@ check_desc_string(Name, BinStr) ->
             Err("remove trailing <br/>");
         ">/ rb<" ++ _ ->
             Err("remove trailing <br />");
+        [$~ | _] ->
+            Err("unpaired '~\"\"\"' for multi-line string?");
         _ ->
             ok
     end.

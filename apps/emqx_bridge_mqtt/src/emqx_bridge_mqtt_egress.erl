@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_mqtt_egress).
@@ -19,6 +7,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("snabbkaffe/include/trace.hrl").
 
 -export([
     config/1,
@@ -45,6 +34,7 @@ config(#{remote := RC = #{}} = Conf) ->
 -spec send(pid(), emqx_trace:rendered_action_template_ctx(), message(), egress()) ->
     ok | {error, {unrecoverable_error, term()}}.
 send(Pid, TraceRenderedCTX, MsgIn, Egress) ->
+    ?tp("mqtt_action_about_to_publish", #{}),
     try
         emqtt:publish(Pid, export_msg(MsgIn, Egress, TraceRenderedCTX))
     catch
@@ -55,6 +45,7 @@ send(Pid, TraceRenderedCTX, MsgIn, Egress) ->
 -spec send_async(pid(), emqx_trace:rendered_action_template_ctx(), message(), callback(), egress()) ->
     {ok, pid()} | {error, {unrecoverable_error, term()}}.
 send_async(Pid, TraceRenderedCTX, MsgIn, Callback, Egress) ->
+    ?tp("mqtt_action_about_to_publish", #{}),
     try
         ok = emqtt:publish_async(
             Pid, export_msg(MsgIn, Egress, TraceRenderedCTX), _Timeout = infinity, Callback

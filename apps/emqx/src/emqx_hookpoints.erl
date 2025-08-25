@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_hookpoints).
@@ -30,14 +18,16 @@
     default_hookpoints/0,
     register_hookpoints/0,
     register_hookpoints/1,
-    verify_hookpoint/1
+    verify_hookpoint/1,
+    registered_hookpoints/0
 ]).
 
 %%-----------------------------------------------------------------------------
 %% Hookpoints
 %%-----------------------------------------------------------------------------
 
--define(HOOKPOINTS, [
+-define(MQTT_CLIENT_LIFECYCLE_HOOKPOINTS, [
+    'channel.limiter_adjustment',
     'client.connect',
     'client.connack',
     'client.connected',
@@ -60,14 +50,25 @@
     'message.publish',
     'message.puback',
     'message.dropped',
+    'message.transformation_failed',
     'schema.validation_failed',
     'message.delivered',
     'message.acked',
     'delivery.dropped',
     'delivery.completed',
-    'cm.channel.unregistered',
-    'tls_handshake.psk_lookup'
+    'cm.channel.unregistered'
 ]).
+
+-define(MANAGEMENT_HOOKPOINTS, [
+    'alarm.activated',
+    'alarm.deactivated',
+    'tls_handshake.psk_lookup',
+    'config.zones_updated',
+    'api_actor.pre_create',
+    'namespace.delete'
+]).
+
+-define(HOOKPOINTS, (?MQTT_CLIENT_LIFECYCLE_HOOKPOINTS ++ ?MANAGEMENT_HOOKPOINTS)).
 
 %% Our template plugin used this hookpoints before its 5.1.0 version,
 %% so we keep them here
@@ -78,6 +79,22 @@
     'session.takeovered'
 ]).
 
+-type alarm_activated_context() :: #{
+    name := binary(),
+    details := map(),
+    message := binary(),
+    activated_at := integer()
+}.
+-type alarm_deactivated_context() :: #{
+    name := binary(),
+    details := map(),
+    message := binary(),
+    activated_at := integer(),
+    deactivated_at := integer()
+}.
+-type transformation_context() :: #{name := binary()}.
+-type validation_context() :: #{name := binary()}.
+
 %%-----------------------------------------------------------------------------
 %% Callbacks
 %%-----------------------------------------------------------------------------
@@ -87,6 +104,12 @@
 %% after the mandatory ones.
 %%
 %% By default, callbacks are executed in the channel process context.
+
+-callback 'alarm.activated'(alarm_activated_context()) ->
+    callback_result().
+
+-callback 'alarm.deactivated'(alarm_deactivated_context()) ->
+    callback_result().
 
 -callback 'client.connect'(emqx_types:conninfo(), Props) ->
     fold_callback_result(Props)
@@ -104,25 +127,26 @@ when
     callback_result().
 
 -callback 'client.authorize'(
-    emqx_types:clientinfo(), emqx_types:pubsub(), emqx_types:topic(), allow | deny
+    emqx_types:clientinfo(),
+    emqx_types:pubsub(),
+    emqx_types:topic(),
+    emqx_access_control:authorize_hook_result()
 ) ->
-    fold_callback_result(#{result := allow | deny, from => term()}).
+    fold_callback_result(emqx_access_control:authorize_hook_result()).
 
 -callback 'client.check_authz_complete'(
-    emqx_types:clientinfo(), emqx_types:pubsub(), emqx_types:topic(), allow | deny, _From :: term()
+    emqx_types:clientinfo(),
+    emqx_types:pubsub(),
+    emqx_types:topic(),
+    emqx_access_control:authz_result(),
+    _From :: term()
 ) ->
     callback_result().
 
--callback 'client.authenticate'(emqx_types:clientinfo(), ignore) ->
-    fold_callback_result(
-        ignore
-        | ok
-        | {ok, map()}
-        | {ok, map(), binary()}
-        | {continue, map()}
-        | {continue, binary(), map()}
-        | {error, term()}
-    ).
+-callback 'client.authenticate'(
+    emqx_types:clientinfo(), emqx_access_control:authenticate_hook_result()
+) ->
+    fold_callback_result(emqx_access_control:authenticate_hook_result()).
 
 -callback 'client.subscribe'(emqx_types:clientinfo(), emqx_types:properties(), TopicFilters) ->
     fold_callback_result(TopicFilters)
@@ -184,7 +208,10 @@ when
 -callback 'message.dropped'(emqx_types:message(), #{node => node()}, _Reason :: atom()) ->
     callback_result().
 
--callback 'schema.validation_failed'(emqx_types:message(), #{node => node()}, _Ctx :: map()) ->
+-callback 'message.transformation_failed'(emqx_types:message(), transformation_context()) ->
+    callback_result().
+
+-callback 'schema.validation_failed'(emqx_types:message(), validation_context()) ->
     callback_result().
 
 -callback 'message.delivered'(emqx_types:clientinfo(), Msg) -> fold_callback_result(Msg) when
@@ -200,6 +227,16 @@ when
 }) ->
     callback_result().
 
+-callback 'channel.limiter_adjustment'(
+    #{
+        zone := emqx_types:zone(),
+        listener_id := emqx_listeners:listener_id(),
+        tns := undefined | binary()
+    },
+    emqx_limiter_client:t()
+) ->
+    fold_callback_result(emqx_limiter_client:t()).
+
 %% NOTE
 %% Executed out of channel process context
 -callback 'cm.channel.unregistered'(_ChanPid :: pid()) -> callback_result().
@@ -212,6 +249,23 @@ when
         | {error, term()}
         | normal
     ).
+
+%% NOTE
+%% Executed out of channel process context
+-callback 'config.zones_updated'(_Old :: emqx_config:config(), _New :: emqx_config:config()) ->
+    callback_result().
+
+%% NOTE
+%% Executed out of channel process context
+-callback 'api_actor.pre_create'(
+    emqx_config:maybe_namespace(), emqx_dashboard_admin:actor_props()
+) ->
+    fold_callback_result(ok | {error, term()}).
+
+%% NOTE
+%% Executed out of channel process context
+%% Implementations must be idempotent.
+-callback 'namespace.delete'(emqx_config:namespace()) -> callback_result().
 
 %%-----------------------------------------------------------------------------
 %% API
@@ -243,15 +297,11 @@ register_hookpoints(HookPoints) when is_map(HookPoints) ->
 -spec verify_hookpoint(registered_hookpoint() | binary()) -> ok | no_return().
 verify_hookpoint(HookPoint) when is_binary(HookPoint) -> ok;
 verify_hookpoint(HookPoint) ->
-    case maps:find(HookPoint, registered_hookpoints()) of
-        {ok, valid} -> ok;
-        {ok, deprecated} -> ?SLOG(warning, #{msg => deprecated_hookpoint, hookpoint => HookPoint});
-        error -> error({invalid_hookpoint, HookPoint})
+    case maps:get(HookPoint, registered_hookpoints(), invalid) of
+        valid -> ok;
+        deprecated -> ?SLOG(warning, #{msg => deprecated_hookpoint, hookpoint => HookPoint});
+        invalid -> error({invalid_hookpoint, HookPoint})
     end.
-
-%%-----------------------------------------------------------------------------
-%% Internal API
-%%-----------------------------------------------------------------------------
 
 -spec registered_hookpoints() -> #{registered_hookpoint() => registered_hookpoint_status()}.
 registered_hookpoints() ->

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_rabbitmq_connector).
@@ -31,6 +31,7 @@
     on_remove_channel/3,
     on_get_channels/1,
     on_stop/2,
+    resource_type/0,
     callback_mode/0,
     on_get_status/2,
     on_get_channel_status/3,
@@ -55,27 +56,32 @@ fields(config) ->
     emqx_bridge_rabbitmq_connector_schema:fields(connector) ++
         emqx_bridge_rabbitmq_pubsub_schema:fields(action_parameters).
 
+-define(GET_STATUS_TIMEOUT, 10_000).
+%% Less than ?T_OPERATION of emqx_resource_manager
+-define(CHANNEL_CLOSE_TIMEOUT, 4_000).
+
 %% ===================================================================
 %% Callbacks defined in emqx_resource
 %% ===================================================================
 
 %% emqx_resource callback
+resource_type() -> rabbitmq.
 
 callback_mode() -> always_sync.
 
-on_start(InstanceID, Config) ->
+on_start(InstanceId, Config) ->
     ?SLOG(info, #{
         msg => "starting_rabbitmq_connector",
-        connector => InstanceID,
+        connector => InstanceId,
         config => emqx_utils:redact(Config)
     }),
     init_secret(),
     Options = [
         {config, Config},
         {pool_size, maps:get(pool_size, Config)},
-        {pool, InstanceID}
+        {pool, InstanceId}
     ],
-    case emqx_resource_pool:start(InstanceID, ?MODULE, Options) of
+    case emqx_resource_pool:start(InstanceId, ?MODULE, Options) of
         ok ->
             {ok, #{channels => #{}}};
         {error, Reason} ->
@@ -97,7 +103,7 @@ on_add_channel(
         true ->
             {error, already_exists};
         false ->
-            ProcParam = preproc_parameter(Config),
+            ProcParam = preproc_parameter(ChannelId, Config),
             case make_channel(InstanceId, ChannelId, ProcParam) of
                 {ok, RabbitChannels} ->
                     Channel = #{param => ProcParam, rabbitmq => RabbitChannels},
@@ -176,32 +182,49 @@ connect(Options) ->
     end.
 
 -spec on_get_status(resource_id(), term()) ->
-    {connected, resource_state()} | {disconnected, resource_state(), binary()}.
-on_get_status(PoolName, #{channels := Channels} = State) ->
+    ?status_connected | {?status_disconnected, binary()}.
+on_get_status(PoolName, #{channels := Channels}) ->
     ChannelNum = maps:size(Channels),
     Conns = get_rabbitmq_connections(PoolName),
-    Check =
-        lists:all(
-            fun(Conn) ->
-                [{num_channels, ActualNum}] = amqp_connection:info(Conn, [num_channels]),
-                ChannelNum >= ActualNum
-            end,
-            Conns
-        ),
-    case Check andalso Conns =/= [] of
-        true -> {connected, State};
-        false -> {disconnected, State, <<"not_connected">>}
+    try actual_channel_nums(Conns) of
+        ActualNums ->
+            Check = lists:all(fun(ActualNum) -> ActualNum >= ChannelNum end, ActualNums),
+            case Check of
+                true when Conns =/= [] ->
+                    ?status_connected;
+                _ ->
+                    {?status_disconnected, <<"not_connected">>}
+            end
+    catch
+        Error:Reason ->
+            ?SLOG(error, #{
+                msg => "rabbitmq_connector_get_status_failed",
+                connector => PoolName,
+                error => Error,
+                reason => Reason
+            }),
+            {?status_disconnected, <<"not_connected">>}
     end.
+
+actual_channel_nums(Conns) ->
+    emqx_utils:pmap(
+        fun(Conn) ->
+            [{num_channels, ActualNum}] = amqp_connection:info(Conn, [num_channels]),
+            ActualNum
+        end,
+        Conns,
+        ?GET_STATUS_TIMEOUT
+    ).
 
 on_get_channel_status(_InstanceId, ChannelId, #{channels := Channels}) ->
     case emqx_utils_maps:deep_find([ChannelId, rabbitmq], Channels) of
         {ok, RabbitMQ} ->
             case lists:all(fun is_process_alive/1, maps:values(RabbitMQ)) of
-                true -> connected;
-                false -> {error, not_connected}
+                true -> ?status_connected;
+                false -> {?status_disconnected, not_connected}
             end;
         _ ->
-            {error, not_exists}
+            ?status_disconnected
     end.
 
 on_query(ResourceID, {ChannelId, Data} = MsgReq, State) ->
@@ -250,28 +273,16 @@ on_batch_query(ResourceID, [{ChannelId, _Data} | _] = Batch, State) ->
 publish_messages(
     Conn,
     RabbitMQ,
-    #{
-        delivery_mode := DeliveryMode,
-        payload_template := PayloadTmpl,
-        routing_key := RoutingKey,
-        exchange := Exchange,
-        wait_for_publish_confirmations := WaitForPublishConfirmations,
-        publish_confirmation_timeout := PublishConfirmationTimeout
-    },
+    ChanState,
     Messages,
     TraceRenderedCTX
 ) ->
     try
-        publish_messages(
+        do_publish_messages(
             Conn,
             RabbitMQ,
-            DeliveryMode,
-            Exchange,
-            RoutingKey,
-            PayloadTmpl,
+            ChanState,
             Messages,
-            WaitForPublishConfirmations,
-            PublishConfirmationTimeout,
             TraceRenderedCTX
         )
     catch
@@ -279,42 +290,74 @@ publish_messages(
             {error, Reason};
         %% if send a message to a non-existent exchange, RabbitMQ client will crash
         %% {shutdown,{server_initiated_close,404,<<"NOT_FOUND - no exchange 'xyz' in vhost '/'">>}
-        %% so we catch and return {recoverable_error, Reason} to increase metrics
+        %% so we catch and return a more user friendly message in that case.
+        %% This seems to happen sometimes when the exchange does not exists.
+        exit:{{shutdown, {server_initiated_close, Code, Msg}}, _InternalReason} ->
+            ?tp(emqx_bridge_rabbitmq_connector_rabbit_publish_failed_with_msg, #{}),
+            {error,
+                {recoverable_error, #{
+                    msg => <<"rabbitmq_publish_failed">>,
+                    explain => Msg,
+                    exchange => maps:get(exchange, ChanState),
+                    routing_key => maps:get(routing_key, ChanState),
+                    rabbit_mq_error_code => Code
+                }}};
+        %% This probably happens when the RabbitMQ driver is restarting the connection process
+        exit:{noproc, _} = InternalError ->
+            ?tp(emqx_bridge_rabbitmq_connector_rabbit_publish_failed_con_not_ready, #{}),
+            {error,
+                {recoverable_error, #{
+                    msg => <<"rabbitmq_publish_failed">>,
+                    explain => "Connection is establishing",
+                    exchange => maps:get(exchange, ChanState),
+                    routing_key => maps:get(routing_key, ChanState),
+                    internal_error => InternalError
+                }}};
         _Type:Reason ->
+            ?tp(emqx_bridge_rabbitmq_connector_rabbit_publish_failed_other, #{}),
             Msg = iolist_to_binary(io_lib:format("RabbitMQ: publish_failed: ~p", [Reason])),
             {error, {recoverable_error, Msg}}
     end.
 
-publish_messages(
+do_publish_messages(
     Conn,
     RabbitMQ,
-    DeliveryMode,
-    Exchange,
-    RoutingKey,
-    PayloadTmpl,
+    ChanState,
     Messages,
-    WaitForPublishConfirmations,
-    PublishConfirmationTimeout,
     TraceRenderedCTX
 ) ->
+    #{
+        delivery_mode := DeliveryMode,
+        payload_template := _PayloadTmpl,
+        headers_template := _HeadersTemplate,
+        properties_template := _PropsTemplate,
+        routing_key := RoutingKey0,
+        exchange := Exchange0,
+        wait_for_publish_confirmations := WaitForPublishConfirmations,
+        publish_confirmation_timeout := PublishConfirmationTimeout
+    } = ChanState,
     case maps:find(Conn, RabbitMQ) of
         {ok, Channel} ->
-            MessageProperties = #'P_basic'{
-                headers = [],
-                delivery_mode = DeliveryMode
-            },
+            Exchange = render_template(Exchange0, Messages),
+            RoutingKey = render_template(RoutingKey0, Messages),
             Method = #'basic.publish'{
                 exchange = Exchange,
                 routing_key = RoutingKey
             },
-            FormattedMsgs = [
-                format_data(PayloadTmpl, M)
-             || {_, M} <- Messages
-            ],
+
+            BaseProps = #'P_basic'{
+                delivery_mode = DeliveryMode
+            },
+            FormattedMsgs = lists:map(
+                fun({_ChanId, Msg}) ->
+                    render_data(Msg, BaseProps, ChanState)
+                end,
+                Messages
+            ),
+
             emqx_trace:rendered_action_template_with_ctx(TraceRenderedCTX, #{
                 messages => FormattedMsgs,
                 properties => #{
-                    headers => [],
                     delivery_mode => DeliveryMode
                 },
                 method => #{
@@ -323,13 +366,13 @@ publish_messages(
                 }
             }),
             lists:foreach(
-                fun(Msg) ->
+                fun({Payload, Props}) ->
                     amqp_channel:cast(
                         Channel,
                         Method,
                         #amqp_msg{
-                            payload = Msg,
-                            props = MessageProperties
+                            payload = Payload,
+                            props = Props
                         }
                     )
                 end,
@@ -337,7 +380,12 @@ publish_messages(
             ),
             case WaitForPublishConfirmations of
                 true ->
-                    case amqp_channel:wait_for_confirms(Channel, PublishConfirmationTimeout) of
+                    case
+                        amqp_channel:wait_for_confirms(
+                            Channel,
+                            {PublishConfirmationTimeout, millisecond}
+                        )
+                    of
                         true ->
                             ok;
                         false ->
@@ -364,6 +412,39 @@ format_data([], Msg) ->
     emqx_utils_json:encode(Msg);
 format_data(Tokens, Msg) ->
     emqx_placeholder:proc_tmpl(Tokens, Msg).
+
+render_data(Msg, BaseProps, ChanState) ->
+    #{
+        payload_template := PayloadTemplate,
+        headers_template := HeadersTemplate,
+        properties_template := PropsTemplate
+    } = ChanState,
+    Payload = format_data(PayloadTemplate, Msg),
+    Props1 = add_rendered_props(PropsTemplate, Msg, BaseProps),
+    Headers = lists:map(
+        fun(Tpl) ->
+            {K, V} = render_kv_template(Tpl, Msg),
+            %% should we support other types?
+            {K, binary, V}
+        end,
+        HeadersTemplate
+    ),
+    Props = Props1#'P_basic'{headers = Headers},
+    {Payload, Props}.
+
+%% Dynamic `exchange` and `routing_key` are restricted in batch mode,
+%% we assume these two values ​​are the same in a batch.
+render_template({fixed, Data}, _) ->
+    Data;
+render_template(Template, [Req | _]) ->
+    render_template(Template, Req);
+render_template({dynamic, Template}, {_, Message}) ->
+    try
+        erlang:iolist_to_binary(emqx_template:render_strict(Template, {emqx_jsonish, Message}))
+    catch
+        error:_Errors ->
+            erlang:throw(bad_template)
+    end.
 
 handle_result({error, ecpool_empty}) ->
     {error, {recoverable_error, ecpool_empty}};
@@ -416,18 +497,120 @@ init_secret() ->
             ok
     end.
 
-preproc_parameter(#{config_root := actions, parameters := Parameter}) ->
+preproc_parameter(_ActionResId, #{config_root := actions, parameters := Parameter}) ->
     #{
         payload_template := PayloadTemplate,
-        delivery_mode := InitialDeliveryMode
+        delivery_mode := InitialDeliveryMode,
+        exchange := Exchange,
+        routing_key := RoutingKey,
+        headers_template := HeadersTemplate,
+        properties_template := PropsTemplate
     } = Parameter,
     Parameter#{
         delivery_mode => delivery_mode(InitialDeliveryMode),
         payload_template => emqx_placeholder:preproc_tmpl(PayloadTemplate),
-        config_root => actions
+        config_root => actions,
+        exchange := preproc_template(Exchange),
+        routing_key := preproc_template(RoutingKey),
+        headers_template := lists:map(fun parse_kv_template/1, HeadersTemplate),
+        properties_template := lists:map(fun parse_v_template/1, PropsTemplate)
     };
-preproc_parameter(#{config_root := sources, parameters := Parameter, hookpoints := Hooks}) ->
-    Parameter#{hookpoints => Hooks, config_root => sources}.
+preproc_parameter(SourceResId, #{
+    config_root := sources, parameters := Parameter, hookpoints := Hooks
+}) ->
+    #{namespace := Namespace} = emqx_resource:parse_channel_id(SourceResId),
+    Parameter#{
+        hookpoints => Hooks,
+        namespace => Namespace,
+        config_root => sources
+    }.
+
+preproc_template(Template0) ->
+    Template = emqx_template:parse(Template0),
+    case emqx_template:placeholders(Template) of
+        [] ->
+            {fixed, emqx_utils_conv:bin(Template0)};
+        [_ | _] ->
+            {dynamic, Template}
+    end.
+
+parse_v_template(#{key := K, value := VTpl}) ->
+    {K, emqx_template:parse(VTpl)}.
+
+parse_kv_template(#{key := KTpl, value := VTpl}) ->
+    #{
+        key => emqx_template:parse(KTpl),
+        value => emqx_template:parse(VTpl)
+    }.
+
+render_kv_template(#{key := KTpl, value := VTpl}, Msg) ->
+    Key = render_lax(KTpl, Msg),
+    Value = render_lax(VTpl, Msg),
+    {Key, Value}.
+
+render_lax(Template, Data) ->
+    %% Unknown/undefined values are rendered as empty strings
+    VarTrans = fun
+        (undefined) -> <<"">>;
+        (X) -> X
+    end,
+    {Rendered, _} = emqx_template:render(Template, {emqx_jsonish, Data}, #{var_trans => VarTrans}),
+    case Rendered of
+        [Value] -> Value;
+        _ -> iolist_to_binary(Rendered)
+    end.
+
+add_rendered_props(PropsTemplate, Data, PBasic) ->
+    lists:foldl(
+        fun
+            ({app_id, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{app_id = Val};
+            ({cluster_id, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{cluster_id = Val};
+            ({content_encoding, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{content_encoding = Val};
+            ({content_type, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{content_type = Val};
+            ({correlation_id, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{correlation_id = Val};
+            ({expiration, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{expiration = Val};
+            ({message_id, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{message_id = Val};
+            ({reply_to, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{reply_to = Val};
+            ({timestamp, Tpl}, Acc) ->
+                Val0 = render_lax(Tpl, Data),
+                Val = try_cast_timestamp_to_integer(Val0),
+                Acc#'P_basic'{timestamp = Val};
+            ({type, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{type = Val};
+            ({user_id, Tpl}, Acc) ->
+                Val = render_lax(Tpl, Data),
+                Acc#'P_basic'{user_id = Val}
+        end,
+        PBasic,
+        PropsTemplate
+    ).
+
+try_cast_timestamp_to_integer(I) when is_integer(I) ->
+    I;
+try_cast_timestamp_to_integer(Bin) when is_binary(Bin) ->
+    try
+        binary_to_integer(Bin)
+    catch
+        error:badarg ->
+            throw({unrecoverable_error, {bad_timestamp_value, Bin}})
+    end.
 
 delivery_mode(non_persistent) -> 1;
 delivery_mode(persistent) -> 2.
@@ -465,8 +648,20 @@ try_subscribe(#{config_root := actions}, _RabbitChan, _ChannelId) ->
 try_unsubscribe(ChannelId, Channels) ->
     case emqx_utils_maps:deep_find([ChannelId, rabbitmq], Channels) of
         {ok, RabbitMQ} ->
-            lists:foreach(fun(Pid) -> catch amqp_channel:close(Pid) end, maps:values(RabbitMQ)),
-            emqx_bridge_rabbitmq_sup:ensure_deleted(ChannelId);
+            Pids = maps:values(RabbitMQ),
+            ok = close_channels(Pids),
+            _ = emqx_bridge_rabbitmq_sup:ensure_deleted(ChannelId),
+            ok;
         _ ->
+            ok
+    end.
+
+close_channels(Pids) ->
+    try
+        emqx_utils:pforeach(
+            fun(Pid) -> amqp_channel:close(Pid) end, Pids, ?CHANNEL_CLOSE_TIMEOUT
+        )
+    catch
+        _:_ ->
             ok
     end.

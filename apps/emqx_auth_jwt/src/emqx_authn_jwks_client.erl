@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_jwks_client).
@@ -28,8 +16,7 @@
 ]).
 
 -export([
-    get_jwks/1,
-    update/2
+    get_jwks/1
 ]).
 
 %% gen_server callbacks
@@ -55,9 +42,6 @@ stop(Pid) ->
 get_jwks(Pid) ->
     gen_server:call(Pid, get_cached_jwks, 5000).
 
-update(Pid, Opts) ->
-    gen_server:call(Pid, {update, Opts}, 5000).
-
 %%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
@@ -66,11 +50,8 @@ init([Opts]) ->
     State = handle_options(Opts),
     {ok, refresh_jwks(State)}.
 
-handle_call(get_cached_jwks, _From, #{jwks := Jwks} = State) ->
-    {reply, {ok, Jwks}, State};
-handle_call({update, Opts}, _From, _State) ->
-    NewState = handle_options(Opts),
-    {reply, ok, refresh_jwks(NewState)};
+handle_call(get_cached_jwks, _From, #{jwks := JWKS} = State) ->
+    {reply, {ok, JWKS}, State};
 handle_call(_Req, _From, State) ->
     {reply, ok, State}.
 
@@ -86,7 +67,9 @@ handle_info(
     {http, {RequestID, Result}},
     #{request_id := RequestID, endpoint := Endpoint} = State0
 ) ->
-    ?tp(debug, jwks_endpoint_response, #{request_id => RequestID}),
+    ?tp(debug, jwks_endpoint_response, #{
+        request_id => RequestID, response => emqx_utils:redact(Result)
+    }),
     State1 = State0#{request_id := undefined},
     NewState =
         case Result of
@@ -99,9 +82,9 @@ handle_info(
                 State1;
             {StatusLine, Headers, Body} ->
                 try
-                    JWKS = jose_jwk:from(emqx_utils_json:decode(Body, [return_maps])),
-                    {_, JWKs} = JWKS#jose_jwk.keys,
-                    State1#{jwks := JWKs}
+                    JWK = jose_jwk:from(emqx_utils_json:decode(Body)),
+                    {_, JWKS} = JWK#jose_jwk.keys,
+                    State1#{jwks := JWKS}
                 catch
                     _:_ ->
                         ?SLOG(warning, #{
@@ -133,13 +116,15 @@ code_change(_OldVsn, State, _Extra) ->
 
 handle_options(#{
     endpoint := Endpoint,
+    headers := Headers,
     refresh_interval := RefreshInterval0,
-    ssl_opts := SSLOpts
+    ssl := SSLOpts
 }) ->
     #{
         endpoint => Endpoint,
+        headers => to_httpc_headers(Headers),
         refresh_interval => limit_refresh_interval(RefreshInterval0),
-        ssl_opts => maps:to_list(SSLOpts),
+        ssl_opts => emqx_tls_lib:to_client_opts(SSLOpts),
         jwks => [],
         request_id => undefined
     }.
@@ -147,6 +132,7 @@ handle_options(#{
 refresh_jwks(
     #{
         endpoint := Endpoint,
+        headers := Headers,
         ssl_opts := SSLOpts
     } = State
 ) ->
@@ -159,7 +145,7 @@ refresh_jwks(
         case
             httpc:request(
                 get,
-                {Endpoint, [{"Accept", "application/json"}]},
+                {Endpoint, Headers},
                 HTTPOpts,
                 [{body_format, binary}, {sync, false}, {receiver, self()}]
             )
@@ -185,6 +171,9 @@ limit_refresh_interval(Interval) when Interval < 10 ->
 limit_refresh_interval(Interval) ->
     Interval.
 
+to_httpc_headers(Headers) ->
+    [{binary_to_list(bin(K)), V} || {K, V} <- maps:to_list(Headers)].
+
 cancel_http_request(#{request_id := undefined} = State) ->
     State;
 cancel_http_request(#{request_id := RequestID} = State) ->
@@ -195,3 +184,10 @@ cancel_http_request(#{request_id := RequestID} = State) ->
         ok
     end,
     State#{request_id => undefined}.
+
+bin(List) when is_list(List) ->
+    unicode:characters_to_binary(List, utf8);
+bin(Atom) when is_atom(Atom) ->
+    erlang:atom_to_binary(Atom);
+bin(Bin) when is_binary(Bin) ->
+    Bin.

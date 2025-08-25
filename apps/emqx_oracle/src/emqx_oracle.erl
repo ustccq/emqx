@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_oracle).
@@ -8,11 +8,15 @@
 
 -include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -define(UNHEALTHY_TARGET_MSG,
     "Oracle table is invalid. Please check if the table exists in Oracle Database."
 ).
+
+-define(DEFAULT_ROLE, normal).
+-define(SYSDBA_ROLE, sysdba).
 
 %%====================================================================
 %% Exports
@@ -20,6 +24,7 @@
 
 %% callbacks for behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -33,7 +38,7 @@
 ]).
 
 %% callbacks for ecpool
--export([connect/1, prepare_sql_to_conn/3]).
+-export([connect/1, prepare_sql_to_conn/3, get_reconnect_callback_signature/1]).
 
 %% Internal exports used to execute code with ecpool worker
 -export([
@@ -45,6 +50,8 @@
 -export([
     oracle_host_options/0
 ]).
+
+-export_type([state/0]).
 
 -define(ORACLE_DEFAULT_PORT, 1521).
 -define(SYNC_QUERY_MODE, no_handover).
@@ -65,6 +72,8 @@
         params_tokens := params_tokens(),
         batch_params_tokens := params_tokens()
     }.
+
+resource_type() -> oracle.
 
 % As ecpool is not monitoring the worker's PID when doing a handover_async, the
 % request can be lost if worker crashes. Thus, it's better to force requests to
@@ -96,9 +105,11 @@ on_start(
             undefined -> undefined;
             ServiceName0 -> emqx_utils_conv:str(ServiceName0)
         end,
+    Role = convert_role_to_integer(maps:get(role, Config, ?DEFAULT_ROLE)),
     Options = [
         {host, Host},
         {port, Port},
+        {role, Role},
         {user, emqx_utils_conv:str(User)},
         {password, maps:get(password, Config, "")},
         {sid, emqx_utils_conv:str(Sid)},
@@ -268,27 +279,27 @@ on_batch_query(
 proc_sql_params(query, SQLOrKey, Params, _State) ->
     {SQLOrKey, Params};
 proc_sql_params(TypeOrKey, SQLOrData, Params, #{
-    params_tokens := ParamsTokens, prepare_sql := PrepareSql
+    params_tokens := ParamsTokens, prepare_sql := PrepareSQL
 }) ->
     Key = to_bin(TypeOrKey),
     case maps:get(Key, ParamsTokens, undefined) of
         undefined ->
             {SQLOrData, Params};
         Tokens ->
-            case maps:get(Key, PrepareSql, undefined) of
+            case maps:get(Key, PrepareSQL, undefined) of
                 undefined ->
                     {SQLOrData, Params};
-                Sql ->
-                    {Sql, emqx_placeholder:proc_sql(Tokens, SQLOrData)}
+                SQL ->
+                    {SQL, emqx_placeholder:proc_sql(Tokens, SQLOrData)}
             end
     end.
 
-on_sql_query(InstId, ChannelID, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
-    emqx_trace:rendered_action_template(ChannelID, #{
+on_sql_query(InstId, ChannelId, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
+    emqx_trace:rendered_action_template(ChannelId, #{
         type => Type,
         apply_mode => ApplyMode,
         name_or_sql => NameOrSQL,
-        data => Data
+        data => #emqx_trace_format_func_data{function = fun trace_format_data/1, data = Data}
     }),
     case ecpool:pick_and_do(PoolName, {?MODULE, Type, [NameOrSQL, Data]}, ApplyMode) of
         {error, Reason} = Result ->
@@ -316,6 +327,15 @@ on_sql_query(InstId, ChannelID, PoolName, Type, ApplyMode, NameOrSQL, Data) ->
             ),
             Result
     end.
+
+trace_format_data(Data0) ->
+    %% In batch request, we get a two level list
+    {'$array$', lists:map(fun insert_array_marker_if_list/1, Data0)}.
+
+insert_array_marker_if_list(List) when is_list(List) ->
+    {'$array$', List};
+insert_array_marker_if_list(Item) ->
+    Item.
 
 on_get_status(_InstId, #{pool_name := Pool} = _State) ->
     case emqx_resource_pool:health_check_workers(Pool, fun ?MODULE:do_get_status/1) of
@@ -383,6 +403,7 @@ sql_params_to_str(Params) when is_list(Params) ->
         fun
             (false) -> "0";
             (true) -> "1";
+            (null) -> null;
             (Value) -> emqx_utils_conv:str(Value)
         end,
         Params
@@ -483,6 +504,12 @@ prepare_sql_to_conn(Conn, [{Key, SQL} | PrepareList], TokensMap, Statements) whe
             Error
     end.
 
+%% this callback accepts the arg list provided to
+%% ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn, [Templates]})
+%% so ecpool_worker can de-duplicate the callbacks based on the signature.
+get_reconnect_callback_signature([[{ChannelId, _Template}]]) ->
+    ChannelId.
+
 check_if_table_exists(Conn, SQL, Tokens0) ->
     % Discard nested tokens for checking if table exist. As payload here is defined as
     % a single string, it would fail if Token is, for instance, ${payload.msg}, causing
@@ -527,6 +554,20 @@ check_if_table_exists(Conn, SQL, Tokens0) ->
                     % table does exist. Probably this inconsistency was caused by
                     % token discarding in this test query.
                     ok;
+                _ when is_map_key(<<"ORA-01400">>, OraMap) ->
+                    % ORA-01400: cannot insert NULL into (string)
+                    % There is a some type inconsistency with table definition but
+                    % table does exist. Probably this inconsistency was caused by
+                    % token discarding in this test query.
+                    ok;
+                _ when is_map_key(<<"ORA-01013">>, OraMap) ->
+                    % ORA-01013: user requested cancel of current operation
+                    % This error is returned when the query is canceled by the user.
+                    ok;
+                _ when is_map_key(<<"ORA-12899">>, OraMap) ->
+                    % ORA-12899: value too large for column
+                    % This error is returned when the value is too large for the column.
+                    ok;
                 _ ->
                     {error, Description}
             end;
@@ -564,3 +605,8 @@ handle_batch_result([{proc_result, RetCode, Reason} | _Rest], _Acc) ->
     {error, {unrecoverable_error, {RetCode, Reason}}};
 handle_batch_result([], Acc) ->
     {ok, Acc}.
+
+convert_role_to_integer(?SYSDBA_ROLE) ->
+    1;
+convert_role_to_integer(_) ->
+    0.

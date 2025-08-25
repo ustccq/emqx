@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_s3_connector).
@@ -13,6 +13,7 @@
 
 -behaviour(emqx_resource).
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -27,7 +28,7 @@
 
 -behaviour(emqx_connector_aggreg_delivery).
 -export([
-    init_transfer_state/2,
+    init_transfer_state_and_container_opts/2,
     process_append/2,
     process_write/1,
     process_complete/1,
@@ -69,7 +70,7 @@
         max_records := pos_integer()
     },
     container := #{
-        type := csv,
+        type := csv | json_lines,
         column_order => [string()]
     },
     min_part_size := emqx_schema:bytesize(),
@@ -84,7 +85,6 @@
 
 -type state() :: #{
     pool_name := resource_id(),
-    pool_pid => pid(),
     client_config := emqx_s3_client:config(),
     channels := #{channel_id() => channel_state()}
 }.
@@ -92,6 +92,8 @@
 -define(AGGREG_SUP, emqx_bridge_s3_sup).
 
 %%
+-spec resource_type() -> resource_type().
+resource_type() -> s3.
 
 -spec callback_mode() -> callback_mode().
 callback_mode() ->
@@ -109,17 +111,16 @@ on_start(InstId, Config) ->
         client_config => emqx_s3_profile_conf:client_config(S3Config, PoolName),
         channels => #{}
     },
-    HttpConfig = emqx_s3_profile_conf:http_config(Config),
-    _ = ehttpc_sup:stop_pool(PoolName),
-    case ehttpc_sup:start_pool(PoolName, HttpConfig) of
-        {ok, Pid} ->
+    _ = emqx_s3_client_http:stop_pool(PoolName),
+    case emqx_s3_client_http:start_pool(PoolName, S3Config) of
+        ok ->
             ?SLOG(info, #{msg => "s3_connector_start_http_pool_success", pool_name => PoolName}),
-            {ok, State#{pool_pid => Pid}};
+            {ok, State};
         {error, Reason} = Error ->
             ?SLOG(error, #{
                 msg => "s3_connector_start_http_pool_fail",
                 pool_name => PoolName,
-                http_config => HttpConfig,
+                config => S3Config,
                 reason => Reason
             }),
             Error
@@ -127,37 +128,15 @@ on_start(InstId, Config) ->
 
 -spec on_stop(_InstanceId :: resource_id(), state()) ->
     ok.
-on_stop(InstId, _State = #{pool_name := PoolName}) ->
-    case ehttpc_sup:stop_pool(PoolName) of
-        ok ->
-            ?tp(s3_bridge_stopped, #{instance_id => InstId}),
-            ok;
-        {error, Reason} ->
-            ?SLOG(error, #{
-                msg => "s3_connector_http_pool_stop_fail",
-                pool_name => PoolName,
-                reason => Reason
-            }),
-            ok
-    end.
+on_stop(_InstId, _State = #{pool_name := PoolName}) ->
+    Res = emqx_s3_client_http:stop_pool(PoolName),
+    ?tp(s3_bridge_stopped, #{instance_id => _InstId}),
+    Res.
 
 -spec on_get_status(_InstanceId :: resource_id(), state()) ->
     health_check_status().
-on_get_status(_InstId, State = #{client_config := Config}) ->
-    case emqx_s3_client:aws_config(Config) of
-        {error, Reason} ->
-            {?status_disconnected, State, Reason};
-        AWSConfig ->
-            try erlcloud_s3:list_buckets(AWSConfig) of
-                Props when is_list(Props) ->
-                    ?status_connected
-            catch
-                error:{aws_error, {http_error, _Code, _, Reason}} ->
-                    {?status_disconnected, State, Reason};
-                error:{aws_error, {socket_error, Reason}} ->
-                    {?status_disconnected, State, Reason}
-            end
-    end.
+on_get_status(_InstId, #{client_config := Config}) ->
+    emqx_s3_client:get_status(Config).
 
 -spec on_add_channel(_InstanceId :: resource_id(), state(), channel_id(), channel_config()) ->
     {ok, state()} | {error, _Reason}.
@@ -212,7 +191,8 @@ start_channel(State, #{
             max_records := MaxRecords
         },
         container := Container,
-        bucket := Bucket
+        bucket := Bucket,
+        key := Key
     }
 }) ->
     AggregId = {Type, Name},
@@ -221,9 +201,10 @@ start_channel(State, #{
         max_records => MaxRecords,
         work_dir => work_dir(Type, Name)
     },
+    Template = emqx_bridge_s3_upload:mk_key_template(Key),
     DeliveryOpts = #{
         bucket => Bucket,
-        key => emqx_bridge_s3_upload:mk_key_template(Parameters),
+        key => Template,
         container => Container,
         upload_options => emqx_bridge_s3_upload:mk_upload_options(Parameters),
         callback_module => ?MODULE,
@@ -274,7 +255,7 @@ channel_status(#{mode := aggregated, aggreg_id := AggregId, bucket := Bucket}, S
 check_bucket_accessible(Bucket, #{client_config := Config}) ->
     case emqx_s3_client:aws_config(Config) of
         {error, Reason} ->
-            throw({unhealthy_target, Reason});
+            throw({unhealthy_target, emqx_s3_utils:map_error_details(Reason)});
         AWSConfig ->
             try erlcloud_s3:list_objects(Bucket, [{max_keys, 1}], AWSConfig) of
                 Props when is_list(Props) ->
@@ -282,8 +263,8 @@ check_bucket_accessible(Bucket, #{client_config := Config}) ->
             catch
                 error:{aws_error, {http_error, 404, _, _Reason}} ->
                     throw({unhealthy_target, "Bucket does not exist"});
-                error:{aws_error, {socket_error, Reason}} ->
-                    throw({unhealthy_target, emqx_utils:format(Reason)})
+                error:Error ->
+                    throw({unhealthy_target, emqx_s3_utils:map_error_details(Error)})
             end
     end.
 
@@ -293,8 +274,7 @@ check_aggreg_upload_errors(AggregId) ->
             %% TODO
             %% This approach means that, for example, 3 upload failures will cause
             %% the channel to be marked as unhealthy for 3 consecutive health checks.
-            ErrorMessage = emqx_utils:format(Error),
-            throw({unhealthy_target, ErrorMessage});
+            throw({unhealthy_target, emqx_s3_utils:map_error_details(Error)});
         [] ->
             ok
     end.
@@ -310,7 +290,7 @@ on_query(InstId, {Tag, Data}, #{client_config := Config, channels := Channels}) 
         ChannelState = #{mode := direct} ->
             run_simple_upload(InstId, Tag, Data, ChannelState, Config);
         ChannelState = #{mode := aggregated} ->
-            run_aggregated_upload(InstId, [Data], ChannelState);
+            run_aggregated_upload(InstId, Tag, [Data], ChannelState);
         undefined ->
             {error, {unrecoverable_error, {invalid_message_tag, Tag}}}
     end.
@@ -321,14 +301,14 @@ on_batch_query(InstId, [{Tag, Data0} | Rest], #{channels := Channels}) ->
     case maps:get(Tag, Channels, undefined) of
         ChannelState = #{mode := aggregated} ->
             Records = [Data0 | [Data || {_, Data} <- Rest]],
-            run_aggregated_upload(InstId, Records, ChannelState);
+            run_aggregated_upload(InstId, Tag, Records, ChannelState);
         undefined ->
             {error, {unrecoverable_error, {invalid_message_tag, Tag}}}
     end.
 
 run_simple_upload(
     InstId,
-    ChannelID,
+    ChannelId,
     Data,
     #{
         bucket := BucketTemplate,
@@ -342,7 +322,7 @@ run_simple_upload(
     Client = emqx_s3_client:create(Bucket, Config),
     Key = render_key(KeyTemplate, Data),
     Content = render_content(ContentTemplate, Data),
-    emqx_trace:rendered_action_template(ChannelID, #{
+    emqx_trace:rendered_action_template(ChannelId, #{
         bucket => Bucket,
         key => Key,
         content => #emqx_trace_format_func_data{
@@ -362,23 +342,34 @@ run_simple_upload(
             {error, map_error(Reason)}
     end.
 
-run_aggregated_upload(InstId, Records, #{aggreg_id := AggregId}) ->
+run_aggregated_upload(InstId, ChannelId, Records, #{aggreg_id := AggregId}) ->
     Timestamp = erlang:system_time(second),
+    emqx_trace:rendered_action_template(ChannelId, #{
+        mode => aggregated,
+        records => Records
+    }),
     case emqx_connector_aggregator:push_records(AggregId, Timestamp, Records) of
         ok ->
             ?tp(s3_bridge_aggreg_push_ok, #{instance_id => InstId, name => AggregId}),
             ok;
         {error, Reason} ->
-            {error, {unrecoverable_error, Reason}}
+            {error, {unrecoverable_error, emqx_utils:explain_posix(Reason)}}
     end.
 
-map_error({socket_error, _} = Reason) ->
-    {recoverable_error, Reason};
-map_error(Reason = {aws_error, Status, _, _Body}) when Status >= 500 ->
+map_error(Error) ->
+    {map_error_class(Error), emqx_s3_utils:map_error_details(Error)}.
+
+map_error_class({s3_error, _, _}) ->
+    unrecoverable_error;
+map_error_class({aws_error, Error}) ->
+    map_error_class(Error);
+map_error_class({socket_error, _}) ->
+    recoverable_error;
+map_error_class({http_error, Status, _, _}) when Status >= 500 ->
     %% https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#ErrorCodeList
-    {recoverable_error, Reason};
-map_error(Reason) ->
-    {unrecoverable_error, Reason}.
+    recoverable_error;
+map_error_class(_Error) ->
+    unrecoverable_error.
 
 render_bucket(Template, Data) ->
     case emqx_template:render(Template, {emqx_jsonish, Data}) of
@@ -403,20 +394,21 @@ iolist_to_string(IOList) ->
 
 %% `emqx_connector_aggreg_delivery` APIs
 
--spec init_transfer_state(buffer_map(), map()) -> emqx_s3_upload:t().
-init_transfer_state(BufferMap, Opts) ->
+-spec init_transfer_state_and_container_opts(buffer(), map()) -> {ok, emqx_s3_upload:t(), map()}.
+init_transfer_state_and_container_opts(Buffer, Opts) ->
     #{
         bucket := Bucket,
         upload_options := UploadOpts,
+        container := ContainerOpts,
         client_config := Config,
         uploader_config := UploaderConfig
     } = Opts,
     Client = emqx_s3_client:create(Bucket, Config),
-    Key = mk_object_key(BufferMap, Opts),
-    emqx_s3_upload:new(Client, Key, UploadOpts, UploaderConfig).
+    Key = mk_object_key(Buffer, Opts),
+    {ok, emqx_s3_upload:new(Client, Key, UploadOpts, UploaderConfig), ContainerOpts}.
 
-mk_object_key(BufferMap, #{action := AggregId, key := Template}) ->
-    emqx_template:render_strict(Template, {?MODULE, {AggregId, BufferMap}}).
+mk_object_key(Buffer, #{action := AggregId, key := Template}) ->
+    emqx_template:render_strict(Template, {?MODULE, {AggregId, Buffer}}).
 
 process_append(Writes, Upload0) ->
     {ok, Upload} = emqx_s3_upload:append(Writes, Upload0),
@@ -450,34 +442,26 @@ process_terminate(Upload) ->
 
 %% `emqx_template` APIs
 
--spec lookup(emqx_template:accessor(), {_Name, buffer_map()}) ->
+-spec lookup(emqx_template:accessor(), {_Name, buffer()}) ->
     {ok, integer() | string()} | {error, undefined}.
 lookup([<<"action">>], {_AggregId = {_Type, Name}, _Buffer}) ->
     {ok, mk_fs_safe_string(Name)};
-lookup(Accessor, {_AggregId, Buffer = #{}}) ->
+lookup([<<"node">>], {_AggregId, _Buffer}) ->
+    {ok, mk_fs_safe_string(atom_to_binary(erlang:node()))};
+lookup(Accessor, {_AggregId, Buffer}) ->
     lookup_buffer_var(Accessor, Buffer);
 lookup(_Accessor, _Context) ->
     {error, undefined}.
 
-lookup_buffer_var([<<"datetime">>, Format], #{since := Since}) ->
-    {ok, format_timestamp(Since, Format)};
-lookup_buffer_var([<<"datetime_until">>, Format], #{until := Until}) ->
-    {ok, format_timestamp(Until, Format)};
-lookup_buffer_var([<<"sequence">>], #{seq := Seq}) ->
-    {ok, Seq};
-lookup_buffer_var([<<"node">>], #{}) ->
-    {ok, mk_fs_safe_string(atom_to_binary(erlang:node()))};
-lookup_buffer_var(_Binding, _Context) ->
-    {error, undefined}.
-
-format_timestamp(Timestamp, <<"rfc3339utc">>) ->
-    String = calendar:system_time_to_rfc3339(Timestamp, [{unit, second}, {offset, "Z"}]),
-    mk_fs_safe_string(String);
-format_timestamp(Timestamp, <<"rfc3339">>) ->
-    String = calendar:system_time_to_rfc3339(Timestamp, [{unit, second}]),
-    mk_fs_safe_string(String);
-format_timestamp(Timestamp, <<"unix">>) ->
-    Timestamp.
+lookup_buffer_var(Accessor, Buffer) ->
+    case emqx_connector_aggreg_buffer_ctx:lookup(Accessor, Buffer) of
+        {ok, String} when is_list(String) ->
+            {ok, mk_fs_safe_string(String)};
+        {ok, Value} ->
+            {ok, Value};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 mk_fs_safe_string(String) ->
     unicode:characters_to_binary(string:replace(String, ":", "_", all)).

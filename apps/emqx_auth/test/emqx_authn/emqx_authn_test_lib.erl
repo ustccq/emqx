@@ -1,25 +1,16 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_test_lib).
 
 -include("emqx_authn.hrl").
+-include_lib("stdlib/include/assert.hrl").
 
 -compile(nowarn_export_all).
 -compile(export_all).
+
+-import(emqx_common_test_helpers, [on_exit/1]).
 
 authenticator_example(Id) ->
     #{Id := #{value := Example}} = emqx_authn_api:authenticator_examples(),
@@ -60,11 +51,11 @@ delete_config(ID) ->
         ).
 
 client_ssl_cert_opts() ->
-    Dir = code:lib_dir(emqx_auth, test),
+    Dir = code:lib_dir(emqx_auth),
     #{
-        <<"keyfile">> => filename:join([Dir, <<"data/certs">>, <<"client.key">>]),
-        <<"certfile">> => filename:join([Dir, <<"data/certs">>, <<"client.crt">>]),
-        <<"cacertfile">> => filename:join([Dir, <<"data/certs">>, <<"ca.crt">>])
+        <<"keyfile">> => filename:join([Dir, <<"test/data/certs">>, <<"client.key">>]),
+        <<"certfile">> => filename:join([Dir, <<"test/data/certs">>, <<"client.crt">>]),
+        <<"cacertfile">> => filename:join([Dir, <<"test/data/certs">>, <<"ca.crt">>])
     }.
 
 register_fake_providers(ProviderTypes) ->
@@ -77,3 +68,39 @@ register_fake_providers(ProviderTypes) ->
 deregister_providers() ->
     ProviderTypes = maps:keys(emqx_authn_chains:get_providers()),
     emqx_authn_chains:deregister_providers(ProviderTypes).
+
+enable_node_cache(Enable) ->
+    {ok, _} = emqx:update_config(
+        [authentication_settings, node_cache],
+        #{<<"enable">> => Enable}
+    ),
+    ok.
+
+-doc """
+Checks that, if an authentication backend returns the `clientid_override` attribute, it's
+used to override.
+""".
+t_clientid_override(TCConfig, Opts) when is_list(TCConfig) ->
+    #{
+        mk_config_fn := MkConfigFn,
+        overridden_clientid := OverriddenClientId
+    } = Opts,
+    PostConfigFn = maps:get(post_config_fn, Opts, fun() -> ok end),
+    ClientOpts = maps:get(client_opts, Opts, #{}),
+    Config = MkConfigFn(),
+    on_exit(fun() -> _ = emqx_authn_test_lib:delete_authenticators([?CONF_NS_ATOM], ?GLOBAL) end),
+    {ok, _} = emqx:update_config(
+        [?CONF_NS_ATOM],
+        {create_authenticator, ?GLOBAL, Config}
+    ),
+    PostConfigFn(),
+    OriginalClientId = <<"original_clientid">>,
+    {ok, C} = emqtt:start_link(ClientOpts#{clientid => OriginalClientId}),
+    {ok, _} = emqtt:connect(C),
+    %% We use the clientid override internally.
+    ?assertMatch([OverriddenClientId], emqx_cm:all_client_ids()),
+    %% We don't return `'Assigned-Client-Identifier'` in `CONNACK` properties because the
+    %% client did not specify an empty clientid.
+    ?assertMatch(OriginalClientId, proplists:get_value(clientid, emqtt:info(C))),
+    ok = emqtt:stop(C),
+    ok.

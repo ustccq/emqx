@@ -28,7 +28,6 @@
             {hocon, load},
             telemetry,
             observer_cli,
-            covertool,
             tools,
             observer,
             {system_monitor, load},
@@ -39,11 +38,14 @@
         [
             emqx,
             emqx_conf,
-            esasl,
             emqx_utils,
+            emqx_license,
             emqx_durable_storage,
+            emqx_ds_backends,
             emqx_http_lib,
             emqx_resource,
+            emqx_gen_bridge,
+            emqx_connector_jwt,
             emqx_connector,
             emqx_auth,
             emqx_auth_http,
@@ -79,16 +81,19 @@
             emqx_mysql,
             emqx_postgresql,
             emqx_plugins,
-            emqx_opentelemetry,
             quicer,
-            bcrypt
+            bcrypt,
+            emqx_telemetry
         ],
     %% must always be of type `load'
     ee_business_apps =>
         [
-            emqx_license,
             emqx_enterprise,
+            emqx_opentelemetry,
+            emqx_mt,
             emqx_schema_validation,
+            emqx_message_transformation,
+            emqx_ai_completion,
             emqx_connector_aggregator,
             emqx_bridge_kafka,
             emqx_bridge_pulsar,
@@ -98,7 +103,6 @@
             emqx_bridge_clickhouse,
             emqx_bridge_dynamo,
             emqx_bridge_greptimedb,
-            emqx_bridge_hstreamdb,
             emqx_bridge_influxdb,
             emqx_bridge_iotdb,
             emqx_bridge_es,
@@ -116,7 +120,13 @@
             emqx_bridge_oracle,
             emqx_bridge_rabbitmq,
             emqx_bridge_azure_event_hub,
+            emqx_bridge_datalayers,
+            emqx_bridge_tablestore,
+            emqx_s3,
             emqx_bridge_s3,
+            emqx_bridge_azure_blob_storage,
+            emqx_bridge_couchbase,
+            emqx_bridge_snowflake,
             emqx_schema_registry,
             emqx_eviction_agent,
             emqx_node_rebalance,
@@ -128,10 +138,20 @@
             emqx_gateway_gbt32960,
             emqx_gateway_ocpp,
             emqx_gateway_jt808,
+            emqx_gateway_nats,
             emqx_bridge_syskeeper,
-            emqx_bridge_confluent
-        ],
-    %% must always be of type `load'
-    ce_business_apps =>
-        [emqx_telemetry]
+            emqx_bridge_confluent,
+            emqx_bridge_disk_log,
+            emqx_bridge_s3tables,
+            emqx_bridge_doris,
+            emqx_bridge_bigquery,
+            emqx_bridge_redshift,
+            emqx_bridge_alloydb,
+            emqx_bridge_cockroachdb,
+            emqx_ds_shared_sub,
+            emqx_auth_kerberos,
+            emqx_cluster_link,
+            emqx_ds_builtin_raft,
+            emqx_auth_cinfo
+        ]
 }.

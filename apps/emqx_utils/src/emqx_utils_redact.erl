@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,21 +20,36 @@
 -export([deobfuscate/2]).
 
 -define(REDACT_VAL, "******").
--define(IS_KEY_HEADERS(K), K == headers; K == <<"headers">>; K == "headers").
+-define(IS_KEY_HEADERS(K), (K == headers orelse K == <<"headers">> orelse K == "headers")).
 
 %% NOTE: keep alphabetical order
+is_sensitive_key(account_key) -> true;
+is_sensitive_key("account_key") -> true;
+is_sensitive_key(<<"account_key">>) -> true;
+is_sensitive_key(api_key) -> true;
+is_sensitive_key("api_key") -> true;
+is_sensitive_key(<<"api_key">>) -> true;
 is_sensitive_key(aws_secret_access_key) -> true;
 is_sensitive_key("aws_secret_access_key") -> true;
 is_sensitive_key(<<"aws_secret_access_key">>) -> true;
 is_sensitive_key(password) -> true;
 is_sensitive_key("password") -> true;
 is_sensitive_key(<<"password">>) -> true;
+is_sensitive_key(private_key) -> true;
+is_sensitive_key("private_key") -> true;
+is_sensitive_key(<<"private_key">>) -> true;
 is_sensitive_key(secret) -> true;
 is_sensitive_key("secret") -> true;
 is_sensitive_key(<<"secret">>) -> true;
 is_sensitive_key(secret_access_key) -> true;
 is_sensitive_key("secret_access_key") -> true;
 is_sensitive_key(<<"secret_access_key">>) -> true;
+is_sensitive_key(access_key_secret) -> true;
+is_sensitive_key("access_key_secret") -> true;
+is_sensitive_key(<<"access_key_secret">>) -> true;
+is_sensitive_key(access_key_id) -> true;
+is_sensitive_key("access_key_id") -> true;
+is_sensitive_key(<<"access_key_id">>) -> true;
 is_sensitive_key(secret_key) -> true;
 is_sensitive_key("secret_key") -> true;
 is_sensitive_key(<<"secret_key">>) -> true;
@@ -43,6 +58,8 @@ is_sensitive_key("security_token") -> true;
 is_sensitive_key(<<"security_token">>) -> true;
 is_sensitive_key(sp_private_key) -> true;
 is_sensitive_key(<<"sp_private_key">>) -> true;
+is_sensitive_key(private_key_password) -> true;
+is_sensitive_key(<<"private_key_password">>) -> true;
 is_sensitive_key(token) -> true;
 is_sensitive_key("token") -> true;
 is_sensitive_key(<<"token">>) -> true;
@@ -144,12 +161,41 @@ is_sensitive_header("proxy-authorization") ->
 is_sensitive_header(_Any) ->
     false.
 
-redact_v(V) when is_binary(V) -> <<?REDACT_VAL>>;
-%% The HOCON schema system may generate sensitive values with this format
+redact_v(V) when is_binary(V) ->
+    case emqx_placeholder:preproc_tmpl(V) of
+        [{var, _}] ->
+            V;
+        _ ->
+            do_redact_v(V)
+    end;
 redact_v([{str, Bin}]) when is_binary(Bin) ->
-    [{str, <<?REDACT_VAL>>}];
-redact_v(_V) ->
-    ?REDACT_VAL.
+    %% The HOCON schema system may generate sensitive values with this format
+    [{str, do_redact_v(Bin)}];
+redact_v(V) ->
+    do_redact_v(V).
+
+do_redact_v(<<"file://", _/binary>> = V) ->
+    V;
+do_redact_v("file://" ++ _ = V) ->
+    V;
+do_redact_v(B) when is_binary(B) ->
+    <<?REDACT_VAL>>;
+do_redact_v(L) when is_list(L) ->
+    ?REDACT_VAL;
+do_redact_v(F) ->
+    try
+        %% this can happen in logs
+        case emqx_secret:term(F) of
+            {file, File} ->
+                File;
+            V ->
+                do_redact_v(V)
+        end
+    catch
+        _:_ ->
+            %% most of the time
+            ?REDACT_VAL
+    end.
 
 deobfuscate(NewConf, OldConf) ->
     deobfuscate(NewConf, OldConf, fun(_) -> false end).
@@ -236,8 +282,10 @@ redact_test_() ->
 
     Types = [atom, string, binary],
     Keys = [
+        account_key,
         aws_secret_access_key,
         password,
+        private_key,
         secret,
         secret_key,
         secret_access_key,

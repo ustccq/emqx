@@ -1,21 +1,20 @@
-ARG BUILD_FROM=ghcr.io/emqx/emqx-builder/5.3-5:1.15.7-26.2.1-2-debian12
-ARG RUN_FROM=public.ecr.aws/debian/debian:12-slim
+ARG BUILD_FROM=ghcr.io/emqx/emqx-builder/5.5-7:1.18.3-27.3.4.2-1-debian12
+ARG RUN_FROM=debian:12-slim
 ARG SOURCE_TYPE=src # tgz
 
-FROM ${BUILD_FROM} as builder_src
+FROM ${BUILD_FROM} AS builder_src
 ONBUILD COPY . /emqx
 
-FROM ${RUN_FROM} as builder_tgz
+FROM ${RUN_FROM} AS builder_tgz
 ARG PROFILE=emqx
 ARG PKG_VSN
 ARG SUFFIX
 ARG TARGETARCH
 ONBUILD COPY ${PROFILE}-${PKG_VSN}${SUFFIX}-debian12-$TARGETARCH.tar.gz /${PROFILE}.tar.gz
 
-FROM builder_${SOURCE_TYPE} as builder
+FROM builder_${SOURCE_TYPE} AS builder
 
 ARG PROFILE=emqx
-ARG IS_ELIXIR=no
 ARG DEBUG
 
 ENV EMQX_RELUP=false
@@ -37,7 +36,8 @@ RUN mkdir -p /emqx-rel/emqx && \
       git config --global --add safe.directory '*' && \
       make ${PROFILE}-tgz && \
       tar zxf _packages/${PROFILE}/*.tar.gz -C /emqx-rel/emqx; \
-    fi
+    fi && \
+    rm -rf /emqx-rel/emqx/dynlibs
 
 FROM $RUN_FROM
 ARG EXTRA_DEPS=''
@@ -50,16 +50,14 @@ COPY deploy/docker/docker-entrypoint.sh /usr/bin/
 
 RUN set -eu; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates procps $(echo "${EXTRA_DEPS}" | tr ',' ' '); \
+    apt-get install -y --no-install-recommends ca-certificates procps curl $(echo "${EXTRA_DEPS}" | tr ',' ' '); \
     rm -rf /var/lib/apt/lists/*; \
     groupadd -r -g 1000 emqx; \
     useradd -r -m -u 1000 -g emqx emqx;
 
 COPY --from=builder --chown=emqx:emqx /emqx-rel /opt/
 
-RUN set -eu; \
-    find /opt/emqx -name 'swagger*.js.map' -exec rm {} +; \
-    ln -s /opt/emqx/bin/* /usr/local/bin/;
+RUN ln -s /opt/emqx/bin/* /usr/local/bin/
 
 WORKDIR /opt/emqx
 

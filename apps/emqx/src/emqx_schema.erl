@@ -1,20 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_schema).
+-feature(maybe_expr, enable).
 
 -dialyzer(no_return).
 -dialyzer(no_match).
@@ -29,7 +18,11 @@
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("logger.hrl").
 
--define(MAX_INT_MQTT_PACKET_SIZE, 268435456).
+-define(KB, 1024).
+-define(MB, 1024 * ?KB).
+-define(GB, 1024 * ?MB).
+
+-define(MAX_INT_MQTT_PACKET_SIZE, 268435455).
 -define(MAX_INT_TIMEOUT_MS, 4294967295).
 %% floor(?MAX_INT_TIMEOUT_MS / 1000).
 -define(MAX_INT_TIMEOUT_S, 4294967).
@@ -54,7 +47,7 @@
 -type cipher() :: map().
 -type port_number() :: 1..65535.
 -type server_parse_option() :: #{
-    default_port => port_number(),
+    default_port => integer(),
     no_port => boolean(),
     supported_schemes => [string()],
     default_scheme => string()
@@ -63,6 +56,7 @@
 -type json_binary() :: binary().
 -type template() :: binary().
 -type template_str() :: string().
+-type binary_kv() :: #{binary() => binary()}.
 
 -typerefl_from_string({duration/0, emqx_schema, to_duration}).
 -typerefl_from_string({duration_s/0, emqx_schema, to_duration_s}).
@@ -85,22 +79,26 @@
 
 -type parsed_server() :: #{
     hostname := string(),
-    port => port_number(),
+    port => integer(),
     scheme => string()
 }.
 
 -export([
     validate_heap_size/1,
-    validate_packet_size/1,
+    validate_max_packet_size/1,
+    convert_max_packet_size/2,
     user_lookup_fun_tr/2,
     validate_keepalive_multiplier/1,
     non_empty_string/1,
+    non_empty_array/1,
     validations/0,
     naive_env_interpolation/1,
     ensure_unicode_path/2,
     validate_server_ssl_opts/1,
     validate_tcp_keepalive/1,
-    parse_tcp_keepalive/1
+    parse_tcp_keepalive/1,
+    tcp_keepalive_opts/1,
+    tcp_keepalive_opts/4
 ]).
 
 -export([qos/0]).
@@ -113,7 +111,7 @@
     to_timeout_duration/1,
     to_timeout_duration_s/1,
     to_timeout_duration_ms/1,
-    mk_duration/2,
+    mk_duration/1,
     to_bytesize/1,
     to_wordsize/1,
     to_percent/1,
@@ -133,6 +131,8 @@
     parse_servers/2,
     servers_validator/2,
     servers_sc/2,
+    latency_histogram_buckets_sc/1,
+    parse_latency_histogram_buckets/1,
     convert_servers/1,
     convert_servers/2,
     mqtt_converter/2
@@ -145,6 +145,10 @@
 ]).
 
 -export([listeners/0]).
+-export([mkunion/2, mkunion/3]).
+-export([str/1]).
+-export([fill_defaults/2, fill_defaults_for_type/2]).
+-export([duration_ms_to_str/1, duration_ms_to_str/2]).
 
 -behaviour(hocon_schema).
 
@@ -167,7 +171,8 @@
     json_binary/0,
     port_number/0,
     template/0,
-    template_str/0
+    template_str/0,
+    binary_kv/0
 ]).
 
 -export([namespace/0, roots/0, roots/1, fields/1, desc/1, tags/0]).
@@ -184,6 +189,9 @@
 -export([authz_fields/0]).
 -export([sc/2, map/2]).
 
+%% Some types are already exported by typerefl macros, but elvis is incapable of seeing
+%% that.
+-elvis([{elvis_style, export_used_types, disable}]).
 -elvis([{elvis_style, god_modules, disable}]).
 
 -define(BIT(Bits), (1 bsl (Bits))).
@@ -205,7 +213,10 @@ roots(high) ->
         {listeners,
             sc(
                 ref("listeners"),
-                #{importance => ?IMPORTANCE_HIGH}
+                #{
+                    importance => ?IMPORTANCE_HIGH,
+                    desc => ?DESC("listeners_root_doc")
+                }
             )},
         {mqtt,
             sc(
@@ -218,7 +229,7 @@ roots(high) ->
             )},
         {zones, zones_field_schema()}
     ] ++
-        emqx_schema_hooks:injection_point(
+        emqx_schema_hooks:list_injection_point(
             'roots.high',
             [
                 %% NOTE: authorization schema here is only to keep emqx app pure
@@ -307,7 +318,7 @@ roots(low) ->
             sc(
                 ref("durable_sessions"),
                 #{
-                    importance => ?IMPORTANCE_HIDDEN
+                    importance => ?IMPORTANCE_MEDIUM
                 }
             )},
         {trace,
@@ -319,6 +330,20 @@ roots(low) ->
             sc(
                 ref("crl_cache"),
                 #{importance => ?IMPORTANCE_HIDDEN}
+            )},
+        {banned,
+            sc(
+                ref("banned"),
+                #{importance => ?IMPORTANCE_HIDDEN}
+            )},
+        {config_backup_interval,
+            sc(
+                timeout_duration_ms(),
+                #{
+                    importance => ?IMPORTANCE_LOW,
+                    desc => ?DESC("config_backup_interval"),
+                    default => <<"5m">>
+                }
             )}
     ].
 
@@ -344,6 +369,7 @@ fields("authz_cache") ->
                 #{
                     default => true,
                     required => true,
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(fields_cache_enable)
                 }
             )},
@@ -370,9 +396,40 @@ fields("authz_cache") ->
             })}
     ];
 fields("mqtt") ->
-    mqtt_general() ++ mqtt_session();
+    mqtt_general() ++ mqtt_session() ++ mqtt_limiter();
 fields("zone") ->
     emqx_zone_schema:zones_without_default();
+fields("topic_qos_rule") ->
+    [
+        {topic,
+            sc(topic_predicate_type(), #{
+                required => true,
+                desc => ?DESC(topic_predicate),
+                importance => ?IMPORTANCE_HIGH
+            })},
+        {qos,
+            sc(qos(), #{
+                required => true,
+                desc => ?DESC(mqtt_max_qos_allowed),
+                importance => ?IMPORTANCE_HIGH
+            })}
+    ];
+fields("topic_predicate_matches") ->
+    [
+        {matches,
+            sc(binary(), #{
+                required => true,
+                importance => ?IMPORTANCE_HIGH
+            })}
+    ];
+fields("topic_predicate_equals") ->
+    [
+        {equals,
+            sc(binary(), #{
+                required => true,
+                importance => ?IMPORTANCE_HIGH
+            })}
+    ];
 fields("flapping_detect") ->
     [
         {"enable",
@@ -380,6 +437,7 @@ fields("flapping_detect") ->
                 boolean(),
                 #{
                     default => false,
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(flapping_detect_enable)
                 }
             )},
@@ -416,6 +474,7 @@ fields("force_shutdown") ->
                 boolean(),
                 #{
                     default => true,
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(force_shutdown_enable)
                 }
             )},
@@ -445,6 +504,7 @@ fields("overload_protection") ->
                 boolean(),
                 #{
                     desc => ?DESC(overload_protection_enable),
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     default => false
                 }
             )},
@@ -505,7 +565,11 @@ fields("force_gc") ->
         {"enable",
             sc(
                 boolean(),
-                #{default => true, desc => ?DESC(force_gc_enable)}
+                #{
+                    default => true,
+                    importance => ?IMPORTANCE_NO_DOC,
+                    desc => ?DESC(force_gc_enable)
+                }
             )},
         {"count",
             sc(
@@ -548,6 +612,14 @@ fields("crl_cache") ->
                     desc => ?DESC("crl_cache_refresh_http_timeout")
                 }
             )},
+        {failure_threshold,
+            sc(
+                duration_ms(),
+                #{
+                    default => <<"60s">>,
+                    desc => ?DESC("crl_cache_failure_threshold")
+                }
+            )},
         {capacity,
             sc(
                 pos_integer(),
@@ -560,6 +632,21 @@ fields("crl_cache") ->
 fields("mqtt_tcp_listener") ->
     mqtt_listener(1883) ++
         [
+            {"tcp_backend",
+                sc(
+                    case os:type() of
+                        {unix, _} -> hoconsc:enum([gen_tcp, socket]);
+                        {win32, _} -> hoconsc:enum([gen_tcp])
+                    end,
+                    #{
+                        default => <<"gen_tcp">>,
+                        desc => ?DESC(fields_mqtt_opts_tcp_backend),
+                        importance => ?IMPORTANCE_LOW
+                    }
+                )}
+        ] ++
+        mqtt_parse_options() ++
+        [
             {"tcp_options",
                 sc(
                     ref("tcp_opts"),
@@ -568,6 +655,7 @@ fields("mqtt_tcp_listener") ->
         ];
 fields("mqtt_ssl_listener") ->
     mqtt_listener(8883) ++
+        mqtt_parse_options() ++
         [
             {"tcp_options",
                 sc(
@@ -840,6 +928,14 @@ fields("mqtt_quic_listener") ->
                 ?MAX_UINT(16),
                 ?DESC(fields_mqtt_quic_listener_stateless_operation_expiration_ms)
             )},
+        {"sslkeylogfile",
+            sc(
+                string(),
+                #{
+                    desc => ?DESC(fields_mqtt_quic_listener_sslkeylogfile),
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
         {"ssl_options",
             sc(
                 ref("listener_quic_ssl_opts"),
@@ -885,7 +981,7 @@ fields("ws_opts") ->
             )},
         {"max_frame_size",
             sc(
-                hoconsc:union([infinity, integer()]),
+                hoconsc:union([infinity, pos_integer()]),
                 #{
                     default => infinity,
                     desc => ?DESC(fields_ws_opts_max_frame_size)
@@ -901,7 +997,7 @@ fields("ws_opts") ->
             )},
         {"supported_subprotocols",
             sc(
-                comma_separated_list(),
+                comma_separated_binary(),
                 #{
                     default => <<"mqtt, mqtt-v3, mqtt-v3.1.1, mqtt-v5">>,
                     desc => ?DESC(fields_ws_opts_supported_subprotocols)
@@ -965,7 +1061,7 @@ fields("tcp_opts") ->
     [
         {"active_n",
             sc(
-                integer(),
+                non_neg_integer(),
                 #{
                     default => 100,
                     desc => ?DESC(fields_tcp_opts_active_n)
@@ -1034,6 +1130,14 @@ fields("tcp_opts") ->
                 #{
                     default => true,
                     desc => ?DESC(fields_tcp_opts_nodelay)
+                }
+            )},
+        {"nolinger",
+            sc(
+                boolean(),
+                #{
+                    default => false,
+                    desc => ?DESC(fields_tcp_opts_nolinger)
                 }
             )},
         {"reuseaddr",
@@ -1278,7 +1382,9 @@ fields("broker_routing") ->
                 #{
                     default => v2,
                     'readOnly' => true,
-                    desc => ?DESC(broker_routing_storage_schema)
+                    desc => ?DESC(broker_routing_storage_schema),
+                    deprecated => {since, "5.9.0"},
+                    importance => ?IMPORTANCE_HIDDEN
                 }
             )},
         {"batch_sync",
@@ -1317,10 +1423,31 @@ fields("shared_subscription_group") ->
                     default => random,
                     desc => ?DESC(shared_subscription_strategy_enum)
                 }
+            )},
+        {"initial_sticky_pick",
+            sc(
+                hoconsc:enum([
+                    random,
+                    local,
+                    hash_topic,
+                    hash_clientid
+                ]),
+                #{
+                    default => random,
+                    desc => ?DESC(shared_subscription_initial_sticky_pick_enum)
+                }
             )}
     ];
 fields("broker_perf") ->
     [
+        {"async_fanout_shard_dispatch",
+            sc(
+                boolean(),
+                #{
+                    default => false,
+                    desc => ?DESC(broker_perf_async_fanout_shard_dispatch)
+                }
+            )},
         {"route_lock_type",
             sc(
                 hoconsc:enum([key, tab, global]),
@@ -1334,6 +1461,7 @@ fields("broker_perf") ->
                 boolean(),
                 #{
                     default => true,
+                    deprecated => {since, "5.10.0"},
                     desc => ?DESC(broker_perf_trie_compaction)
                 }
             )}
@@ -1415,6 +1543,22 @@ fields("sysmon") ->
                 %% Userful monitoring solution when benchmarking,
                 %% but hardly common enough for regular users.
                 #{importance => ?IMPORTANCE_HIDDEN}
+            )},
+        {"mnesia_tm_mailbox_size_alarm_threshold",
+            sc(
+                pos_integer(),
+                #{
+                    default => 500,
+                    desc => ?DESC("sysmon_mnesia_tm_mailbox_size_alarm_threshold")
+                }
+            )},
+        {"broker_pool_mailbox_size_alarm_threshold",
+            sc(
+                pos_integer(),
+                #{
+                    default => 500,
+                    desc => ?DESC("sysmon_broker_pool_mailbox_size_alarm_threshold")
+                }
             )}
     ];
 fields("sysmon_vm") ->
@@ -1644,6 +1788,20 @@ fields("alarm") ->
     ];
 fields("trace") ->
     [
+        {"max_file_size",
+            sc(bytesize(), #{
+                default => <<"512MB">>,
+                importance => ?IMPORTANCE_LOW,
+                validator => mk_validator_bounds({10 * ?KB, "10KB"}, {10 * ?GB, "10GB"}),
+                desc => ?DESC(fields_trace_max_file_size)
+            })},
+        {"max_traces",
+            sc(range(0, 100), #{
+                default => 30,
+                importance => ?IMPORTANCE_LOW,
+                desc => ?DESC(fields_trace_max_traces)
+            })},
+        %% Deprecated fields:
         {"payload_encode",
             sc(hoconsc:enum([hex, text, hidden]), #{
                 default => text,
@@ -1667,48 +1825,47 @@ fields("durable_sessions") ->
                 #{
                     default => 100,
                     desc => ?DESC(session_ds_batch_size),
+                    importance => ?IMPORTANCE_MEDIUM,
+                    %% Note: the same value is used for both sync
+                    %% `next' request and async polls. Since poll
+                    %% workers are global for the DS DB, this value is
+                    %% global and it cannot be overridden per
+                    %% listener:
+                    mapping => "emqx_durable_session.poll_batch_size"
+                }
+            )},
+        {"checkpoint_interval",
+            sc(
+                timeout_duration(),
+                #{
+                    default => <<"5s">>,
+                    desc => ?DESC(session_ds_checkpoint_interval),
                     importance => ?IMPORTANCE_MEDIUM
                 }
             )},
-        {"idle_poll_interval",
+        {"commit_timeout",
             sc(
                 timeout_duration(),
                 #{
-                    default => <<"100ms">>,
-                    desc => ?DESC(session_ds_idle_poll_interval)
-                }
-            )},
-        {"heartbeat_interval",
-            sc(
-                timeout_duration(),
-                #{
-                    default => <<"5000ms">>,
-                    desc => ?DESC(session_ds_heartbeat_interval)
-                }
-            )},
-        {"renew_streams_interval",
-            sc(
-                timeout_duration(),
-                #{
-                    default => <<"5000ms">>,
+                    default => <<"5s">>,
+                    desc => ?DESC(session_ds_commit_timeout),
                     importance => ?IMPORTANCE_HIDDEN
                 }
             )},
-        {"session_gc_interval",
+        {"commit_retry_interval",
             sc(
                 timeout_duration(),
                 #{
-                    default => <<"10m">>,
-                    desc => ?DESC(session_ds_session_gc_interval)
+                    default => <<"1s">>,
+                    importance => ?IMPORTANCE_HIDDEN
                 }
             )},
-        {"session_gc_batch_size",
+        {"commit_retries",
             sc(
-                pos_integer(),
+                non_neg_integer(),
                 #{
-                    default => 100,
-                    importance => ?IMPORTANCE_LOW,
-                    desc => ?DESC(session_ds_session_gc_batch_size)
+                    default => 10,
+                    importance => ?IMPORTANCE_HIDDEN
                 }
             )},
         {"subscription_count_refresh_interval",
@@ -1762,7 +1919,25 @@ fields("client_attrs_init") ->
                 desc => ?DESC("client_attrs_init_set_as_attr"),
                 validator => fun restricted_string/1
             })}
+    ];
+fields("banned") ->
+    [
+        {bootstrap_file,
+            sc(
+                binary(),
+                #{
+                    desc => ?DESC("banned_bootstrap_file"),
+                    require => false
+                }
+            )}
     ].
+
+compile_variform_allow_disabled(disabled, _Opts) ->
+    disabled;
+compile_variform_allow_disabled(<<"disabled">>, _Opts) ->
+    disabled;
+compile_variform_allow_disabled(Expression, Opts) ->
+    compile_variform(Expression, Opts).
 
 compile_variform(undefined, _Opts) ->
     undefined;
@@ -1786,6 +1961,16 @@ restricted_string(Str) ->
         true -> ok;
         false -> {error, <<"Invalid string for attribute name">>}
     end.
+
+mk_validator_bounds(Lower, Upper) ->
+    fun(X) -> validate_bounds(X, Lower, Upper) end.
+
+validate_bounds(X, {Lower, DisplayName}, _) when X < Lower ->
+    {error, emqx_utils:format("Invalid value: lower than allowed ~s", [DisplayName])};
+validate_bounds(X, _, {Upper, DisplayName}) when X > Upper ->
+    {error, emqx_utils:format("Invalid value: higher than allowed ~s", [DisplayName])};
+validate_bounds(_, _, _) ->
+    ok.
 
 mqtt_listener(Bind) ->
     base_listener(Bind) ++
@@ -1816,7 +2001,20 @@ mqtt_listener(Bind) ->
                         default => <<"3s">>
                     }
                 )}
-        ] ++ emqx_schema_hooks:injection_point('mqtt.listener').
+        ] ++ emqx_schema_hooks:list_injection_point('mqtt.listener').
+
+mqtt_parse_options() ->
+    [
+        {"parse_unit",
+            sc(
+                hoconsc:enum([chunk, frame]),
+                #{
+                    default => <<"chunk">>,
+                    desc => ?DESC(fields_mqtt_opts_parse_unit),
+                    importance => ?IMPORTANCE_LOW
+                }
+            )}
+    ].
 
 access_rules_converter(AccessRules) ->
     DeepRules =
@@ -1870,6 +2068,7 @@ base_listener(Bind) ->
                 #{
                     default => true,
                     aliases => [enabled],
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(fields_listener_enabled)
                 }
             )},
@@ -1915,17 +2114,6 @@ base_listener(Bind) ->
                     importance => ?IMPORTANCE_LOW
                 }
             )},
-        {"limiter",
-            sc(
-                ?R_REF(
-                    emqx_limiter_schema,
-                    listener_fields
-                ),
-                #{
-                    desc => ?DESC(base_listener_limiter),
-                    importance => ?IMPORTANCE_HIDDEN
-                }
-            )},
         {"enable_authn",
             sc(
                 hoconsc:enum([true, false, quick_deny_anonymous]),
@@ -1934,7 +2122,7 @@ base_listener(Bind) ->
                     default => true
                 }
             )}
-    ] ++ emqx_limiter_schema:short_paths_fields().
+    ] ++ emqx_limiter_schema:fields(mqtt).
 
 %% @hidden Starting from 5.7, listeners.{TYPE}.{NAME}.zone is no longer hidden
 %% However, the root key 'zones' is still hidden because the fields' schema
@@ -1952,10 +2140,6 @@ zones_field_schema() ->
         }
     ).
 
-desc("persistent_session_store") ->
-    "Settings for message persistence.";
-desc("persistent_session_builtin") ->
-    "Settings for the built-in storage engine of persistent messages.";
 desc("persistent_table_mria_opts") ->
     "Tuning options for the mria table.";
 desc("stats") ->
@@ -2100,11 +2284,13 @@ desc("ocsp") ->
 desc("crl_cache") ->
     "Global CRL cache options.";
 desc("durable_sessions") ->
-    "Settings governing durable sessions persistence.";
+    ?DESC(durable_sessions);
 desc(durable_storage) ->
     ?DESC(durable_storage);
 desc("client_attrs_init") ->
     ?DESC(client_attrs_init);
+desc("banned") ->
+    "Banned .";
 desc(_) ->
     undefined.
 
@@ -2178,22 +2364,6 @@ common_ssl_opts_schema(Defaults, Type) ->
                     desc => ?DESC(common_ssl_opts_schema_verify)
                 }
             )},
-        {"partial_chain",
-            sc(
-                hoconsc:enum([true, false, two_cacerts_from_cacertfile, cacert_from_cacertfile]),
-                #{
-                    default => Df(partial_chain, false),
-                    desc => ?DESC(common_ssl_opts_schema_partial_chain)
-                }
-            )},
-        {"verify_peer_ext_key_usage",
-            sc(
-                string(),
-                #{
-                    required => false,
-                    desc => ?DESC(common_ssl_opts_verify_peer_ext_key_usage)
-                }
-            )},
         {"reuse_sessions",
             sc(
                 boolean(),
@@ -2211,30 +2381,18 @@ common_ssl_opts_schema(Defaults, Type) ->
                 }
             )},
         {"password",
-            sc(
-                string(),
+            emqx_schema_secret:mk(
                 #{
                     sensitive => true,
                     required => false,
                     example => <<"">>,
                     format => <<"password">>,
                     desc => ?DESC(common_ssl_opts_schema_password),
-                    importance => ?IMPORTANCE_LOW,
-                    converter => fun password_converter/2
+                    importance => ?IMPORTANCE_LOW
                 }
             )},
         {"versions", tls_versions_schema(Collection)},
         {"ciphers", ciphers_schema(D(ciphers))},
-        {"user_lookup_fun",
-            sc(
-                typerefl:alias("string", any()),
-                #{
-                    default => <<"emqx_tls_psk:lookup">>,
-                    converter => fun ?MODULE:user_lookup_fun_tr/2,
-                    importance => ?IMPORTANCE_HIDDEN,
-                    desc => ?DESC(common_ssl_opts_schema_user_lookup_fun)
-                }
-            )},
         {"secure_renegotiate",
             sc(
                 boolean(),
@@ -2261,6 +2419,27 @@ common_ssl_opts_schema(Defaults, Type) ->
                 #{
                     default => Df(hibernate_after, <<"5s">>),
                     desc => ?DESC(common_ssl_opts_schema_hibernate_after)
+                }
+            )}
+    ] ++ common_ssl_auth_ext_fields().
+
+common_ssl_auth_ext_fields() ->
+    [
+        {"partial_chain",
+            sc(
+                hoconsc:enum([true, false, two_cacerts_from_cacertfile, cacert_from_cacertfile]),
+                #{
+                    required => false,
+                    desc => ?DESC(common_ssl_opts_schema_partial_chain)
+                }
+            )},
+        {"verify_peer_ext_key_usage",
+            sc(
+                string(),
+                #{
+                    required => false,
+                    example => <<>>,
+                    desc => ?DESC(common_ssl_opts_verify_peer_ext_key_usage)
                 }
             )}
     ].
@@ -2311,6 +2490,16 @@ server_ssl_opts_schema(Defaults, IsRanchListener) ->
                     #{
                         default => Df(handshake_timeout, <<"15s">>),
                         desc => ?DESC(server_ssl_opts_schema_handshake_timeout)
+                    }
+                )},
+            {"user_lookup_fun",
+                sc(
+                    typerefl:alias("string", any()),
+                    #{
+                        required => false,
+                        converter => fun ?MODULE:user_lookup_fun_tr/2,
+                        importance => ?IMPORTANCE_HIDDEN,
+                        desc => ?DESC(common_ssl_opts_schema_user_lookup_fun)
                     }
                 )}
         ] ++
@@ -2416,7 +2605,17 @@ client_ssl_opts_schema(Defaults) ->
                     boolean(),
                     #{
                         default => false,
+                        %% importance => ?IMPORTANCE_NO_DOC,
                         desc => ?DESC(client_ssl_opts_schema_enable)
+                    }
+                )},
+            {"middlebox_comp_mode",
+                sc(
+                    boolean(),
+                    #{
+                        required => false,
+                        default => true,
+                        desc => ?DESC(client_ssl_opts_schema_middlebox_comp_mode)
                     }
                 )},
             {"server_name_indication",
@@ -2427,6 +2626,14 @@ client_ssl_opts_schema(Defaults) ->
                         example => disable,
                         validator => fun emqx_schema:non_empty_string/1,
                         desc => ?DESC(client_ssl_opts_schema_server_name_indication)
+                    }
+                )},
+            {"user_lookup_fun",
+                sc(
+                    string(),
+                    #{
+                        deprecated => {since, "5.8.1"},
+                        importance => ?IMPORTANCE_HIDDEN
                     }
                 )}
         ].
@@ -2487,7 +2694,7 @@ converter_ciphers(Ciphers, _Opts) when is_binary(Ciphers) ->
 
 default_ciphers(Which) ->
     lists:map(
-        fun erlang:iolist_to_binary/1,
+        fun unicode:characters_to_binary/1,
         do_default_ciphers(Which)
     ).
 
@@ -2510,7 +2717,7 @@ bin_str_converter(I, _) when is_integer(I) ->
     integer_to_binary(I);
 bin_str_converter(X, _) ->
     try
-        iolist_to_binary(X)
+        unicode:characters_to_binary(X)
     catch
         _:_ ->
             throw("must_quote")
@@ -2548,15 +2755,6 @@ authz_fields() ->
 keys(Parent, Conf) ->
     [binary_to_list(B) || B <- maps:keys(conf_get(Parent, Conf, #{}))].
 
--spec ceiling(number()) -> integer().
-ceiling(X) ->
-    T = erlang:trunc(X),
-    case (X - T) of
-        Neg when Neg < 0 -> T;
-        Pos when Pos > 0 -> T + 1;
-        _ -> T
-    end.
-
 %% types
 
 sc(Type, Meta) -> hoconsc:mk(Type, Meta).
@@ -2567,37 +2765,93 @@ ref(StructName) -> hoconsc:ref(?MODULE, StructName).
 
 ref(Module, StructName) -> hoconsc:ref(Module, StructName).
 
-mk_duration(Desc, OverrideMeta) ->
+mk_duration(OverrideMeta) ->
     DefaultMeta = #{
-        desc => Desc ++
-            " Time interval is a string that contains a number followed by time unit:<br/>"
-            "- `ms` for milliseconds,\n"
-            "- `s` for seconds,\n"
-            "- `m` for minutes,\n"
-            "- `h` for hours;\n<br/>"
-            "or combination of whereof: `1h5m0s`"
+        desc => ?DESC("duration")
     },
     hoconsc:mk(typerefl:alias("string", duration()), maps:merge(DefaultMeta, OverrideMeta)).
 
 to_duration(Str) ->
     case hocon_postprocess:duration(Str) of
-        I when is_integer(I) -> {ok, I};
-        _ -> to_integer(Str)
+        D when is_integer(D) ->
+            {ok, D};
+        _ ->
+            case to_integer(Str) of
+                {ok, I} -> {ok, I};
+                {error, _} -> {error, "Not a valid duration"}
+            end
     end.
 
 to_duration_s(Str) ->
     case hocon_postprocess:duration(Str) of
-        I when is_number(I) -> {ok, ceiling(I / 1000)};
-        _ -> to_integer(Str)
+        D when is_number(D) ->
+            {ok, erlang:ceil(D / 1000)};
+        _ ->
+            case to_integer(Str) of
+                {ok, I} -> {ok, I};
+                {error, _} -> {error, "Not a valid duration"}
+            end
     end.
 
--spec to_duration_ms(Input) -> {ok, integer()} | {error, Input} when
+-spec to_duration_ms(Input) -> {ok, integer()} | {error, string()} when
     Input :: string() | binary().
 to_duration_ms(Str) ->
     case hocon_postprocess:duration(Str) of
-        I when is_number(I) -> {ok, ceiling(I)};
-        _ -> to_integer(Str)
+        D when is_number(D) ->
+            {ok, erlang:ceil(D)};
+        _ ->
+            case to_integer(Str) of
+                {ok, I} -> {ok, I};
+                {error, _} -> {error, "Not a valid duration"}
+            end
     end.
+
+-define(SECOND, 1000).
+-define(MINUTE, (?SECOND * 60)).
+-define(HOUR, (?MINUTE * 60)).
+-define(DAY, (?HOUR * 24)).
+-define(WEEK, (?DAY * 7)).
+-define(FORTNIGHT, (?WEEK * 2)).
+
+all_duration_units() ->
+    [
+        {?FORTNIGHT, <<"f">>},
+        {?WEEK, <<"w">>},
+        {?DAY, <<"d">>},
+        {?HOUR, <<"h">>},
+        {?MINUTE, <<"m">>},
+        {?SECOND, <<"s">>}
+    ].
+
+duration_ms_to_str(0) ->
+    <<"0ms">>;
+duration_ms_to_str(I) when is_integer(I) ->
+    duration_ms_to_str1(I, all_duration_units()).
+
+duration_ms_to_str(I, AllowedUnits0) when is_integer(I), is_list(AllowedUnits0) ->
+    AllUnits = all_duration_units(),
+    AllowedUnits = lists:filter(
+        fun({_UnitMS, UnitStr}) ->
+            lists:member(UnitStr, AllowedUnits0)
+        end,
+        AllUnits
+    ),
+    duration_ms_to_str1(I, AllowedUnits).
+
+duration_ms_to_str1(I, []) ->
+    <<(integer_to_binary(I))/binary, "ms">>;
+duration_ms_to_str1(I0, [{UnitMS, UnitStr} | _Rest]) when I0 rem UnitMS == 0 ->
+    I1 = I0 div UnitMS,
+    <<(integer_to_binary(I1))/binary, UnitStr/binary>>;
+duration_ms_to_str1(I, [_ | Rest]) ->
+    duration_ms_to_str1(I, Rest).
+
+-undef(SECOND).
+-undef(MINUTE).
+-undef(HOUR).
+-undef(DAY).
+-undef(WEEK).
+-undef(FORTNIGHT).
 
 -spec to_timeout_duration(Input) -> {ok, timeout_duration()} | {error, Input} when
     Input :: string() | binary().
@@ -2616,28 +2870,26 @@ to_timeout_duration_s(Str) ->
 
 do_to_timeout_duration(Str, Fn, Max, Unit) ->
     case Fn(Str) of
-        {ok, I} ->
-            case I =< Max of
-                true ->
-                    {ok, I};
-                false ->
-                    Msg = lists:flatten(
-                        io_lib:format("timeout value too large (max: ~b ~s)", [Max, Unit])
-                    ),
-                    throw(#{
-                        schema_module => ?MODULE,
-                        message => Msg,
-                        kind => validation_error
-                    })
-            end;
+        {ok, I} when I =< Max ->
+            {ok, I};
+        {ok, _} ->
+            Msg = lists:flatten(
+                io_lib:format("timeout value too large (max: ~b ~s)", [Max, Unit])
+            ),
+            {error, Msg};
         Err ->
             Err
     end.
 
 to_bytesize(Str) ->
     case hocon_postprocess:bytesize(Str) of
-        I when is_integer(I) -> {ok, I};
-        _ -> to_integer(Str)
+        BS when is_integer(BS) ->
+            {ok, BS};
+        _ ->
+            case to_integer(Str) of
+                {ok, I} -> {ok, I};
+                {error, _} -> {error, "Not a valid bytesize"}
+            end
     end.
 
 to_wordsize(Str) ->
@@ -2665,7 +2917,7 @@ to_comma_separated_list(Str) ->
     {ok, string:tokens(Str, ", ")}.
 
 to_comma_separated_binary(Str) ->
-    {ok, lists:map(fun erlang:list_to_binary/1, string:tokens(Str, ", "))}.
+    {ok, lists:map(fun unicode:characters_to_binary/1, string:tokens(Str, ", "))}.
 
 to_comma_separated_atoms(Str) ->
     {ok, lists:map(fun to_atom/1, string:tokens(Str, ", "))}.
@@ -2674,21 +2926,24 @@ to_url(Str) ->
     case emqx_http_lib:uri_parse(Str) of
         {ok, URIMap} ->
             URIString = emqx_http_lib:normalize(URIMap),
-            {ok, iolist_to_binary(URIString)};
+            {ok, unicode:characters_to_binary(URIString)};
         Error ->
             Error
     end.
 
 to_json_binary(Str) ->
     case emqx_utils_json:safe_decode(Str) of
-        {ok, _} ->
-            {ok, iolist_to_binary(Str)};
-        Error ->
-            Error
+        {ok, _} -> {ok, unicode:characters_to_binary(Str)};
+        {error, {_Pos, truncated_json}} -> {error, "Truncated JSON value"};
+        {error, {_Pos, invalid_literal}} -> {error, "Invalid JSON literal"};
+        {error, {_Pos, invalid_number}} -> {error, "Invalid JSON number"};
+        {error, {_Pos, invalid_string}} -> {error, "Invalid JSON string"};
+        {error, {_Pos, invalid_json}} -> {error, "Invalid JSON"};
+        Error -> Error
     end.
 
 to_template(Str) ->
-    {ok, iolist_to_binary(Str)}.
+    {ok, unicode:characters_to_binary(Str, utf8)}.
 
 to_template_str(Str) ->
     {ok, unicode:characters_to_list(Str, utf8)}.
@@ -2703,13 +2958,14 @@ to_ip_port(Str) ->
     case split_ip_port(Str) of
         {"", Port} ->
             %% this is a local address
-            {ok, parse_port(Port)};
+            parse_port(Port);
         {MaybeIp, Port} ->
-            PortVal = parse_port(Port),
-            case inet:parse_address(MaybeIp) of
-                {ok, IpTuple} ->
-                    {ok, {IpTuple, PortVal}};
-                _ ->
+            maybe
+                {ok, PortVal} ?= parse_port(Port),
+                {ok, IpTuple} ?= inet:parse_address(MaybeIp),
+                {ok, {IpTuple, PortVal}}
+            else
+                {error, _} ->
                     {error, bad_ip_port}
             end;
         _ ->
@@ -2738,7 +2994,7 @@ split_ip_port(Str0) ->
 
 to_erl_cipher_suite(Str) ->
     case ssl:str_to_suite(Str) of
-        {error, Reason} -> error({invalid_cipher, Reason});
+        {error, Reason} -> {error, {invalid_cipher, Reason}};
         Cipher -> Cipher
     end.
 
@@ -2750,31 +3006,37 @@ to_atom(Bin) when is_binary(Bin) ->
     binary_to_atom(Bin, utf8).
 
 validate_heap_size(Siz) when is_integer(Siz) ->
-    MaxSiz =
-        case erlang:system_info(wordsize) of
-            % arch_64
-            8 -> (1 bsl 59) - 1;
-            % arch_32
-            4 -> (1 bsl 27) - 1
-        end,
+    WordSize = erlang:system_info(wordsize),
+    %% 128 GB
+    MaxSiz = (128 * 1024 * 1024 * 1024) div WordSize,
     case Siz > MaxSiz of
         true ->
-            {error, #{reason => max_heap_size_too_large, maximum => MaxSiz}};
+            %% Turn back into bytesize for error message...
+            {error, #{cause => max_heap_size_too_large, maximum => MaxSiz * WordSize}};
         false ->
             ok
     end;
 validate_heap_size(_SizStr) ->
     {error, invalid_heap_size}.
 
-validate_packet_size(Siz) when is_integer(Siz) andalso Siz < 1 ->
-    {error, #{reason => max_mqtt_packet_size_too_small, minimum => 1}};
-validate_packet_size(Siz) when is_integer(Siz) andalso Siz > ?MAX_INT_MQTT_PACKET_SIZE ->
-    Max = integer_to_list(round(?MAX_INT_MQTT_PACKET_SIZE / 1024 / 1024)) ++ "M",
-    {error, #{reason => max_mqtt_packet_size_too_large, maximum => Max}};
-validate_packet_size(Siz) when is_integer(Siz) ->
+validate_max_packet_size(Siz) when is_integer(Siz) andalso Siz < 1 ->
+    {error, #{cause => max_mqtt_packet_size_too_small, minimum => 1}};
+validate_max_packet_size(Siz) when is_integer(Siz) andalso Siz > ?MAX_INT_MQTT_PACKET_SIZE ->
+    {error, #{
+        cause => max_mqtt_packet_size_too_large,
+        maximum => ?MAX_INT_MQTT_PACKET_SIZE
+    }};
+validate_max_packet_size(Siz) when is_integer(Siz) ->
     ok;
-validate_packet_size(_SizStr) ->
+validate_max_packet_size(_SizStr) ->
     {error, invalid_packet_size}.
+
+%% This is for backward compatibility.
+%% We used to allow setting 256MB, but in fact the limit is one byte less.
+convert_max_packet_size(<<"256MB">>, _) ->
+    iolist_to_binary([integer_to_list(?MAX_INT_MQTT_PACKET_SIZE), "B"]);
+convert_max_packet_size(X, _) ->
+    X.
 
 validate_keepalive_multiplier(Multiplier) when
     is_number(Multiplier) andalso Multiplier >= 1.0 andalso Multiplier =< 65535.0
@@ -2783,8 +3045,42 @@ validate_keepalive_multiplier(Multiplier) when
 validate_keepalive_multiplier(_Multiplier) ->
     {error, #{reason => keepalive_multiplier_out_of_range, min => 1, max => 65535}}.
 
+%% @doc Translate TCP keea-alive string config value into raw TCP options.
+-spec tcp_keepalive_opts(string() | binary()) ->
+    [{keepalive, true} | {raw, non_neg_integer(), non_neg_integer(), binary()}].
+tcp_keepalive_opts(None) when None =:= "none"; None =:= <<"none">> ->
+    [];
+tcp_keepalive_opts(KeepAlive) ->
+    {Idle, Interval, Probes} = parse_tcp_keepalive(KeepAlive),
+    case tcp_keepalive_opts(os:type(), Idle, Interval, Probes) of
+        {ok, Opts} ->
+            Opts;
+        {error, {unsupported_os, _OS}} ->
+            []
+    end.
+
+-spec tcp_keepalive_opts(term(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    {ok, [{keepalive, true} | {raw, non_neg_integer(), non_neg_integer(), binary()}]}
+    | {error, {unsupported_os, term()}}.
+tcp_keepalive_opts({unix, linux}, Idle, Interval, Probes) ->
+    {ok, [
+        {keepalive, true},
+        {raw, 6, 4, <<Idle:32/native>>},
+        {raw, 6, 5, <<Interval:32/native>>},
+        {raw, 6, 6, <<Probes:32/native>>}
+    ]};
+tcp_keepalive_opts({unix, darwin}, Idle, Interval, Probes) ->
+    {ok, [
+        {keepalive, true},
+        {raw, 6, 16#10, <<Idle:32/native>>},
+        {raw, 6, 16#101, <<Interval:32/native>>},
+        {raw, 6, 16#102, <<Probes:32/native>>}
+    ]};
+tcp_keepalive_opts(OS, _Idle, _Interval, _Probes) ->
+    {error, {unsupported_os, OS}}.
+
 validate_tcp_keepalive(Value) ->
-    case iolist_to_binary(Value) of
+    case unicode:characters_to_binary(Value) of
         <<"none">> ->
             ok;
         _ ->
@@ -2821,8 +3117,8 @@ parse_ka_int(Bin, Name, Min, Max) ->
             throw(#{reason => lists:flatten(Msg), value => I})
     end.
 
-user_lookup_fun_tr(undefined, Opts) ->
-    user_lookup_fun_tr(<<"emqx_tls_psk:lookup">>, Opts);
+user_lookup_fun_tr(undefined, _Opts) ->
+    undefined;
 user_lookup_fun_tr(Lookup, #{make_serializable := true}) ->
     fmt_user_lookup_fun(Lookup);
 user_lookup_fun_tr(Lookup, _) ->
@@ -2920,6 +3216,13 @@ non_empty_string("") -> {error, empty_string_not_allowed};
 non_empty_string(S) when is_binary(S); is_list(S) -> ok;
 non_empty_string(_) -> {error, invalid_string}.
 
+non_empty_array([]) ->
+    {error, empty_array_not_allowed};
+non_empty_array(List) when is_list(List) ->
+    ok;
+non_empty_array(_) ->
+    {error, invalid_data}.
+
 %% @doc Make schema for 'server' or 'servers' field.
 %% for each field, there are three passes:
 %% 1. converter: Normalize the value.
@@ -2965,7 +3268,7 @@ convert_servers(undefined) ->
 convert_servers(Map) when is_map(Map) ->
     try
         List = convert_hocon_map_host_port(Map),
-        iolist_to_binary(string:join(List, ","))
+        unicode:characters_to_binary(string:join(List, ","))
     catch
         _:_ ->
             throw("bad_host_port")
@@ -2973,13 +3276,13 @@ convert_servers(Map) when is_map(Map) ->
 convert_servers([H | _] = Array) when is_binary(H) orelse is_list(H) ->
     %% if the old config was a string array
     %% we want to make sure it's converted to a comma-separated
-    iolist_to_binary([[I, ","] || I <- Array]);
+    unicode:characters_to_binary([[I, ","] || I <- Array]);
 convert_servers(Str) ->
     normalize_host_port_str(Str).
 
 %% remove spaces around comma (,)
 normalize_host_port_str(Str) ->
-    iolist_to_binary(re:replace(Str, "(\s)*,(\s)*", ",")).
+    unicode:characters_to_binary(re:replace(Str, "(\s)*,(\s)*", ",")).
 
 %% @doc Shared validation function for both 'server' and 'servers' string.
 %% NOTE: Validator is called after converter.
@@ -3111,7 +3414,7 @@ check_server_parts([Scheme, "//" ++ Hostname, Port], Context) ->
     #{
         scheme => check_scheme(Scheme, Opts),
         hostname => check_hostname(Hostname),
-        port => parse_port(Port)
+        port => parse_port_(Port)
     };
 check_server_parts([Scheme, "//" ++ Hostname], Context) ->
     #{
@@ -3146,13 +3449,13 @@ check_server_parts([Hostname, Port], Context) ->
         false ->
             #{
                 hostname => check_hostname(Hostname),
-                port => parse_port(Port)
+                port => parse_port_(Port)
             };
         true ->
             #{
                 scheme => DefaultScheme,
                 hostname => check_hostname(Hostname),
-                port => parse_port(Port)
+                port => parse_port_(Port)
             }
     end;
 check_server_parts([Hostname], Context) ->
@@ -3241,21 +3544,76 @@ convert_hocon_map_host_port(Map) ->
         hocon_maps:flatten(Map, #{})
     ).
 
-is_port_number(Port) ->
-    try
-        _ = parse_port(Port),
-        true
-    catch
-        _:_ ->
-            false
+is_port_number(Str) ->
+    {Status, _} = parse_port(Str),
+    Status == ok.
+
+parse_port_(Str) ->
+    case parse_port(Str) of
+        {ok, Port} -> Port;
+        {error, Reason} -> throw(Reason)
     end.
 
 parse_port(Port) ->
     case string:to_integer(string:strip(Port)) of
-        {P, ""} when P < 0 -> throw("port_number_must_be_positive");
-        {P, ""} when P > 65535 -> throw("port_number_too_large");
-        {P, ""} -> P;
-        _ -> throw("bad_port_number")
+        {P, ""} when P < 0 ->
+            {error, "port_number_must_be_positive"};
+        {P, ""} when P > 65535 ->
+            {error, "port_number_too_large"};
+        {P, ""} ->
+            {ok, P};
+        _ ->
+            {error, "bad_port_number"}
+    end.
+
+latency_histogram_buckets_sc(Meta0) ->
+    DefaultMeta = #{
+        default => <<"10ms, 100ms, 1s, 5s, 30s">>,
+        desc => "Comma separated duration values for latency histogram buckets.",
+        converter => fun latency_histogram_buckets_converter/2,
+        required => true
+    },
+    hoconsc:mk(string(), maps:merge(DefaultMeta, Meta0)).
+
+latency_histogram_buckets_converter(undefined, _Opts) ->
+    undefined;
+latency_histogram_buckets_converter(Buckets, #{make_serializable := true}) ->
+    case is_list(Buckets) of
+        true ->
+            iolist_to_binary(
+                string:join(
+                    [integer_to_list(I) || I <- Buckets],
+                    ", "
+                )
+            );
+        false ->
+            Buckets
+    end;
+latency_histogram_buckets_converter(Buckets, _Opts) ->
+    case is_binary(Buckets) of
+        true ->
+            parse_latency_histogram_buckets(Buckets);
+        false ->
+            Buckets
+    end.
+
+parse_latency_histogram_buckets(Str) ->
+    case binary:split(Str, <<",">>, [global, trim]) of
+        [] ->
+            [];
+        BucketsStr ->
+            lists:map(
+                fun(BucketStr) ->
+                    case to_duration_ms(string:trim(BucketStr)) of
+                        {ok, Duration} when Duration > 0 -> Duration;
+                        {ok, Duration} when Duration =< 0 ->
+                            throw("non_positive_latency_histogram_bucket");
+                        {error, Error} ->
+                            throw({"bad_latency_histogram_bucket", Error})
+                    end
+                end,
+                BucketsStr
+            )
     end.
 
 quic_feature_toggle(Desc) ->
@@ -3293,9 +3651,9 @@ is_quic_ssl_opts(Name) ->
         "certfile",
         "keyfile",
         "verify",
-        "password"
+        "password",
+        "hibernate_after"
         %% Followings are planned
-        %% , "hibernate_after"
         %% , "fail_if_no_peer_cert"
         %% , "handshake_timeout"
         %% , "gc_after_handshake"
@@ -3339,68 +3697,8 @@ default_listener(SSLListener) ->
             }
     end.
 
-%% @doc This function helps to perform a naive string interpolation which
-%% only looks at the first segment of the string and tries to replace it.
-%% For example
-%%  "$MY_FILE_PATH"
-%%  "${MY_FILE_PATH}"
-%%  "$ENV_VARIABLE/sub/path"
-%%  "${ENV_VARIABLE}/sub/path"
-%%  "${ENV_VARIABLE}\sub\path" # windows
-%% This function returns undefined if the input is undefined
-%% otherwise always return string.
-naive_env_interpolation(undefined) ->
-    undefined;
-naive_env_interpolation(Bin) when is_binary(Bin) ->
-    naive_env_interpolation(unicode:characters_to_list(Bin, utf8));
-naive_env_interpolation("$" ++ Maybe = Original) ->
-    {Env, Tail} = split_path(Maybe),
-    case resolve_env(Env) of
-        {ok, Path} ->
-            filename:join([Path, Tail]);
-        error ->
-            ?SLOG(warning, #{
-                msg => "cannot_resolve_env_variable",
-                env => Env,
-                original => Original
-            }),
-            Original
-    end;
-naive_env_interpolation(Other) ->
-    Other.
-
-split_path(Path) ->
-    split_path(Path, []).
-
-split_path([], Acc) ->
-    {lists:reverse(Acc), []};
-split_path([Char | Rest], Acc) when Char =:= $/ orelse Char =:= $\\ ->
-    {lists:reverse(Acc), string:trim(Rest, leading, "/\\")};
-split_path([Char | Rest], Acc) ->
-    split_path(Rest, [Char | Acc]).
-
-resolve_env(Name0) ->
-    Name = string:trim(Name0, both, "{}"),
-    Value = os:getenv(Name),
-    case Value =/= false andalso Value =/= "" of
-        true ->
-            {ok, Value};
-        false ->
-            special_env(Name)
-    end.
-
--ifdef(TEST).
-%% when running tests, we need to mock the env variables
-special_env("EMQX_ETC_DIR") ->
-    {ok, filename:join([code:lib_dir(emqx), etc])};
-special_env("EMQX_LOG_DIR") ->
-    {ok, "log"};
-special_env(_Name) ->
-    %% only in tests
-    error.
--else.
-special_env(_Name) -> error.
--endif.
+naive_env_interpolation(MaybeEnv) ->
+    emqx_utils_schema:naive_env_interpolation(MaybeEnv).
 
 %% The tombstone atom.
 tombstone() ->
@@ -3458,8 +3756,10 @@ ensure_default_listener(Map, ListenerType) ->
     NewMap = Map#{<<"default">> => default_listener(ListenerType)},
     keep_default_tombstone(NewMap, #{}).
 
-cert_file(_File, client) -> undefined;
-cert_file(File, server) -> iolist_to_binary(filename:join(["${EMQX_ETC_DIR}", "certs", File])).
+cert_file(_File, client) ->
+    undefined;
+cert_file(File, server) ->
+    unicode:characters_to_binary(filename:join(["${EMQX_ETC_DIR}", "certs", File])).
 
 mqtt_converter(#{<<"keepalive_multiplier">> := Multi} = Mqtt, _Opts) ->
     case round(Multi * 100) =:= round(?DEFAULT_MULTIPLIER * 100) of
@@ -3499,12 +3799,14 @@ mqtt_general() ->
                 bytesize(),
                 #{
                     default => <<"1MB">>,
-                    validator => fun ?MODULE:validate_packet_size/1,
+                    validator => fun ?MODULE:validate_max_packet_size/1,
+                    converter => fun ?MODULE:convert_max_packet_size/2,
                     desc => ?DESC(mqtt_max_packet_size)
                 }
             )},
         {"max_clientid_len",
             sc(
+                %% MQTT-v3.1.1-[MQTT-3.1.3-5], MQTT-v5.0-[MQTT-3.1.3-5]
                 range(23, 65535),
                 #{
                     default => 65535,
@@ -3567,6 +3869,19 @@ mqtt_general() ->
                     desc => ?DESC(mqtt_shared_subscription_strategy)
                 }
             )},
+        {"shared_subscription_initial_sticky_pick",
+            sc(
+                hoconsc:enum([
+                    random,
+                    local,
+                    hash_topic,
+                    hash_clientid
+                ]),
+                #{
+                    default => random,
+                    desc => ?DESC(mqtt_shared_subscription_initial_sticky_pick)
+                }
+            )},
         {"exclusive_subscription",
             sc(
                 boolean(),
@@ -3626,11 +3941,19 @@ mqtt_general() ->
                     desc => ?DESC(mqtt_keepalive_multiplier)
                 }
             )},
-        {"retry_interval",
+        {"keepalive_check_interval",
             sc(
-                duration(),
+                timeout_duration(),
                 #{
                     default => <<"30s">>,
+                    desc => ?DESC(mqtt_keepalive_check_interval)
+                }
+            )},
+        {"retry_interval",
+            sc(
+                hoconsc:union([infinity, timeout_duration()]),
+                #{
+                    default => infinity,
                     desc => ?DESC(mqtt_retry_interval)
                 }
             )},
@@ -3664,6 +3987,15 @@ mqtt_general() ->
                 #{
                     default => [],
                     desc => ?DESC("client_attrs_init")
+                }
+            )},
+        {"clientid_override",
+            sc(
+                hoconsc:union([disabled, typerefl:alias("string", any())]),
+                #{
+                    default => disabled,
+                    desc => ?DESC("clientid_override"),
+                    converter => fun compile_variform_allow_disabled/2
                 }
             )}
     ].
@@ -3704,6 +4036,15 @@ mqtt_session() ->
                     default => 2,
                     desc => ?DESC(mqtt_max_qos_allowed),
                     importance => ?IMPORTANCE_LOW
+                }
+            )},
+        {"subscription_max_qos_rules",
+            sc(
+                hoconsc:array(?R_REF("topic_qos_rule")),
+                #{
+                    required => false,
+                    desc => ?DESC(mqtt_subscription_max_qos_rules),
+                    importance => ?IMPORTANCE_HIDDEN
                 }
             )},
         {"mqueue_priorities",
@@ -3780,11 +4121,40 @@ mqtt_session() ->
             )}
     ].
 
+mqtt_limiter() ->
+    [
+        {limiter,
+            sc(
+                ref(emqx_limiter_schema, mqtt),
+                #{
+                    required => {false, recursively},
+                    desc => ?DESC(mqtt_limiter)
+                }
+            )}
+    ].
+
 default_mem_check_interval() ->
     case emqx_os_mon:is_os_check_supported() of
         true -> <<"60s">>;
         false -> disabled
     end.
+
+topic_predicate_type() ->
+    hoconsc:union(
+        fun
+            (all_union_members) ->
+                [
+                    ?R_REF("topic_predicate_matches"),
+                    ?R_REF("topic_predicate_equals")
+                ];
+            ({value, V}) when is_map_key(matches, V); is_map_key(<<"matches">>, V) ->
+                [?R_REF("topic_predicate_matches")];
+            ({value, V}) when is_map_key(equals, V); is_map_key(<<"equals">>, V) ->
+                [?R_REF("topic_predicate_equals")];
+            (_) ->
+                []
+        end
+    ).
 
 description_schema() ->
     sc(
@@ -3874,3 +4244,45 @@ listeners() ->
                 }
             )}
     ].
+
+mkunion(Field, Schemas) ->
+    mkunion(Field, Schemas, none).
+
+mkunion(Field, Schemas, Default) ->
+    hoconsc:union(fun(Arg) -> scunion(Field, Schemas, Default, Arg) end).
+
+scunion(_Field, Schemas, _Default, all_union_members) ->
+    maps:values(Schemas);
+scunion(Field, Schemas, Default, {value, Value}) ->
+    Selector =
+        case maps:get(emqx_utils_conv:bin(Field), Value, undefined) of
+            undefined ->
+                Default;
+            X ->
+                emqx_utils_conv:bin(X)
+        end,
+    case maps:find(Selector, Schemas) of
+        {ok, Schema} ->
+            [Schema];
+        _Error ->
+            throw(#{field_name => Field, expected => maps:keys(Schemas)})
+    end.
+
+fill_defaults(Roots, RawConf) ->
+    Schema = #{roots => Roots},
+    case emqx_hocon:check(Schema, RawConf, #{make_serializable => true}) of
+        {ok, WithDefaults} ->
+            WithDefaults;
+        {error, Reason} ->
+            throw(Reason)
+    end.
+
+fill_defaults_for_type(Type, RawConf) ->
+    WithRoot = #{<<"conf">> => RawConf},
+    Roots = [{conf, hoconsc:mk(Type, #{})}],
+    case fill_defaults(Roots, WithRoot) of
+        #{<<"conf">> := WithDefaults} ->
+            WithDefaults;
+        {error, Reason} ->
+            throw(Reason)
+    end.

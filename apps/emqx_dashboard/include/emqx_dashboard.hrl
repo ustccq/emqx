@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -include("emqx_dashboard_rbac.hrl").
 
@@ -26,23 +14,35 @@
 -type dashboard_user_role() :: binary().
 
 -record(?ADMIN, {
+    username,
+    pwdhash,
+    description,
+    role = ?ROLE_DEFAULT,
+    extra = #{}
+}).
+
+-type dashboard_user() :: #?ADMIN{
     username :: dashboard_username(),
     pwdhash :: binary(),
     description :: binary(),
-    role = ?ROLE_DEFAULT :: dashboard_user_role(),
-    extra = #{} :: map()
-}).
-
--type dashboard_user() :: #?ADMIN{}.
+    role :: dashboard_user_role(),
+    extra :: map()
+}.
 
 -define(ADMIN_JWT, emqx_admin_jwt).
 
 -record(?ADMIN_JWT, {
+    token,
+    username,
+    exptime,
+    extra = #{}
+}).
+-type admin_jwt() :: #?ADMIN_JWT{
     token :: binary(),
     username :: binary(),
     exptime :: integer(),
-    extra = #{} :: map()
-}).
+    extra :: map()
+}.
 
 -define(TAB_COLLECT, emqx_collect).
 
@@ -62,48 +62,75 @@
 
 -define(DELTA_SAMPLER_LIST, [
     received,
-    %, received_bytes
     sent,
-    %, sent_bytes
     validation_succeeded,
     validation_failed,
+    transformation_succeeded,
+    transformation_failed,
     dropped,
     persisted
 ]).
 
 -define(GAUGE_SAMPLER_LIST, [
     disconnected_durable_sessions,
-    durable_subscriptions,
+    subscriptions_durable,
     subscriptions,
     topics,
     connections,
     live_connections
 ]).
 
--define(SAMPLER_LIST, ?GAUGE_SAMPLER_LIST ++ ?DELTA_SAMPLER_LIST).
+-define(SAMPLER_LIST, (?GAUGE_SAMPLER_LIST ++ ?DELTA_SAMPLER_LIST)).
 
 -define(DELTA_SAMPLER_RATE_MAP, #{
     received => received_msg_rate,
-    %% In 5.0.0, temporarily comment it to suppress bytes rate
-    %received_bytes  => received_bytes_rate,
-    %sent_bytes      => sent_bytes_rate,
     sent => sent_msg_rate,
     validation_succeeded => validation_succeeded_rate,
     validation_failed => validation_failed_rate,
+    transformation_succeeded => transformation_succeeded_rate,
+    transformation_failed => transformation_failed_rate,
     dropped => dropped_msg_rate,
     persisted => persisted_rate
 }).
 
--define(CURRENT_SAMPLE_NON_RATE,
-    [
-        node_uptime,
-        retained_msg_count,
-        shared_subscriptions
-    ] ++ ?LICENSE_QUOTA
+-define(CURRENT_SAMPLE_NON_RATE, [
+    node_uptime,
+    retained_msg_count,
+    shared_subscriptions,
+    cluster_sessions,
+    license_quota
+]).
+
+-define(CLUSTERONLY_SAMPLER_LIST, [
+    subscriptions_durable,
+    disconnected_durable_sessions
+]).
+
+%% record the max value over the history
+-define(WATERMARK_SAMPLER_LIST, [
+    %% sessions history high water mark is only recorded when
+    %% the config broker.session_history_retain > 0s
+    sessions_hist_hwmark
+]).
+
+%% Pick the newer value from the two maps when merging
+%% Keys are from ?WATERMARK_SAMPLER_LIST and ?GAUGE_SAMPLER_LIST
+%% test case is added to ensure no missing key in this macro
+-define(IS_PICK_NEWER(Key),
+    (Key =:= sessions_hist_hwmark orelse
+        Key =:= disconnected_durable_sessions orelse
+        Key =:= subscriptions_durable orelse
+        Key =:= subscriptions orelse
+        Key =:= topics orelse
+        Key =:= connections orelse
+        Key =:= live_connections)
 ).
 
--if(?EMQX_RELEASE_EDITION == ee).
--define(LICENSE_QUOTA, [license_quota]).
--else.
--define(LICENSE_QUOTA, []).
--endif.
+%% use this atom to indicate no value provided from http request
+-define(NO_MFA_TOKEN, no_mfa_token).
+%% use this atom for internal calls where token validation is not required
+%% for example, when handling change_pwd request (which is authenticated
+%% with bearer token).
+-define(TRUSTED_MFA_TOKEN, trusted_mfa_token).
+%% empty bin-string is when the token field exists, but empty
+-define(IS_NO_MFA_TOKEN(X), (X =:= ?NO_MFA_TOKEN orelse X =:= <<>>)).

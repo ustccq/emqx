@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% Filesystem storage GC
@@ -39,6 +27,9 @@
 -export([handle_call/3]).
 -export([handle_cast/2]).
 -export([handle_info/2]).
+
+%% Internal export only for testing/spying events
+-export([maybe_report/2]).
 
 -record(st, {
     next_gc_timer :: option(reference()),
@@ -107,7 +98,7 @@ handle_info({timeout, TRef, collect}, St = #st{next_gc_timer = TRef}) ->
 
 do_collect_transfer(Storage, Transfer, Node, St = #st{}) when Node == node() ->
     Stats = try_collect_transfer(Storage, Transfer, complete, init_gcstats()),
-    ok = maybe_report(Stats, St),
+    ok = ?MODULE:maybe_report(Stats, St),
     ok;
 do_collect_transfer(_Storage, _Transfer, _Node, _St = #st{}) ->
     % TODO
@@ -129,7 +120,7 @@ maybe_collect_garbage(CalledAt, St = #st{last_gc = #gcstats{finished_at = Finish
 do_collect_garbage(St = #st{}) ->
     emqx_ft_storage:with_storage_type(local, fun(Storage) ->
         Stats = collect_garbage(Storage),
-        ok = maybe_report(Stats, Storage),
+        ok = ?MODULE:maybe_report(Stats, Storage),
         St#st{last_gc = Stats}
     end).
 

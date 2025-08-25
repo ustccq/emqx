@@ -1,8 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_influxdb_connector).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 
 -include_lib("hocon/include/hoconsc.hrl").
@@ -16,6 +17,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -68,8 +70,12 @@
         (STATUS_CODE < 200 orelse STATUS_CODE >= 300))
 ).
 
+-define(DEFAULT_POOL_SIZE, 8).
+
 %% -------------------------------------------------------------------------------------------------
 %% resource callback
+resource_type() -> influxdb.
+
 callback_mode() -> async_if_possible.
 
 on_add_channel(
@@ -216,9 +222,9 @@ on_format_query_result(Result) ->
 on_get_status(_InstId, #{client := Client}) ->
     case influxdb:is_alive(Client) andalso ok =:= influxdb:check_auth(Client) of
         true ->
-            connected;
+            ?status_connected;
         false ->
-            disconnected
+            ?status_disconnected
     end.
 
 transform_bridge_v1_config_to_connector_config(BridgeV1Config) ->
@@ -251,6 +257,8 @@ roots() ->
 fields("connector") ->
     [
         server_field(),
+        pool_size_field(),
+        emqx_connector_schema:ehttpc_max_inactive_sc(),
         parameter_field()
     ] ++ emqx_connector_schema_lib:ssl_fields();
 fields("connector_influxdb_api_v1") ->
@@ -265,7 +273,8 @@ fields(influxdb_api_v2) ->
 fields(common) ->
     [
         server_field(),
-        precision_field()
+        precision_field(),
+        pool_size_field()
     ] ++ emqx_connector_schema_lib:ssl_fields().
 %% ============ end: schema for old bridge configs ============
 
@@ -289,6 +298,17 @@ precision_field() ->
         mk(enum([ns, us, ms, s]), #{
             required => false, default => ms, desc => ?DESC("precision")
         })}.
+
+pool_size_field() ->
+    {pool_size,
+        mk(
+            integer(),
+            #{
+                required => false,
+                default => ?DEFAULT_POOL_SIZE,
+                desc => ?DESC("pool_size")
+            }
+        )}.
 
 parameter_field() ->
     {parameters,
@@ -353,7 +373,7 @@ start_client(InstId, Config) ->
     }),
     try do_start_client(InstId, ClientConfig, Config) of
         Res = {ok, #{client := Client}} ->
-            ok = emqx_resource:allocate_resource(InstId, ?influx_client, Client),
+            ok = emqx_resource:allocate_resource(InstId, ?MODULE, ?influx_client, Client),
             Res;
         {error, Reason} ->
             {error, Reason}
@@ -441,7 +461,7 @@ client_config(
     [
         {host, str(Host)},
         {port, Port},
-        {pool_size, erlang:system_info(schedulers)},
+        {pool_size, maps:get(pool_size, Config, ?DEFAULT_POOL_SIZE)},
         {pool, InstId}
     ] ++ protocol_config(Config).
 
@@ -671,11 +691,16 @@ lines_to_points(_, [], Points, ErrorPoints) ->
             %% ignore trans succeeded points
             {error, ErrorPoints}
     end;
-lines_to_points(Data, [#{timestamp := Ts} = Item | Rest], ResultPointsAcc, ErrorPointsAcc) when
+lines_to_points(
+    Data,
+    [#{timestamp := Ts, precision := Precision} = Item | Rest],
+    ResultPointsAcc,
+    ErrorPointsAcc
+) when
     is_list(Ts)
 ->
     TransOptions = #{return => rawlist, var_trans => fun data_filter/1},
-    case parse_timestamp(emqx_placeholder:proc_tmpl(Ts, Data, TransOptions)) of
+    case parse_timestamp(emqx_placeholder:proc_tmpl(Ts, Data, TransOptions), Precision) of
         {ok, TsInt} ->
             Item1 = Item#{timestamp => TsInt},
             continue_lines_to_points(Data, Item1, Rest, ResultPointsAcc, ErrorPointsAcc);
@@ -684,20 +709,47 @@ lines_to_points(Data, [#{timestamp := Ts} = Item | Rest], ResultPointsAcc, Error
                 {error, {bad_timestamp, BadTs}} | ErrorPointsAcc
             ])
     end;
-lines_to_points(Data, [#{timestamp := Ts} = Item | Rest], ResultPointsAcc, ErrorPointsAcc) when
+lines_to_points(
+    Data,
+    [#{timestamp := Ts, precision := Precision} = Item | Rest],
+    ResultPointsAcc,
+    ErrorPointsAcc
+) when
     is_integer(Ts)
 ->
-    continue_lines_to_points(Data, Item, Rest, ResultPointsAcc, ErrorPointsAcc).
+    continue_lines_to_points(
+        Data,
+        Item#{timestamp => maybe_convert_time_unit(Ts, Precision)},
+        Rest,
+        ResultPointsAcc,
+        ErrorPointsAcc
+    ).
 
-parse_timestamp([TsInt]) when is_integer(TsInt) ->
-    {ok, TsInt};
-parse_timestamp([TsBin]) ->
+parse_timestamp([undefined], {_From, To} = _Precision) ->
+    %% used ${timestamp} or keep it blank. but the `timestamp` field not present in RULE SQL
+    {ok, maybe_convert_time_unit(emqx_message:timestamp_now(), {ms, To})};
+parse_timestamp([TsInt], Precision) when is_integer(TsInt) ->
+    {ok, maybe_convert_time_unit(TsInt, Precision)};
+parse_timestamp([TsBin], Precision) ->
     try
-        {ok, binary_to_integer(TsBin)}
+        {ok, maybe_convert_time_unit(binary_to_integer(TsBin), Precision)}
     catch
         _:_ ->
-            {error, TsBin}
-    end.
+            {error, {non_integer_timestamp, TsBin}}
+    end;
+parse_timestamp(InvalidTs, _) ->
+    %% The timestamp field must be a single integer or a single placeholder. i.e. the
+    %%   following is not allowed:
+    %%   - weather,location=us-midwest,season=summer temperature=82 ${timestamp}00
+    {error, {unsupported_placeholder_usage_for_timestamp, InvalidTs}}.
+
+maybe_convert_time_unit(Ts, {FromPrecision, ToPrecision}) ->
+    erlang:convert_time_unit(Ts, time_unit(FromPrecision), time_unit(ToPrecision)).
+
+time_unit(s) -> second;
+time_unit(ms) -> millisecond;
+time_unit(us) -> microsecond;
+time_unit(ns) -> nanosecond.
 
 continue_lines_to_points(Data, Item, Rest, ResultPointsAcc, ErrorPointsAcc) ->
     case line_to_point(Data, Item) of
@@ -715,8 +767,7 @@ line_to_point(
         measurement := Measurement,
         tags := Tags,
         fields := Fields,
-        timestamp := Ts,
-        precision := Precision
+        timestamp := Ts
     } = Item
 ) ->
     {_, EncodedTags, _} = maps:fold(fun maps_config_to_data/3, {Data, #{}, ?set_tag}, Tags),
@@ -725,16 +776,8 @@ line_to_point(
         measurement => emqx_placeholder:proc_tmpl(Measurement, Data),
         tags => EncodedTags,
         fields => EncodedFields,
-        timestamp => maybe_convert_time_unit(Ts, Precision)
+        timestamp => Ts
     }).
-
-maybe_convert_time_unit(Ts, {FromPrecision, ToPrecision}) ->
-    erlang:convert_time_unit(Ts, time_unit(FromPrecision), time_unit(ToPrecision)).
-
-time_unit(s) -> second;
-time_unit(ms) -> millisecond;
-time_unit(us) -> microsecond;
-time_unit(ns) -> nanosecond.
 
 maps_config_to_data(K, V, {Data, Res, SetType}) ->
     KTransOptions = #{return => rawlist, var_trans => fun key_filter/1},

@@ -9,6 +9,8 @@ set -euo pipefail
 
 # ensure dir
 cd -P -- "$(dirname -- "$0")/../.."
+# shellcheck disable=SC1091
+source ./env.sh
 
 set -x
 
@@ -22,7 +24,7 @@ WEBHOOK="webhook.$NET"
 BENCH="bench.$NET"
 COOKIE='this-is-a-secret'
 ## Erlang image is needed to run webhook server and emqtt-bench
-ERLANG_IMAGE="ghcr.io/emqx/emqx-builder/5.3-5:1.15.7-26.2.1-2-ubuntu22.04"
+ERLANG_IMAGE="${EMQX_BUILDER}"
 # builder has emqtt-bench installed
 BENCH_IMAGE="$ERLANG_IMAGE"
 

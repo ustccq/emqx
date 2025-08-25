@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license).
@@ -27,7 +27,7 @@
     update_setting/1
 ]).
 
--export([import_config/1]).
+-export([import_config/2]).
 
 -define(CONF_KEY_PATH, [license]).
 
@@ -35,6 +35,8 @@
 %% We don't define it in the emqx_hooks.hrl becasue that is an opensource code
 %% and can be changed by the communitiy.
 -define(HP_LICENSE, 2000).
+
+-define(IS_CLIENTID_TO_BE_ASSIGENED(X), (X =:= <<>> orelse X =:= undefined)).
 
 %%------------------------------------------------------------------------------
 %% API
@@ -61,7 +63,8 @@ unload() ->
 -spec update_key(binary() | string()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 update_key(Value) when is_binary(Value); is_list(Value) ->
-    Result = exec_config_update({key, Value}),
+    Value1 = emqx_utils_conv:bin(Value),
+    Result = exec_config_update({key, Value1}),
     handle_config_update_result(Result).
 
 update_setting(Setting) when is_map(Setting) ->
@@ -79,13 +82,22 @@ exec_config_update(Param) ->
 %% emqx_hooks
 %%------------------------------------------------------------------------------
 
-check(_ConnInfo, AckProps) ->
+check(#{clientid := ClientId}, AckProps) ->
     case emqx_license_checker:limits() of
-        {ok, #{max_connections := ?ERR_EXPIRED}} ->
-            ?SLOG(error, #{msg => "connection_rejected_due_to_license_expired"}, #{tag => "LICENSE"}),
+        {ok, #{max_sessions := ?ERR_EXPIRED}} ->
+            ?SLOG_THROTTLE(error, #{msg => connection_rejected_due_to_license_expired}, #{
+                tag => "LICENSE"
+            }),
             {stop, {error, ?RC_QUOTA_EXCEEDED}};
-        {ok, #{max_connections := MaxClients}} ->
-            case check_max_clients_exceeded(MaxClients) of
+        {ok, #{max_sessions := ?ERR_MAX_UPTIME}} ->
+            ?SLOG_THROTTLE(
+                error, #{msg => connection_rejected_due_to_trial_license_uptime_limit}, #{
+                    tag => "LICENSE"
+                }
+            ),
+            {stop, {error, ?RC_QUOTA_EXCEEDED}};
+        {ok, #{max_sessions := MaxSessions}} ->
+            case is_max_clients_exceeded(MaxSessions) andalso is_new_client(ClientId) of
                 true ->
                     ?SLOG_THROTTLE(
                         error,
@@ -108,7 +120,7 @@ check(_ConnInfo, AckProps) ->
             {stop, {error, ?RC_QUOTA_EXCEEDED}}
     end.
 
-import_config(#{<<"license">> := Config}) ->
+import_config(_Namespace, #{<<"license">> := Config}) ->
     OldConf = emqx:get_config(?CONF_KEY_PATH),
     case exec_config_update(Config) of
         {ok, #{config := NewConf}} ->
@@ -118,7 +130,7 @@ import_config(#{<<"license">> := Config}) ->
         Error ->
             {error, #{root_key => license, reason => Error}}
     end;
-import_config(_RawConf) ->
+import_config(_Namespace, _RawConf) ->
     {ok, #{root_key => license, changed => []}}.
 
 %%------------------------------------------------------------------------------
@@ -151,7 +163,8 @@ del_license_hook() ->
 
 do_update({key, Content}, Conf) when is_binary(Content); is_list(Content) ->
     case emqx_license_parser:parse(Content) of
-        {ok, _License} ->
+        {ok, License} ->
+            ok = no_violation(License),
             Conf#{<<"key">> => Content};
         {error, Reason} ->
             erlang:throw(Reason)
@@ -171,8 +184,29 @@ do_update(NewConf, _PrevConf) ->
     #{<<"key">> := NewKey} = NewConf,
     do_update({key, NewKey}, NewConf).
 
-check_max_clients_exceeded(MaxClients) ->
-    emqx_license_resources:connection_count() > MaxClients * 1.1.
+no_violation(License) ->
+    case emqx_license_checker:no_violation(License) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            throw(Reason)
+    end.
+
+%% Return 'true' if it is a client new to the cluster.
+%% A client is new when it cannot be found in session registry.
+is_new_client(ClientId) when ?IS_CLIENTID_TO_BE_ASSIGENED(ClientId) ->
+    %% no client ID provided, yet to be randomly assigned,
+    %% so it must be new
+    true;
+is_new_client(ClientId) ->
+    %% it's a new client if no live session is found
+    [] =:= emqx_cm:lookup_channels(ClientId).
+
+is_max_clients_exceeded(MaxClients) when MaxClients =< ?NO_OVERSHOOT_SESSIONS_LIMIT ->
+    emqx_license_resources:cached_connection_count() >= MaxClients;
+is_max_clients_exceeded(MaxClients) ->
+    Limit = MaxClients * ?SESSIONS_LIMIT_OVERSHOOT_FACTOR,
+    emqx_license_resources:cached_connection_count() >= erlang:round(Limit).
 
 read_license(#{key := Content}) ->
     emqx_license_parser:parse(Content).

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_api_keys_SUITE).
 
@@ -21,8 +9,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
--if(?EMQX_RELEASE_EDITION == ee).
 -define(EE_CASES, [
     t_ee_create,
     t_ee_update,
@@ -30,9 +18,6 @@
     t_ee_authorize_admin,
     t_ee_authorize_publisher
 ]).
--else.
--define(EE_CASES, []).
--endif.
 
 -define(APP, emqx_app).
 
@@ -56,11 +41,20 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_management]),
-    Config.
+    application:ensure_all_started(hackney),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf, emqx_management]).
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
+    application:stop(hackney).
 
 t_bootstrap_file(_) ->
     TestPath = <<"/api/v5/status">>,
@@ -68,8 +62,8 @@ t_bootstrap_file(_) ->
     File = "./bootstrap_api_keys.txt",
     ok = file:write_file(File, Bin),
     update_file(File),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-1">>)),
 
     %% relaunch to check if the table is changed.
@@ -78,23 +72,23 @@ t_bootstrap_file(_) ->
     update_file(File),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-1">>, <<"new-secret-1">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-2">>, <<"new-secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"new-secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"new-secret-2">>)),
 
     %% not error when bootstrap_file is empty
     update_file(<<>>),
     update_file("./bootstrap_apps_not_exist.txt"),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-1">>)),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-2">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-1">>, <<"new-secret-1">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-2">>, <<"new-secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"new-secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-2">>, <<"new-secret-2">>)),
 
     %% bad format
     BadBin = <<"test-1:secret-11\ntest-2 secret-12">>,
     ok = file:write_file(File, BadBin),
     update_file(File),
-    ?assertMatch({error, #{reason := "invalid_format"}}, emqx_mgmt_auth:init_bootstrap_file()),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-1">>, <<"secret-11">>)),
+    ?assertMatch({error, #{reason := "invalid_format"}}, emqx_mgmt_auth:init_bootstrap_file(File)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-1">>, <<"secret-11">>)),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-2">>, <<"secret-12">>)),
     update_file(<<>>),
 
@@ -104,8 +98,8 @@ t_bootstrap_file(_) ->
     update_file(File),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-3">>, <<"secret-1">>)),
     ?assertMatch({error, _}, auth_authorize(TestPath, <<"test-4">>, <<"secret-2">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-3">>, <<"new-secret-1">>)),
-    ?assertEqual(ok, auth_authorize(TestPath, <<"test-4">>, <<"new-secret-2">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-3">>, <<"new-secret-1">>)),
+    ?assertMatch({ok, _}, auth_authorize(TestPath, <<"test-4">>, <<"new-secret-2">>)),
     ok.
 
 t_bootstrap_file_override(_) ->
@@ -116,7 +110,7 @@ t_bootstrap_file_override(_) ->
     ok = file:write_file(File, Bin),
     update_file(File),
 
-    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file()),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
 
     MatchFun = fun(ApiKey) -> mnesia:match_object(#?APP{api_key = ApiKey, _ = '_'}) end,
     ?assertMatch(
@@ -149,7 +143,7 @@ t_bootstrap_file_dup_override(_) ->
     File = "./bootstrap_api_keys.txt",
     ok = file:write_file(File, Bin),
     update_file(File),
-    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file()),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
 
     SameAppWithDiffName = #?APP{
         name = <<"name-1">>,
@@ -183,7 +177,7 @@ t_bootstrap_file_dup_override(_) ->
 
     %% Similar to loading bootstrap file at node startup
     %% the duplicated apikey in mnesia will be cleaned up
-    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file()),
+    ?assertEqual(ok, emqx_mgmt_auth:init_bootstrap_file(File)),
     ?assertMatch(
         {ok, [
             #?APP{
@@ -199,7 +193,6 @@ t_bootstrap_file_dup_override(_) ->
 
     ok.
 
--if(?EMQX_RELEASE_EDITION == ee).
 t_bootstrap_file_with_role(_) ->
     Search = fun(Name) ->
         lists:search(
@@ -210,80 +203,51 @@ t_bootstrap_file_with_role(_) ->
         )
     end,
 
-    Bin = <<"role-1:role-1:viewer\nrole-2:role-2:administrator\nrole-3:role-3">>,
+    Bin = iolist_to_binary(
+        lists:join($\n, [
+            <<"role-1:role-1:viewer">>,
+            <<"role-2:role-2:administrator">>,
+            <<"role-3:role-3">>,
+            <<"role-4:role-4:ns:ns1::administrator">>,
+            <<"role-5:role-5:ns:ns1::viewer">>,
+            <<"role-6:role-6:ns:ns1::blobber">>
+        ])
+    ),
     File = "./bootstrap_api_keys.txt",
     ok = file:write_file(File, Bin),
     update_file(File),
 
     ?assertMatch(
-        {value, #{api_key := <<"role-1">>, role := <<"viewer">>}},
+        {value, #{api_key := <<"role-1">>, role := <<"viewer">>, namespace := ?global_ns}},
         Search(<<"role-1">>)
     ),
-
     ?assertMatch(
-        {value, #{api_key := <<"role-2">>, role := <<"administrator">>}},
+        {value, #{api_key := <<"role-2">>, role := <<"administrator">>, namespace := ?global_ns}},
         Search(<<"role-2">>)
     ),
-
     ?assertMatch(
-        {value, #{api_key := <<"role-3">>, role := <<"administrator">>}},
+        {value, #{api_key := <<"role-3">>, role := <<"administrator">>, namespace := ?global_ns}},
         Search(<<"role-3">>)
     ),
+    ?assertMatch(
+        {value, #{api_key := <<"role-4">>, role := <<"administrator">>, namespace := <<"ns1">>}},
+        Search(<<"role-4">>)
+    ),
+    ?assertMatch(
+        {value, #{api_key := <<"role-5">>, role := <<"viewer">>, namespace := <<"ns1">>}},
+        Search(<<"role-5">>)
+    ),
+    ?assertMatch(false, Search(<<"role-6">>)),
 
     %% bad role
-    BadBin = <<"role-4:secret-11:bad\n">>,
+    BadBin = <<"role-7:secret-11:bad\n">>,
     ok = file:write_file(File, BadBin),
     update_file(File),
     ?assertEqual(
         false,
-        Search(<<"role-4">>)
+        Search(<<"role-7">>)
     ),
     ok.
--else.
-t_bootstrap_file_with_role(_) ->
-    Search = fun(Name) ->
-        lists:search(
-            fun(#{api_key := AppName}) ->
-                AppName =:= Name
-            end,
-            emqx_mgmt_auth:list()
-        )
-    end,
-
-    Bin = <<"role-1:role-1:administrator\nrole-2:role-2">>,
-    File = "./bootstrap_api_keys.txt",
-    ok = file:write_file(File, Bin),
-    update_file(File),
-
-    ?assertMatch(
-        {value, #{api_key := <<"role-1">>, role := <<"administrator">>}},
-        Search(<<"role-1">>)
-    ),
-
-    ?assertMatch(
-        {value, #{api_key := <<"role-2">>, role := <<"administrator">>}},
-        Search(<<"role-2">>)
-    ),
-
-    %% only administrator
-    OtherRoleBin = <<"role-3:role-3:viewer\n">>,
-    ok = file:write_file(File, OtherRoleBin),
-    update_file(File),
-    ?assertEqual(
-        false,
-        Search(<<"role-3">>)
-    ),
-
-    %% bad role
-    BadBin = <<"role-4:secret-11:bad\n">>,
-    ok = file:write_file(File, BadBin),
-    update_file(File),
-    ?assertEqual(
-        false,
-        Search(<<"role-4">>)
-    ),
-    ok.
--endif.
 
 auth_authorize(Path, Key, Secret) ->
     FakePath = erlang:list_to_binary(emqx_dashboard_swagger:relative_uri("/fake")),
@@ -399,12 +363,22 @@ t_authorize(_Config) ->
     BanPath = emqx_mgmt_api_test_util:api_path(["banned"]),
     ApiKeyPath = emqx_mgmt_api_test_util:api_path(["api_key"]),
     UserPath = emqx_mgmt_api_test_util:api_path(["users"]),
+    DeleteUserPath1 = emqx_mgmt_api_test_util:api_path(["users", "some_user"]),
+    DeleteUserPath2 = [emqx_mgmt_api_test_util:api_path([""]), "./users/some_user"],
 
     {ok, _Status} = emqx_mgmt_api_test_util:request_api(get, BanPath, BasicHeader),
     ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, BanPath, KeyError)),
     ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, BanPath, SecretError)),
     ?assertEqual(Unauthorized, emqx_mgmt_api_test_util:request_api(get, UserPath, BasicHeader)),
-    {error, {{"HTTP/1.1", 401, "Unauthorized"}, _Headers, Body}} =
+
+    ?assertEqual(
+        Unauthorized, emqx_mgmt_api_test_util:request_api(delete, DeleteUserPath1, BasicHeader)
+    ),
+    %% We make request with hackney to avoid path normalization made by httpc.
+    {ok, Code, _Headers0, _Body0} = hackney:request(delete, DeleteUserPath2, [BasicHeader], <<>>),
+    ?assertEqual(401, Code),
+
+    {error, {{"HTTP/1.1", 401, "Unauthorized"}, _Headers1, Body1}} =
         emqx_mgmt_api_test_util:request_api(
             get,
             ApiKeyPath,
@@ -418,7 +392,7 @@ t_authorize(_Config) ->
             <<"code">> := <<"API_KEY_NOT_ALLOW">>,
             <<"message">> := _
         },
-        emqx_utils_json:decode(Body, [return_maps])
+        emqx_utils_json:decode(Body1, [return_maps])
     ),
 
     ?assertMatch(
@@ -550,7 +524,7 @@ list_app() ->
     AuthHeader = emqx_dashboard_SUITE:auth_header_(),
     Path = emqx_mgmt_api_test_util:api_path(["api_key"]),
     case emqx_mgmt_api_test_util:request_api(get, Path, AuthHeader) of
-        {ok, Apps} -> {ok, emqx_utils_json:decode(Apps, [return_maps])};
+        {ok, Apps} -> {ok, emqx_utils_json:decode(Apps)};
         Error -> Error
     end.
 
@@ -558,7 +532,7 @@ read_app(Name) ->
     AuthHeader = emqx_dashboard_SUITE:auth_header_(),
     Path = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
     case emqx_mgmt_api_test_util:request_api(get, Path, AuthHeader) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -576,7 +550,7 @@ create_app(Name, Extra) ->
         enable => true
     },
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, App) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -585,7 +559,7 @@ create_unexpired_app(Name, Params) ->
     Path = emqx_mgmt_api_test_util:api_path(["api_key"]),
     App = maps:merge(#{name => Name, desc => <<"Note"/utf8>>, enable => true}, Params),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, App) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -598,7 +572,7 @@ update_app(Name, Change) ->
     AuthHeader = emqx_dashboard_SUITE:auth_header_(),
     UpdatePath = emqx_mgmt_api_test_util:api_path(["api_key", Name]),
     case emqx_mgmt_api_test_util:request_api(put, UpdatePath, "", AuthHeader, Change) of
-        {ok, Update} -> {ok, emqx_utils_json:decode(Update, [return_maps])};
+        {ok, Update} -> {ok, emqx_utils_json:decode(Update)};
         Error -> Error
     end.
 

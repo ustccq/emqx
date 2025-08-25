@@ -1,11 +1,13 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_test_lib).
 
 -compile(nowarn_export_all).
 -compile(export_all).
+
+-include("emqx_license.hrl").
 
 private_key() ->
     test_key("pvt.key").
@@ -20,8 +22,8 @@ test_key(Filename) ->
     test_key(Filename, decoded).
 
 test_key(Filename, Format) ->
-    Dir = code:lib_dir(emqx_license, test),
-    Path = filename:join([Dir, "data", Filename]),
+    Dir = code:lib_dir(emqx_license),
+    Path = filename:join([Dir, "test", "data", Filename]),
     {ok, KeyData} = file:read_file(Path),
     case Format of
         pem ->
@@ -34,14 +36,14 @@ test_key(Filename, Format) ->
 make_license(Values0 = #{}) ->
     Defaults = #{
         license_format => "220111",
-        license_type => "0",
-        customer_type => "10",
+        license_type => "2",
+        customer_type => "11",
         name => "Foo",
         email => "contact@foo.com",
         deployment => "bar-deployment",
         start_date => "20220111",
         days => "100000",
-        max_connections => "10"
+        max_sessions => "0"
     },
     Values1 = maps:merge(Defaults, Values0),
     Keys = [
@@ -53,7 +55,7 @@ make_license(Values0 = #{}) ->
         deployment,
         start_date,
         days,
-        max_connections
+        max_sessions
     ],
     Values = lists:map(fun(K) -> maps:get(K, Values1) end, Keys),
     make_license(Values);
@@ -69,12 +71,15 @@ default_test_license() ->
     make_license(#{}).
 
 default_license() ->
-    emqx_license_schema:default_license().
+    ?DEFAULT_COMMUNITY_LICENSE_KEY.
 
 mock_parser() ->
     meck:new(emqx_license_parser, [non_strict, passthrough, no_history, no_link]),
     meck:expect(emqx_license_parser, pubkey, fun() -> public_key_pem() end),
     meck:expect(emqx_license_parser, default, fun() -> default_test_license() end),
+    meck:expect(emqx_license_parser, evaluation, fun() ->
+        make_license(#{license_type => "0", customer_type => "10"})
+    end),
     ok.
 
 unmock_parser() ->

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_stomp_channel).
@@ -23,8 +11,6 @@
 -include_lib("emqx/include/emqx_access_control.hrl").
 -include_lib("emqx/include/logger.hrl").
 
--import(proplists, [get_value/2, get_value/3]).
-
 %% API
 -export([
     info/1,
@@ -35,6 +21,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_out/3,
     handle_deliver/2,
     handle_timeout/3,
@@ -54,6 +41,8 @@
     handle_recv_ack_frame/2,
     handle_recv_nack_frame/2
 ]).
+
+-export_type([channel/0, replies/0, stomp_frame/0]).
 
 -record(channel, {
     %% Context
@@ -78,7 +67,7 @@
     transaction :: #{binary() => list()}
 }).
 
--type channel() :: #channel{}.
+-opaque channel() :: #channel{}.
 
 -type conn_state() :: idle | connecting | connected | disconnected.
 
@@ -109,6 +98,7 @@
 ).
 
 -define(INFO_KEYS, [conninfo, conn_state, clientinfo, session, will_msg]).
+-define(RAND_CLIENTID_BYETS, 16).
 
 %%--------------------------------------------------------------------
 %% Init the channel
@@ -117,7 +107,7 @@
 %% @doc Init protocol
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     Option
@@ -137,6 +127,7 @@ init(
             listener => ListenerId,
             protocol => stomp,
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             clientid => undefined,
             username => undefined,
@@ -277,6 +268,18 @@ assign_clientid_to_conninfo(
     NConnInfo = maps:put(clientid, ClientId, ConnInfo),
     {ok, Packet, Channel#channel{conninfo = NConnInfo}}.
 
+assign_keepalive_to_conninfo(
+    Packet,
+    Channel = #channel{
+        conninfo = ConnInfo,
+        clientinfo = ClientInfo
+    }
+) ->
+    {Cx, _Cy} = maps:get(heartbeat, ClientInfo),
+    Keepalive = floor(Cx / 1000),
+    NConnInfo = maps:put(keepalive, Keepalive, ConnInfo),
+    {ok, Packet, Channel#channel{conninfo = NConnInfo}}.
+
 feedvar(Override, Packet, ConnInfo, ClientInfo) ->
     Envs = #{
         'ConnInfo' => ConnInfo,
@@ -302,7 +305,7 @@ maybe_assign_clientid(_Packet, ClientInfo = #{clientid := ClientId}) when
     ClientId == undefined;
     ClientId == <<>>
 ->
-    {ok, ClientInfo#{clientid => emqx_guid:to_base62(emqx_guid:gen())}};
+    {ok, ClientInfo#{clientid => emqx_utils:rand_id(?RAND_CLIENTID_BYETS)}};
 maybe_assign_clientid(_Packet, ClientInfo) ->
     {ok, ClientInfo}.
 
@@ -404,7 +407,8 @@ process_connect(
                 {<<"version">>, <<"1.0,1.1,1.2">>},
                 {<<"content-type">>, <<"text/plain">>}
             ],
-            handle_out(connerr, {Headers, undefined, <<"Not Authenticated">>}, Channel)
+            ErrMsg = io_lib:format("Failed to open session: ~ts", [Reason]),
+            handle_out(connerr, {Headers, undefined, failed_to_open_session, ErrMsg}, Channel)
     end.
 
 %%--------------------------------------------------------------------
@@ -432,6 +436,7 @@ handle_in(Packet = ?PACKET(?CMD_CONNECT), Channel) ->
                 fun negotiate_version/2,
                 fun enrich_clientinfo/2,
                 fun assign_clientid_to_conninfo/2,
+                fun assign_keepalive_to_conninfo/2,
                 fun run_conn_hooks/2,
                 fun set_log_meta/2,
                 %% TODO: How to implement the banned in the gateway instance?
@@ -446,7 +451,7 @@ handle_in(Packet = ?PACKET(?CMD_CONNECT), Channel) ->
             process_connect(ensure_connected(NChannel));
         {error, ReasonCode, NChannel} ->
             ErrMsg = io_lib:format("Login Failed: ~ts", [ReasonCode]),
-            handle_out(connerr, {[], undefined, ErrMsg}, NChannel)
+            handle_out(connerr, {[], undefined, ReasonCode, ErrMsg}, NChannel)
     end;
 handle_in(
     Frame = ?PACKET(?CMD_SEND, Headers),
@@ -668,10 +673,11 @@ handle_in(
 ) ->
     NewVal = emqx_pd:get_counter(recv_pkt),
     NewHeartbeat = emqx_stomp_heartbeat:reset(incoming, NewVal, Heartbeat),
-    {ok, Channel#channel{heartbeat = NewHeartbeat}};
-handle_in({frame_error, Reason}, Channel = #channel{conn_state = idle}) ->
+    {ok, Channel#channel{heartbeat = NewHeartbeat}}.
+
+handle_frame_error(Reason, Channel = #channel{conn_state = idle}) ->
     shutdown(Reason, Channel);
-handle_in({frame_error, Reason}, Channel = #channel{conn_state = _ConnState}) ->
+handle_frame_error(Reason, Channel = #channel{conn_state = _ConnState}) ->
     ErrMsg = io_lib:format("Frame error: ~0p", [Reason]),
     Frame = error_frame(undefined, ErrMsg),
     shutdown(Reason, Frame, Channel).
@@ -778,9 +784,9 @@ do_subscribe(
     | {shutdown, Reason :: term(), channel()}
     | {shutdown, Reason :: term(), replies(), channel()}.
 
-handle_out(connerr, {Headers, ReceiptId, ErrMsg}, Channel) ->
+handle_out(connerr, {Headers, ReceiptId, ErrCode, ErrMsg}, Channel) ->
     Frame = error_frame(Headers, ReceiptId, ErrMsg),
-    shutdown(ErrMsg, Frame, Channel);
+    shutdown(ErrCode, Frame, Channel);
 handle_out(error, {ReceiptId, ErrMsg}, Channel) ->
     Frame = error_frame(ReceiptId, ErrMsg),
     {ok, {outgoing, Frame}, Channel};
@@ -798,7 +804,7 @@ handle_out(
         {outgoing, connected_frame(Headers)},
         {event, connected}
     ],
-    {ok, Replies, ensure_heartbeart_timer(Channel)};
+    {ok, Replies, ensure_heartbeat_timer(Channel)};
 handle_out(receipt, undefined, Channel) ->
     {ok, Channel};
 handle_out(receipt, ReceiptId, Channel) ->
@@ -1190,9 +1196,9 @@ do_negotiate_version(Ver, _) ->
     {error, <<"Supported protocol versions < ", Ver/binary>>}.
 
 header(Name, Headers) ->
-    get_value(Name, Headers).
+    proplists:get_value(Name, Headers).
 header(Name, Headers, Val) ->
-    get_value(Name, Headers, Val).
+    proplists:get_value(Name, Headers, Val).
 
 connected_frame(Headers) ->
     emqx_stomp_frame:make(<<"CONNECTED">>, Headers).
@@ -1321,7 +1327,7 @@ ensure_clean_trans_timer(Channel = #channel{transaction = Trans}) ->
 reverse_heartbeats({Cx, Cy}) ->
     iolist_to_binary(io_lib:format("~w,~w", [Cy, Cx])).
 
-ensure_heartbeart_timer(Channel = #channel{clientinfo = ClientInfo}) ->
+ensure_heartbeat_timer(Channel = #channel{clientinfo = ClientInfo}) ->
     Heartbeat = maps:get(heartbeat, ClientInfo),
     ensure_timer(
         [incoming_timer, outgoing_timer],

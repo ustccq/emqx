@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_release).
@@ -24,52 +12,43 @@
     version/0,
     version_with_prefix/0,
     vsn_compare/1,
-    vsn_compare/2
+    vsn_compare/2,
+    get_flavor/0
 ]).
+
+-ifdef(TEST).
+-export([set_flavor/1]).
+-endif.
 
 -include("emqx_release.hrl").
 
--define(EMQX_DESCS, #{
-    ee => "EMQX Enterprise",
-    ce => "EMQX"
-}).
+-define(EMQX_DESCS,
+    case get_flavor() of
+        official -> "EMQX Enterprise";
+        Flavor -> io_lib:format("EMQX Enterprise(~s)", [Flavor])
+    end
+).
 
--define(EMQX_REL_NAME, #{
-    ee => <<"Enterprise">>,
-    ce => <<"Opensource">>
-}).
+-define(EMQX_REL_NAME, <<"Enterprise">>).
 
--define(EMQX_REL_VSNS, #{
-    ee => ?EMQX_RELEASE_EE,
-    ce => ?EMQX_RELEASE_CE
-}).
+-define(EMQX_REL_VSNS, ?EMQX_RELEASE_EE).
 
--define(EMQX_REL_VSN_PREFIX, #{
-    ee => "e",
-    ce => "v"
-}).
+-define(EMQX_REL_VSN_PREFIX, "e").
 
 %% @doc Return EMQX description.
+-dialyzer({[no_match], [description/0]}).
 description() ->
-    maps:get(edition(), ?EMQX_DESCS).
+    ?EMQX_DESCS.
 
-%% @doc Return EMQX edition info.
-%% Read info from persistent_term at runtime.
-%% Or meck this function to run tests for another edition.
--spec edition() -> ce | ee.
--ifdef(EMQX_RELEASE_EDITION).
-edition() -> ?EMQX_RELEASE_EDITION.
--else.
-edition() -> ce.
--endif.
+edition() ->
+    ee.
 
 %% @doc Return EMQX version prefix string.
 edition_vsn_prefix() ->
-    maps:get(edition(), ?EMQX_REL_VSN_PREFIX).
+    ?EMQX_REL_VSN_PREFIX.
 
 %% @doc Return EMQX edition name, ee => Enterprise ce => Opensource.
-edition_longstr() ->
-    maps:get(edition(), ?EMQX_REL_NAME).
+edition_longstr() -> ?EMQX_REL_NAME.
 
 %% @doc Return the release version with prefix.
 version_with_prefix() ->
@@ -98,12 +77,13 @@ version() ->
     end.
 
 build_vsn() ->
-    maps:get(edition(), ?EMQX_REL_VSNS).
+    ?EMQX_REL_VSNS.
 
 %% @doc Compare the given version with the current running version,
 %% return 'newer' 'older' or 'same'.
 vsn_compare("v" ++ Vsn) ->
-    vsn_compare(?EMQX_RELEASE_CE, Vsn);
+    %% this clause is kept in case one wants to rolling-upgrade from ce to ee
+    vsn_compare(?EMQX_RELEASE_EE, Vsn);
 vsn_compare("e" ++ Vsn) ->
     vsn_compare(?EMQX_RELEASE_EE, Vsn).
 
@@ -146,3 +126,22 @@ parse_vsn(Vsn) ->
         _:_ ->
             erlang:error({invalid_version_string, Vsn})
     end.
+
+-spec get_flavor() -> atom().
+-ifdef(TEST).
+set_flavor(Flavor) when is_atom(Flavor) ->
+    persistent_term:put({?MODULE, 'EMQX_FLAVOR'}, Flavor).
+
+get_flavor() ->
+    persistent_term:get({?MODULE, 'EMQX_FLAVOR'}, official).
+-else.
+
+-ifndef(EMQX_FLAVOR).
+get_flavor() ->
+    official.
+-else.
+get_flavor() ->
+    ?EMQX_FLAVOR.
+-endif.
+
+-endif.

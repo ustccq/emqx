@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_gcp_pubsub_consumer_schema).
@@ -67,9 +67,7 @@ fields(source_parameters) ->
     Fields = lists:map(
         fun
             ({topic_mapping = Name, Sc}) ->
-                %% to please dialyzer...
                 Override = #{
-                    type => hocon_schema:field_schema(Sc, type),
                     required => false,
                     default => [],
                     validator => fun(_) -> ok end,
@@ -95,6 +93,8 @@ fields(source_parameters) ->
 fields(source_resource_opts) ->
     Fields = [
         health_check_interval,
+        health_check_interval_jitter,
+        health_check_timeout,
         %% the workers pull the messages
         request_ttl,
         resume_interval
@@ -111,7 +111,6 @@ fields(source_resource_opts) ->
 %% Connector fields
 %%=========================================
 fields("config_connector") ->
-    %% FIXME
     emqx_connector_schema:common_fields() ++
         connector_config_fields();
 fields(connector_resource_opts) ->

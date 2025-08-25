@@ -1,21 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_postgresql).
 
 -include("emqx_postgresql.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("emqx/include/logger.hrl").
@@ -29,6 +18,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -50,8 +40,18 @@
     execute_batch/3
 ]).
 
+-export([disable_prepared_statements/0]).
+
 %% for ecpool workers usage
--export([do_get_status/1, prepare_sql_to_conn/2]).
+-export([
+    do_get_status/1,
+    prepare_sql_to_conn/2,
+    get_reconnect_callback_signature/1,
+    on_get_status_prepares/1
+]).
+
+%% Allocatable resources
+-define(conn_pool, conn_pool).
 
 -define(PGSQL_HOST_OPTIONS, #{
     default_port => ?PGSQL_DEFAULT_PORT
@@ -60,9 +60,10 @@
 -type template() :: {unicode:chardata(), emqx_template_sql:row_template()}.
 -type state() ::
     #{
+        installed_channels := #{action_resource_id() => map()},
         pool_name := binary(),
         query_templates := #{binary() => template()},
-        prepares := #{binary() => epgsql:statement()} | {error, _}
+        prepares := disabled | #{binary() => epgsql:statement()} | {error, _}
     }.
 
 %% FIXME: add `{error, sync_required}' to `epgsql:execute_batch'
@@ -78,7 +79,10 @@ roots() ->
     [{config, #{type => hoconsc:ref(?MODULE, config)}}].
 
 fields(config) ->
-    [{server, server()}] ++
+    [
+        {server, server()},
+        disable_prepared_statements()
+    ] ++
         adjust_fields(emqx_connector_schema_lib:relational_db_fields()) ++
         emqx_connector_schema_lib:ssl_fields() ++
         emqx_connector_schema_lib:prepare_statement_fields().
@@ -87,12 +91,22 @@ server() ->
     Meta = #{desc => ?DESC("server")},
     emqx_schema:servers_sc(Meta, ?PGSQL_HOST_OPTIONS).
 
+disable_prepared_statements() ->
+    {disable_prepared_statements,
+        hoconsc:mk(
+            boolean(),
+            #{
+                default => false,
+                required => false,
+                desc => ?DESC("disable_prepared_statements")
+            }
+        )}.
+
 adjust_fields(Fields) ->
     lists:map(
         fun
             ({username, Sc}) ->
-                %% to please dialyzer...
-                Override = #{type => hocon_schema:field_schema(Sc, type), required => true},
+                Override = #{required => true},
                 {username, hocon_schema:override(Sc, Override)};
             (Field) ->
                 Field
@@ -101,6 +115,8 @@ adjust_fields(Fields) ->
     ).
 
 %% ===================================================================
+resource_type() -> pgsql.
+
 callback_mode() -> always_sync.
 
 -spec on_start(binary(), hocon:config()) -> {ok, state()} | {error, _}.
@@ -108,6 +124,7 @@ on_start(
     InstId,
     #{
         server := Server,
+        disable_prepared_statements := DisablePreparedStatements,
         database := DB,
         username := User,
         pool_size := PoolSize,
@@ -115,8 +132,7 @@ on_start(
     } = Config
 ) ->
     #{hostname := Host, port := Port} = emqx_schema:parse_server(Server, ?PGSQL_HOST_OPTIONS),
-    ?SLOG(info, #{
-        msg => "starting_postgresql_connector",
+    ?tp(info, "starting_postgresql_connector", #{
         connector => InstId,
         config => emqx_utils:redact(Config)
     }),
@@ -134,20 +150,33 @@ on_start(
             false ->
                 [{ssl, false}]
         end,
-    Options = [
+    Codecs = maps:get(codecs, Config, undefined),
+    Options = lists:flatten([
         {host, Host},
         {port, Port},
         {username, User},
         {password, maps:get(password, Config, emqx_secret:wrap(""))},
         {database, DB},
         {auto_reconnect, ?AUTO_RECONNECT_INTERVAL},
-        {pool_size, PoolSize}
-    ],
-    State1 = parse_prepare_sql(Config, <<"send_message">>),
+        {pool_size, PoolSize},
+        [{codecs, []} || Codecs /= undefined]
+    ]),
+    State1 = parse_sql_template(Config, <<"send_message">>),
     State2 = State1#{installed_channels => #{}},
+    ok = emqx_resource:allocate_resource(InstId, ?MODULE, ?conn_pool, InstId),
     case emqx_resource_pool:start(InstId, ?MODULE, Options ++ SslOpts) of
         ok ->
-            {ok, init_prepare(State2#{pool_name => InstId, prepares => #{}})};
+            Prepares =
+                case DisablePreparedStatements of
+                    true -> disabled;
+                    false -> #{}
+                end,
+            case init_prepare(State2#{pool_name => InstId, prepares => Prepares}) of
+                #{prepares := {error, _} = Error} ->
+                    Error;
+                State ->
+                    {ok, State}
+            end;
         {error, Reason} ->
             ?tp(
                 pgsql_connector_start_failed,
@@ -169,6 +198,8 @@ on_stop(InstId, State) ->
 close_connections(#{pool_name := PoolName} = _State) ->
     WorkerPids = [Worker || {_WorkerName, Worker} <- ecpool:workers(PoolName)],
     close_connections_with_worker_pids(WorkerPids),
+    ok;
+close_connections(_) ->
     ok.
 
 close_connections_with_worker_pids([WorkerPid | Rest]) ->
@@ -209,13 +240,17 @@ on_add_channel(
 
 create_channel_state(
     ChannelId,
-    #{pool_name := PoolName} = _ConnectorState,
+    #{
+        pool_name := PoolName,
+        prepares := Prepares
+    } = _ConnectorState,
     #{parameters := Parameters} = _ChannelConfig
 ) ->
-    State1 = parse_prepare_sql(Parameters, ChannelId),
+    State1 = parse_sql_template(Parameters, ChannelId),
     {ok,
         init_prepare(State1#{
             pool_name => PoolName,
+            prepares => Prepares,
             prepare_statement => #{}
         })}.
 
@@ -233,6 +268,8 @@ on_remove_channel(
     NewState = OldState#{installed_channels => NewInstalledChannels},
     {ok, NewState}.
 
+close_prepared_statement(_ChannelId, #{prepares := disabled}) ->
+    ok;
 close_prepared_statement(ChannelId, #{pool_name := PoolName} = State) ->
     WorkerPids = [Worker || {_WorkerName, Worker} <- ecpool:workers(PoolName)],
     close_prepared_statement(WorkerPids, ChannelId, State),
@@ -240,12 +277,20 @@ close_prepared_statement(ChannelId, #{pool_name := PoolName} = State) ->
 
 close_prepared_statement([WorkerPid | Rest], ChannelId, State) ->
     %% We ignore errors since any error probably means that the
-    %% prepared statement doesn't exist.
+    %% prepared statement doesn't exist. If it exists when we try
+    %% to insert one with the same name, we will try to remove it
+    %% again anyway.
     try ecpool_worker:client(WorkerPid) of
         {ok, Conn} ->
-            Statement = get_prepared_statement(ChannelId, State),
-            _ = epgsql:close(Conn, Statement),
-            close_prepared_statement(Rest, ChannelId, State);
+            ok = ecpool_worker:remove_reconnect_callback_by_signature(WorkerPid, ChannelId),
+            case get_templated_statement(ChannelId, State) of
+                {ok, Statement} ->
+                    _ = epgsql:close(Conn, Statement),
+                    close_prepared_statement(Rest, ChannelId, State);
+                error ->
+                    %% channel was not added
+                    ok
+            end;
         _ ->
             close_prepared_statement(Rest, ChannelId, State)
     catch
@@ -272,9 +317,9 @@ on_get_channel_status(
         )
     of
         ok ->
-            connected;
+            ?status_connected;
         {error, undefined_table} ->
-            {error, {unhealthy_target, <<"Table does not exist">>}}
+            {?status_disconnected, {unhealthy_target, <<"Table does not exist">>}}
     end.
 
 do_check_channel_sql(
@@ -289,35 +334,38 @@ do_check_channel_sql(
 on_get_channels(ResId) ->
     emqx_bridge_v2:get_channels_for_connector(ResId).
 
-on_query(InstId, {TypeOrKey, NameOrSQL}, State) ->
-    on_query(InstId, {TypeOrKey, NameOrSQL, []}, State);
+-spec on_query
+    %% Called from authn and authz modules
+    (connector_resource_id(), {prepared_query, binary(), [term()]}, state()) ->
+        {ok, _} | {error, term()};
+    %% Called from bridges
+    (connector_resource_id(), {action_resource_id(), map()}, state()) ->
+        {ok, _} | {error, term()}.
+on_query(InstId, {TypeOrKey, NameOrMap}, State) ->
+    on_query(InstId, {TypeOrKey, NameOrMap, []}, State);
 on_query(
     InstId,
-    {TypeOrKey, NameOrSQL, Params},
+    {TypeOrKey, NameOrMap, Params},
     #{pool_name := PoolName} = State
 ) ->
-    ?SLOG(debug, #{
-        msg => "postgresql_connector_received_sql_query",
+    ?TRACE("QUERY", "postgresql_connector_received_sql_query", #{
         connector => InstId,
         type => TypeOrKey,
-        sql => NameOrSQL,
+        sql => NameOrMap,
         state => State
     }),
-    Type = pgsql_query_type(TypeOrKey),
-    {NameOrSQL2, Data} = proc_sql_params(TypeOrKey, NameOrSQL, Params, State),
-    Res = on_sql_query(TypeOrKey, InstId, PoolName, Type, NameOrSQL2, Data),
+    {QueryType, NameOrSQL2, Data} = proc_sql_params(TypeOrKey, NameOrMap, Params, State),
+    emqx_trace:rendered_action_template(
+        TypeOrKey,
+        #{
+            statement_type => QueryType,
+            statement_or_name => NameOrSQL2,
+            data => Data
+        }
+    ),
+    Res = on_sql_query(InstId, PoolName, QueryType, NameOrSQL2, Data),
     ?tp(postgres_bridge_connector_on_query_return, #{instance_id => InstId, result => Res}),
     handle_result(Res).
-
-pgsql_query_type(sql) ->
-    query;
-pgsql_query_type(query) ->
-    query;
-pgsql_query_type(prepared_query) ->
-    prepared_query;
-%% for bridge
-pgsql_query_type(_) ->
-    pgsql_query_type(prepared_query).
 
 on_batch_query(
     InstId,
@@ -336,9 +384,17 @@ on_batch_query(
             ?SLOG(error, Log),
             {error, {unrecoverable_error, batch_prepare_not_implemented}};
         {_Statement, RowTemplate} ->
-            PrepStatement = get_prepared_statement(BinKey, State),
+            {ok, StatementTemplate} = get_templated_statement(BinKey, State),
             Rows = [render_prepare_sql_row(RowTemplate, Data) || {_Key, Data} <- BatchReq],
-            case on_sql_query(Key, InstId, PoolName, execute_batch, PrepStatement, Rows) of
+            emqx_trace:rendered_action_template(
+                Key,
+                #{
+                    statement_type => execute_batch,
+                    statement_or_name => StatementTemplate,
+                    data => Rows
+                }
+            ),
+            case on_sql_query(InstId, PoolName, execute_batch, StatementTemplate, Rows) of
                 {error, _Error} = Result ->
                     handle_result(Result);
                 {_Column, Results} ->
@@ -354,18 +410,38 @@ on_batch_query(InstId, BatchReq, State) ->
     }),
     {error, {unrecoverable_error, invalid_request}}.
 
-proc_sql_params(query, SQLOrKey, Params, _State) ->
-    {SQLOrKey, Params};
-proc_sql_params(prepared_query, SQLOrKey, Params, _State) ->
-    {SQLOrKey, Params};
-proc_sql_params(TypeOrKey, SQLOrData, Params, State) ->
-    BinKey = to_bin(TypeOrKey),
-    case get_template(BinKey, State) of
-        undefined ->
-            {SQLOrData, Params};
-        {_Statement, RowTemplate} ->
-            {BinKey, render_prepare_sql_row(RowTemplate, SQLOrData)}
-    end.
+proc_sql_params(ActionResId, #{} = Map, [], State) when is_binary(ActionResId) ->
+    %% When this connector is called from actions/bridges.
+    DisablePreparedStatements = prepared_statements_disabled(State),
+    {ExprTemplate, RowTemplate} = get_template(ActionResId, State),
+    Rendered = render_prepare_sql_row(RowTemplate, Map),
+    case DisablePreparedStatements of
+        true ->
+            {query, ExprTemplate, Rendered};
+        false ->
+            {prepared_query, ActionResId, Rendered}
+    end;
+proc_sql_params(prepared_query, ConnResId, Params, State) ->
+    %% When this connector is called from authn/authz modules
+    DisablePreparedStatements = prepared_statements_disabled(State),
+    case DisablePreparedStatements of
+        true ->
+            #{query_templates := #{ConnResId := {ExprTemplate, _VarsTemplate}}} = State,
+            {query, ExprTemplate, Params};
+        false ->
+            %% Connector resource id itself is the prepared statement name
+            {prepared_query, ConnResId, Params}
+    end;
+proc_sql_params(QueryType, SQL, Params, _State) when
+    is_atom(QueryType) andalso
+        (is_binary(SQL) orelse is_list(SQL)) andalso
+        is_list(Params)
+->
+    %% When called to do ad-hoc commands/queries.
+    {QueryType, SQL, Params}.
+
+prepared_statements_disabled(State) ->
+    maps:get(prepares, State, #{}) =:= disabled.
 
 get_template(Key, #{installed_channels := Channels} = _State) when is_map_key(Key, Channels) ->
     BinKey = to_bin(Key),
@@ -376,26 +452,25 @@ get_template(Key, #{query_templates := Templates}) ->
     BinKey = to_bin(Key),
     maps:get(BinKey, Templates, undefined).
 
-get_prepared_statement(Key, #{installed_channels := Channels} = _State) when
-    is_map_key(Key, Channels)
-->
+get_templated_statement(Key, #{installed_channels := Channels} = _State) ->
     BinKey = to_bin(Key),
-    ChannelState = maps:get(BinKey, Channels),
-    ChannelPreparedStatements = maps:get(prepares, ChannelState),
-    maps:get(BinKey, ChannelPreparedStatements);
-get_prepared_statement(Key, #{prepares := PrepStatements}) ->
+    case is_map_key(BinKey, Channels) of
+        true ->
+            ChannelState = maps:get(BinKey, Channels),
+            case ChannelState of
+                #{prepares := disabled, query_templates := #{BinKey := {ExprTemplate, _}}} ->
+                    {ok, ExprTemplate};
+                #{prepares := #{BinKey := ExprTemplate}} ->
+                    {ok, ExprTemplate}
+            end;
+        false ->
+            error
+    end;
+get_templated_statement(Key, #{prepares := PrepStatements}) ->
     BinKey = to_bin(Key),
-    maps:get(BinKey, PrepStatements).
+    {ok, maps:get(BinKey, PrepStatements)}.
 
-on_sql_query(Key, InstId, PoolName, Type, NameOrSQL, Data) ->
-    emqx_trace:rendered_action_template(
-        Key,
-        #{
-            statement_type => Type,
-            statement_or_name => NameOrSQL,
-            data => Data
-        }
-    ),
+on_sql_query(InstId, PoolName, Type, NameOrSQL, Data) ->
     try ecpool:pick_and_do(PoolName, {?MODULE, Type, [NameOrSQL, Data]}, no_handover) of
         {error, Reason} ->
             ?tp(
@@ -444,28 +519,67 @@ on_sql_query(Key, InstId, PoolName, Type, NameOrSQL, Data) ->
             {error, {unrecoverable_error, invalid_request}}
     end.
 
-on_get_status(_InstId, #{pool_name := PoolName} = State) ->
-    case emqx_resource_pool:health_check_workers(PoolName, fun ?MODULE:do_get_status/1) of
-        true ->
-            case do_check_prepares(State) of
-                ok ->
-                    connected;
-                {ok, NState} ->
-                    %% return new state with prepared statements
-                    {connected, NState};
-                {error, undefined_table} ->
-                    %% return new state indicating that we are connected but the target table is not created
-                    {disconnected, State, unhealthy_target};
-                {error, _Reason} ->
-                    %% do not log error, it is logged in prepare_sql_to_conn
-                    connecting
+on_get_status(_InstId, #{pool_name := PoolName} = ConnState) ->
+    Res = emqx_resource_pool:health_check_workers(
+        PoolName,
+        fun ?MODULE:do_get_status/1,
+        emqx_resource_pool:health_check_timeout(),
+        #{return_values => true}
+    ),
+    case Res of
+        {ok, []} ->
+            {?status_connecting, <<"connection_pool_not_initialized">>};
+        {ok, Results} ->
+            Errors =
+                lists:filter(
+                    fun
+                        ({ok, _, _}) ->
+                            false;
+                        (_) ->
+                            true
+                    end,
+                    Results
+                ),
+            case Errors of
+                [] ->
+                    do_on_get_status_prepares(ConnState);
+                [{error, Reason} | _] ->
+                    {?status_disconnected, Reason};
+                [Reason | _] ->
+                    {?status_disconnected, Reason}
             end;
-        false ->
-            connecting
+        {error, timeout} ->
+            %% We trigger a full reconnection if the health check times out, by declaring
+            %% the connector `?status_disconnected`.  We choose to do this because there
+            %% have been issues where the connection process does not die and the
+            %% connection itself unusable.
+            {?status_disconnected, <<"health_check_timeout">>}
+    end.
+
+do_on_get_status_prepares(ConnState) ->
+    %% TODO: this is a hot patch; when merging to 5.10, we have a new
+    %% `resource_opts.health_check_timeout` that supersedes the need for this, which
+    %% should be dropped.
+    Fn = fun() -> ?MODULE:on_get_status_prepares(ConnState) end,
+    try
+        emqx_utils:nolink_apply(Fn, emqx_resource_pool:health_check_timeout())
+    catch
+        exit:timeout ->
+            {?status_disconnected, <<"resource_health_check_timed_out">>}
+    end.
+
+on_get_status_prepares(ConnState) ->
+    case do_check_prepares(ConnState) of
+        ok ->
+            ?status_connected;
+        {error, undefined_table} ->
+            %% return error indicating that we are connected but the target table
+            %% is not created
+            {?status_disconnected, {unhealthy_target, undefined_table}}
     end.
 
 do_get_status(Conn) ->
-    ok == element(1, epgsql:squery(Conn, "SELECT count(1) AS T")).
+    epgsql:squery(Conn, "SELECT count(1) AS T").
 
 do_check_prepares(
     #{
@@ -480,17 +594,8 @@ do_check_prepares(
         {error, Reason} ->
             {error, Reason}
     end;
-do_check_prepares(#{prepares := Prepares}) when is_map(Prepares) ->
-    ok;
-do_check_prepares(#{prepares := {error, _}} = State) ->
-    %% retry to prepare
-    case prepare_sql(State) of
-        {ok, PrepStatements} ->
-            %% remove the error
-            {ok, State#{prepares := PrepStatements}};
-        {error, Reason} ->
-            {error, Reason}
-    end.
+do_check_prepares(_) ->
+    ok.
 
 -spec validate_table_existence([pid()], binary()) -> ok | {error, undefined_table}.
 validate_table_existence([WorkerPid | Rest], SQL) ->
@@ -523,7 +628,9 @@ connect(Opts) ->
     Username = proplists:get_value(username, Opts),
     %% TODO: teach `epgsql` to accept 0-arity closures as passwords.
     Password = emqx_secret:unwrap(proplists:get_value(password, Opts)),
-    case epgsql:connect(Host, Username, Password, conn_opts(Opts)) of
+    ConnOpts = conn_opts(Opts),
+    ?tp("postgres_epgsql_connect", #{opts => ConnOpts}),
+    case epgsql:connect(Host, Username, Password, ConnOpts) of
         {ok, _Conn} = Ok ->
             Ok;
         {error, Reason} ->
@@ -576,23 +683,25 @@ conn_opts([Opt = {timeout, _} | Opts], Acc) ->
     conn_opts(Opts, [Opt | Acc]);
 conn_opts([Opt = {ssl_opts, _} | Opts], Acc) ->
     conn_opts(Opts, [Opt | Acc]);
+conn_opts([Opt = {codecs, _} | Opts], Acc) ->
+    conn_opts(Opts, [Opt | Acc]);
 conn_opts([_Opt | Opts], Acc) ->
     conn_opts(Opts, Acc).
 
-parse_prepare_sql(Config, SQLID) ->
+parse_sql_template(Config, ChannelId) ->
     Queries =
         case Config of
             #{prepare_statement := Qs} ->
                 Qs;
             #{sql := Query} ->
-                #{SQLID => Query};
+                #{ChannelId => Query};
             #{} ->
                 #{}
         end,
-    Templates = maps:fold(fun parse_prepare_sql/3, #{}, Queries),
+    Templates = maps:fold(fun parse_sql_template/3, #{}, Queries),
     #{query_templates => Templates}.
 
-parse_prepare_sql(Key, Query, Acc) ->
+parse_sql_template(Key, Query, Acc) ->
     Template = emqx_template_sql:parse_prepstmt(Query, #{parameters => '$n'}),
     Acc#{Key => Template}.
 
@@ -601,6 +710,8 @@ render_prepare_sql_row(RowTemplate, Data) ->
     {Row, _Errors} = emqx_template_sql:render_prepstmt(RowTemplate, {emqx_jsonish, Data}),
     Row.
 
+init_prepare(State = #{prepares := disabled}) ->
+    State;
 init_prepare(State = #{query_templates := Templates}) when map_size(Templates) == 0 ->
     State;
 init_prepare(State = #{}) ->
@@ -633,6 +744,12 @@ prepare_sql(Templates, PoolName) ->
             Error
     end.
 
+%% this callback accepts the arg list provided to
+%% ecpool:add_reconnect_callback(PoolName, {?MODULE, prepare_sql_to_conn, [Templates]})
+%% so ecpool_worker can de-duplicate the callbacks based on the signature.
+get_reconnect_callback_signature([[{ChannelId, _Template}]]) ->
+    ChannelId.
+
 do_prepare_sql(Templates, PoolName) ->
     do_prepare_sql(ecpool:workers(PoolName), Templates, #{}).
 
@@ -648,17 +765,21 @@ do_prepare_sql([], _Prepares, LastSts) ->
     {ok, LastSts}.
 
 prepare_sql_to_conn(Conn, Prepares) ->
-    prepare_sql_to_conn(Conn, Prepares, #{}).
+    prepare_sql_to_conn(Conn, Prepares, #{}, 0).
 
-prepare_sql_to_conn(Conn, [], Statements) when is_pid(Conn) ->
+prepare_sql_to_conn(Conn, [], Statements, _Attempts) when is_pid(Conn) ->
     {ok, Statements};
-prepare_sql_to_conn(Conn, [{Key, {SQL, _RowTemplate}} | Rest], Statements) when is_pid(Conn) ->
+prepare_sql_to_conn(Conn, [{_Key, _} | _Rest], _Statements, _MaxAttempts = 2) when is_pid(Conn) ->
+    failed_to_remove_prev_prepared_statement_error();
+prepare_sql_to_conn(
+    Conn, [{Key, {SQL, _RowTemplate}} | Rest] = ToPrepare, Statements, Attempts
+) when is_pid(Conn) ->
     LogMeta = #{msg => "postgresql_prepare_statement", name => Key, sql => SQL},
     ?SLOG(info, LogMeta),
     case epgsql:parse2(Conn, Key, SQL, []) of
         {ok, Statement} ->
-            prepare_sql_to_conn(Conn, Rest, Statements#{Key => Statement});
-        {error, {error, error, _, undefined_table, _, _} = Error} ->
+            prepare_sql_to_conn(Conn, Rest, Statements#{Key => Statement}, 0);
+        {error, #error{severity = error, codename = undefined_table} = Error} ->
             %% Target table is not created
             ?tp(pgsql_undefined_table, #{}),
             LogMsg =
@@ -668,6 +789,30 @@ prepare_sql_to_conn(Conn, [{Key, {SQL, _RowTemplate}} | Rest], Statements) when 
                 ),
             ?SLOG(error, LogMsg),
             {error, undefined_table};
+        {error, #error{severity = error, codename = duplicate_prepared_statement}} = Error ->
+            ?tp(pgsql_prepared_statement_exists, #{}),
+            LogMsg =
+                maps:merge(
+                    LogMeta#{
+                        msg => "postgresql_prepared_statment_with_same_name_already_exists",
+                        explain => <<
+                            "A prepared statement with the same name already "
+                            "exists in the driver. Will attempt to remove the "
+                            "previous prepared statement with the name and then "
+                            "try again."
+                        >>
+                    },
+                    translate_to_log_context(Error)
+                ),
+            ?SLOG(warning, LogMsg),
+            case epgsql:close(Conn, statement, Key) of
+                ok ->
+                    ?SLOG(info, #{msg => "pqsql_closed_statement_successfully"}),
+                    prepare_sql_to_conn(Conn, ToPrepare, Statements, Attempts + 1);
+                {error, CloseError} ->
+                    ?SLOG(error, #{msg => "pqsql_close_statement_failed", cause => CloseError}),
+                    failed_to_remove_prev_prepared_statement_error()
+            end;
         {error, Error} ->
             TranslatedError = translate_to_log_context(Error),
             LogMsg =
@@ -678,6 +823,13 @@ prepare_sql_to_conn(Conn, [{Key, {SQL, _RowTemplate}} | Rest], Statements) when 
             ?SLOG(error, LogMsg),
             {error, export_error(TranslatedError)}
     end.
+
+failed_to_remove_prev_prepared_statement_error() ->
+    Msg =
+        ("A previous prepared statement for the action already exists "
+        "but cannot be closed. Please, try to disable and then enable "
+        "the connector to resolve this issue."),
+    {error, unicode:characters_to_binary(Msg)}.
 
 to_bin(Bin) when is_binary(Bin) ->
     Bin;
@@ -690,6 +842,9 @@ handle_result({error, {unrecoverable_error, _Error}} = Res) ->
     Res;
 handle_result({error, disconnected}) ->
     {error, {recoverable_error, disconnected}};
+handle_result({error, #{reason := bad_param} = Context}) ->
+    ?tp("postgres_bad_param_error", #{context => Context}),
+    {error, {unrecoverable_error, Context}};
 handle_result({error, Error}) ->
     TranslatedError = translate_to_log_context(Error),
     {error, {unrecoverable_error, export_error(TranslatedError)}};
@@ -707,6 +862,7 @@ handle_batch_result([{error, Error} | _Rest], _Acc) ->
     TranslatedError = translate_to_log_context(Error),
     {error, {unrecoverable_error, export_error(TranslatedError)}};
 handle_batch_result([], Acc) ->
+    ?tp("postgres_success_batch_result", #{row_count => Acc}),
     {ok, Acc}.
 
 translate_to_log_context({error, Reason}) ->

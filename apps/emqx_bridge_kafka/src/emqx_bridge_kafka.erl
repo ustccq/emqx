@@ -1,21 +1,16 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_kafka).
+
+-feature(maybe_expr, enable).
 
 -behaviour(emqx_connector_examples).
 
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 
-%% allow atoms like scram_sha_256 and scram_sha_512
-%% i.e. the _256 part does not start with a-z
--elvis([
-    {elvis_style, atom_naming_convention, #{
-        regex => "^([a-z][a-z0-9]*_?)([a-z0-9]*_?)*$",
-        enclosed_atoms => ".*"
-    }}
-]).
+-elvis([{elvis_style, atom_naming_convention, disable}]).
 -import(hoconsc, [mk/2, enum/1, ref/2]).
 
 -export([
@@ -40,7 +35,9 @@
 -export([
     kafka_connector_config_fields/0,
     kafka_producer_converter/2,
-    producer_strategy_key_validator/1
+    producer_strategy_key_validator/1,
+    producer_buffer_mode_validator/1,
+    producer_parameters_validator/1
 ]).
 
 -define(CONNECTOR_TYPE, kafka_producer).
@@ -175,6 +172,8 @@ values(producer_values) ->
             value => <<"${.}">>,
             timestamp => <<"${.timestamp}">>
         },
+        max_linger_time => <<"5ms">>,
+        max_linger_bytes => <<"10MB">>,
         max_batch_bytes => <<"896KB">>,
         compression => <<"no_compression">>,
         partition_strategy => <<"random">>,
@@ -197,7 +196,7 @@ values(producer_values) ->
         buffer => #{
             mode => <<"hybrid">>,
             per_partition_limit => <<"2GB">>,
-            segment_bytes => <<"100MB">>,
+            segment_bytes => <<"10MB">>,
             memory_overload_protection => true
         }
     };
@@ -295,17 +294,10 @@ fields("config_producer") ->
 fields("config_consumer") ->
     fields(kafka_consumer);
 fields(kafka_producer) ->
+    %% Schema used by bridges V1.
     connector_config_fields() ++ producer_opts(v1);
 fields(kafka_producer_action) ->
-    [
-        {enable, mk(boolean(), #{desc => ?DESC("config_enable"), default => true})},
-        {connector,
-            mk(binary(), #{
-                desc => ?DESC(emqx_connector_schema, "connector_field"), required => true
-            })},
-        {tags, emqx_schema:tags_schema()},
-        {description, emqx_schema:description_schema()}
-    ] ++ producer_opts(action);
+    emqx_bridge_v2_schema:common_action_fields() ++ producer_opts(action);
 fields(kafka_consumer) ->
     connector_config_fields() ++ fields(consumer_opts);
 fields(ssl_client_opts) ->
@@ -360,14 +352,48 @@ fields(socket_opts) ->
         {tcp_keepalive,
             mk(string(), #{
                 default => <<"none">>,
-                desc => ?DESC(socket_tcp_keepalive),
+                desc => ?DESC(emqx_schema, socket_tcp_keepalive),
                 validator => fun emqx_schema:validate_tcp_keepalive/1
             })}
     ];
+fields(v1_producer_kafka_opts) ->
+    OldSchemaFields =
+        [
+            topic,
+            message,
+            max_batch_bytes,
+            compression,
+            partition_strategy,
+            required_acks,
+            kafka_headers,
+            kafka_ext_headers,
+            kafka_header_value_encode_mode,
+            partition_count_refresh_interval,
+            partitions_limit,
+            max_inflight,
+            buffer,
+            query_mode,
+            sync_query_timeout
+        ],
+    Fields = fields(producer_kafka_opts),
+    lists:filter(
+        fun({K, _V}) -> lists:member(K, OldSchemaFields) end,
+        Fields
+    );
 fields(producer_kafka_opts) ->
     [
-        {topic, mk(string(), #{required => true, desc => ?DESC(kafka_topic)})},
+        {topic, mk(emqx_schema:template(), #{required => true, desc => ?DESC(kafka_topic)})},
         {message, mk(ref(kafka_message), #{required => false, desc => ?DESC(kafka_message)})},
+        {max_linger_time,
+            mk(emqx_schema:timeout_duration_ms(), #{
+                default => <<"0ms">>,
+                desc => ?DESC(max_linger_time)
+            })},
+        {max_linger_bytes,
+            mk(emqx_schema:bytesize(), #{
+                default => <<"10MB">>,
+                desc => ?DESC(max_linger_bytes)
+            })},
         {max_batch_bytes,
             mk(emqx_schema:bytesize(), #{default => <<"896KB">>, desc => ?DESC(max_batch_bytes)})},
         {compression,
@@ -503,16 +529,16 @@ fields(producer_buffer) ->
         {per_partition_limit,
             mk(
                 emqx_schema:bytesize(),
-                #{default => <<"2GB">>, desc => ?DESC(buffer_per_partition_limit)}
+                #{default => <<"256MB">>, desc => ?DESC(buffer_per_partition_limit)}
             )},
         {segment_bytes,
             mk(
                 emqx_schema:bytesize(),
-                #{default => <<"100MB">>, desc => ?DESC(buffer_segment_bytes)}
+                #{default => <<"10MB">>, desc => ?DESC(buffer_segment_bytes)}
             )},
         {memory_overload_protection,
             mk(boolean(), #{
-                default => false,
+                default => true,
                 desc => ?DESC(buffer_memory_overload_protection)
             })}
     ];
@@ -578,7 +604,7 @@ fields(consumer_kafka_opts) ->
 fields(connector_resource_opts) ->
     emqx_connector_schema:resource_opts_fields();
 fields(resource_opts) ->
-    SupportedFields = [health_check_interval],
+    SupportedFields = [health_check_interval, health_check_timeout],
     CreationOpts = emqx_bridge_v2_schema:action_resource_opts_fields(),
     lists:filter(fun({Field, _}) -> lists:member(Field, SupportedFields) end, CreationOpts);
 fields(action_field) ->
@@ -652,9 +678,17 @@ kafka_connector_config_fields() ->
                 desc => ?DESC(metadata_request_timeout)
             })},
         {authentication,
-            mk(hoconsc:union([none, ref(auth_username_password), ref(auth_gssapi_kerberos)]), #{
-                default => none, desc => ?DESC("authentication")
-            })},
+            mk(
+                hoconsc:union([
+                    none,
+                    msk_iam,
+                    ref(auth_username_password),
+                    ref(auth_gssapi_kerberos)
+                ]),
+                #{
+                    default => none, desc => ?DESC("authentication")
+                }
+            )},
         {socket_opts, mk(ref(socket_opts), #{required => false, desc => ?DESC(socket_opts)})},
         {health_check_topic,
             mk(binary(), #{
@@ -680,19 +714,19 @@ resource_opts() ->
 %% However we need to keep it backward compatible for generated schema json (version 0.1.0)
 %% since schema is data for the 'schemas' API.
 parameters_field(ActionOrBridgeV1) ->
-    {Name, Alias} =
+    {Name, Alias, Ref} =
         case ActionOrBridgeV1 of
             v1 ->
-                {kafka, parameters};
+                {kafka, parameters, v1_producer_kafka_opts};
             action ->
-                {parameters, kafka}
+                {parameters, kafka, producer_kafka_opts}
         end,
     {Name,
-        mk(ref(producer_kafka_opts), #{
+        mk(ref(Ref), #{
             required => true,
             aliases => [Alias],
             desc => ?DESC(producer_kafka_opts),
-            validator => fun producer_strategy_key_validator/1
+            validator => fun producer_parameters_validator/1
         })}.
 
 %% -------------------------------------------------------------------------------------------------
@@ -751,6 +785,26 @@ consumer_topic_mapping_validator(TopicMapping0 = [_ | _]) ->
         false ->
             {error, "Kafka topics must not be repeated in a bridge"}
     end.
+
+producer_parameters_validator(Conf) ->
+    maybe
+        ok ?= producer_strategy_key_validator(Conf),
+        ok ?= producer_buffer_mode_validator(Conf)
+    end.
+
+producer_buffer_mode_validator(#{buffer := _} = Conf) ->
+    producer_buffer_mode_validator(emqx_utils_maps:binary_key_map(Conf));
+producer_buffer_mode_validator(#{<<"buffer">> := #{<<"mode">> := disk}, <<"topic">> := Topic}) ->
+    Template = emqx_template:parse(Topic),
+    case emqx_template:placeholders(Template) of
+        [] ->
+            ok;
+        [_ | _] ->
+            {error, <<"disk-mode buffering is disallowed when using dynamic topics">>}
+    end;
+producer_buffer_mode_validator(_) ->
+    %% `buffer' field is not required
+    ok.
 
 producer_strategy_key_validator(
     #{

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_swagger).
@@ -30,17 +18,20 @@
 -export([base_path/0]).
 -export([relative_uri/1, get_relative_uri/1]).
 -export([compose_filters/2]).
+-export([validate_content_type_json/2, validate_content_type/3]).
+-export([hocon_schema_to_spec/2, components/2]).
 
 -export([
     filter_check_request/2,
+    filter_check_request_and_translate_body_atom_keys/2,
     filter_check_request_and_translate_body/2,
+    filter_check_request_and_translate_body_serializable/2,
     gen_api_schema_json_iodata/3
 ]).
 
 -ifdef(TEST).
 -export([
-    parse_spec_ref/3,
-    components/2
+    parse_spec_ref/3
 ]).
 -endif.
 
@@ -64,13 +55,6 @@
     is_template
 ]).
 
--define(INIT_SCHEMA, #{
-    fields => #{},
-    translations => #{},
-    validations => [],
-    namespace => undefined
-}).
-
 -define(TO_REF(_N_, _F_), iolist_to_binary([to_bin(_N_), ".", to_bin(_F_)])).
 -define(TO_COMPONENTS_SCHEMA(_M_, _F_),
     iolist_to_binary([
@@ -91,7 +75,14 @@
 -define(DEFAULT_ROW, 100).
 
 -type request() :: #{bindings => map(), query_string => map(), body => map()}.
--type request_meta() :: #{module => module(), path => string(), method => atom()}.
+-type request_meta() :: #{
+    module := module(),
+    path := string(),
+    method := atom(),
+    %% API Operation specification override.
+    %% Takes precedence over the API specification defined in the module.
+    apispec => map()
+}.
 
 %% More exact types are defined in minirest.hrl, but we don't want to include it
 %% because it defines a lot of types and they may clash with the types declared locally.
@@ -113,7 +104,7 @@
 
 -type spec_opts() :: #{
     check_schema => boolean() | filter(),
-    translate_body => boolean(),
+    translate_body => boolean() | {true, atom_keys},
     schema_converter => fun((hocon_schema:schema(), Module :: atom()) -> map()),
     i18n_lang => atom() | string() | binary(),
     filter => filter()
@@ -152,57 +143,65 @@ spec(Module, Options) ->
         ),
     {ApiSpec, components(lists:usort(AllRefs), Options)}.
 
+validate_content_type_json(Params, Meta) ->
+    validate_content_type(Params, Meta, <<"application/json">>).
+
+%% tip: Skip content-type check if body is empty.
+validate_content_type(
+    #{body := Body, headers := Headers} = Params,
+    #{method := Method},
+    Expect
+) when
+    (Method =:= put orelse
+        Method =:= post orelse
+        method =:= patch) andalso
+        Body =/= #{}
+->
+    ExpectSize = byte_size(Expect),
+    case maps:get(<<"content-type">>, Headers, undefined) of
+        <<Expect:ExpectSize/binary, _/binary>> ->
+            {ok, Params};
+        _ ->
+            {415, 'UNSUPPORTED_MEDIA_TYPE', <<"content-type:", Expect/binary, " Required">>}
+    end;
+validate_content_type(Params, _Meta, _Expect) ->
+    {ok, Params}.
+
 -spec namespace() -> hocon_schema:name().
 namespace() -> "public".
 
 -spec fields(hocon_schema:name()) -> hocon_schema:fields().
 fields(page) ->
-    Desc = <<"Page number of the results to fetch.">>,
+    Desc = ?DESC("page"),
     Meta = #{in => query, desc => Desc, default => 1, example => 1},
     [{page, hoconsc:mk(pos_integer(), Meta)}];
 fields(limit) ->
-    Desc = iolist_to_binary([
-        <<"Results per page(max ">>,
-        integer_to_binary(?MAX_ROW_LIMIT),
-        <<")">>
-    ]),
+    Desc = ?DESC("limit"),
     Meta = #{in => query, desc => Desc, default => ?DEFAULT_ROW, example => 50},
     [{limit, hoconsc:mk(range(1, ?MAX_ROW_LIMIT), Meta)}];
 fields(cursor) ->
-    Desc = <<"Opaque value representing the current iteration state.">>,
-    Meta = #{default => none, in => query, desc => Desc},
-    [{cursor, hoconsc:mk(hoconsc:union([none, binary()]), Meta)}];
+    Desc = ?DESC("cursor"),
+    Meta = #{required => false, in => query, desc => Desc},
+    [{cursor, hoconsc:mk(binary(), Meta)}];
 fields(cursor_response) ->
-    Desc = <<"Opaque value representing the current iteration state.">>,
+    Desc = ?DESC("cursor_response"),
     Meta = #{desc => Desc, required => false},
     [{cursor, hoconsc:mk(binary(), Meta)}];
 fields(count) ->
-    Desc = <<
-        "Total number of records matching the query.<br/>"
-        "Note: this field is present only if the query can be optimized and does "
-        "not require a full table scan."
-    >>,
-    Meta = #{desc => Desc, required => false},
+    Meta = #{desc => ?DESC("count"), required => false},
     [{count, hoconsc:mk(non_neg_integer(), Meta)}];
 fields(hasnext) ->
-    Desc = <<
-        "Flag indicating whether there are more results available on next pages."
-    >>,
+    Desc = ?DESC("hasnext"),
     Meta = #{desc => Desc, required => true},
     [{hasnext, hoconsc:mk(boolean(), Meta)}];
 fields(position) ->
-    Desc = <<
-        "An opaque token that can then be in subsequent requests to get "
-        " the next chunk of results: \"?position={prev_response.meta.position}\"<br/>"
-        "It is used instead of \"page\" parameter to traverse highly volatile data.<br/>"
-        "Can be omitted or set to \"none\" to get the first chunk of data."
-    >>,
+    Desc = ?DESC("position"),
     Meta = #{
         in => query, desc => Desc, required => false, example => <<"none">>
     },
     [{position, hoconsc:mk(hoconsc:union([none, end_of_data, binary()]), Meta)}];
 fields(start) ->
-    Desc = <<"The position of the current first element of the data collection.">>,
+    Desc = ?DESC("start"),
     Meta = #{
         desc => Desc, required => true, example => <<"none">>
     },
@@ -224,8 +223,10 @@ schema_with_examples(Type, Examples) ->
     hoconsc:mk(Type, #{examples => #{<<"examples">> => Examples}}).
 
 -spec error_codes(list(atom())) -> hocon_schema:fields().
+error_codes(['BAD_REQUEST']) ->
+    error_codes(['BAD_REQUEST'], ?DESC("bad_request"));
 error_codes(Codes) ->
-    error_codes(Codes, <<"Error code to troubleshoot problems.">>).
+    error_codes(Codes, ?DESC("error_codes")).
 
 -spec error_codes(nonempty_list(atom()), binary() | {desc, module(), term()}) ->
     hocon_schema:fields().
@@ -301,7 +302,7 @@ gen_api_schema_json_iodata(SchemaMod, SchemaInfo, Converter) ->
         ApiSpec0
     ),
     Components = lists:foldl(fun(M, Acc) -> maps:merge(M, Acc) end, #{}, Components0),
-    emqx_utils_json:encode(
+    emqx_utils_json:encode_proplist(
         #{
             info => SchemaInfo,
             paths => ApiSpec,
@@ -316,14 +317,7 @@ compose_filters(undefined, Filter2) ->
 compose_filters(Filter1, undefined) ->
     Filter1;
 compose_filters(Filter1, Filter2) ->
-    fun(Request, RequestMeta) ->
-        case Filter1(Request, RequestMeta) of
-            {ok, Request1} ->
-                Filter2(Request1, RequestMeta);
-            Response ->
-                Response
-        end
-    end.
+    [Filter1, Filter2].
 
 %%------------------------------------------------------------------------------
 %% Private functions
@@ -332,25 +326,49 @@ compose_filters(Filter1, Filter2) ->
 filter_check_request_and_translate_body(Request, RequestMeta) ->
     translate_req(Request, RequestMeta, fun check_and_translate/3).
 
+filter_check_request_and_translate_body_serializable(Request, RequestMeta) ->
+    CheckFun = fun(Schema, Map, Opts0) ->
+        Opts = maps:merge(Opts0, #{make_serializable => true}),
+        check_and_translate(Schema, Map, Opts)
+    end,
+    translate_req(Request, RequestMeta, CheckFun).
+
 filter_check_request(Request, RequestMeta) ->
     translate_req(Request, RequestMeta, fun check_only/3).
 
-translate_req(Request, #{module := Module, path := Path, method := Method}, CheckFun) ->
-    #{Method := Spec} = apply(Module, schema, [Path]),
+filter_check_request_and_translate_body_atom_keys(Request, RequestMeta) ->
+    CheckFun = fun(Schema, Map, Opts0) ->
+        Opts = maps:merge(Opts0, #{atom_key => true}),
+        check_and_translate(Schema, Map, Opts)
+    end,
+    translate_req(Request, RequestMeta, CheckFun).
+
+translate_req(Request, ReqMeta = #{module := Module}, CheckFun) ->
+    Spec = find_req_apispec(ReqMeta),
     try
         Params = maps:get(parameters, Spec, []),
         Body = maps:get('requestBody', Spec, []),
         {Bindings, QueryStr} = check_parameters(Request, Params, Module),
-        NewBody = check_request_body(Request, Body, Module, CheckFun, hoconsc:is_schema(Body)),
-        {ok, Request#{bindings => Bindings, query_string => QueryStr, body => NewBody}}
+        case check_request_body(Request, Body, Module, CheckFun, hoconsc:is_schema(Body)) of
+            {ok, NewBody} ->
+                {ok, Request#{bindings => Bindings, query_string => QueryStr, body => NewBody}};
+            Error ->
+                Error
+        end
     catch
         throw:HoconError ->
             Msg = hocon_error_msg(HoconError),
             {400, 'BAD_REQUEST', Msg}
     end.
 
+find_req_apispec(#{apispec := Spec}) ->
+    Spec;
+find_req_apispec(#{module := Module, path := Path, method := Method}) ->
+    #{Method := Spec} = apply(Module, schema, [Path]),
+    Spec.
+
 check_and_translate(Schema, Map, Opts) ->
-    hocon_tconf:check_plain(Schema, Map, Opts).
+    hocon_tconf:check_plain(Schema, Map, Opts#{computed_fields => false}).
 
 check_only(Schema, Map, Opts) ->
     _ = hocon_tconf:check_plain(Schema, Map, Opts),
@@ -366,6 +384,8 @@ custom_filter(Options) ->
 
 check_schema_filter(#{check_schema := true, translate_body := true}) ->
     fun ?MODULE:filter_check_request_and_translate_body/2;
+check_schema_filter(#{check_schema := true, translate_body := {true, atom_keys}}) ->
+    fun ?MODULE:filter_check_request_and_translate_body_atom_keys/2;
 check_schema_filter(#{check_schema := true}) ->
     fun ?MODULE:filter_check_request/2;
 check_schema_filter(#{check_schema := Filter}) when is_function(Filter, 2) ->
@@ -408,7 +428,7 @@ failed_to_generate_swagger_spec(Module, Path, Error, Reason, Stacktrace) ->
         standard_error,
         "Failed to generate swagger for path ~p in module ~p~n"
         "error:~p~nreason:~p~n~p~n",
-        [Module, Path, Error, Reason, Stacktrace]
+        [Path, Module, Error, Reason, Stacktrace]
     ),
     error({failed_to_generate_swagger_spec, Module, Path}).
 
@@ -451,14 +471,14 @@ check_parameter([], _Bindings, _QueryStr, _Module, NewBindings, NewQueryStr) ->
 check_parameter([{Name, Type} | Spec], Bindings, QueryStr, Module, BindingsAcc, QueryStrAcc) ->
     case hocon_schema:field_schema(Type, in) of
         path ->
-            Schema = ?INIT_SCHEMA#{roots => [{Name, Type}]},
+            Schema = #{roots => [{Name, Type}], fields => #{}},
             Option = #{atom_key => true},
             NewBindings = hocon_tconf:check_plain(Schema, Bindings, Option),
             NewBindingsAcc = maps:merge(BindingsAcc, NewBindings),
             check_parameter(Spec, Bindings, QueryStr, Module, NewBindingsAcc, QueryStrAcc);
         query ->
             Type1 = maybe_wrap_array_qs_param(Type),
-            Schema = ?INIT_SCHEMA#{roots => [{Name, Type1}]},
+            Schema = #{roots => [{Name, Type1}], fields => #{}},
             Option = #{},
             NewQueryStr = hocon_tconf:check_plain(Schema, QueryStr, Option),
             NewQueryStrAcc = maps:merge(QueryStrAcc, NewQueryStr),
@@ -523,16 +543,34 @@ unwrap_array_conv([HVal | _], _Opts) -> HVal;
 unwrap_array_conv(SingleVal, _Opts) -> SingleVal.
 
 check_request_body(#{body := Body}, Schema, Module, CheckFun, true) ->
-    Type0 = hocon_schema:field_schema(Schema, type),
-    Type =
-        case Type0 of
-            ?REF(StructName) -> ?R_REF(Module, StructName);
-            _ -> Type0
-        end,
-    NewSchema = ?INIT_SCHEMA#{roots => [{root, Type}]},
-    Option = #{required => false},
-    #{<<"root">> := NewBody} = CheckFun(NewSchema, #{<<"root">> => Body}, Option),
-    NewBody;
+    %% the body was already being decoded
+    %% if the content-type header specified application/json.
+    case is_binary(Body) of
+        false ->
+            Type0 = hocon_schema:field_schema(Schema, type),
+            Type =
+                case Type0 of
+                    ?REF(StructName) -> ?R_REF(Module, StructName);
+                    _ -> Type0
+                end,
+            Validations =
+                case hocon_schema:field_schema(Schema, validator) of
+                    undefined ->
+                        [];
+                    Fun when is_function(Fun) ->
+                        [{validator, fun(#{<<"root">> := B}) -> Fun(B) end}]
+                end,
+            NewSchema = #{roots => [{root, Type}], validations => Validations, fields => #{}},
+            Option = #{required => false},
+            NewBody =
+                case CheckFun(NewSchema, #{<<"root">> => Body}, Option) of
+                    #{<<"root">> := NewBody0} -> NewBody0;
+                    #{root := NewBody0} -> NewBody0
+                end,
+            {ok, NewBody};
+        true ->
+            {415, 'UNSUPPORTED_MEDIA_TYPE', <<"content-type:application/json Required">>}
+    end;
 %% TODO not support nest object check yet, please use ref!
 %% 'requestBody' = [ {per_page, mk(integer(), #{}},
 %%                 {nest_object, [
@@ -541,18 +579,19 @@ check_request_body(#{body := Body}, Schema, Module, CheckFun, true) ->
 %%                ]}
 %% ]
 check_request_body(#{body := Body}, Spec, _Module, CheckFun, false) when is_list(Spec) ->
-    lists:foldl(
-        fun({Name, Type}, Acc) ->
-            Schema = ?INIT_SCHEMA#{roots => [{Name, Type}]},
-            maps:merge(Acc, CheckFun(Schema, Body, #{}))
-        end,
-        #{},
-        Spec
-    );
+    {ok,
+        lists:foldl(
+            fun({Name, Type}, Acc) ->
+                Schema = #{roots => [{Name, Type}], fields => #{}},
+                maps:merge(Acc, CheckFun(Schema, Body, #{}))
+            end,
+            #{},
+            Spec
+        )};
 %% requestBody => #{content => #{ 'application/octet-stream' =>
 %% #{schema => #{ type => string, format => binary}}}
 check_request_body(#{body := Body}, Spec, _Module, _CheckFun, false) when is_map(Spec) ->
-    Body.
+    {ok, Body}.
 
 %% tags, description, summary, security, deprecated
 meta_to_spec(Meta, Module, Options) ->
@@ -560,7 +599,7 @@ meta_to_spec(Meta, Module, Options) ->
     {RequestBody, Refs2} = request_body(maps:get('requestBody', Meta, []), Module, Options),
     {Responses, Refs3} = responses(maps:get(responses, Meta, #{}), Module, Options),
     {
-        generate_method_desc(to_spec(Meta, Params, RequestBody, Responses), Options),
+        generate_method_desc(to_spec(Meta, Params, RequestBody, Responses), Options, Module),
         lists:usort(Refs1 ++ Refs2 ++ Refs3)
     }.
 
@@ -571,13 +610,13 @@ to_spec(Meta, Params, RequestBody, Responses) ->
     Spec = to_spec(Meta, Params, [], Responses),
     maps:put('requestBody', RequestBody, Spec).
 
-generate_method_desc(Spec = #{desc := _Desc}, Options) ->
-    Spec1 = trans_description(maps:remove(desc, Spec), Spec, Options),
+generate_method_desc(Spec = #{desc := _Desc}, Options, Module) ->
+    Spec1 = trans_description(maps:remove(desc, Spec), Spec, Options, Module),
     trans_tags(Spec1);
-generate_method_desc(Spec = #{description := _Desc}, Options) ->
-    Spec1 = trans_description(Spec, Spec, Options),
+generate_method_desc(Spec = #{description := _Desc}, Options, Module) ->
+    Spec1 = trans_description(Spec, Spec, Options, Module),
     trans_tags(Spec1);
-generate_method_desc(Spec, _Options) ->
+generate_method_desc(Spec, _Options, _Module) ->
     trans_tags(Spec).
 
 trans_tags(Spec = #{tags := Tags}) ->
@@ -611,7 +650,7 @@ parameters(Params, Module, Options) ->
                             Type
                         ),
                         Spec1 = trans_required(Spec0, Required, In),
-                        Spec2 = trans_description(Spec1, Type, Options),
+                        Spec2 = trans_description(Spec1, Type, Options, Module),
                         {[Spec2 | Acc], Refs ++ RefsAcc}
                 end
             end,
@@ -656,12 +695,16 @@ trans_required(Spec, true, _) -> Spec#{required => true};
 trans_required(Spec, _, path) -> Spec#{required => true};
 trans_required(Spec, _, _) -> Spec.
 
-trans_description(Spec, Hocon, Options) ->
+trans_description(Spec, Hocon, Options, Module) ->
     Desc =
         case desc_struct(Hocon) of
-            undefined -> undefined;
-            ?DESC(_, _) = Struct -> get_i18n(<<"desc">>, Struct, undefined, Options);
-            Text -> to_bin(Text)
+            undefined ->
+                undefined;
+            ?DESC(_, _) = Struct ->
+                get_i18n(<<"desc">>, Struct, undefined, Options);
+            Text ->
+                maybe_warn_missing_desc(Hocon, Text, Module),
+                to_bin(Text)
         end,
     case Desc =:= undefined of
         true ->
@@ -669,6 +712,16 @@ trans_description(Spec, Hocon, Options) ->
         false ->
             Desc1 = binary:replace(Desc, [<<"\n">>], <<"<br/>">>, [global]),
             Spec#{description => Desc1}
+    end.
+
+maybe_warn_missing_desc(Hocon, Text, Module) ->
+    case os:getenv("WARN_MISSING_DESC") of
+        "1" when Text =/= <<>> ->
+            io:format(user, "~p Missing-api-translation: ~s~n", [Module, Text]);
+        "1" ->
+            io:format(user, "~p Missing-api-translation: ~0p~n", [Module, Hocon]);
+        _ ->
+            ok
     end.
 
 get_i18n(Tag, ?DESC(Namespace, Id), Default, Options) ->
@@ -739,7 +792,7 @@ responses(Responses, Module, Options) ->
     {Spec, Refs}.
 
 response(Status, ?DESC(_Mod, _Id) = Schema, {Acc, RefsAcc, Module, Options}) ->
-    Desc = trans_description(#{}, #{desc => Schema}, Options),
+    Desc = trans_description(#{}, #{desc => Schema}, Options, Module),
     {Acc#{integer_to_binary(Status) => Desc}, RefsAcc, Module, Options};
 response(Status, Bin, {Acc, RefsAcc, Module, Options}) when is_binary(Bin) ->
     {Acc#{integer_to_binary(Status) => #{description => Bin}}, RefsAcc, Module, Options};
@@ -768,7 +821,7 @@ response(Status, Schema, {Acc, RefsAcc, Module, Options}) ->
             Hocon = hocon_schema:field_schema(Schema, type),
             Examples = hocon_schema:field_schema(Schema, examples),
             {Spec, Refs} = hocon_schema_to_spec(Hocon, Module),
-            Init = trans_description(#{}, Schema, Options),
+            Init = trans_description(#{}, Schema, Options, Module),
             Content = content(Spec, Examples),
             {
                 Acc#{integer_to_binary(Status) => Init#{<<"content">> => Content}},
@@ -778,7 +831,7 @@ response(Status, Schema, {Acc, RefsAcc, Module, Options}) ->
             };
         false ->
             {Props, Refs} = parse_object(Schema, Module, Options),
-            Init = trans_description(#{}, Schema, Options),
+            Init = trans_description(#{}, Schema, Options, Module),
             Content = Init#{<<"content">> => content(Props)},
             {Acc#{integer_to_binary(Status) => Content}, Refs ++ RefsAcc, Module, Options}
     end.
@@ -827,7 +880,7 @@ hocon_schema_fields(Module, StructName) ->
 namespace(Module) ->
     case hocon_schema:namespace(Module) of
         undefined -> Module;
-        NameSpace -> re:replace(to_bin(NameSpace), ":", "-", [global])
+        Namespace -> re:replace(to_bin(Namespace), ":", "-", [global])
     end.
 
 hocon_schema_to_spec(?R_REF(Module, StructName), _LocalModule) ->
@@ -931,7 +984,7 @@ parse_object_loop([{Name, Hocon} | Rest], Module, Options, Props, Required, Refs
             SchemaToSpec = get_schema_converter(Options),
             Init = maps:remove(
                 summary,
-                trans_description(Init0, Hocon, Options)
+                trans_description(Init0, Hocon, Options, Module)
             ),
             {Prop, Refs1} = SchemaToSpec(HoconType, Module),
             NewRequiredAcc =
@@ -958,7 +1011,7 @@ parse_object_loop([{Name, Hocon} | Rest], Module, Options, Props, Required, Refs
 
 %% return true if the field has 'importance' set to 'hidden'
 is_hidden(Hocon) ->
-    hocon_schema:is_hidden(Hocon, #{include_importance_up_from => ?IMPORTANCE_LOW}).
+    hocon_schema:is_hidden(Hocon, #{include_importance_up_from => ?IMPORTANCE_NO_DOC}).
 
 is_required(Hocon) ->
     hocon_schema:field_schema(Hocon, required) =:= true.

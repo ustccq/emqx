@@ -1,0 +1,36 @@
+--------------------------------------------------------------------------
+-- Copyright (c) 2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+--------------------------------------------------------------------------
+
+-- A collection of ASN.1 definitions encoding various types related to
+-- the builtin backends that may at some point end up stored
+-- persistently on disk.
+DSBuiltinMetadata DEFINITIONS AUTOMATIC TAGS ::=
+BEGIN
+  -- Top level (Local and Raft)
+  Stream ::= SEQUENCE {
+    shard OCTET STRING,
+    generation INTEGER,
+    inner OCTET STRING
+  }
+
+  Iterator ::= SEQUENCE {
+    shard OCTET STRING,
+    generation INTEGER,
+    -- The most frequent operation on the iterators is
+    -- `update_iterator` done by beamformer. To avoid constant
+    -- transconding, we split iterator record into static and varying
+    -- parts:
+    --
+    --   Layout-specific metadata
+    innerStatic OCTET STRING,
+    --   Layout-specific variable position information
+    innerPos OCTET STRING
+  }
+
+  -- Encoding of iterator or end_of_stream
+  ReplayPosition ::= CHOICE {
+    endOfStream NULL,
+    value Iterator
+  }
+END

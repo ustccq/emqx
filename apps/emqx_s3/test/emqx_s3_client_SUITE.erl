@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_s3_client_SUITE).
@@ -20,41 +20,26 @@ all() ->
 
 groups() ->
     AllCases = emqx_common_test_helpers:all(?MODULE),
-    PoolGroups = [
-        {group, pool_random},
-        {group, pool_hash}
-    ],
     [
-        {tcp, [], PoolGroups},
-        {tls, [], PoolGroups},
-        {pool_random, [], AllCases},
-        {pool_hash, [], AllCases}
+        {tcp, [], AllCases},
+        {tls, [], AllCases}
     ].
 
 init_per_suite(Config) ->
-    {ok, _} = application:ensure_all_started(emqx_s3),
-    Config.
+    Apps = emqx_cth_suite:start([emqx_s3], #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    ok = application:stop(emqx_s3).
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_group(ConnTypeGroup, Config) when ConnTypeGroup =:= tcp; ConnTypeGroup =:= tls ->
-    [{conn_type, ConnTypeGroup} | Config];
-init_per_group(PoolTypeGroup, Config) when
-    PoolTypeGroup =:= pool_random; PoolTypeGroup =:= pool_hash
-->
-    PoolType =
-        case PoolTypeGroup of
-            pool_random -> random;
-            pool_hash -> hash
-        end,
-    [{pool_type, PoolType} | Config].
+    [{conn_type, ConnTypeGroup} | Config].
+
 end_per_group(_ConnType, _Config) ->
     ok.
 
 init_per_testcase(_TestCase, Config0) ->
     ConnType = ?config(conn_type, Config0),
-
     Bucket = emqx_s3_test_helpers:unique_bucket(),
     TestAwsConfig = emqx_s3_test_helpers:aws_config(ConnType),
     ok = erlcloud_s3:create_bucket(Bucket, TestAwsConfig),
@@ -65,10 +50,10 @@ init_per_testcase(_TestCase, Config0) ->
         | Config0
     ],
     {ok, PoolName} = emqx_s3_profile_conf:start_http_pool(?PROFILE_ID, profile_config(Config1)),
-    [{ehttpc_pool_name, PoolName} | Config1].
+    [{pool_name, PoolName} | Config1].
 
 end_per_testcase(_TestCase, Config) ->
-    ok = ehttpc_sup:stop_pool(?config(ehttpc_pool_name, Config)).
+    ok = emqx_s3_client_http:stop_pool(?config(pool_name, Config)).
 
 %%--------------------------------------------------------------------
 %% Test cases
@@ -168,7 +153,7 @@ t_no_credentials(Config) ->
     ),
     ClientConfig = emqx_s3_profile_conf:client_config(
         ProfileConfig,
-        ?config(ehttpc_pool_name, Config)
+        ?config(pool_name, Config)
     ),
     Client = emqx_s3_client:create(Bucket, ClientConfig),
     ?assertMatch(
@@ -183,7 +168,7 @@ t_no_credentials(Config) ->
 client(Config) ->
     Bucket = ?config(bucket, Config),
     ClientConfig = emqx_s3_profile_conf:client_config(
-        profile_config(Config), ?config(ehttpc_pool_name, Config)
+        profile_config(Config), ?config(pool_name, Config)
     ),
     emqx_s3_client:create(Bucket, ClientConfig).
 
@@ -193,7 +178,6 @@ profile_config(Config) ->
         fun inject_config/3,
         ProfileConfig0,
         #{
-            [transport_options, pool_type] => ?config(pool_type, Config),
             [transport_options, headers] => ?config(extra_headers, Config)
         }
     ).

@@ -1,345 +1,234 @@
-name: Performance Test Suite
+name: Performance Test
 
 on:
-  push:
-    branches:
-      - 'perf/**'
-  schedule:
-    - cron:  '0 1 * * MON-FRI'
   workflow_dispatch:
     inputs:
-      ref:
+      version:
         required: false
-
-env:
-  TF_AWS_REGION: eu-west-1
-  TF_VAR_s3_bucket_name: tf-emqx-performance-test2
-  TF_VAR_test_duration: 1800
-  TF_VAR_prometheus_remote_write_region: eu-west-1
-  TF_VAR_prometheus_remote_write_url: ${{ secrets.TF_EMQX_PERF_TEST_PROMETHEUS_REMOTE_WRITE_URL }}
-  SLACK_WEBHOOK_URL: ${{ secrets.TF_EMQX_PERF_TEST_SLACK_URL }}
+      download_url:
+        required: false
 
 permissions:
   contents: read
 
 jobs:
-  prepare:
+  perftest:
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'emqx'
-    container: ghcr.io/emqx/emqx-builder/5.3-5:1.15.7-26.2.1-2-ubuntu20.04
-    outputs:
-      BENCH_ID: ${{ steps.prepare.outputs.BENCH_ID }}
-      PACKAGE_FILE: ${{ steps.package_file.outputs.PACKAGE_FILE }}
+    strategy:
+      max-parallel: 1
+      matrix:
+        scenario:
+          - tests/ci/pubsub-2x2c4g-10k-20k-tps
+    defaults:
+      run:
+        shell: bash
 
     steps:
-    - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+    - name: Checkout tf-emqx-performance-test
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
-        fetch-depth: 0
-        ref: ${{ github.event.inputs.ref }}
-    - name: Work around https://github.com/actions/checkout/issues/766
-      run: |
-        git config --global --add safe.directory "$GITHUB_WORKSPACE"
-    - id: prepare
-      run: |
-        echo "EMQX_NAME=emqx" >> $GITHUB_ENV
-        echo "CODE_PATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-        echo "BENCH_ID=$(date --utc +%F)/emqx-$(./pkg-vsn.sh emqx)" >> $GITHUB_OUTPUT
-    - name: Build deb package
-      run: |
-        make ${EMQX_NAME}-pkg
-        ./scripts/pkg-tests.sh ${EMQX_NAME}-pkg
-    - name: Get package file name
-      id: package_file
-      run: |
-        echo "PACKAGE_FILE=$(find _packages/emqx -name 'emqx-*.deb' | head -n 1 | xargs basename)" >> $GITHUB_OUTPUT
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        repository: emqx/tf-emqx-performance-test
+        ref: v0.4.1
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       with:
-        name: emqx-ubuntu20.04
-        path: _packages/emqx/${{ steps.package_file.outputs.PACKAGE_FILE }}
+        terraform_version: 1.11.2
+        terraform_wrapper: false
 
-  scenario_1on1:
-    runs-on: ubuntu-latest
-    needs:
-      - prepare
-    env:
-      TF_VAR_package_file: ${{ needs.prepare.outputs.PACKAGE_FILE }}
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
 
-    steps:
+    - run: pip install -r requirements.txt
+
+    - name: Download emqx package (custom URL)
+      if: github.event.inputs.version == '' && github.event.inputs.download_url != ''
+      run: |
+        wget "${{ github.event.inputs.download_url }}"
+
+    - uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+    - name: Download emqx package (specific version)
+      env:
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      if: github.event.inputs.version != '' && github.event.inputs.download_url == ''
+      run: |
+        version=${{ github.event.inputs.version }}
+        aws s3 cp s3://$AWS_S3_BUCKET/emqx-ee/e${version}/emqx-enterprise-${version}-ubuntu22.04-amd64.deb .
+
+    - name: Download emqx package (latest version)
+      if: github.event.inputs.version == '' && github.event.inputs.download_url == ''
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      run: |
+        set -xeuo pipefail
+        # get latest emqx version
+        version=$(gh release list --repo emqx/emqx --limit 1 --json tagName --jq '.[] | .tagName')
+        # remove 'v' prefix from the version
+        version=${version:1}
+        aws s3 cp s3://$AWS_S3_BUCKET/emqx-ee/e${version}/emqx-enterprise-${version}-ubuntu22.04-amd64.deb .
+
     - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_PERF_TEST }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PERF_TEST }}
-        aws-region: eu-west-1
-    - name: Checkout tf-emqx-performance-test
-      uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
-      with:
-        repository: emqx/tf-emqx-performance-test
-        path: tf-emqx-performance-test
-        ref: v0.2.3
-    - uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
-      with:
-        name: emqx-ubuntu20.04
-        path: tf-emqx-performance-test/
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
-      with:
-        terraform_wrapper: false
-    - name: run scenario
-      working-directory: ./tf-emqx-performance-test
-      timeout-minutes: 60
-      env:
-        TF_VAR_bench_id: "${{ needs.prepare.outputs.BENCH_ID }}/1on1"
-        TF_VAR_use_emqttb: 1
-        TF_VAR_use_emqtt_bench: 0
-        TF_VAR_emqttb_instance_count: 1
-        TF_VAR_emqttb_instance_type: c5.2xlarge
-        TF_VAR_emqttb_scenario: '@pubsub_fwd -n 50_000 --pub-qos 1 --sub-qos 1'
-        TF_VAR_emqx_instance_type: c5.2xlarge
-        TF_VAR_emqx_instance_count: 3
+        aws-region: ${{ secrets.AWS_DEFAULT_REGION_PERF_TEST }}
+
+    - name: Create infrastructure
+      id: infra
+      timeout-minutes: 30
       run: |
+        mv emqx-enterprise-*.deb emqx-enterprise-ubuntu22.04-amd64.deb
+        ls -lh *.deb
+
+        echo "${{ secrets.EMQX_ENTERPRISE_LICENSE }}" > emqx5.lic
+        cat ${{ matrix.scenario }}.env >> "$GITHUB_ENV"
+
         terraform init
-        terraform apply -auto-approve
-        ./wait-emqttb.sh
-        ./fetch-metrics.sh
-        terraform destroy -auto-approve
-        aws s3 sync --exclude '*' --include '*.tar.gz' s3://$TF_VAR_s3_bucket_name/$TF_VAR_bench_id .
-    - name: Send notification to Slack
-      uses: slackapi/slack-github-action@6c661ce58804a1a20f6dc5fbee7f0381b469e001 # v1.25.0
-      with:
-        payload-file-path: "./tf-emqx-performance-test/slack-payload.json"
-    - name: terraform destroy
-      if: always()
-      working-directory: ./tf-emqx-performance-test
-      run: |
-        terraform destroy -auto-approve
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        set +e
+        terraform apply -var spec_file=${{ matrix.scenario }}.yaml -auto-approve -lock=false
+        # retry once
+        if [ $? != 0 ]; then
+          echo "Retrying once"
+          set -e
+          terraform apply -var spec_file=${{ matrix.scenario }}.yaml -auto-approve -lock=false
+        fi
+        set -e
+        echo "ssh_key_path=$(terraform output -raw ssh_key_path)" >> $GITHUB_OUTPUT
+
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: success()
       with:
-        name: metrics
+        name: ssh_private_key
         path: |
-          "./tf-emqx-performance-test/*.tar.gz"
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+          ${{ steps.infra.outputs.ssh_key_path }}
+
+    - name: Run benchmark
+      if: success()
+      id: benchmark
+      timeout-minutes: 60
+      run: |
+        success=0
+
+        export TMPDIR=$(mktemp -d)
+        echo "TMPDIR=$TMPDIR" >> $GITHUB_ENV
+
+        PERIOD=1m scripts/summary.sh
+
+        MEM_CORE_1=$(jq -r '.[] | select(.host == "emqx-core-1") | .mem' $TMPDIR/mem.json)
+        MEM_CORE_2=$(jq -r '.[] | select(.host == "emqx-core-2") | .mem' $TMPDIR/mem.json)
+
+        if [ $(echo "$MEM_CORE_1 > $INITIAL_RAM_BASELINE * (1 + $ALLOWED_DEVIATION_CPU_RAM)" | bc -l) -eq 1 ] \
+        || [ $(echo "$MEM_CORE_2 > $INITIAL_RAM_BASELINE * (1 + $ALLOWED_DEVIATION_CPU_RAM)" | bc -l) -eq 1 ]; then
+          success=1
+        fi
+
+        EMQX_API_URL=$(terraform output -raw emqx_dashboard_url)
+
+        ansible loadgen -m command -a 'systemctl start loadgen' --become --limit 'loadgen-emqtt_bench-1.*'
+        echo "Waiting for subscribers to connect"
+        subs=0
+        attempts=30
+        while [ $attempts -gt 0 ]; do
+          curl -s -u perftest:perftest "$EMQX_API_URL/api/v5/monitor_current" > "$TMPDIR/monitor_current.json"
+          subs=$(jq -r '.subscriptions' "$TMPDIR/monitor_current.json")
+          if [ $subs -ge 10000 ]; then
+            echo "Subscribers connected: $subs"
+            break
+          fi
+          sleep 1
+          attempts=$((attempts - 1))
+        done
+        if [ $subs -lt 10000 ]; then
+          echo "Failed to connect enough subscribers, exiting"
+          exit 1
+        fi
+
+        ansible loadgen -m command -a 'systemctl start loadgen' --become --limit 'loadgen-emqtt_bench-2.*'
+        echo "Waiting for publishers to connect"
+        conns=0
+        attempts=30
+        while [ $attempts -gt 0 ]; do
+          curl -s -u perftest:perftest "$EMQX_API_URL/api/v5/monitor_current" > "$TMPDIR/monitor_current.json"
+          conns=$(jq -r '.live_connections' "$TMPDIR/monitor_current.json")
+          if [ $conns -ge 20000 ]; then
+            echo "Publishers connected. Total live connections: $conns"
+            break
+          fi
+          sleep 1
+          attempts=$((attempts - 1))
+        done
+        if [ $conns -lt 20000 ]; then
+          echo "Failed to connect enough publishers, exiting"
+          exit 1
+        fi
+        echo "All clients connected, sleep for $DURATION seconds"
+
+        sleep $DURATION
+        PERIOD="${DURATION}s" scripts/summary.sh
+        cat summary.md >> $GITHUB_STEP_SUMMARY
+
+        echo "success=$success" >> $GITHUB_OUTPUT
+
+    - name: Cleanup infrastructure
+      if: always()
+      run: |
+        terraform destroy -var spec_file=${{ matrix.scenario }}.yaml -auto-approve
+
+    - name: Analyze results
+      if: success()
+      run: |
+        success=${{ steps.benchmark.outputs.success }}
+
+        echo "## Test results analysis" >> $GITHUB_STEP_SUMMARY
+        echo '' >> $GITHUB_STEP_SUMMARY
+
+        CPU_CORE_1=$(jq -r '.[] | select(.host == "emqx-core-1") | .cpu' $TMPDIR/cpu.json)
+        CPU_CORE_2=$(jq -r '.[] | select(.host == "emqx-core-2") | .cpu' $TMPDIR/cpu.json)
+
+        if [ $(echo "$CPU_CORE_1 > $CPU_BASELINE * (1 + $ALLOWED_DEVIATION_CPU_RAM)" | bc -l) -eq 1 ] \
+        || [ $(echo "$CPU_CORE_2 > $CPU_BASELINE * (1 + $ALLOWED_DEVIATION_CPU_RAM)" | bc -l) -eq 1 ]; then
+          success=1
+          echo "* CPU utilization was too high: Core 1: $CPU_CORE_1%, Core 2: $CPU_CORE_2%" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        MEM_CORE_1=$(jq -r '.[] | select(.host == "emqx-core-1") | .mem' $TMPDIR/mem.json)
+        MEM_CORE_2=$(jq -r '.[] | select(.host == "emqx-core-2") | .mem' $TMPDIR/mem.json)
+
+        if [ $(echo "$MEM_CORE_1 > $RAM_BASELINE * (1 + $ALLOWED_DEVIATION_CPU_RAM)" | bc -l) -eq 1 ] \
+        || [ $(echo "$MEM_CORE_2 > $RAM_BASELINE * (1 + $ALLOWED_DEVIATION_CPU_RAM)" | bc -l) -eq 1 ]; then
+          success=1
+          echo "* RAM usage was too high: Core 1: $MEM_CORE_1%, Core 2: $MEM_CORE_2%" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        RECEIVED_MSG_RATE=$(jq -r '.received_msg_rate' $TMPDIR/emqx_metrics.json)
+        SENT_MSG_RATE=$(jq -r '.sent_msg_rate' $TMPDIR/emqx_metrics.json)
+
+        if [ $(echo "$RECEIVED_MSG_RATE < $RECEIVED_MSG_RATE_BASELINE * (1 - $ALLOWED_DEVIATION_MSG_RATE)" | bc -l) -eq 1 ] \
+        || [ $(echo "$SENT_MSG_RATE < $SENT_MSG_RATE_BASELINE * (1 - $ALLOWED_DEVIATION_MSG_RATE)" | bc -l) -eq 1 ]; then
+          success=1
+          echo "* Message rate was too low: Received message rate: $RECEIVED_MSG_RATE, Sent message rate: $SENT_MSG_RATE" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        MESSAGES_DROPPED=$(jq -r '.messages_dropped' $TMPDIR/emqx_metrics.json)
+        if [ $(echo "$MESSAGES_DROPPED > 100" | bc) -eq 1 ]; then
+          success=1
+          echo "* Too many dropped messages: $MESSAGES_DROPPED" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        exit $success
+
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: failure()
       with:
         name: terraform
         path: |
-          ./tf-emqx-performance-test/.terraform
-          ./tf-emqx-performance-test/*.tfstate
-
-  scenario_fanout:
-    runs-on: ubuntu-latest
-    needs:
-      - prepare
-      - scenario_1on1
-    env:
-      TF_VAR_package_file: ${{ needs.prepare.outputs.PACKAGE_FILE }}
-
-    steps:
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_PERF_TEST }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PERF_TEST }}
-        aws-region: eu-west-1
-    - name: Checkout tf-emqx-performance-test
-      uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
-      with:
-        repository: emqx/tf-emqx-performance-test
-        path: tf-emqx-performance-test
-        ref: v0.2.3
-    - uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
-      with:
-        name: emqx-ubuntu20.04
-        path: tf-emqx-performance-test/
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
-      with:
-        terraform_wrapper: false
-    - name: run scenario
-      working-directory: ./tf-emqx-performance-test
-      timeout-minutes: 60
-      env:
-        TF_VAR_bench_id: "${{ needs.prepare.outputs.BENCH_ID }}/fan-out"
-        TF_VAR_use_emqttb: 1
-        TF_VAR_use_emqtt_bench: 0
-        TF_VAR_emqttb_instance_count: 1
-        TF_VAR_emqttb_instance_type: c5.2xlarge
-        TF_VAR_emqttb_scenario: '@pub --topic "t/%n" --conninterval 10ms --pubinterval 20ms --num-clients 5 --size 16 @sub --topic "t/#" --conninterval 10ms --num-clients 1000'
-        TF_VAR_emqx_instance_type: c5.large
-        TF_VAR_emqx_instance_count: 3
-      run: |
-        terraform init
-        terraform apply -auto-approve
-        ./wait-emqttb.sh
-        ./fetch-metrics.sh
-        terraform destroy -auto-approve
-        aws s3 sync --exclude '*' --include '*.tar.gz' s3://$TF_VAR_s3_bucket_name/$TF_VAR_bench_id .
-    - name: Send notification to Slack
-      uses: slackapi/slack-github-action@6c661ce58804a1a20f6dc5fbee7f0381b469e001 # v1.25.0
-      with:
-        payload-file-path: "./tf-emqx-performance-test/slack-payload.json"
-    - name: terraform destroy
-      if: always()
-      working-directory: ./tf-emqx-performance-test
-      run: |
-        terraform destroy -auto-approve
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-      if: success()
-      with:
-        name: metrics
-        path: |
-          "./tf-emqx-performance-test/*.tar.gz"
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-      if: failure()
-      with:
-        name: terraform
-        path: |
-          ./tf-emqx-performance-test/.terraform
-          ./tf-emqx-performance-test/*.tfstate
-
-  scenario_fanin:
-    runs-on: ubuntu-latest
-    needs:
-      - prepare
-      - scenario_1on1
-      - scenario_fanout
-    env:
-      TF_VAR_package_file: ${{ needs.prepare.outputs.PACKAGE_FILE }}
-
-    steps:
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_PERF_TEST }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PERF_TEST }}
-        aws-region: eu-west-1
-    - name: Checkout tf-emqx-performance-test
-      uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
-      with:
-        repository: emqx/tf-emqx-performance-test
-        path: tf-emqx-performance-test
-        ref: v0.2.3
-    - uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
-      with:
-        name: emqx-ubuntu20.04
-        path: tf-emqx-performance-test/
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
-      with:
-        terraform_wrapper: false
-    - name: run scenario
-      working-directory: ./tf-emqx-performance-test
-      timeout-minutes: 60
-      env:
-        TF_VAR_bench_id: "${{ needs.prepare.outputs.BENCH_ID }}/fan-in"
-        TF_VAR_use_emqttb: 1
-        TF_VAR_use_emqtt_bench: 0
-        TF_VAR_emqttb_instance_count: 2
-        TF_VAR_emqttb_start_n_multiplier: 25000
-        TF_VAR_emqttb_instance_type: c5.xlarge
-        TF_VAR_emqttb_scenario: '@pub --topic t/%n --conninterval 10ms --pubinterval 1s --num-clients 25_000 --start-n $START_N --size 16 @sub --topic \$share/perf/t/# --conninterval 10ms --num-clients 250'
-        TF_VAR_emqx_instance_type: c5.2xlarge
-        TF_VAR_emqx_instance_count: 3
-      run: |
-        terraform init
-        terraform apply -auto-approve
-        ./wait-emqttb.sh
-        ./fetch-metrics.sh
-        terraform destroy -auto-approve
-        aws s3 sync --exclude '*' --include '*.tar.gz' s3://$TF_VAR_s3_bucket_name/$TF_VAR_bench_id .
-    - name: Send notification to Slack
-      uses: slackapi/slack-github-action@6c661ce58804a1a20f6dc5fbee7f0381b469e001 # v1.25.0
-      with:
-        payload-file-path: "./tf-emqx-performance-test/slack-payload.json"
-    - name: terraform destroy
-      if: always()
-      working-directory: ./tf-emqx-performance-test
-      run: |
-        terraform destroy -auto-approve
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-      if: success()
-      with:
-        name: metrics
-        path: |
-          "./tf-emqx-performance-test/*.tar.gz"
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-      if: failure()
-      with:
-        name: terraform
-        path: |
-          ./tf-emqx-performance-test/.terraform
-          ./tf-emqx-performance-test/*.tfstate
-
-  scenario_1m_conns:
-    runs-on: ubuntu-latest
-    needs:
-      - prepare
-      - scenario_fanin
-      - scenario_fanout
-      - scenario_1on1
-    env:
-      TF_VAR_package_file: ${{ needs.prepare.outputs.PACKAGE_FILE }}
-
-    steps:
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_PERF_TEST }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PERF_TEST }}
-        aws-region: eu-west-1
-    - name: Checkout tf-emqx-performance-test
-      uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
-      with:
-        repository: emqx/tf-emqx-performance-test
-        path: tf-emqx-performance-test
-        ref: v0.2.3
-    - uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
-      with:
-        name: emqx-ubuntu20.04
-        path: tf-emqx-performance-test/
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
-      with:
-        terraform_wrapper: false
-    - name: run scenario
-      working-directory: ./tf-emqx-performance-test
-      timeout-minutes: 60
-      env:
-        TF_VAR_bench_id: "${{ needs.prepare.outputs.BENCH_ID }}/1m-connections"
-        TF_VAR_use_emqttb: 1
-        TF_VAR_use_emqtt_bench: 0
-        TF_VAR_emqttb_instance_count: 5
-        TF_VAR_emqttb_instance_type: c5.2xlarge
-        TF_VAR_emqttb_scenario: '@conn -N 200_000 --conninterval 1ms'
-        TF_VAR_emqx_instance_type: c5.2xlarge
-        TF_VAR_emqx_instance_count: 3
-      run: |
-        terraform init
-        terraform apply -auto-approve
-        ./wait-emqttb.sh
-        ./fetch-metrics.sh
-        terraform destroy -auto-approve
-        aws s3 sync --exclude '*' --include '*.tar.gz' s3://$TF_VAR_s3_bucket_name/$TF_VAR_bench_id .
-    - name: Send notification to Slack
-      uses: slackapi/slack-github-action@6c661ce58804a1a20f6dc5fbee7f0381b469e001 # v1.25.0
-      with:
-        payload-file-path: "./tf-emqx-performance-test/slack-payload.json"
-    - name: terraform destroy
-      if: always()
-      working-directory: ./tf-emqx-performance-test
-      run: |
-        terraform destroy -auto-approve
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-      if: success()
-      with:
-        name: metrics
-        path: |
-          "./tf-emqx-performance-test/*.tar.gz"
-    - uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
-      if: failure()
-      with:
-        name: terraform
-        path: |
-          ./tf-emqx-performance-test/.terraform
-          ./tf-emqx-performance-test/*.tfstate
+          .terraform
+          *.tfstate

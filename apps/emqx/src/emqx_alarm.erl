@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_alarm).
@@ -50,13 +38,18 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2,
-    code_change/3
+    terminate/2
 ]).
 
 %% Internal exports (RPC)
 -export([
     do_get_alarms/0
+]).
+
+%% Internal exports
+-export([
+    do_start_worker/0,
+    worker_loop/0
 ]).
 
 -record(activated_alarm, {
@@ -73,6 +66,10 @@
     message :: binary(),
     deactivate_at :: integer() | infinity
 }).
+
+-define(worker, worker).
+
+-record(work, {mod :: module(), fn :: atom(), args :: [term()]}).
 
 -ifdef(TEST).
 -compile(export_all).
@@ -218,14 +215,16 @@ to_rfc3339(Timestamp) ->
 %%--------------------------------------------------------------------
 
 init([]) ->
-    ok = mria:wait_for_tables([?ACTIVATED_ALARM, ?DEACTIVATED_ALARM, ?TRIE]),
+    ok = mria:wait_for_tables([?ACTIVATED_ALARM, ?DEACTIVATED_ALARM]),
     deactivate_all_alarms(),
-    {ok, #{}, get_validity_period()}.
+    process_flag(trap_exit, true),
+    State = #{?worker => start_worker()},
+    {ok, State, get_validity_period()}.
 
 handle_call({activate_alarm, Name, Details, Message}, _From, State) ->
     case create_activate_alarm(Name, Details, Message) of
         {ok, Alarm} ->
-            do_actions(activate, Alarm, emqx:get_config([alarm, actions])),
+            do_actions(activate, Alarm, emqx:get_config([alarm, actions]), State),
             {reply, ok, State, get_validity_period()};
         Err ->
             {reply, Err, State, get_validity_period()}
@@ -235,7 +234,7 @@ handle_call({deactivate_alarm, Name, Details, Message}, _From, State) ->
         [] ->
             {reply, {error, not_found}, State};
         [Alarm] ->
-            deactivate_alarm(Alarm, Details, Message),
+            deactivate_alarm(Alarm, Details, Message, State),
             {reply, ok, State, get_validity_period()}
     end;
 handle_call(delete_all_deactivated_alarms, _From, State) ->
@@ -265,15 +264,15 @@ handle_info(timeout, State) ->
     Period = get_validity_period(),
     delete_expired_deactivated_alarms(erlang:system_time(microsecond) - Period * 1000),
     {noreply, State, Period};
+handle_info({'EXIT', Worker, _}, #{?worker := Worker} = State0) ->
+    State = State0#{?worker := start_worker()},
+    {noreply, State};
 handle_info(Info, State) ->
     ?SLOG(error, #{msg => "unexpected_info", info_req => Info}),
     {noreply, State, get_validity_period()}.
 
 terminate(_Reason, _State) ->
     ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
 
 %%------------------------------------------------------------------------------
 %% Internal functions
@@ -313,7 +312,8 @@ deactivate_alarm(
         message = Msg0
     },
     Details,
-    Message
+    Message,
+    State
 ) ->
     SizeLimit = emqx:get_config([alarm, size_limit]),
     case SizeLimit > 0 andalso (mnesia:table_info(?DEACTIVATED_ALARM, size) >= SizeLimit) of
@@ -342,15 +342,15 @@ deactivate_alarm(
     ),
     mria:dirty_write(?DEACTIVATED_ALARM, HistoryAlarm),
     mria:dirty_delete(?ACTIVATED_ALARM, Name),
-    do_actions(deactivate, DeActAlarm, emqx:get_config([alarm, actions])).
+    do_actions(deactivate, DeActAlarm, emqx:get_config([alarm, actions]), State).
 
-make_deactivated_alarm(ActivateAt, Name, Details, Message, DeActivateAt) ->
+make_deactivated_alarm(ActivateAt, Name, Details, Message, DeactivateAt) ->
     #deactivated_alarm{
         activate_at = ActivateAt,
         name = Name,
         details = Details,
         message = Message,
-        deactivate_at = DeActivateAt
+        deactivate_at = DeactivateAt
     }.
 
 deactivate_all_alarms() ->
@@ -406,24 +406,25 @@ delete_expired_deactivated_alarms(ActivatedAt, Checkpoint) ->
             ok
     end.
 
-do_actions(_, _, []) ->
+do_actions(_, _, [], _State) ->
     ok;
-do_actions(activate, Alarm = #activated_alarm{name = Name, message = Message}, [log | More]) ->
+do_actions(activate, Alarm = #activated_alarm{name = Name, message = Message}, [log | More], State) ->
     ?SLOG(warning, #{
         msg => "alarm_is_activated",
         name => Name,
         message => Message
     }),
-    do_actions(activate, Alarm, More);
-do_actions(deactivate, Alarm = #deactivated_alarm{name = Name}, [log | More]) ->
+    do_actions(activate, Alarm, More, State);
+do_actions(deactivate, Alarm = #deactivated_alarm{name = Name}, [log | More], State) ->
     ?SLOG(warning, #{
         msg => "alarm_is_deactivated",
         name => Name
     }),
-    do_actions(deactivate, Alarm, More);
-do_actions(Operation, Alarm, [publish | More]) ->
+    do_actions(deactivate, Alarm, More, State);
+do_actions(Operation, Alarm, [publish | More], State) ->
     Topic = topic(Operation),
-    {ok, Payload} = emqx_utils_json:safe_encode(normalize(Alarm)),
+    NormalizedAlarm = normalize(Alarm),
+    {ok, Payload} = emqx_utils_json:safe_encode(NormalizedAlarm),
     Message = emqx_message:make(
         ?MODULE,
         0,
@@ -433,7 +434,27 @@ do_actions(Operation, Alarm, [publish | More]) ->
         #{properties => #{'Content-Type' => <<"application/json">>}}
     ),
     _ = emqx_broker:safe_publish(Message),
-    do_actions(Operation, Alarm, More).
+    _ =
+        %% We run hooks in a temporary process to avoid blocking the alarm process for long.
+        case Operation of
+            activate ->
+                ActivatedAlarmContext = to_activated_alarm_context(NormalizedAlarm),
+                send_job_to_worker(
+                    emqx_hooks,
+                    run,
+                    ['alarm.activated', [ActivatedAlarmContext]],
+                    State
+                );
+            deactivate ->
+                DeactivatedAlarmContext = to_deactivated_alarm_context(NormalizedAlarm),
+                send_job_to_worker(
+                    emqx_hooks,
+                    run,
+                    ['alarm.deactivated', [DeactivatedAlarmContext]],
+                    State
+                )
+        end,
+    do_actions(Operation, Alarm, More, State).
 
 topic(activate) ->
     emqx_topic:systop(<<"alarms/activate">>);
@@ -470,10 +491,21 @@ normalize(#deactivated_alarm{
         activated => false
     }.
 
+normalize_message(Name, <<"">>) when is_binary(Name) ->
+    Name;
 normalize_message(Name, <<"">>) ->
-    list_to_binary(io_lib:format("~p", [Name]));
+    iolist_to_binary(io_lib:format("~p", [Name]));
 normalize_message(_Name, Message) ->
     Message.
+
+to_activated_alarm_context(NormalizedAlarm) ->
+    Ctx0 = maps:with([name, details, message, activate_at], NormalizedAlarm),
+    emqx_utils_maps:rename(activate_at, activated_at, Ctx0).
+
+to_deactivated_alarm_context(NormalizedAlarm) ->
+    Ctx0 = maps:with([name, details, message, activate_at, deactivate_at], NormalizedAlarm),
+    Ctx1 = emqx_utils_maps:rename(activate_at, activated_at, Ctx0),
+    emqx_utils_maps:rename(deactivate_at, deactivated_at, Ctx1).
 
 safe_call(Req) ->
     try
@@ -489,4 +521,41 @@ safe_call(Req) ->
                 stacktrace => St
             }),
             {error, Reason}
+    end.
+
+start_worker() ->
+    proc_lib:start_link(?MODULE, do_start_worker, []).
+
+do_start_worker() ->
+    set_label(<<"alarm_event_worker">>),
+    ok = proc_lib:init_ack(self()),
+    ?MODULE:worker_loop().
+
+%% Drop check after OTP 26 is dropped.
+-if(OTP_RELEASE >= 27).
+set_label(Label) -> proc_lib:set_label(Label).
+-else.
+set_label(_Label) -> ok.
+-endif.
+
+send_job_to_worker(Mod, Fn, Args, State0) ->
+    #{?worker := WorkerPid} = State0,
+    WorkerPid ! #work{mod = Mod, fn = Fn, args = Args},
+    ok.
+
+worker_loop() ->
+    receive
+        #work{mod = Mod, fn = Fn, args = Args} ->
+            try
+                apply(Mod, Fn, Args)
+            catch
+                Kind:Error:Stacktrace ->
+                    ?SLOG(warning, #{
+                        msg => "failed_to_trigger_alarm_event",
+                        mfa => {Mod, Fn, Args},
+                        reason => {Kind, Error},
+                        stacktrace => Stacktrace
+                    })
+            end,
+            ?MODULE:worker_loop()
     end.

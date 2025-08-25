@@ -1,22 +1,11 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_schema).
 
 -elvis([{elvis_style, invalid_dynamic_call, disable}]).
+-include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include("emqx_authn.hrl").
 -include("emqx_authn_chains.hrl").
@@ -35,13 +24,15 @@
     roots/0,
     tags/0,
     fields/1,
+    desc/1,
     authenticator_type/0,
     authenticator_type/1,
     authenticator_type_without/1,
     authenticator_type_without/2,
     mechanism/1,
     backend/1,
-    namespace/0
+    namespace/0,
+    fill_defaults/1
 ]).
 
 -export([
@@ -92,6 +83,9 @@ injected_fields(AuthnSchemaMods) ->
 tags() ->
     [<<"Authentication">>].
 
+fill_defaults(Config) ->
+    emqx_schema:fill_defaults_for_type(?R_REF("settings"), Config).
+
 authenticator_type() ->
     authenticator_type(?DEFAULT_SCHEMA_KIND).
 
@@ -137,19 +131,16 @@ select_union_member(_Kind, Value, _Mods) ->
     throw(#{reason => "not_a_struct", value => Value}).
 
 mod_select_union_member(Kind, Value, Mod) ->
-    emqx_utils:call_first_defined([
-        {Mod, select_union_member, [Kind, Value]},
-        {Mod, select_union_member, [Value]}
-    ]).
+    Args1 = [Kind, Value],
+    Args2 = [Value],
+    ArgsL = [Args1, Args2],
+    emqx_utils:call_first_defined(Mod, select_union_member, ArgsL).
 
 config_refs(Kind, Mods) ->
     lists:append([mod_refs(Kind, Mod) || Mod <- Mods]).
 
 mod_refs(Kind, Mod) ->
-    emqx_utils:call_first_defined([
-        {Mod, refs, [Kind]},
-        {Mod, refs, []}
-    ]).
+    emqx_utils:call_first_defined(Mod, refs, [[Kind], []]).
 
 root_type() ->
     hoconsc:array(authenticator_type()).
@@ -163,7 +154,15 @@ global_auth_fields() ->
                 default => [],
                 validator => validator(),
                 importance => ?IMPORTANCE_LOW
-            })}
+            })},
+        {authentication_settings,
+            ?HOCON(
+                ?R_REF("settings"),
+                #{
+                    desc => ?DESC(settings),
+                    importance => ?IMPORTANCE_LOW
+                }
+            )}
     ].
 
 mqtt_listener_auth_fields() ->
@@ -198,14 +197,39 @@ backend(Name) ->
         desc => ?DESC("backend")
     }).
 
+precondition() ->
+    ?HOCON(
+        binary(),
+        #{
+            default => <<>>,
+            desc => ?DESC("precondition")
+        }
+    ).
+
 common_fields() ->
-    [{enable, fun enable/1}].
+    [
+        {enable, fun enable/1},
+        {precondition, precondition()}
+    ].
 
 enable(type) -> boolean();
 enable(default) -> true;
+enable(importance) -> ?IMPORTANCE_NO_DOC;
 enable(desc) -> ?DESC(?FUNCTION_NAME);
 enable(_) -> undefined.
 
+fields("settings") ->
+    [
+        {"node_cache",
+            ?HOCON(
+                ?R_REF(emqx_auth_cache_schema, config),
+                #{
+                    desc => ?DESC(authentication_cache),
+                    importance => ?IMPORTANCE_LOW,
+                    default => emqx_auth_cache_schema:default_config()
+                }
+            )}
+    ];
 fields("metrics_status_fields") ->
     [
         {"resource_metrics", ?HOCON(?R_REF("resource_metrics"), #{desc => ?DESC("metrics")})},
@@ -258,6 +282,11 @@ common_field() ->
         {"rate_max", ?HOCON(float(), #{desc => ?DESC("rate_max")})},
         {"rate_last5m", ?HOCON(float(), #{desc => ?DESC("rate_last5m")})}
     ].
+
+desc("settings") ->
+    "Global settings for authentication";
+desc(_) ->
+    undefined.
 
 validator() ->
     Validations = lists:flatmap(

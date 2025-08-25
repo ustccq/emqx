@@ -2,27 +2,30 @@ receivers:
   otlp:
     protocols:
       grpc:
+        endpoint: 0.0.0.0:4317
+        auth:
+          authenticator: basicauth/server
         tls:
           ca_file: /etc/certs/ca.crt
           cert_file: /etc/certs/server.crt
           key_file: /etc/certs/server.key
-      http:
-        tls:
-          ca_file: /etc/certs/ca.crt
-          cert_file: /etc/certs/server.crt
-          key_file: /etc/certs/server.key
+#      http:
+#        tls:
+#          ca_file: /etc/certs/ca.crt
+#          cert_file: /etc/certs/server.crt
+#          key_file: /etc/certs/server.key
 
 exporters:
-  logging:
-    verbosity: detailed
   otlp:
     endpoint: jaeger.emqx.net:4317
     tls:
       insecure: true
   debug:
     verbosity: detailed
-  file:
-    path: /etc/otel-collector-tls.json
+  file/log:
+    path: /etc/otel_tls_emqx_log.json
+  file/metrics:
+    path: /etc/otel_tls_emqx_metrics.json
 
 
 processors:
@@ -34,19 +37,23 @@ extensions:
   health_check:
   zpages:
     endpoint: :55679
+  basicauth/server:
+    htpasswd:
+      inline: |
+        admin:public
 
 service:
-  extensions: [zpages, health_check]
+  extensions: [zpages, health_check, basicauth/server]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging, otlp]
+      exporters: [otlp]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging]
+      exporters: [file/metrics]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [logging, file]
+      exporters: [file/log]

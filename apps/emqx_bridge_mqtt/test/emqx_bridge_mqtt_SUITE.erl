@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_mqtt_SUITE).
@@ -20,9 +9,9 @@
 
 -import(emqx_dashboard_api_test_helpers, [request/4, uri/1]).
 
--include("emqx/include/emqx.hrl").
--include("emqx/include/emqx_hooks.hrl").
--include("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
@@ -166,22 +155,32 @@ end_per_testcase(_, _Config) ->
     ok.
 
 clear_resources() ->
-    lists:foreach(
-        fun(#{id := Id}) ->
-            ok = emqx_rule_engine:delete_rule(Id)
-        end,
-        emqx_rule_engine:get_rules()
-    ),
-    lists:foreach(
-        fun(#{type := Type, name := Name}) ->
-            ok = emqx_bridge:remove(Type, Name)
-        end,
-        emqx_bridge:list()
-    ).
+    emqx_bridge_v2_testlib:delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors().
 
 %%------------------------------------------------------------------------------
 %% Testcases
 %%------------------------------------------------------------------------------
+
+t_conf_no_resource_leak(_) ->
+    FindTopicIndexTab = fun() ->
+        lists:filter(
+            fun(T) -> ets:info(T, name) =:= emqx_topic_index end,
+            ets:all()
+        )
+    end,
+    Tabs1 = FindTopicIndexTab(),
+    {ok, 201, _Bridge} = request(
+        post,
+        uri(["bridges"]),
+        ?SERVER_CONF#{
+            %% invalid server
+            <<"server">> => <<"127.0.0.1:6060">>,
+            <<"name">> => <<"t_conf_no_resource_leak">>,
+            <<"ingress">> => ?INGRESS_CONF#{<<"pool_size">> => 1}
+        }
+    ),
+    ?assertEqual(Tabs1, FindTopicIndexTab()).
 
 t_conf_bridge_authn_anonymous(_) ->
     ok = hook_authenticate(),
@@ -214,6 +213,7 @@ t_conf_bridge_authn_password(_) ->
     ).
 
 t_conf_bridge_authn_passfile(Config) ->
+    %% test_server_ctrl:run_test_cases_loop
     DataDir = ?config(data_dir, Config),
     Username2 = <<"user2">>,
     PasswordFilename = filename:join(DataDir, "password"),
@@ -267,8 +267,8 @@ t_mqtt_conn_bridge_ingress(_) ->
         }
     ),
     #{
-        <<"type">> := ?TYPE_MQTT,
-        <<"name">> := ?BRIDGE_NAME_INGRESS
+        <<"type">> := ?TYPE_MQTT = Type,
+        <<"name">> := ?BRIDGE_NAME_INGRESS = Name
     } = emqx_utils_json:decode(Bridge),
 
     BridgeIDIngress = emqx_bridge_resource:bridge_id(?TYPE_MQTT, ?BRIDGE_NAME_INGRESS),
@@ -284,6 +284,7 @@ t_mqtt_conn_bridge_ingress(_) ->
         {ok, 200, _},
         request(put, uri(["bridges", BridgeIDIngress]), ServerConf)
     ),
+    _ = emqx_bridge_v2_testlib:kickoff_source_health_check(Type, Name),
 
     %% non-shared subscription, verify that only one client is subscribed
     ?assertEqual(
@@ -329,6 +330,7 @@ t_mqtt_conn_bridge_ingress_full_context(_Config) ->
             <<"ingress">> => IngressConf
         }
     ),
+    _ = emqx_bridge_v2_testlib:kickoff_source_health_check(?TYPE_MQTT, ?BRIDGE_NAME_INGRESS),
 
     RemoteTopic = <<?INGRESS_REMOTE_TOPIC, "/1">>,
     LocalTopic = <<?INGRESS_LOCAL_TOPIC, "/", RemoteTopic/binary>>,
@@ -352,7 +354,7 @@ t_mqtt_conn_bridge_ingress_full_context(_Config) ->
             <<"server">> := <<"127.0.0.1:1883">>,
             <<"topic">> := <<"ingress_remote_topic/1">>
         },
-        emqx_utils_json:decode(EncodedPayload, [return_maps])
+        emqx_utils_json:decode(EncodedPayload)
     ),
 
     ok.
@@ -568,6 +570,7 @@ t_egress_short_clientid(_Config) ->
     Name = <<"abc01234">>,
     BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
     ExpectedClientId = iolist_to_binary([BaseId, $:, "1"]),
+    ?assertMatch(<<"abc01234", _/binary>>, ExpectedClientId),
     test_egress_clientid(Name, ExpectedClientId).
 
 t_egress_long_clientid(_Config) ->
@@ -578,11 +581,34 @@ t_egress_long_clientid(_Config) ->
     ExpectedClientId = emqx_bridge_mqtt_lib:bytes23(BaseId, 1),
     test_egress_clientid(Name, ExpectedClientId).
 
+t_egress_with_short_prefix(_Config) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <prefix>head(sha1(<name><nodename-hash>:<pool_worker_id>), 16)
+    Prefix = <<"012-">>,
+    Name = <<"345">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = emqx_bridge_mqtt_lib:bytes23_with_prefix(Prefix, BaseId, 1),
+    ?assertMatch(<<"012-", _/binary>>, ExpectedClientId),
+    test_egress_clientid(Name, Prefix, ExpectedClientId).
+
+t_egress_with_long_prefix(_Config) ->
+    %% Expect the actual client ID in use is hashed from
+    %% <prefix><name><nodename-hash>:<pool_worker_id>
+    Prefix = <<"0123456789abcdef01234-">>,
+    Name = <<"345">>,
+    BaseId = emqx_bridge_mqtt_lib:clientid_base([Name]),
+    ExpectedClientId = iolist_to_binary([Prefix, BaseId, <<":1">>]),
+    test_egress_clientid(Name, Prefix, ExpectedClientId).
+
 test_egress_clientid(Name, ExpectedClientId) ->
+    test_egress_clientid(Name, <<>>, ExpectedClientId).
+
+test_egress_clientid(Name, ClientIdPrefix, ExpectedClientId) ->
     BridgeIDEgress = create_bridge(
         ?SERVER_CONF#{
             <<"name">> => Name,
-            <<"egress">> => (?EGRESS_CONF)#{<<"pool_size">> => 1}
+            <<"egress">> => (?EGRESS_CONF)#{<<"pool_size">> => 1},
+            <<"clientid_prefix">> => ClientIdPrefix
         }
     ),
     LocalTopic = <<?EGRESS_LOCAL_TOPIC, "/1">>,
@@ -956,9 +982,10 @@ t_mqtt_conn_bridge_egress_reconnect(_) ->
 
     %% start the listener 1883 to make the bridge reconnected
     ok = emqx_listeners:start_listener('tcp:default'),
-    timer:sleep(1500),
     %% verify the metrics of the bridge, the 2 queued messages should have been sent
-    ?assertMatch(#{<<"status">> := <<"connected">>}, request_bridge(BridgeIDEgress)),
+    ?retry(
+        500, 20, ?assertMatch(#{<<"status">> := <<"connected">>}, request_bridge(BridgeIDEgress))
+    ),
     %% matched >= 3 because of possible retries.
     ?assertMetrics(
         #{
@@ -977,54 +1004,69 @@ t_mqtt_conn_bridge_egress_reconnect(_) ->
     ok.
 
 t_mqtt_conn_bridge_egress_async_reconnect(_) ->
-    BridgeIDEgress = create_bridge(
-        ?SERVER_CONF#{
-            <<"name">> => ?BRIDGE_NAME_EGRESS,
-            <<"egress">> => ?EGRESS_CONF,
-            <<"resource_opts">> => #{
-                <<"query_mode">> => <<"async">>,
-                %% using a long time so we can test recovery
-                <<"request_ttl">> => <<"15s">>,
-                %% to make it check the healthy and reconnect quickly
-                <<"health_check_interval">> => <<"0.5s">>
-            }
-        }
-    ),
-
     Self = self(),
     LocalTopic = <<?EGRESS_LOCAL_TOPIC, "/1">>,
     RemoteTopic = <<?EGRESS_REMOTE_TOPIC, "/", LocalTopic/binary>>,
     emqx:subscribe(RemoteTopic),
 
-    Publisher = start_publisher(LocalTopic, 200, Self),
-    ct:sleep(1000),
+    ?check_trace(
+        begin
+            %% stop the listener 1883 to make the bridge disconnected
+            ok = emqx_listeners:stop_listener('tcp:default'),
 
-    %% stop the listener 1883 to make the bridge disconnected
-    ok = emqx_listeners:stop_listener('tcp:default'),
-    ct:sleep(1500),
-    ?assertMatch(
-        #{<<"status">> := Status} when
-            Status == <<"connecting">> orelse Status == <<"disconnected">>,
-        request_bridge(BridgeIDEgress)
+            BridgeIDEgress = create_bridge(
+                ?SERVER_CONF#{
+                    <<"name">> => ?BRIDGE_NAME_EGRESS,
+                    <<"egress">> => ?EGRESS_CONF,
+                    <<"resource_opts">> => #{
+                        <<"query_mode">> => <<"async">>,
+                        %% using a long time so we can test recovery
+                        <<"request_ttl">> => <<"15s">>,
+                        %% to make it check the healthy and reconnect quickly
+                        <<"health_check_interval">> => <<"0.5s">>
+                    }
+                }
+            ),
+
+            Publisher = start_publisher(LocalTopic, 200, Self),
+            ct:sleep(1000),
+
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    #{<<"status">> := Status} when
+                        Status == <<"connecting">> orelse Status == <<"disconnected">>,
+                    request_bridge(BridgeIDEgress)
+                )
+            ),
+
+            %% start the listener 1883 to make the bridge reconnected
+            ok = emqx_listeners:start_listener('tcp:default'),
+            ?retry(
+                500,
+                20,
+                ?assertMatch(
+                    #{<<"status">> := <<"connected">>},
+                    request_bridge(BridgeIDEgress)
+                )
+            ),
+
+            N = stop_publisher(Publisher),
+
+            %% all those messages should eventually be delivered
+            [
+                assert_mqtt_msg_received(RemoteTopic, Payload)
+             || I <- lists:seq(1, N),
+                Payload <- [integer_to_binary(I)]
+            ],
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([_ | _], ?of_kind(emqx_bridge_mqtt_connector_econnrefused_error, Trace)),
+            ok
+        end
     ),
-
-    %% start the listener 1883 to make the bridge reconnected
-    ok = emqx_listeners:start_listener('tcp:default'),
-    timer:sleep(1500),
-    ?assertMatch(
-        #{<<"status">> := <<"connected">>},
-        request_bridge(BridgeIDEgress)
-    ),
-
-    N = stop_publisher(Publisher),
-
-    %% all those messages should eventually be delivered
-    [
-        assert_mqtt_msg_received(RemoteTopic, Payload)
-     || I <- lists:seq(1, N),
-        Payload <- [integer_to_binary(I)]
-    ],
-
     ok.
 
 start_publisher(Topic, Interval, CtrlPid) ->
@@ -1078,6 +1120,8 @@ create_bridge(Config = #{<<"type">> := Type, <<"name">> := Name}) ->
         uri(["bridges"]),
         Config
     ),
+    _ = emqx_bridge_v2_testlib:kickoff_action_health_check(Type, Name),
+    _ = emqx_bridge_v2_testlib:kickoff_source_health_check(Type, Name),
     ?assertMatch(
         #{
             <<"type">> := Type,

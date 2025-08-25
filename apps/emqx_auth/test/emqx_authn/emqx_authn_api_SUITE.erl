@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_api_SUITE).
@@ -21,6 +10,7 @@
 -import(emqx_mgmt_api_test_util, [request/3, uri/1]).
 
 -include("emqx_authn.hrl").
+-include_lib("emqx/include/emqx.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
@@ -29,7 +19,7 @@
 -define(assertAuthenticatorsMatch(Guard, Path),
     (fun() ->
         {ok, 200, Response} = request(get, uri(Path)),
-        ?assertMatch(Guard, emqx_utils_json:decode(Response, [return_maps]))
+        ?assertMatch(Guard, emqx_utils_json:decode(Response))
     end)()
 ).
 
@@ -329,20 +319,12 @@ test_authenticator(PathPrefix) ->
         get,
         uri(PathPrefix ++ [?CONF_NS, "password_based:http"])
     ),
-
     {ok, 200, Res} = request(
         get,
         uri(PathPrefix ++ [?CONF_NS, "password_based:http", "status"])
     ),
-    {ok, RList} = emqx_utils_json:safe_decode(Res),
-    Snd = fun({_, Val}) -> Val end,
-    LookupVal = fun LookupV(List, RestJson) ->
-        case List of
-            [Name] -> Snd(lists:keyfind(Name, 1, RestJson));
-            [Name | NS] -> LookupV(NS, Snd(lists:keyfind(Name, 1, RestJson)))
-        end
-    end,
-    LookFun = fun(List) -> LookupVal(List, RList) end,
+    RMap = emqx_utils_json:decode(Res),
+    LookFun = fun(List) -> emqx_utils_maps:deep_get(List, RMap) end,
     MetricsList = [
         {<<"failed">>, 0},
         {<<"total">>, 0},
@@ -409,7 +391,8 @@ test_authenticator(PathPrefix) ->
         ValidConfig2
     ),
 
-    {ok, 404, _} = request(
+    %% allow deletion of unknown (not created) authenticator
+    {ok, 204, _} = request(
         delete,
         uri(PathPrefix ++ [?CONF_NS, "password_based:redis"])
     ),
@@ -632,6 +615,12 @@ ignore_switch_to_global_chain(_) ->
         delete,
         uri([listeners, "tcp:default", ?CONF_NS, "password_based:http"])
     ),
+    %% Delete unknown should retun 204
+    %% There is not even a name validation for it.
+    {ok, 204, _} = request(
+        delete,
+        uri([listeners, "tcp:default", ?CONF_NS, "password_based:httpx"])
+    ),
 
     %% Local chain is empty now and should be removed
     %% Listener user should not be OK
@@ -683,6 +672,72 @@ t_bcrypt_validation(_Config) ->
         post,
         uri([?CONF_NS]),
         ConfValid
+    ).
+
+t_cache(_Config) ->
+    {ok, 200, CacheData0} = request(
+        get,
+        uri(["authentication", "settings"])
+    ),
+    ?assertMatch(
+        #{<<"node_cache">> := #{<<"enable">> := false}},
+        emqx_utils_json:decode(CacheData0)
+    ),
+    {ok, 200, MetricsData0} = request(
+        get,
+        uri(["authentication", "node_cache", "status"])
+    ),
+    ?assertMatch(
+        #{<<"metrics">> := #{<<"count">> := 0}},
+        emqx_utils_json:decode(MetricsData0)
+    ),
+    {ok, 204, _} = request(
+        put,
+        uri(["authentication", "settings"]),
+        #{
+            <<"node_cache">> => #{<<"enable">> => true}
+        }
+    ),
+    {ok, 200, CacheData1} = request(
+        get,
+        uri(["authentication", "settings"])
+    ),
+    ?assertMatch(
+        #{<<"node_cache">> := #{<<"enable">> := true}},
+        emqx_utils_json:decode(CacheData1)
+    ),
+
+    %% We enabled authn cache, let's create
+    %% * authenticator
+    %% * connection to miss the cache
+    {ok, 200, _} = request(
+        post,
+        uri([?CONF_NS]),
+        emqx_authn_test_lib:http_example()
+    ),
+
+    process_flag(trap_exit, true),
+    {ok, Client} = emqtt:start_link([
+        {username, <<"user">>},
+        {password, <<"pass">>}
+    ]),
+    _ = emqtt:connect(Client),
+
+    %% Now check the metrics, the cache should have been populated
+    {ok, 200, MetricsData2} = request(
+        get,
+        uri(["authentication", "node_cache", "status"])
+    ),
+    ?assertMatch(
+        #{<<"metrics">> := #{<<"misses">> := #{<<"value">> := 1}}},
+        emqx_utils_json:decode(MetricsData2)
+    ),
+    ok.
+
+t_cache_reset(_) ->
+    {ok, 204, _} = request(
+        post,
+        uri(["authentication", "node_cache", "reset"])
     ).
 
 %%------------------------------------------------------------------------------

@@ -1,20 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_banned).
+
+-feature(maybe_expr, enable).
 
 -behaviour(gen_server).
 -behaviour(emqx_db_backup).
@@ -38,6 +28,7 @@
     info/1,
     format/1,
     parse/1,
+    parse_who/1,
     clear/0,
     who/2,
     tables/0
@@ -49,6 +40,7 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
+    handle_continue/2,
     terminate/2,
     code_change/3
 ]).
@@ -64,10 +56,6 @@
 
 -define(BANNED_INDIVIDUAL_TAB, ?MODULE).
 -define(BANNED_RULE_TAB, emqx_banned_rules).
-
-%% The default expiration time should be infinite
-%% but for compatibility, a large number (1 years) is used here to represent the 'infinite'
--define(EXPIRATION_TIME, 31536000).
 
 -ifdef(TEST).
 -compile(export_all).
@@ -94,7 +82,7 @@ create_tables() ->
 %%--------------------------------------------------------------------
 %% Data backup
 %%--------------------------------------------------------------------
-backup_tables() -> tables().
+backup_tables() -> {<<"banned">>, tables()}.
 
 -spec tables() -> [atom()].
 tables() -> [?BANNED_RULE_TAB, ?BANNED_INDIVIDUAL_TAB].
@@ -137,7 +125,7 @@ format(#banned{
         until => to_rfc3339(Until)
     }.
 
--spec parse(map()) -> emqx_types:banned() | {error, term()}.
+-spec parse(map()) -> {ok, emqx_types:banned()} | {error, term()}.
 parse(Params) ->
     case parse_who(Params) of
         {error, Reason} ->
@@ -146,19 +134,21 @@ parse(Params) ->
             By = maps:get(<<"by">>, Params, <<"mgmt_api">>),
             Reason = maps:get(<<"reason">>, Params, <<"">>),
             At = maps:get(<<"at">>, Params, erlang:system_time(second)),
-            Until = maps:get(<<"until">>, Params, At + ?EXPIRATION_TIME),
+            Until = maps:get(<<"until">>, Params, infinity),
             case Until > erlang:system_time(second) of
                 true ->
-                    #banned{
+                    {ok, #banned{
                         who = Who,
                         by = By,
                         reason = Reason,
                         at = At,
                         until = Until
-                    };
+                    }};
                 false ->
                     ErrorReason =
-                        io_lib:format("Cannot create expired banned, ~p to ~p", [At, Until]),
+                        iolist_to_binary(
+                            io_lib:format("Cannot create expired banned, ~p to ~p", [At, Until])
+                        ),
                     {error, ErrorReason}
             end
     end.
@@ -240,11 +230,145 @@ who(peerhost_net, CIDR) when is_binary(CIDR) ->
     {peerhost_net, esockd_cidr:parse(binary_to_list(CIDR), true)}.
 
 %%--------------------------------------------------------------------
+%% Import From CSV
+%%--------------------------------------------------------------------
+init_from_csv(undefined) ->
+    ok;
+init_from_csv(File) ->
+    maybe
+        core ?= mria_rlog:role(),
+        '$end_of_table' ?= mnesia:dirty_first(?BANNED_RULE_TAB),
+        '$end_of_table' ?= mnesia:dirty_first(?BANNED_INDIVIDUAL_TAB),
+        {ok, Bin} ?= file:read_file(File),
+        Stream = emqx_utils_stream:csv(Bin, #{nullable => true, filter_null => true}),
+        {ok, List} ?= parse_stream(Stream),
+        import_from_stream(List),
+        ?SLOG(info, #{
+            msg => "load_banned_bootstrap_file_succeeded",
+            file => File
+        })
+    else
+        replicant ->
+            ok;
+        {Name, _} when
+            Name == peerhost;
+            Name == peerhost_net;
+            Name == clientid_re;
+            Name == username_re;
+            Name == clientid;
+            Name == username
+        ->
+            ok;
+        {error, Reason} = Error ->
+            ?SLOG(error, #{
+                msg => "load_banned_bootstrap_file_failed",
+                reason => Reason,
+                file => File
+            }),
+            Error
+    end.
+
+import_from_stream(Stream) ->
+    Groups = maps:groups_from_list(
+        fun(#banned{who = Who}) -> table(Who) end, Stream
+    ),
+    maps:foreach(
+        fun(Tab, Items) ->
+            Trans = fun() ->
+                lists:foreach(
+                    fun(Item) ->
+                        mnesia:write(Tab, Item, write)
+                    end,
+                    Items
+                )
+            end,
+
+            case trans(Trans) of
+                {ok, _} ->
+                    ?SLOG(info, #{
+                        msg => "import_banned_from_stream_succeeded",
+                        items => Items
+                    });
+                {error, Reason} ->
+                    ?SLOG(error, #{
+                        msg => "import_banned_from_stream_failed",
+                        reason => Reason,
+                        items => Items
+                    })
+            end
+        end,
+        Groups
+    ).
+
+parse_stream(Stream) ->
+    try
+        List = emqx_utils_stream:consume(Stream),
+        parse_stream(List, [], [])
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
+
+parse_stream([Item | List], Ok, Error) ->
+    maybe
+        {ok, Item1} ?= normalize_parse_item(Item),
+        {ok, Banned} ?= parse(Item1),
+        parse_stream(List, [Banned | Ok], Error)
+    else
+        {error, _} ->
+            parse_stream(List, Ok, [Item | Error])
+    end;
+parse_stream([], Ok, []) ->
+    {ok, Ok};
+parse_stream([], Ok, Error) ->
+    ?SLOG(warning, #{
+        msg => "invalid_banned_items",
+        items => Error
+    }),
+    {ok, Ok}.
+
+normalize_parse_item(#{<<"as">> := As} = Item) ->
+    ToSecond = fun(Name, Time, Input) ->
+        case emqx_utils_calendar:to_epoch_second(emqx_utils_conv:str(Time)) of
+            {ok, Epoch} ->
+                {ok, Input#{Name := Epoch}};
+            Error ->
+                Error
+        end
+    end,
+
+    ParseTime = fun
+        (<<"at">>, #{<<"at">> := Time} = Input) ->
+            ToSecond(<<"at">>, Time, Input);
+        (<<"until">>, #{<<"until">> := <<"infinity">>} = Input) ->
+            {ok, Input#{<<"until">> := infinity}};
+        (<<"until">>, #{<<"until">> := Time} = Input) ->
+            ToSecond(<<"until">>, Time, Input);
+        (_, Input) ->
+            {ok, Input}
+    end,
+
+    maybe
+        {ok, Type} ?= emqx_utils:safe_to_existing_atom(As),
+        {ok, Item1} ?= ParseTime(<<"at">>, Item#{<<"as">> := Type}),
+        ParseTime(<<"until">>, Item1)
+    end;
+normalize_parse_item(_Item) ->
+    {error, invalid_item}.
+
+%%--------------------------------------------------------------------
 %% gen_server callbacks
 %%--------------------------------------------------------------------
 
 init([]) ->
-    {ok, ensure_expiry_timer(#{expiry_timer => undefined})}.
+    {ok, ensure_expiry_timer(#{expiry_timer => undefined}), {continue, init_from_csv}}.
+
+handle_continue(init_from_csv, State) ->
+    File = emqx_schema:naive_env_interpolation(
+        emqx:get_config([banned, bootstrap_file], undefined)
+    ),
+    _ = init_from_csv(File),
+    {noreply, State}.
 
 handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", call => Req}),
@@ -255,7 +379,7 @@ handle_cast(Msg, State) ->
     {noreply, State}.
 
 handle_info({timeout, TRef, expire}, State = #{expiry_timer := TRef}) ->
-    _ = mria:transaction(?COMMON_SHARD, fun ?MODULE:expire_banned_items/1, [
+    _ = trans(fun ?MODULE:expire_banned_items/1, [
         erlang:system_time(second)
     ]),
     {noreply, ensure_expiry_timer(State), hibernate};
@@ -338,6 +462,8 @@ format_who({AsRE, {_RE, REOriginal}}) when AsRE =:= clientid_re orelse AsRE =:= 
 format_who({As, Who}) when As =:= clientid orelse As =:= username ->
     {As, Who}.
 
+to_rfc3339(infinity) ->
+    infinity;
 to_rfc3339(Timestamp) ->
     emqx_utils_calendar:epoch_to_rfc3339(Timestamp, second).
 
@@ -389,10 +515,22 @@ on_banned(#banned{who = {clientid, ClientId}}) ->
             clientid => ClientId
         }
     ),
-    emqx_cm:kick_session(ClientId),
+    emqx_cm:try_kick_session(ClientId),
     ok;
 on_banned(_) ->
     ok.
 
 all_rules() ->
     ets:tab2list(?BANNED_RULE_TAB).
+
+trans(Fun) ->
+    case mria:transaction(?COMMON_SHARD, Fun) of
+        {atomic, Res} -> {ok, Res};
+        {aborted, Reason} -> {error, Reason}
+    end.
+
+trans(Fun, Args) ->
+    case mria:transaction(?COMMON_SHARD, Fun, Args) of
+        {atomic, Res} -> {ok, Res};
+        {aborted, Reason} -> {error, Reason}
+    end.

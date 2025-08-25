@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_rocketmq).
 
@@ -28,7 +28,6 @@
 -define(CONNECTOR_TYPE, rocketmq).
 -define(ACTION_TYPE, ?CONNECTOR_TYPE).
 -define(DEFAULT_TEMPLATE, <<>>).
--define(DEFFAULT_REQ_TIMEOUT, <<"15s">>).
 
 %% -------------------------------------------------------------------------------------------------
 %% api
@@ -167,8 +166,18 @@ fields(action_parameters) ->
                 )},
             {strategy,
                 mk(
-                    hoconsc:union([roundrobin, binary()]),
+                    hoconsc:union([roundrobin, key_dispatch, binary()]),
                     #{desc => ?DESC("strategy"), default => roundrobin}
+                )},
+            {key,
+                mk(
+                    emqx_schema:template(),
+                    #{desc => ?DESC("key"), required => false}
+                )},
+            {tag,
+                mk(
+                    emqx_schema:template(),
+                    #{desc => ?DESC("tag"), required => false}
                 )}
         ] ++ emqx_bridge_rocketmq_connector:fields(config),
     lists:foldl(
@@ -178,6 +187,7 @@ fields(action_parameters) ->
         Parameters,
         [
             servers,
+            ssl,
             namespace,
             pool_size,
             auto_reconnect,

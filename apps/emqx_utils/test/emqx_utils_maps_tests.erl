@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -176,3 +176,24 @@ map_indent_unindent_test_() ->
             unindent(b, #{a => #{c => 3}, b => #{a => #{d => 4}}})
         )
     ].
+
+printable_props_test() ->
+    Headers = #{
+        peerhost => {127, 0, 0, 1},
+        peername => {{127, 0, 0, 1}, 9980},
+        sockname => {{127, 0, 0, 1}, 1883},
+        redispatch_to => {<<"group">>, <<"sub/topic/+">>},
+        shared_dispatch_ack => {self(), ref}
+    },
+    Converted = emqx_utils_maps:printable_props(Headers),
+    ?assertMatch(
+        #{
+            peerhost := <<"127.0.0.1">>,
+            peername := <<"127.0.0.1:9980">>,
+            sockname := <<"127.0.0.1:1883">>
+        },
+        Converted
+    ),
+    ?assertNot(maps:is_key(redispatch_to, Converted)),
+    ?assertNot(maps:is_key(shared_dispatch_ack, Converted)),
+    ok.

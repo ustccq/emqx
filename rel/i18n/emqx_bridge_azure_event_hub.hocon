@@ -69,7 +69,7 @@ producer_kafka_opts.label:
 """Azure Event Hubs Producer"""
 
 kafka_topic.desc:
-"""Event Hubs name"""
+"""Event Hubs name.  Supports templates (e.g.: `t-${payload.t}`)."""
 
 kafka_topic.label:
 """Event Hubs Name"""
@@ -103,6 +103,17 @@ discovered partitions into account when dispatching messages per <code>partition
 
 partition_count_refresh_interval.label:
 """Partition Count Refresh Interval"""
+
+max_linger_time.desc:
+"""Maximum duration for a per-partition producer to wait for messages in order to collect a batch to buffer.
+The default value `0` means no wait. For non-memory buffer mode, it's advised to configure at least `5ms` for less IOPS."""
+
+max_linger_time.label: "Max Linger Time"
+
+max_linger_bytes.desc:
+"""Maximum number of bytes for a per-partition producer to wait for messages in order to collect a batch to buffer."""
+
+max_linger_bytes.label: "Max Linger Bytes"
 
 max_batch_bytes.desc:
 """Maximum bytes to collect in an Azure Event Hubs message batch."""

@@ -1,24 +1,8 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_jwt).
-
--include_lib("emqx_auth/include/emqx_authn.hrl").
--include_lib("emqx/include/logger.hrl").
--include_lib("emqx/include/emqx_placeholder.hrl").
 
 -export([
     create/2,
@@ -26,6 +10,12 @@
     authenticate/2,
     destroy/1
 ]).
+
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_placeholder.hrl").
+-include_lib("jose/include/jose_jwk.hrl").
+-include("emqx_auth_jwt.hrl").
 
 -define(ALLOWED_VARS, [
     ?VAR_CLIENTID,
@@ -39,12 +29,28 @@
 create(_AuthenticatorID, Config) ->
     create(Config).
 
-create(#{verify_claims := VerifyClaims} = Config) ->
-    create2(Config#{verify_claims => handle_verify_claims(VerifyClaims)}).
+create(#{algorithm := 'hmac-based', use_jwks := false} = Config) ->
+    create_authn_hmac_based(Config);
+create(#{algorithm := 'public-key', use_jwks := false} = Config) ->
+    create_authn_public_key(Config);
+create(#{use_jwks := true} = Config) ->
+    ResourceId = emqx_authn_utils:make_resource_id(?AUTHN_TYPE),
+    maybe
+        {ok, ResourceConfig, State} ?= create_authn_public_key_with_jwks(ResourceId, Config),
+        ok ?=
+            emqx_authn_utils:create_resource(
+                emqx_authn_jwks_connector,
+                ResourceConfig,
+                State,
+                ?AUTHN_MECHANISM_BIN,
+                _Backend = <<>>
+            ),
+        {ok, State}
+    end.
 
 update(
     #{use_jwks := false} = Config,
-    #{jwk_resource := ResourceId}
+    #{resource_id := ResourceId}
 ) ->
     _ = emqx_resource:remove_local(ResourceId),
     create(Config);
@@ -52,22 +58,19 @@ update(#{use_jwks := false} = Config, _State) ->
     create(Config);
 update(
     #{use_jwks := true} = Config,
-    #{jwk_resource := ResourceId} = State
+    #{resource_id := ResourceId}
 ) ->
-    case emqx_resource:simple_sync_query(ResourceId, {update, connector_opts(Config)}) of
-        ok ->
-            case maps:get(verify_claims, Config, undefined) of
-                undefined ->
-                    {ok, State};
-                VerifyClaims ->
-                    {ok, State#{verify_claims => handle_verify_claims(VerifyClaims)}}
-            end;
-        {error, Reason} ->
-            ?SLOG(error, #{
-                msg => "jwks_client_option_update_failed",
-                resource => ResourceId,
-                reason => Reason
-            })
+    maybe
+        {ok, ResourceConfig, State} ?= create_authn_public_key_with_jwks(ResourceId, Config),
+        ok ?=
+            emqx_authn_utils:update_resource(
+                emqx_authn_jwks_connector,
+                ResourceConfig,
+                State,
+                ?AUTHN_MECHANISM_BIN,
+                _Backend = <<>>
+            ),
+        {ok, State}
     end;
 update(#{use_jwks := true} = Config, _State) ->
     create(Config).
@@ -85,6 +88,7 @@ authenticate(
     }
 ) ->
     JWT = maps:get(From, Credential),
+    %% XXX: Only supports single public key
     JWKs = [JWK],
     VerifyClaims = render_expected(VerifyClaims0, Credential),
     verify(JWT, JWKs, VerifyClaims, AclClaimName, DisconnectAfterExpire);
@@ -93,7 +97,7 @@ authenticate(
     #{
         verify_claims := VerifyClaims0,
         disconnect_after_expire := DisconnectAfterExpire,
-        jwk_resource := ResourceId,
+        resource_id := ResourceId,
         acl_claim_name := AclClaimName,
         from := From
     }
@@ -111,7 +115,7 @@ authenticate(
             verify(JWT, JWKs, VerifyClaims, AclClaimName, DisconnectAfterExpire)
     end.
 
-destroy(#{jwk_resource := ResourceId}) ->
+destroy(#{resource_id := ResourceId}) ->
     _ = emqx_resource:remove_local(ResourceId),
     ok;
 destroy(_) ->
@@ -121,15 +125,14 @@ destroy(_) ->
 %% Internal functions
 %%--------------------------------------------------------------------
 
-create2(#{
-    use_jwks := false,
-    algorithm := 'hmac-based',
+create_authn_hmac_based(#{
     secret := Secret0,
     secret_base64_encoded := Base64Encoded,
     verify_claims := VerifyClaims,
     disconnect_after_expire := DisconnectAfterExpire,
     acl_claim_name := AclClaimName,
-    from := From
+    from := From,
+    enable := Enable
 }) ->
     case may_decode_secret(Base64Encoded, Secret0) of
         {error, Reason} ->
@@ -138,70 +141,87 @@ create2(#{
             JWK = jose_jwk:from_oct(Secret),
             {ok, #{
                 jwk => JWK,
-                verify_claims => VerifyClaims,
+                verify_claims => handle_verify_claims(VerifyClaims),
                 disconnect_after_expire => DisconnectAfterExpire,
                 acl_claim_name => AclClaimName,
-                from => From
+                from => From,
+                enable => Enable
             }}
-    end;
-create2(#{
-    use_jwks := false,
-    algorithm := 'public-key',
-    public_key := PublicKey,
-    verify_claims := VerifyClaims,
-    disconnect_after_expire := DisconnectAfterExpire,
-    acl_claim_name := AclClaimName,
-    from := From
-}) ->
-    JWK = create_jwk_from_public_key(PublicKey),
-    {ok, #{
-        jwk => JWK,
-        verify_claims => VerifyClaims,
-        disconnect_after_expire => DisconnectAfterExpire,
-        acl_claim_name => AclClaimName,
-        from => From
-    }};
-create2(
+    end.
+
+create_authn_public_key(
     #{
-        use_jwks := true,
+        public_key := PublicKey,
+        verify_claims := VerifyClaims,
+        disconnect_after_expire := DisconnectAfterExpire,
+        acl_claim_name := AclClaimName,
+        from := From,
+        enable := Enable
+    } = Config
+) ->
+    maybe
+        {ok, JWK} ?=
+            create_jwk_from_public_key(
+                maps:get(enable, Config, false),
+                PublicKey
+            ),
+        {ok, #{
+            jwk => JWK,
+            verify_claims => handle_verify_claims(VerifyClaims),
+            disconnect_after_expire => DisconnectAfterExpire,
+            acl_claim_name => AclClaimName,
+            from => From,
+            enable => Enable
+        }}
+    end.
+
+create_authn_public_key_with_jwks(
+    ResourceId,
+    #{
         verify_claims := VerifyClaims,
         disconnect_after_expire := DisconnectAfterExpire,
         acl_claim_name := AclClaimName,
         from := From
     } = Config
 ) ->
-    ResourceId = emqx_authn_utils:make_resource_id(?MODULE),
-    {ok, _Data} = emqx_resource:create_local(
-        ResourceId,
-        ?AUTHN_RESOURCE_GROUP,
-        emqx_authn_jwks_connector,
-        connector_opts(Config)
+    ResourceConfig = emqx_authn_utils:cleanup_resource_config(
+        [verify_claims, disconnect_after_expire, acl_claim_name, from], Config
     ),
-    {ok, #{
-        jwk_resource => ResourceId,
-        verify_claims => VerifyClaims,
-        disconnect_after_expire => DisconnectAfterExpire,
-        acl_claim_name => AclClaimName,
-        from => From
-    }}.
+    State = emqx_authn_utils:init_state(
+        Config,
+        #{
+            resource_id => ResourceId,
+            verify_claims => handle_verify_claims(VerifyClaims),
+            disconnect_after_expire => DisconnectAfterExpire,
+            acl_claim_name => AclClaimName,
+            from => From
+        }
+    ),
+    {ok, ResourceConfig, State}.
 
-create_jwk_from_public_key(PublicKey) when
+create_jwk_from_public_key(true, PublicKey) when
     is_binary(PublicKey); is_list(PublicKey)
 ->
+    try do_create_jwk_from_public_key(PublicKey) of
+        %% XXX: Only supports single public key
+        #jose_jwk{} = Res ->
+            {ok, Res};
+        _ ->
+            {error, invalid_public_key}
+    catch
+        _:_ ->
+            {error, invalid_public_key}
+    end;
+create_jwk_from_public_key(false, _PublicKey) ->
+    {ok, []}.
+
+do_create_jwk_from_public_key(PublicKey) ->
     case filelib:is_file(PublicKey) of
         true ->
             jose_jwk:from_pem_file(PublicKey);
         false ->
             jose_jwk:from_pem(iolist_to_binary(PublicKey))
     end.
-
-connector_opts(#{ssl := #{enable := Enable} = SSL} = Config) ->
-    SSLOpts =
-        case Enable of
-            true -> maps:without([enable], SSL);
-            false -> #{}
-        end,
-    Config#{ssl_opts => SSLOpts}.
 
 may_decode_secret(false, Secret) ->
     Secret;
@@ -216,7 +236,7 @@ may_decode_secret(true, Secret) ->
 render_expected([], _Variables) ->
     [];
 render_expected([{Name, ExpectedTemplate} | More], Variables) ->
-    Expected = emqx_auth_utils:render_str(ExpectedTemplate, Variables),
+    Expected = emqx_auth_template:render_str(ExpectedTemplate, Variables),
     [{Name, Expected} | render_expected(More, Variables)].
 
 verify(undefined, _, _, _, _) ->
@@ -243,9 +263,10 @@ extra_to_auth_data(Extra, JWT, AclClaimName, DisconnectAfterExpire) ->
     IsSuperuser = emqx_authn_utils:is_superuser(Extra),
     Attrs = emqx_authn_utils:client_attrs(Extra),
     ExpireAt = expire_at(DisconnectAfterExpire, Extra),
+    ClientIdOverride = emqx_authn_utils:clientid_override(Extra),
     try
         ACL = acl(Extra, AclClaimName),
-        Result = merge_maps([ExpireAt, IsSuperuser, ACL, Attrs]),
+        Result = merge_maps([ExpireAt, IsSuperuser, ACL, Attrs, ClientIdOverride]),
         {ok, Result}
     catch
         throw:{bad_acl_rule, Reason} ->
@@ -280,8 +301,8 @@ do_verify(_JWT, [], _VerifyClaims) ->
 do_verify(JWT, [JWK | More], VerifyClaims) ->
     try jose_jws:verify(JWK, JWT) of
         {true, Payload, _JWT} ->
-            Claims0 = emqx_utils_json:decode(Payload, [return_maps]),
-            Claims = try_convert_to_num(Claims0, [<<"exp">>, <<"iat">>, <<"nbf">>]),
+            Claims0 = emqx_utils_json:decode(Payload),
+            Claims = try_convert_to_num(Claims0, [<<"exp">>, <<"nbf">>]),
             case verify_claims(Claims, VerifyClaims) of
                 ok ->
                     {ok, Claims};
@@ -292,7 +313,7 @@ do_verify(JWT, [JWK | More], VerifyClaims) ->
             do_verify(JWT, More, VerifyClaims)
     catch
         _:Reason ->
-            ?TRACE_AUTHN_PROVIDER("jwt_verify_error", #{jwk => JWK, jwt => JWT, reason => Reason}),
+            ?TRACE_AUTHN_PROVIDER("jwt_verify_error", #{jwt => JWT, reason => Reason}),
             do_verify(JWT, More, VerifyClaims)
     end.
 
@@ -302,9 +323,6 @@ verify_claims(Claims, VerifyClaims0) ->
         [
             {<<"exp">>, fun(ExpireTime) ->
                 is_number(ExpireTime) andalso Now < ExpireTime
-            end},
-            {<<"iat">>, fun(IssueAt) ->
-                is_number(IssueAt) andalso IssueAt =< Now
             end},
             {<<"nbf">>, fun(NotBefore) ->
                 is_number(NotBefore) andalso NotBefore =< Now
@@ -364,7 +382,7 @@ handle_verify_claims(VerifyClaims) ->
 handle_verify_claims([], Acc) ->
     Acc;
 handle_verify_claims([{Name, Expected0} | More], Acc) ->
-    Expected1 = emqx_auth_utils:parse_str(Expected0, ?ALLOWED_VARS),
+    {_, Expected1} = emqx_auth_template:parse_str(Expected0, ?ALLOWED_VARS),
     handle_verify_claims(More, [{Name, Expected1} | Acc]).
 
 binary_to_number(Bin) ->
@@ -384,20 +402,7 @@ binary_to_number(Bin) ->
 parse_rules(Rules) when is_map(Rules) ->
     Rules;
 parse_rules(Rules) when is_list(Rules) ->
-    lists:map(fun parse_rule/1, Rules).
-
-parse_rule(Rule) ->
-    case emqx_authz_rule_raw:parse_rule(Rule) of
-        {ok, {Permission, Action, Topics}} ->
-            try
-                emqx_authz_rule:compile({Permission, all, Action, Topics})
-            catch
-                throw:Reason ->
-                    throw({bad_acl_rule, Reason})
-            end;
-        {error, Reason} ->
-            throw({bad_acl_rule, Reason})
-    end.
+    emqx_authz_rule_raw:parse_and_compile_rules(Rules).
 
 merge_maps([]) -> #{};
 merge_maps([Map | Maps]) -> maps:merge(Map, merge_maps(Maps)).

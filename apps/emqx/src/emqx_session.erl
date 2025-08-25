@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %%--------------------------------------------------------------------
@@ -52,6 +40,7 @@
 -ifdef(TEST).
 -compile(export_all).
 -compile(nowarn_export_all).
+-include_lib("eunit/include/eunit.hrl").
 -endif.
 
 -export([
@@ -83,6 +72,7 @@
 
 -export([
     deliver/3,
+    handle_info/3,
     handle_timeout/3,
     disconnect/3,
     terminate/3
@@ -183,11 +173,65 @@
 
 -callback create(clientinfo(), conninfo(), emqx_maybe:t(message()), conf()) ->
     t().
+
 -callback open(clientinfo(), conninfo(), emqx_maybe:t(message()), conf()) ->
     {_IsPresent :: true, t(), _ReplayContext} | false.
+
 -callback destroy(t() | clientinfo()) -> ok.
+
 -callback clear_will_message(t()) -> t().
+
 -callback publish_will_message_now(t(), message()) -> t().
+
+-callback handle_timeout(clientinfo(), common_timer_name() | custom_timer_name(), t()) ->
+    {ok, replies(), t()}
+    | {ok, replies(), timeout(), t()}.
+
+-callback handle_info(term(), t(), clientinfo()) -> t().
+
+-callback get_subscription(emqx_types:topic(), t()) ->
+    emqx_types:subopts() | undefined.
+
+-callback subscribe(emqx_types:topic() | emqx_types:share(), emqx_types:subopts(), t()) ->
+    {ok, t()} | {error, emqx_types:reason_code()}.
+
+-callback unsubscribe(emqx_types:topic(), t()) ->
+    {ok, t(), emqx_types:subopts()}
+    | {error, emqx_types:reason_code()}.
+
+-callback publish(emqx_types:packet_id(), emqx_types:message(), t()) ->
+    {ok, emqx_types:publish_result(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback puback(clientinfo(), emqx_types:packet_id(), t()) ->
+    {ok, emqx_types:message(), replies(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback pubrec(emqx_types:packet_id(), t()) ->
+    {ok, emqx_types:message(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback pubrel(emqx_types:packet_id(), t()) ->
+    {ok, t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback pubcomp(clientinfo(), emqx_types:packet_id(), t()) ->
+    {ok, replies(), t()}
+    | {error, emqx_types:reason_code()}.
+
+-callback replay(clientinfo(), _ReplayContext, t()) ->
+    {ok, replies(), t()}.
+
+-callback deliver(clientinfo(), [emqx_types:deliver()], t()) ->
+    {ok, replies(), t()}.
+
+-callback info(atom(), t()) -> term().
+
+-callback stats(t()) -> emqx_types:stats().
+
+-callback disconnect(t(), conninfo()) -> {idle | shutdown, t()}.
+
+-callback terminate(clientinfo(), _Reason, t()) -> ok.
 
 %%--------------------------------------------------------------------
 %% Create a Session
@@ -392,7 +436,7 @@ pubcomp(ClientInfo, PacketId, Session) ->
 
 %%--------------------------------------------------------------------
 
--spec replay(clientinfo(), _ReplayContext, t()) ->
+-spec replay(clientinfo(), [emqx_types:message()], t()) ->
     {ok, replies(), t()}.
 replay(ClientInfo, ReplayContext, Session) ->
     ?IMPL(Session):replay(ClientInfo, ReplayContext, Session).
@@ -443,35 +487,66 @@ enrich_message(
     _ = emqx_session_events:handle_event(ClientInfo, {dropped, Msg, no_local}),
     [];
 enrich_message(_ClientInfo, MsgIn, SubOpts = #{}, UpgradeQoS) ->
+    %% https://www.erlang.org/doc/system/maps.html#using-maps-as-an-alternative-to-records
+    Default = #{nl => 0, qos => undefined, rap => 0, subid => undefined},
+    #{nl := NL, qos := SubQoS, rap := RAP, subid := SubId} = maps:merge(Default, SubOpts),
+    #message{flags = Flags0, headers = Headers0, qos = PubQoS} = MsgIn,
+    %% Update flags of the packet according to the subscription
+    %% options:
+    %%
+    %% - When No Local(NL) = 1, set `nl' to `true'
+    %%
+    %% - Retain as Published (RAP): clear `retain' flag, unless RAP =
+    %% 1 or `retained' header = `true'.
+    KeepRetain =
+        case Headers0 of
+            #{retained := true} -> true;
+            _ -> RAP =:= 1
+        end,
+    Flags =
+        case NL of
+            1 when KeepRetain ->
+                Flags0#{nl => true};
+            1 ->
+                Flags0#{nl => true, retain => false};
+            _ when KeepRetain ->
+                Flags0;
+            _ ->
+                Flags0#{retain => false}
+        end,
+    %% Add `Subscription-Identifier' if it's specified for the
+    %% subscription:
+    Headers =
+        case SubId of
+            undefined ->
+                Headers0;
+            _ ->
+                case Headers0 of
+                    #{properties := Properties} ->
+                        Headers0#{properties := Properties#{'Subscription-Identifier' => SubId}};
+                    #{} ->
+                        Headers0#{properties => #{'Subscription-Identifier' => SubId}}
+                end
+        end,
+    %% Update QoS:
+    QoS =
+        case is_integer(SubQoS) of
+            true when UpgradeQoS ->
+                SubQoS;
+            true ->
+                min(SubQoS, PubQoS);
+            false ->
+                PubQoS
+        end,
     [
-        maps:fold(
-            fun(SubOpt, V, Msg) -> enrich_subopts(SubOpt, V, Msg, UpgradeQoS) end,
-            MsgIn,
-            SubOpts
-        )
+        MsgIn#message{
+            flags = Flags,
+            headers = Headers,
+            qos = QoS
+        }
     ];
 enrich_message(_ClientInfo, Msg, undefined, _UpgradeQoS) ->
     [Msg].
-
-enrich_subopts(nl, 1, Msg, _) ->
-    emqx_message:set_flag(nl, Msg);
-enrich_subopts(nl, 0, Msg, _) ->
-    Msg;
-enrich_subopts(qos, SubQoS, Msg = #message{qos = PubQoS}, _UpgradeQoS = true) ->
-    Msg#message{qos = max(SubQoS, PubQoS)};
-enrich_subopts(qos, SubQoS, Msg = #message{qos = PubQoS}, _UpgradeQoS = false) ->
-    Msg#message{qos = min(SubQoS, PubQoS)};
-enrich_subopts(rap, 1, Msg, _) ->
-    Msg;
-enrich_subopts(rap, 0, Msg = #message{headers = #{retained := true}}, _) ->
-    Msg;
-enrich_subopts(rap, 0, Msg, _) ->
-    emqx_message:set_flag(retain, false, Msg);
-enrich_subopts(subid, SubId, Msg, _) ->
-    Props = emqx_message:get_header(properties, Msg, #{}),
-    emqx_message:set_header(properties, Props#{'Subscription-Identifier' => SubId}, Msg);
-enrich_subopts(_Opt, _V, Msg, _) ->
-    Msg.
 
 %%--------------------------------------------------------------------
 %% Timeouts
@@ -483,6 +558,14 @@ enrich_subopts(_Opt, _V, Msg, _) ->
     | {ok, replies(), timeout(), t()}.
 handle_timeout(ClientInfo, Timer, Session) ->
     ?IMPL(Session):handle_timeout(ClientInfo, Timer, Session).
+
+%%--------------------------------------------------------------------
+%% Generic Messages
+%%--------------------------------------------------------------------
+
+-spec handle_info(term(), t(), clientinfo()) -> t().
+handle_info(Info, Session, ClientInfo) ->
+    ?IMPL(Session):handle_info(Info, Session, ClientInfo).
 
 %%--------------------------------------------------------------------
 
@@ -519,7 +602,7 @@ disconnect(_ClientInfo, ConnInfo, Session) ->
     ok.
 terminate(ClientInfo, Reason, Session) ->
     _ = run_terminate_hooks(ClientInfo, Reason, Session),
-    _ = ?IMPL(Session):terminate(Reason, Session),
+    _ = ?IMPL(Session):terminate(ClientInfo, Reason, Session),
     ok.
 
 run_terminate_hooks(ClientInfo, discarded, Session) ->
@@ -596,7 +679,7 @@ on_dropped_qos2_msg(PacketId, Msg, RC) ->
 
 %%--------------------------------------------------------------------
 
--spec should_keep(message() | emqx_types:deliver()) -> boolean().
+-spec should_keep(message()) -> boolean().
 should_keep(MsgDeliver) ->
     not is_banned_msg(MsgDeliver).
 
@@ -659,3 +742,218 @@ clear_will_message(Session) ->
 -spec publish_will_message_now(t(), message()) -> t().
 publish_will_message_now(Session, WillMsg) ->
     ?IMPL(Session):publish_will_message_now(Session, WillMsg).
+
+%%--------------------------------------------------------------------
+%% Unit tests
+%%--------------------------------------------------------------------
+
+-ifdef(TEST).
+
+enrich_no_local_test_() ->
+    SubOpts = #{nl => 1},
+    Msg = emqx_message:make(<<"client1">>, 1, <<"topic">>, <<"payload">>),
+    {setup,
+        fun() ->
+            meck:new(emqx_session_events, [no_history]),
+            ok = meck:expect(
+                emqx_session_events,
+                handle_event,
+                fun(_, _) ->
+                    ok
+                end
+            )
+        end,
+        fun(_) ->
+            meck:unload(emqx_session_events)
+        end,
+        [
+            ?_assertMatch(
+                [],
+                enrich_message(#{clientid => <<"client1">>}, Msg, SubOpts, false)
+            ),
+            ?_assertMatch(
+                [#message{from = <<"client1">>, topic = <<"topic">>, payload = <<"payload">>}],
+                enrich_message(#{clientid => <<"client2">>}, Msg, SubOpts, false)
+            )
+        ]}.
+
+%% This testcase verifies that enrich function clear `retain' flag:
+enrich_clear_retain_flag_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_flag(
+        my_awesome_flag,
+        emqx_message:set_flag(
+            retain,
+            emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+        )
+    ),
+    [Msg1] = enrich_message(ClientInfo, MsgIn, #{}, false),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(retain, Msg1),
+        "Retain flag should not be cleared"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(my_awesome_flag, Msg1),
+        "Other flags are preserved"
+    ),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(nl, Msg1),
+        "Other flags are preserved"
+    ),
+    %% Now with nl
+    [Msg2] = enrich_message(ClientInfo, MsgIn, #{nl => 1}, false),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(retain, Msg2),
+        "Retain flag should be cleared"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(nl, Msg2),
+        "nl flag should be inherited from the subscription"
+    ).
+
+%% This testcase verifies that enrich function doesn't clear `retain'
+%% flag when retained header is set:
+enrich_retain_as_published1_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_flag(
+        my_awesome_flag,
+        emqx_message:set_flag(
+            retain,
+            emqx_message:set_header(
+                retained,
+                true,
+                emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+            )
+        )
+    ),
+    [Msg1] = enrich_message(ClientInfo, MsgIn, #{}, false),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(retain, Msg1),
+        "Retain flag should not be cleared when retained header is true"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(my_awesome_flag, Msg1),
+        "Other flags are preserved"
+    ),
+    ?assertMatch(
+        false,
+        emqx_message:get_flag(nl, Msg1),
+        "Other flags are preserved"
+    ),
+    ?assertMatch(
+        #{retained := true},
+        emqx_message:get_headers(Msg1)
+    ),
+    %% Now with nl
+    [Msg2] = enrich_message(ClientInfo, MsgIn, #{nl => 1}, false),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(retain, Msg2),
+        "Retain flag should not be cleared when retained header is true"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(nl, Msg2),
+        "nl flag should be inherited from the subscription"
+    ).
+
+%% This testcase verifies that enrich function doesn't clear `retain'
+%% flag when `rap' is set:
+enrich_retain_as_published2_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_flag(
+        my_awesome_flag,
+        emqx_message:set_flag(
+            retain,
+            emqx_message:set_header(
+                retained,
+                true,
+                emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+            )
+        )
+    ),
+    ?assertMatch(
+        [MsgIn],
+        enrich_message(ClientInfo, MsgIn, #{rap => 1}, false)
+    ),
+    %% Now with nl
+    [Msg1] = enrich_message(ClientInfo, MsgIn, #{rap => 1, nl => 1}, false),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(retain, Msg1),
+        "Retain flag should not be cleared when rap is set for the subscription"
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_flag(nl, Msg1),
+        "nl flag should be inherited from the subscription"
+    ).
+
+enrich_subid1_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_header(
+        retained, true, emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+    ),
+    SubInfo = #{subid => 42},
+    [MsgOut] = enrich_message(ClientInfo, MsgIn, SubInfo, false),
+    ?assertMatch(
+        #{'Subscription-Identifier' := 42},
+        emqx_message:get_header(properties, MsgOut)
+    ),
+    ?assertMatch(
+        true,
+        emqx_message:get_header(retained, MsgOut)
+    ).
+
+enrich_subid2_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    MsgIn = emqx_message:set_header(
+        properties,
+        #{myprop => hello},
+        emqx_message:make(<<"client2">>, 1, <<"topic">>, <<"payload">>)
+    ),
+    SubInfo = #{subid => 42},
+    [MsgOut] = enrich_message(ClientInfo, MsgIn, SubInfo, false),
+    ?assertMatch(
+        #{'Subscription-Identifier' := 42, myprop := hello},
+        emqx_message:get_header(properties, MsgOut)
+    ).
+
+enrich_qos_no_upgrade_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    Enrich = fun(QoS, MsgIn) ->
+        [#message{qos = Ret}] = enrich_message(ClientInfo, MsgIn, #{qos => QoS}, false),
+        Ret
+    end,
+    [
+        ?assertEqual(
+            min(PubQoS, SubQoS),
+            Enrich(SubQoS, emqx_message:make(<<"client2">>, PubQoS, <<"topic">>, <<"payload">>))
+        )
+     || PubQoS <- [0, 1, 2],
+        SubQoS <- [0, 1, 2, undefined]
+    ].
+
+enrich_qos_upgrade_test() ->
+    ClientInfo = #{clientid => <<"client">>},
+    Enrich = fun(QoS, MsgIn) ->
+        [#message{qos = Ret}] = enrich_message(ClientInfo, MsgIn, #{qos => QoS}, true),
+        Ret
+    end,
+    [
+        ?assertEqual(
+            SubQoS,
+            Enrich(SubQoS, emqx_message:make(<<"client2">>, PubQoS, <<"topic">>, <<"payload">>))
+        )
+     || PubQoS <- [0, 1, 2],
+        SubQoS <- [0, 1, 2]
+    ].
+
+-endif.

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_scram_mnesia_SUITE).
@@ -105,9 +93,9 @@ t_authenticate(_Config) ->
 
     ok = emqx_config:put([mqtt, idle_timeout], 500),
 
-    {ok, Pid} = emqx_authn_mqtt_test_client:start_link("127.0.0.1", 1883),
+    {ok, Pid} = emqx_mqtt_test_client:start_link("127.0.0.1", 1883),
 
-    ClientFirstMessage = esasl_scram:client_first_message(Username),
+    ClientFirstMessage = sasl_auth_scram:client_first_message(Username),
 
     ConnectPacket = ?CONNECT_PACKET(
         #mqtt_packet_connect{
@@ -119,7 +107,7 @@ t_authenticate(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, ConnectPacket),
+    ok = emqx_mqtt_test_client:send(Pid, ConnectPacket),
 
     %% Intentional sleep to trigger idle timeout for the connection not yet authenticated
     ok = ct:sleep(1000),
@@ -130,7 +118,7 @@ t_authenticate(_Config) ->
     ) = receive_packet(),
 
     {continue, ClientFinalMessage, ClientCache} =
-        esasl_scram:check_server_first_message(
+        sasl_auth_scram:check_server_first_message(
             ServerFirstMessage,
             #{
                 client_first_message => ClientFirstMessage,
@@ -147,7 +135,7 @@ t_authenticate(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, AuthContinuePacket),
+    ok = emqx_mqtt_test_client:send(Pid, AuthContinuePacket),
 
     ?CONNACK_PACKET(
         ?RC_SUCCESS,
@@ -155,7 +143,7 @@ t_authenticate(_Config) ->
         #{'Authentication-Data' := ServerFinalMessage}
     ) = receive_packet(),
 
-    ok = esasl_scram:check_server_final_message(
+    ok = sasl_auth_scram:check_server_final_message(
         ServerFinalMessage, ClientCache#{algorithm => Algorithm}
     ).
 
@@ -166,7 +154,7 @@ t_authenticate_bad_props(_Config) ->
 
     init_auth(Username, Password, Algorithm),
 
-    {ok, Pid} = emqx_authn_mqtt_test_client:start_link("127.0.0.1", 1883),
+    {ok, Pid} = emqx_mqtt_test_client:start_link("127.0.0.1", 1883),
 
     ConnectPacket = ?CONNECT_PACKET(
         #mqtt_packet_connect{
@@ -177,7 +165,7 @@ t_authenticate_bad_props(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, ConnectPacket),
+    ok = emqx_mqtt_test_client:send(Pid, ConnectPacket),
 
     ?CONNACK_PACKET(?RC_NOT_AUTHORIZED) = receive_packet().
 
@@ -188,9 +176,9 @@ t_authenticate_bad_username(_Config) ->
 
     init_auth(Username, Password, Algorithm),
 
-    {ok, Pid} = emqx_authn_mqtt_test_client:start_link("127.0.0.1", 1883),
+    {ok, Pid} = emqx_mqtt_test_client:start_link("127.0.0.1", 1883),
 
-    ClientFirstMessage = esasl_scram:client_first_message(<<"badusername">>),
+    ClientFirstMessage = sasl_auth_scram:client_first_message(<<"badusername">>),
 
     ConnectPacket = ?CONNECT_PACKET(
         #mqtt_packet_connect{
@@ -202,7 +190,7 @@ t_authenticate_bad_username(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, ConnectPacket),
+    ok = emqx_mqtt_test_client:send(Pid, ConnectPacket),
 
     ?CONNACK_PACKET(?RC_NOT_AUTHORIZED) = receive_packet().
 
@@ -213,9 +201,9 @@ t_authenticate_bad_password(_Config) ->
 
     init_auth(Username, Password, Algorithm),
 
-    {ok, Pid} = emqx_authn_mqtt_test_client:start_link("127.0.0.1", 1883),
+    {ok, Pid} = emqx_mqtt_test_client:start_link("127.0.0.1", 1883),
 
-    ClientFirstMessage = esasl_scram:client_first_message(Username),
+    ClientFirstMessage = sasl_auth_scram:client_first_message(Username),
 
     ConnectPacket = ?CONNECT_PACKET(
         #mqtt_packet_connect{
@@ -227,7 +215,7 @@ t_authenticate_bad_password(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, ConnectPacket),
+    ok = emqx_mqtt_test_client:send(Pid, ConnectPacket),
 
     ?AUTH_PACKET(
         ?RC_CONTINUE_AUTHENTICATION,
@@ -235,7 +223,7 @@ t_authenticate_bad_password(_Config) ->
     ) = receive_packet(),
 
     {continue, ClientFinalMessage, _ClientCache} =
-        esasl_scram:check_server_first_message(
+        sasl_auth_scram:check_server_first_message(
             ServerFirstMessage,
             #{
                 client_first_message => ClientFirstMessage,
@@ -252,7 +240,7 @@ t_authenticate_bad_password(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, AuthContinuePacket),
+    ok = emqx_mqtt_test_client:send(Pid, AuthContinuePacket),
 
     ?CONNACK_PACKET(?RC_NOT_AUTHORIZED) = receive_packet().
 
@@ -331,9 +319,9 @@ t_update_user_keys(_Config) ->
 
     ok = emqx_config:put([mqtt, idle_timeout], 500),
 
-    {ok, Pid} = emqx_authn_mqtt_test_client:start_link("127.0.0.1", 1883),
+    {ok, Pid} = emqx_mqtt_test_client:start_link("127.0.0.1", 1883),
 
-    ClientFirstMessage = esasl_scram:client_first_message(Username),
+    ClientFirstMessage = sasl_auth_scram:client_first_message(Username),
 
     ConnectPacket = ?CONNECT_PACKET(
         #mqtt_packet_connect{
@@ -345,7 +333,7 @@ t_update_user_keys(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, ConnectPacket),
+    ok = emqx_mqtt_test_client:send(Pid, ConnectPacket),
 
     ?AUTH_PACKET(
         ?RC_CONTINUE_AUTHENTICATION,
@@ -353,7 +341,7 @@ t_update_user_keys(_Config) ->
     ) = receive_packet(),
 
     {continue, ClientFinalMessage, ClientCache} =
-        esasl_scram:check_server_first_message(
+        sasl_auth_scram:check_server_first_message(
             ServerFirstMessage,
             #{
                 client_first_message => ClientFirstMessage,
@@ -370,7 +358,7 @@ t_update_user_keys(_Config) ->
         }
     ),
 
-    ok = emqx_authn_mqtt_test_client:send(Pid, AuthContinuePacket),
+    ok = emqx_mqtt_test_client:send(Pid, AuthContinuePacket),
 
     ?CONNACK_PACKET(
         ?RC_SUCCESS,
@@ -378,7 +366,7 @@ t_update_user_keys(_Config) ->
         #{'Authentication-Data' := ServerFinalMessage}
     ) = receive_packet(),
 
-    ok = esasl_scram:check_server_final_message(
+    ok = sasl_auth_scram:check_server_final_message(
         ServerFinalMessage, ClientCache#{algorithm => Algorithm}
     ).
 
@@ -447,7 +435,7 @@ test_is_superuser(UserInfo, ExpectedIsSuperuser) ->
 
     {ok, _} = emqx_authn_scram_mnesia:add_user(UserInfo0, State),
 
-    ClientFirstMessage = esasl_scram:client_first_message(Username),
+    ClientFirstMessage = sasl_auth_scram:client_first_message(Username),
 
     {continue, ServerFirstMessage, ServerCache} =
         emqx_authn_scram_mnesia:authenticate(
@@ -460,7 +448,7 @@ test_is_superuser(UserInfo, ExpectedIsSuperuser) ->
         ),
 
     {continue, ClientFinalMessage, ClientCache} =
-        esasl_scram:check_server_first_message(
+        sasl_auth_scram:check_server_first_message(
             ServerFirstMessage,
             #{
                 client_first_message => ClientFirstMessage,
@@ -479,7 +467,7 @@ test_is_superuser(UserInfo, ExpectedIsSuperuser) ->
             State
         ),
 
-    ok = esasl_scram:check_server_final_message(
+    ok = sasl_auth_scram:check_server_final_message(
         ServerFinalMessage, ClientCache#{algorithm => sha512}
     ),
 

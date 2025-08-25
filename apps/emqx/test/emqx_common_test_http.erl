@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_common_test_http).
@@ -57,9 +45,9 @@ request_api(Method, Url, QueryParams, Auth, Body, HttpOpts) ->
     Request =
         case Body of
             [] ->
-                {NewUrl, [Auth]};
+                {NewUrl, [Auth || is_tuple(Auth)]};
             _ ->
-                {NewUrl, [Auth], "application/json", emqx_utils_json:encode(Body)}
+                {NewUrl, [Auth || is_tuple(Auth)], "application/json", emqx_utils_json:encode(Body)}
         end,
     do_request_api(Method, Request, HttpOpts).
 
@@ -75,13 +63,13 @@ do_request_api(Method, Request, HttpOpts) ->
     end.
 
 get_http_data(ResponseBody) ->
-    emqx_utils_json:decode(ResponseBody, [return_maps]).
+    emqx_utils_json:decode(ResponseBody).
 
 auth_header(#{api_key := ApiKey, api_secret := Secret}) ->
     auth_header(binary_to_list(ApiKey), binary_to_list(Secret)).
 
 auth_header(User, Pass) ->
-    Encoded = base64:encode_to_string(lists:append([User, ":", Pass])),
+    Encoded = base64:encode_to_string(iolist_to_binary([User, ":", Pass])),
     {"Authorization", "Basic " ++ Encoded}.
 
 default_auth_header() ->
@@ -106,8 +94,9 @@ create_default_app() ->
     of
         {ok, App} ->
             {ok, App};
-        {error, name_already_existed} ->
-            {ok, _} = emqx_mgmt_auth:read(?DEFAULT_APP_ID)
+        {error, name_already_exists} ->
+            {ok, App} = emqx_mgmt_auth:read(?DEFAULT_APP_ID),
+            {ok, App#{api_secret => ?DEFAULT_APP_SECRET}}
     end.
 
 delete_default_app() ->

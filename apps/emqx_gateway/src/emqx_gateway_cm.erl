@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc The Gateway Channel Manager
@@ -105,7 +93,6 @@
 -type options() :: list(option()).
 
 -define(T_KICK, 5000).
--define(T_GET_INFO, 5000).
 -define(T_TAKEOVER, 15000).
 -define(DEFAULT_BATCH_SIZE, 10000).
 
@@ -462,7 +449,7 @@ takeover_session(GwName, ClientId) ->
             }),
             lists:foreach(
                 fun(StalePid) ->
-                    catch discard_session(GwName, ClientId, StalePid)
+                    discard_session(GwName, ClientId, StalePid)
                 end,
                 StalePids
             ),

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc The behavior abstract for TCP based gateway conn
@@ -57,7 +45,7 @@
 
 -record(state, {
     %% TCP/SSL/UDP/DTLS Wrapped Socket
-    socket :: {esockd_transport, esockd:socket()} | {udp, _, _},
+    socket :: {esockd_transport, esockd:socket()} | {udp, _, _} | {esockd_udp_proxy, _, _},
     %% Peername of the connection
     peername :: emqx_types:peername(),
     %% Sockname of the connection
@@ -67,7 +55,7 @@
     %% The {active, N} option
     active_n :: pos_integer(),
     %% Limiter
-    limiter :: option(emqx_htb_limiter:limiter()),
+    limiter :: option(emqx_limiter_client:t()),
     %% Limit Timer
     limit_timer :: option(reference()),
     %% Parse State
@@ -122,6 +110,9 @@ start_link(Socket = {udp, _SockPid, _Sock}, Peername, Options) ->
 start_link(esockd_transport, Sock, Options) ->
     Socket = {esockd_transport, Sock},
     Args = [self(), Socket, undefined, Options] ++ callback_modules(Options),
+    {ok, proc_lib:spawn_link(?MODULE, init, Args)};
+start_link(Socket = {esockd_udp_proxy, _ProxyId, _Sock}, Peername, Options) ->
+    Args = [self(), Socket, Peername, Options] ++ callback_modules(Options),
     {ok, proc_lib:spawn_link(?MODULE, init, Args)}.
 
 callback_modules(Options) ->
@@ -196,9 +187,13 @@ esockd_peername({udp, _SockPid, _Sock}, Peername) ->
     Peername;
 esockd_peername({esockd_transport, Sock}, _Peername) ->
     {ok, Peername} = esockd_transport:ensure_ok_or_exit(peername, [Sock]),
+    Peername;
+esockd_peername({esockd_udp_proxy, _ProxyId, _Sock}, Peername) ->
     Peername.
 
 esockd_wait(Socket = {udp, _SockPid, _Sock}) ->
+    {ok, Socket};
+esockd_wait(Socket = {esockd_udp_proxy, _ProxyId, _Sock}) ->
     {ok, Socket};
 esockd_wait({esockd_transport, Sock}) ->
     case esockd_transport:wait(Sock) of
@@ -211,29 +206,41 @@ esockd_close({udp, _SockPid, _Sock}) ->
     %%gen_udp:close(Sock);
     ok;
 esockd_close({esockd_transport, Sock}) ->
-    esockd_transport:fast_close(Sock).
+    esockd_transport:fast_close(Sock);
+esockd_close({esockd_udp_proxy, ProxyId, _Sock}) ->
+    esockd_udp_proxy:close(ProxyId).
 
 esockd_ensure_ok_or_exit(peercert, {udp, _SockPid, _Sock}) ->
     nossl;
 esockd_ensure_ok_or_exit(Fun, {udp, _SockPid, Sock}) ->
     esockd_transport:ensure_ok_or_exit(Fun, [Sock]);
 esockd_ensure_ok_or_exit(Fun, {esockd_transport, Socket}) ->
-    esockd_transport:ensure_ok_or_exit(Fun, [Socket]).
+    esockd_transport:ensure_ok_or_exit(Fun, [Socket]);
+esockd_ensure_ok_or_exit(Fun, {esockd_udp_proxy, _ProxyId, Sock}) ->
+    esockd_transport:ensure_ok_or_exit(Fun, [Sock]).
 
 esockd_type({udp, _, _}) ->
     udp;
 esockd_type({esockd_transport, Socket}) ->
-    esockd_transport:type(Socket).
+    esockd_transport:type(Socket);
+esockd_type({esockd_udp_proxy, _ProxyId, Sock}) when is_port(Sock) ->
+    udp;
+esockd_type({esockd_udp_proxy, _ProxyId, _Sock}) ->
+    ssl.
 
 esockd_setopts({udp, _, _}, _) ->
     ok;
 esockd_setopts({esockd_transport, Socket}, Opts) ->
     %% FIXME: DTLS works??
+    esockd_transport:setopts(Socket, Opts);
+esockd_setopts({esockd_udp_proxy, _ProxyId, Socket}, Opts) ->
     esockd_transport:setopts(Socket, Opts).
 
 esockd_getstat({udp, _SockPid, Sock}, Stats) ->
     inet:getstat(Sock, Stats);
 esockd_getstat({esockd_transport, Sock}, Stats) ->
+    esockd_transport:getstat(Sock, Stats);
+esockd_getstat({esockd_udp_proxy, _ProxyId, Sock}, Stats) ->
     esockd_transport:getstat(Sock, Stats).
 
 esockd_send(Data, #state{
@@ -242,7 +249,9 @@ esockd_send(Data, #state{
 }) ->
     gen_udp:send(Sock, Ip, Port, Data);
 esockd_send(Data, #state{socket = {esockd_transport, Sock}}) ->
-    esockd_transport:async_send(Sock, Data).
+    esockd_transport:send(Sock, Data);
+esockd_send(Data, #state{socket = {esockd_udp_proxy, ProxyId, _Sock}}) ->
+    esockd_udp_proxy:send(ProxyId, Data).
 
 keepalive_stats(recv) ->
     emqx_pd:get_counter(recv_pkt);
@@ -250,7 +259,8 @@ keepalive_stats(send) ->
     emqx_pd:get_counter(send_pkt).
 
 is_datadram_socket({esockd_transport, _}) -> false;
-is_datadram_socket({udp, _, _}) -> true.
+is_datadram_socket({udp, _, _}) -> true;
+is_datadram_socket({esockd_udp_proxy, _ProxyId, Sock}) -> erlang:is_port(Sock).
 
 %%--------------------------------------------------------------------
 %% callbacks
@@ -287,7 +297,6 @@ init_state(WrappedSock, Peername, Options, FrameMod, ChannMod) ->
     },
     ActiveN = emqx_gateway_utils:active_n(Options),
     %% FIXME: TODO
-    %%Limiter = emqx_limiter:init(Options),
     Limiter = undefined,
     FrameOpts = emqx_gateway_utils:frame_options(Options),
     ParseState = FrameMod:initial_parse_state(FrameOpts),
@@ -461,6 +470,21 @@ handle_msg({'$gen_cast', Req}, State) ->
     with_channel(handle_cast, [Req], State);
 handle_msg({datagram, _SockPid, Data}, State) ->
     parse_incoming(Data, State);
+handle_msg(
+    {{esockd_udp_proxy, _ProxyId, _Socket} = NSock, Data, Packets},
+    State = #state{
+        chann_mod = ChannMod,
+        channel = Channel
+    }
+) ->
+    ?SLOG(debug, #{msg => "received_udp_proxy_data", data => Data}),
+    Oct = iolist_size(Data),
+    inc_counter(incoming_bytes, Oct),
+    Ctx = ChannMod:info(ctx, Channel),
+    ok = emqx_gateway_ctx:metrics_inc(Ctx, 'bytes.received', Oct),
+
+    NState = State#state{socket = NSock},
+    {ok, next_incoming_msgs(Packets), NState};
 handle_msg({Inet, _Sock, Data}, State) when
     Inet == tcp;
     Inet == ssl
@@ -488,14 +512,12 @@ handle_msg({Closed, _Sock}, State) when
 handle_msg({Passive, _Sock}, State) when
     Passive == tcp_passive; Passive == ssl_passive
 ->
-    %% In Stats
     Bytes = emqx_pd:reset_counter(incoming_bytes),
     Pubs = emqx_pd:reset_counter(incoming_pkt),
-    InStats = #{cnt => Pubs, oct => Bytes},
     %% Ensure Rate Limit
-    NState = ensure_rate_limit(InStats, State),
+    NState = ensure_rate_limit(State),
     %% Run GC and Check OOM
-    NState1 = check_oom(run_gc(InStats, NState)),
+    NState1 = check_oom(run_gc(Pubs, Bytes, NState)),
     handle_info(activate_socket, NState1);
 handle_msg(
     Deliver = {deliver, _Topic, _Msg},
@@ -503,23 +525,14 @@ handle_msg(
 ) ->
     Delivers = [Deliver | emqx_utils:drain_deliver(ActiveN)],
     with_channel(handle_deliver, [Delivers], State);
-%% Something sent
-%% TODO: Who will deliver this message?
-handle_msg({inet_reply, _Sock, ok}, State = #state{active_n = ActiveN}) ->
-    case emqx_pd:get_counter(outgoing_pkt) > ActiveN of
-        true ->
-            Pubs = emqx_pd:reset_counter(outgoing_pkt),
-            Bytes = emqx_pd:reset_counter(outgoing_bytes),
-            OutStats = #{cnt => Pubs, oct => Bytes},
-            {ok, check_oom(run_gc(OutStats, State))};
-        false ->
-            ok
-    end;
 handle_msg({inet_reply, _Sock, {error, Reason}}, State) ->
     handle_info({sock_error, Reason}, State);
 handle_msg({close, Reason}, State) ->
     ?tp(debug, force_socket_close, #{reason => Reason}),
     handle_info({sock_closed, Reason}, close_socket(State));
+handle_msg(udp_proxy_closed, State) ->
+    ?tp(debug, udp_proxy_closed, #{reason => normal}),
+    handle_info({sock_closed, normal}, close_socket(State));
 handle_msg(
     {event, connected},
     State = #state{
@@ -630,8 +643,8 @@ handle_call(
             shutdown(Reason, Reply, State#state{channel = NChannel});
         {shutdown, Reason, Reply, Packet, NChannel} ->
             NState = State#state{channel = NChannel},
-            ok = handle_outgoing(Packet, NState),
-            shutdown(Reason, Reply, NState)
+            {ok, NState1} = handle_outgoing(Packet, NState),
+            shutdown(Reason, Reply, NState1)
     end.
 
 %%--------------------------------------------------------------------
@@ -690,7 +703,7 @@ parse_incoming(
         channel = Channel
     }
 ) ->
-    ?SLOG(debug, #{msg => "RECV_data", data => Data}),
+    ?SLOG(debug, #{msg => "received_data", data => Data}),
     Oct = iolist_size(Data),
     inc_counter(incoming_bytes, Oct),
     Ctx = ChannMod:info(ctx, Channel),
@@ -700,14 +713,8 @@ parse_incoming(
 
 parse_incoming(<<>>, Packets, State) ->
     {Packets, State};
-parse_incoming(
-    Data,
-    Packets,
-    State = #state{
-        frame_mod = FrameMod,
-        parse_state = ParseState
-    }
-) ->
+parse_incoming(Data, Packets, State) ->
+    #state{frame_mod = FrameMod, parse_state = ParseState} = State,
     try FrameMod:parse(Data, ParseState) of
         {more, NParseState} ->
             {Packets, State#state{parse_state = NParseState}};
@@ -734,33 +741,22 @@ next_incoming_msgs(Packets) ->
 %%--------------------------------------------------------------------
 %% Handle incoming packet
 
-handle_incoming(
-    Packet,
-    State = #state{
-        channel = Channel,
-        frame_mod = FrameMod,
-        chann_mod = ChannMod
-    }
-) ->
+handle_incoming({frame_error, Reason}, State) ->
+    with_channel(handle_frame_error, [Reason], State);
+handle_incoming(Packet, State) ->
+    #state{channel = Channel, frame_mod = FrameMod, chann_mod = ChannMod} = State,
     Ctx = ChannMod:info(ctx, Channel),
     ok = inc_incoming_stats(Ctx, FrameMod, Packet),
-    ?SLOG(debug, #{
-        msg => "RECV_packet",
-        packet => FrameMod:format(Packet)
-    }),
+    do_handle_incoming(Packet, FrameMod, State).
+
+do_handle_incoming(Packet, FrameMod, State) ->
+    ?SLOG(debug, #{msg => "packet_received", packet => FrameMod:format(Packet)}),
     with_channel(handle_in, [Packet], State).
 
 %%--------------------------------------------------------------------
 %% With Channel
 
-with_channel(
-    Fun,
-    Args,
-    State = #state{
-        chann_mod = ChannMod,
-        channel = Channel
-    }
-) ->
+with_channel(Fun, Args, State = #state{chann_mod = ChannMod, channel = Channel}) ->
     case erlang:apply(ChannMod, Fun, Args ++ [Channel]) of
         ok ->
             {ok, State};
@@ -772,15 +768,15 @@ with_channel(
             shutdown(Reason, State#state{channel = NChannel});
         {shutdown, Reason, Packet, NChannel} ->
             NState = State#state{channel = NChannel},
-            ok = handle_outgoing(Packet, NState),
-            shutdown(Reason, NState)
+            {ok, NState1} = handle_outgoing(Packet, NState),
+            shutdown(Reason, NState1)
     end.
 
 %%--------------------------------------------------------------------
 %% Handle outgoing packets
 
-handle_outgoing(_Packets = [], _State) ->
-    ok;
+handle_outgoing(_Packets = [], State) ->
+    {ok, State};
 handle_outgoing(
     Packets,
     State = #state{socket = Socket}
@@ -792,12 +788,15 @@ handle_outgoing(
                 State
             );
         _ ->
-            lists:foreach(
-                fun(Packet) ->
-                    handle_outgoing(Packet, State)
+            NState = lists:foldl(
+                fun(Packet, State0) ->
+                    {ok, State1} = handle_outgoing(Packet, State0),
+                    State1
                 end,
+                State,
                 Packets
-            )
+            ),
+            {ok, NState}
     end;
 handle_outgoing(Packet, State) ->
     send((serialize_and_inc_stats_fun(State))(Packet), State).
@@ -813,7 +812,7 @@ serialize_and_inc_stats_fun(#state{
         try
             Data = FrameMod:serialize_pkt(Packet, Serialize),
             ?SLOG(debug, #{
-                msg => "SEND_packet",
+                msg => "send_packet",
                 %% XXX: optimize it, less cpu comsuption?
                 packet => FrameMod:format(Packet)
             }),
@@ -842,7 +841,7 @@ serialize_and_inc_stats_fun(#state{
 %%--------------------------------------------------------------------
 %% Send data
 
--spec send(iodata(), state()) -> ok.
+-spec send(iodata(), state()) -> {ok, state()}.
 send(
     IoData,
     State = #state{
@@ -851,18 +850,28 @@ send(
         channel = Channel
     }
 ) ->
-    ?SLOG(debug, #{msg => "SEND_data", data => IoData}),
+    ?SLOG(debug, #{msg => "send_data", data => IoData}),
     Ctx = ChannMod:info(ctx, Channel),
     Oct = iolist_size(IoData),
     ok = emqx_gateway_ctx:metrics_inc(Ctx, 'bytes.sent', Oct),
     inc_counter(outgoing_bytes, Oct),
     case esockd_send(IoData, State) of
         ok ->
-            ok;
+            sent(State);
         Error = {error, _Reason} ->
-            %% Send an inet_reply to postpone handling the error
+            %% Send an inet_reply to defer handling the error
             self() ! {inet_reply, Socket, Error},
-            ok
+            {ok, State}
+    end.
+
+sent(#state{active_n = ActiveN} = State) ->
+    case emqx_pd:get_counter(outgoing_pkt) > ActiveN of
+        true ->
+            Pubs = emqx_pd:reset_counter(outgoing_pkt),
+            Bytes = emqx_pd:reset_counter(outgoing_bytes),
+            {ok, check_oom(run_gc(Pubs, Bytes, State))};
+        false ->
+            {ok, State}
     end.
 
 %%--------------------------------------------------------------------
@@ -882,7 +891,7 @@ handle_info(activate_socket, State = #state{sockstate = OldSst}) ->
     end;
 handle_info({sock_error, Reason}, State) ->
     ?SLOG(debug, #{
-        msg => "sock_error",
+        msg => "gateway_sock_error",
         reason => Reason
     }),
     handle_info({sock_closed, Reason}, close_socket(State));
@@ -892,37 +901,16 @@ handle_info(Info, State) ->
 %%--------------------------------------------------------------------
 %% Ensure rate limit
 
-%% ensure_rate_limit(Stats, State = #state{limiter = Limiter}) ->
-%%     case ?ENABLED(Limiter) andalso emqx_limiter:check(Stats, Limiter) of
-%%         false ->
-%%             State;
-%%         {ok, Limiter1} ->
-%%             State#state{limiter = Limiter1};
-%%         {pause, Time, Limiter1} ->
-%%             %% XXX: which limiter reached?
-%%             ?SLOG(warning, #{
-%%                 msg => "reach_rate_limit",
-%%                 pause => Time
-%%             }),
-%%             TRef = emqx_utils:start_timer(Time, limit_timeout),
-%%             State#state{
-%%                 sockstate = blocked,
-%%                 limiter = Limiter1,
-%%                 limit_timer = TRef
-%%             }
-%%     end.
-
 %% TODO
-%% Why do we need this?
-%% Why not use the esockd connection limiter (based on emqx_htb_limiter) directly?
-ensure_rate_limit(_Stats, State) ->
+%% Implement limiter for gateway
+ensure_rate_limit(State) ->
     State.
 
 %%--------------------------------------------------------------------
 %% Run GC and Check OOM
 
-run_gc(Stats, State = #state{gc_state = GcSt}) ->
-    case ?ENABLED(GcSt) andalso emqx_gc:run(Stats, GcSt) of
+run_gc(Pubs, Bytes, State = #state{gc_state = GcSt}) ->
+    case ?ENABLED(GcSt) andalso emqx_gc:run(Pubs, Bytes, GcSt) of
         false -> State;
         {_IsGC, GcSt1} -> State#state{gc_state = GcSt1}
     end.

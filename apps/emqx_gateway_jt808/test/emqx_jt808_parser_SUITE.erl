@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_jt808_parser_SUITE).
@@ -11,15 +11,12 @@
 
 -define(LOGT(Format, Args), ct:print("TEST_SUITE: " ++ Format, Args)).
 
--define(FRM_FLAG, 16#7e:8).
 -define(RESERVE, 0).
 -define(NO_FRAGMENT, 0).
--define(WITH_FRAGMENT, 1).
 -define(NO_ENCRYPT, 0).
 -define(MSG_SIZE(X), X:10 / big - integer).
 
 -define(word, 16 / big - integer).
--define(dword, 32 / big - integer).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -688,6 +685,23 @@ t_case15_custome_client_query_ack(_) ->
     ?assertEqual(<<>>, Rest),
     ?assertEqual(#{data => <<>>, phase => searching_head_hex7e}, State),
     _ = emqx_utils_json:encode(Packet).
+
+t_throw_error_if_parse_failed(_) ->
+    Bin =
+        <<126, 2, 5, 0, 128, 1, 137, 96, 146, 0, 51, 3, 64, 72, 66, 77, 54, 48, 49, 67, 86, 77, 48,
+            53, 54, 51, 52, 50, 48, 50, 52, 45, 48, 56, 45, 49, 54, 253, 255, 2, 0, 255, 127, 0,
+            128, 80, 17, 1, 54, 69, 67, 56, 48, 48, 77, 58, 32, 49, 44, 34, 51, 50, 51, 65, 56, 54,
+            56, 48, 49, 57, 48, 55, 51, 55, 48, 51, 50, 50, 54, 52, 54, 48, 48, 56, 56, 53, 53, 52,
+            49, 48, 48, 52, 57, 56, 56, 57, 56, 54, 48, 56, 49, 53, 50, 54, 50, 51, 56, 48, 49, 49,
+            48, 52, 57, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0,
+            0, 0, 0, 207, 126>>,
+    Parser = emqx_jt808_frame:initial_parse_state(#{}),
+    try emqx_jt808_frame:parse(Bin, Parser) of
+        _ -> ?assert(false)
+    catch
+        error:invalid_message ->
+            ok
+    end.
 
 encode(Header, Body) ->
     S1 = <<Header/binary, Body/binary>>,

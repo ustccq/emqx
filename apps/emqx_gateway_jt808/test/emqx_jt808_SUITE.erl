@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_jt808_SUITE).
@@ -12,10 +12,10 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(FRM_FLAG, 16#7e:8).
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
 -define(RESERVE, 0).
 -define(NO_FRAGMENT, 0).
--define(WITH_FRAGMENT, 1).
 -define(NO_ENCRYPT, 0).
 -define(MSG_SIZE(X), X:10 / big - integer).
 
@@ -106,6 +106,7 @@ init_per_testcase(Case, Config) when
     Apps = boot_apps(Case, <<>>, Config),
     [{suite_apps, Apps} | Config];
 init_per_testcase(Case, Config) ->
+    snabbkaffe:start_trace(),
     Apps = boot_apps(Case, ?CONF_DEFAULT, Config),
     [{suite_apps, Apps} | Config].
 
@@ -116,6 +117,7 @@ end_per_testcase(_Case, Config) ->
         exit:noproc ->
             ok
     end,
+    snabbkaffe:stop(),
     ok = emqx_cth_suite:stop(?config(suite_apps, Config)),
     ok.
 
@@ -131,6 +133,13 @@ boot_apps(Case, JT808Conf, Config) ->
     {ok, _Pid} = emqx_jt808_auth_http_test_server:start_link(),
     timer:sleep(1000),
     Apps.
+
+update_jt808_with_idle_timeout(IdleTimeout) ->
+    Conf = emqx:get_raw_config([gateway, jt808]),
+    emqx_gateway_conf:update_gateway(
+        jt808,
+        Conf#{<<"idle_timeout">> => IdleTimeout}
+    ).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% helper functions %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -170,8 +179,8 @@ client_regi_procedure(Socket, ExpectedAuthCode) ->
     % send REGISTER
     %
     Manuf = <<"examp">>,
-    Model = <<"33333333333333333333">>,
-    DevId = <<"1234567">>,
+    Model = <<"33333333333333333", 0, 0, 0>>,
+    DevId = <<"123456", 0>>,
 
     Color = 3,
     Plate = <<"ujvl239">>,
@@ -359,17 +368,49 @@ t_case00_register(_) ->
     ok = gen_tcp:close(Socket).
 
 t_case01_auth(_) ->
+    emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
     {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, ?PORT, [binary, {active, false}, {nodelay, true}]),
     {ok, AuthCode} = client_regi_procedure(Socket),
+
     ok = client_auth_procedure(Socket, AuthCode),
+
+    ?assertMatch(
+        ['client.connect' | _],
+        emqx_gateway_test_utils:collect_emqx_hooks_calls()
+    ),
+
+    ok = gen_tcp:close(Socket).
+
+t_case01_update_not_restart_listener(_) ->
+    {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, ?PORT, [binary, {active, false}]),
+    {ok, AuthCode} = client_regi_procedure(Socket),
+    ok = client_auth_procedure(Socket, AuthCode),
+
+    update_jt808_with_idle_timeout(<<"20s">>),
+
+    % send heartbeat
+    PhoneBCD = <<16#00, 16#01, 16#23, 16#45, 16#67, 16#89>>,
+    MsgId = ?MC_HEARTBEAT,
+    MsgSn = 78,
+    Size = 0,
+    Header =
+        <<MsgId:?WORD, ?RESERVE:2, ?NO_FRAGMENT:1, ?NO_ENCRYPT:3, ?MSG_SIZE(Size), PhoneBCD/binary,
+            MsgSn:?WORD>>,
+    S1 = gen_packet(Header, <<>>),
+
+    ok = gen_tcp:send(Socket, S1),
+    %% assert: heartbeat can be received after gateway update
+    {ok, _} = gen_tcp:recv(Socket, 0, 500),
 
     ok = gen_tcp:close(Socket).
 
 t_case02_anonymous_register_and_auth(_) ->
     {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, ?PORT, [binary, {active, false}]),
 
-    {ok, AuthCode} = client_regi_procedure(Socket, <<>>),
-    ?assertEqual(AuthCode, <<>>),
+    DefaultAuthCode = <<"anonymous">>,
+    {ok, AuthCode} = client_regi_procedure(Socket, DefaultAuthCode),
+    ?assertEqual(AuthCode, DefaultAuthCode),
 
     ok = client_auth_procedure(Socket, AuthCode),
 
@@ -454,7 +495,7 @@ t_case04(_) ->
             },
             <<"body">> => #{<<"id">> => EventReportId}
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -627,7 +668,7 @@ t_case07_dl_0x8302_send_question(_) ->
             },
             <<"body">> => #{<<"seq">> => MsgSn3, <<"id">> => 2}
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -698,7 +739,7 @@ t_case08_dl_0x8500_vehicle_ctrl(_Config) ->
                     }
                 }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -870,7 +911,7 @@ t_case11_dl_0x8106_query_client_param(_Config) ->
                 ]
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     %% timer:sleep(200),
@@ -913,8 +954,8 @@ t_case11_dl_0x8107_query_client_attrib(_Config) ->
     ?LOGT("client receive command from server ~p", [S3]),
 
     UlPacket4 =
-        <<12:?WORD, <<"manu3">>/binary, <<"A1B2C3D4E5F6G7H8I9J0">>:20/binary,
-            <<"dev1234">>:7/binary,
+        <<12:?WORD, <<"manu3">>/binary, <<"A1B2C3D4E5F6G7H8I", 0, 0, 0>>:20/binary,
+            <<"dev123", 0>>:7/binary,
             <<16#33, 16#33, 16#33, 16#33, 16#33, 16#44, 16#44, 16#44, 16#44, 16#44>>:10/binary, 6:8,
             <<"v2.3.7">>:6/binary, 5:8, <<"v1.26">>:5/binary, 101:8, 102:8>>,
     Size4 = size(UlPacket4),
@@ -942,8 +983,8 @@ t_case11_dl_0x8107_query_client_attrib(_Config) ->
             <<"body">> => #{
                 <<"type">> => 12,
                 <<"manufacturer">> => <<"manu3">>,
-                <<"model">> => <<"A1B2C3D4E5F6G7H8I9J0">>,
-                <<"id">> => <<"dev1234">>,
+                <<"model">> => <<"A1B2C3D4E5F6G7H8I">>,
+                <<"id">> => <<"dev123">>,
                 <<"iccid">> => <<"33333333334444444444">>,
                 <<"hardware_version">> => <<"v2.3.7">>,
                 <<"firmware_version">> => <<"v1.26">>,
@@ -951,7 +992,7 @@ t_case11_dl_0x8107_query_client_attrib(_Config) ->
                 <<"comm_prop">> => 102
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     % no retrasmition of downlink message
@@ -1019,7 +1060,7 @@ t_case15_dl_0x8201_query_location(_Config) ->
                 <<"params">> => LocationReportJson
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     %% timer:sleep(200),
@@ -1064,7 +1105,7 @@ t_location_report(_) ->
             },
             <<"body">> => LocationReportJson
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     % receive general response
@@ -1171,7 +1212,7 @@ t_case50_ul_0x0303_info_request_cancel(_Config) ->
             },
             <<"body">> => #{<<"id">> => 1, <<"flag">> => 6}
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -1223,7 +1264,7 @@ t_case51_ul_0x0701_waybill_report(_Config) ->
             },
             <<"body">> => #{<<"length">> => 7, <<"data">> => base64:encode(<<"ABCDEFG">>)}
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -1296,7 +1337,7 @@ t_case52_ul_0x0705_can_bus_report(_Config) ->
                 ]
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -1354,7 +1395,7 @@ t_case53_ul_0x0800_multimedia_event_report(_Config) ->
                 <<"channel">> => 103
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -1406,7 +1447,7 @@ t_case54_ul_0x0900_send_transparent_data(_Config) ->
             },
             <<"body">> => #{<<"type">> => 39, <<"data">> => base64:encode(<<"oufwei">>)}
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
     ok = gen_tcp:close(Socket).
 
@@ -1460,7 +1501,7 @@ t_case55_ul_0x0901_send_zip_data(_Config) ->
                 <<"data">> => base64:encode(<<"1234">>)
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     ok = gen_tcp:close(Socket).
@@ -2206,7 +2247,7 @@ t_case27_dl_0x8700_drive_record_capture(_Config) ->
                 <<"data">> => base64:encode(<<"77777">>)
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     % no retrasmition of downlink message
@@ -2325,7 +2366,7 @@ t_case29_dl_0x8702_request_driver_id(_Config) ->
                 <<"cert_expiry">> => <<"20301231">>
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     % no retrasmition of downlink message
@@ -2410,7 +2451,7 @@ t_case30_dl_0x8801_camera_shot(_Config) ->
                 <<"ids">> => [220, 221]
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     % No retrasmition of downlink message
@@ -2509,7 +2550,7 @@ t_case31_dl_0x8802_mm_data_search(_Config) ->
                 ]
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     %% No retrasmition of downlink message
@@ -2693,12 +2734,33 @@ t_case34_dl_0x8805_single_mm_data_ctrl(_Config) ->
                 ]
             }
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
 
     % no retrasmition of downlink message
     %%timer:sleep(10000),
     {error, timeout} = gen_tcp:recv(Socket, 0, 500),
+
+    ok = gen_tcp:close(Socket).
+
+t_case_dl_invalid_msg(_Config) ->
+    {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, ?PORT, [binary, {active, false}]),
+    {ok, AuthCode} = client_regi_procedure(Socket),
+    ok = client_auth_procedure(Socket, AuthCode),
+    DlCommand = #{
+        %% missing msg_id
+        <<"header">> => #{},
+        <<"body">> => #{
+            <<"id">> => 30,
+            <<"flag">> => 40
+        }
+    },
+
+    emqx:publish(emqx_message:make(?JT808_DN_TOPIC, emqx_utils_json:encode(DlCommand))),
+    ?block_until(#{?snk_kind := invalid_dl_message}),
+
+    emqx:publish(emqx_message:make(?JT808_DN_TOPIC, <<"invliad_json_str">>)),
+    ?block_until(#{?snk_kind := invalid_dl_message}),
 
     ok = gen_tcp:close(Socket).
 
@@ -2772,6 +2834,67 @@ test_invalid_config(CreateOrUpdate, AnonymousAllowed) ->
         UpdateResult
     ).
 
+t_ignore_unsupported_frames_default(_Config) ->
+    %% default value is true
+    ?assertEqual(true, emqx_config:get([gateway, jt808, proto, ignore_unsupported_frames])),
+
+    {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, ?PORT, [binary, {active, false}]),
+    {ok, AuthCode} = client_regi_procedure(Socket),
+    ok = client_auth_procedure(Socket, AuthCode),
+
+    %% send unsupported frame
+    ok = gen_tcp:send(Socket, unsupported_frame_packet()),
+    %% nothing to happen
+
+    %% send heartbeat
+    PhoneBCD = <<16#00, 16#01, 16#23, 16#45, 16#67, 16#89>>,
+    MsgId = ?MC_HEARTBEAT,
+    MsgSn = 78,
+    Size = 0,
+    Header =
+        <<MsgId:?WORD, ?RESERVE:2, ?NO_FRAGMENT:1, ?NO_ENCRYPT:3, ?MSG_SIZE(Size), PhoneBCD/binary,
+            MsgSn:?WORD>>,
+    S1 = gen_packet(Header, <<>>),
+
+    ok = gen_tcp:send(Socket, S1),
+    %% timer:sleep(200),
+    {ok, Packet} = gen_tcp:recv(Socket, 0, 500),
+
+    GenAckPacket = <<MsgSn:?WORD, MsgId:?WORD, 0>>,
+    Size2 = size(GenAckPacket),
+    MsgId2 = ?MS_GENERAL_RESPONSE,
+    MsgSn2 = 2,
+    Header2 =
+        <<MsgId2:?WORD, ?RESERVE:2, ?NO_FRAGMENT:1, ?NO_ENCRYPT:3, ?MSG_SIZE(Size2),
+            PhoneBCD/binary, MsgSn2:?WORD>>,
+    S2 = gen_packet(Header2, GenAckPacket),
+    ?assertEqual(S2, Packet),
+
+    ok = gen_tcp:close(Socket).
+
+t_ignore_unsupported_frames_set_to_false(_Config) ->
+    RawConfig = emqx_config:get_raw([gateway, jt808]),
+    RawConfig1 = emqx_utils_maps:deep_put(
+        [<<"proto">>, <<"ignore_unsupported_frames">>], RawConfig, false
+    ),
+    {ok, _} = emqx_gateway_conf:update_gateway(jt808, RawConfig1),
+
+    {ok, Socket} = gen_tcp:connect({127, 0, 0, 1}, ?PORT, [binary, {active, false}]),
+    {ok, AuthCode} = client_regi_procedure(Socket),
+    ok = client_auth_procedure(Socket, AuthCode),
+
+    %% send unsupported frame
+    ok = gen_tcp:send(Socket, unsupported_frame_packet()),
+    %% socket should be closed
+    {error, closed} = gen_tcp:recv(Socket, 0, 1000),
+
+    ok = gen_tcp:close(Socket),
+
+    %% restore config
+    {ok, _} = emqx_gateway_conf:update_gateway(jt808, RawConfig),
+
+    ok.
+
 create_or_update(create, InvalidConfig) ->
     emqx_gateway_conf:load_gateway(jt808, InvalidConfig);
 create_or_update(update, InvalidConfig) ->
@@ -2818,3 +2941,12 @@ raw_jt808_config() ->
             },
         <<"retry_interval">> => <<"8s">>
     }.
+
+unsupported_frame_packet() ->
+    <<126, 2, 5, 0, 128, 1, 137, 112, 19, 0, 64, 1, 98, 72, 66, 77, 54, 48, 49, 67, 86, 77, 48, 49,
+        49, 77, 50, 50, 48, 50, 53, 45, 48, 49, 45, 49, 55, 253, 255, 2, 0, 255, 127, 0, 128, 80,
+        17, 1, 54, 69, 67, 56, 48, 48, 77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56, 54, 56, 48, 49, 57, 48,
+        55, 51, 55, 48, 52, 51, 56, 48, 52, 54, 48, 49, 49, 51, 56, 55, 49, 49, 48, 49, 53, 55, 52,
+        56, 57, 56, 54, 49, 49, 50, 52, 50, 51, 51, 48, 56, 49, 51, 49, 53, 55, 57, 53, 0, 0, 76,
+        67, 48, 68, 55, 52, 67, 52, 49, 80, 48, 50, 49, 49, 50, 54, 48, 4, 20, 164, 132, 0, 0, 0, 0,
+        66, 126>>.

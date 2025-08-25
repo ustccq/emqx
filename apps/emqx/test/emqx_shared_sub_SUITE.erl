@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_shared_sub_SUITE).
@@ -346,6 +334,14 @@ t_sticky(Config) when is_list(Config) ->
     ok = ensure_config(sticky, true),
     test_two_messages(sticky).
 
+t_sticky_initial_pick_hash_clientid(Config) when is_list(Config) ->
+    ok = ensure_config(sticky, hash_clientid, false),
+    test_two_messages(sticky).
+
+t_sticky_initial_pick_hash_topic(Config) when is_list(Config) ->
+    ok = ensure_config(sticky, hash_topic, false),
+    test_two_messages(sticky).
+
 %% two subscribers in one shared group
 %% one unsubscribe after receiving a message
 %% the other one in the group should receive the next message
@@ -531,6 +527,8 @@ t_per_group_config(Config) when is_list(Config) ->
         <<"local_group">> => local,
         <<"round_robin_group">> => round_robin,
         <<"sticky_group">> => sticky,
+        <<"sticky_group_initial_pick_hash_clientid">> => {sticky, hash_clientid},
+        <<"sticky_group_initial_pick_hash_topic">> => {sticky, hash_topic},
         <<"round_robin_per_group_group">> => round_robin_per_group
     }),
     %% Each test is repeated 4 times because random strategy may technically pass the test
@@ -538,10 +536,18 @@ t_per_group_config(Config) when is_list(Config) ->
 
     test_two_messages(sticky, <<"sticky_group">>),
     test_two_messages(sticky, <<"sticky_group">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(sticky, <<"sticky_group">>),
     test_two_messages(sticky, <<"sticky_group">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_clientid">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
+    test_two_messages(sticky, <<"sticky_group_initial_pick_hash_topic">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(round_robin, <<"round_robin_group">>),
     test_two_messages(round_robin_per_group, <<"round_robin_per_group_group">>),
@@ -554,7 +560,9 @@ t_local(Config) when is_list(Config) ->
         <<"sticky_group">> => sticky
     },
 
-    Node = start_peer('local_shared_sub_local_1', 21999),
+    %% Use a different base port for each test case to avoid flakiness
+    BasePort = 21999,
+    Node = start_peer('local_shared_sub_local_1', BasePort),
     ok = ensure_group_config(GroupConfig),
     ok = ensure_group_config(Node, GroupConfig),
 
@@ -563,7 +571,7 @@ t_local(Config) when is_list(Config) ->
     ClientId2 = <<"ClientId2">>,
 
     {ok, ConnPid1} = emqtt:start_link([{clientid, ClientId1}]),
-    {ok, ConnPid2} = emqtt:start_link([{clientid, ClientId2}, {port, 21999}]),
+    {ok, ConnPid2} = emqtt:start_link([{clientid, ClientId2}, {port, get_tcp_mqtt_port(Node)}]),
 
     {ok, _} = emqtt:connect(ConnPid1),
     {ok, _} = emqtt:connect(ConnPid2),
@@ -607,7 +615,9 @@ t_remote(Config) when is_list(Config) ->
         <<"sticky_group">> => sticky
     },
 
-    Node = start_peer('remote_shared_sub_remote_1', 21999),
+    %% Use a different base port for each test case to avoid flakiness
+    BasePort = 22999,
+    Node = start_peer('remote_shared_sub_remote_1', BasePort),
     ok = ensure_group_config(GroupConfig),
     ok = ensure_group_config(Node, GroupConfig),
 
@@ -616,7 +626,9 @@ t_remote(Config) when is_list(Config) ->
     ClientIdRemote = <<"ClientId2">>,
 
     {ok, ConnPidLocal} = emqtt:start_link([{clientid, ClientIdLocal}]),
-    {ok, ConnPidRemote} = emqtt:start_link([{clientid, ClientIdRemote}, {port, 21999}]),
+    {ok, ConnPidRemote} = emqtt:start_link([
+        {clientid, ClientIdRemote}, {port, get_tcp_mqtt_port(Node)}
+    ]),
 
     try
         {ok, ClientPidLocal} = emqtt:connect(ConnPidLocal),
@@ -656,7 +668,9 @@ t_local_fallback(Config) when is_list(Config) ->
     Topic = <<"local_foo/bar">>,
     ClientId1 = <<"ClientId1">>,
     ClientId2 = <<"ClientId2">>,
-    Node = start_peer('local_fallback_shared_sub_1', 11888),
+    %% Use a different base port for each test case to avoid flakiness
+    BasePort = 11888,
+    Node = start_peer('local_fallback_shared_sub_1', BasePort),
 
     {ok, ConnPid1} = emqtt:start_link([{clientid, ClientId1}]),
     {ok, _} = emqtt:connect(ConnPid1),
@@ -675,6 +689,47 @@ t_local_fallback(Config) when is_list(Config) ->
     stop_peer(Node),
 
     ?assertEqual(UsedSubPid1, UsedSubPid2),
+    ok.
+
+t_stats(Config) when is_list(Config) ->
+    %% Create a shared subscriber on a REMOTE node
+    GroupConfig = #{
+        <<"local_group">> => local,
+        <<"round_robin_group">> => round_robin,
+        <<"sticky_group">> => sticky
+    },
+    %% Use a different base port for each test case to avoid flakiness
+    BasePort = 23999,
+    Node = start_peer('local_shared_sub_stats_1', BasePort),
+    ok = ensure_group_config(GroupConfig),
+    ok = ensure_group_config(Node, GroupConfig),
+    SharedTopic = format_share(<<"local_group">>, <<"local_foo/bar">>),
+    ClientId1 = <<"ClientId1">>,
+    {ok, ConnPid1} = emqtt:start_link([{clientid, ClientId1}, {port, get_tcp_mqtt_port(Node)}]),
+    {ok, _} = emqtt:connect(ConnPid1),
+    emqtt:subscribe(ConnPid1, {SharedTopic, 0}),
+    %% Verify LOCAL stats update
+    ?retry(
+        200,
+        10,
+        ?assertMatch(
+            #{'subscriptions.shared.count' := 1},
+            maps:from_list(emqx_stats:getstats())
+        )
+    ),
+    emqtt:unsubscribe(ConnPid1, SharedTopic),
+    %% Verify LOCAL stats update again
+    ?retry(
+        200,
+        10,
+        ?assertMatch(
+            #{'subscriptions.shared.count' := 0},
+            maps:from_list(emqx_stats:getstats())
+        )
+    ),
+    %% Shutdown
+    emqtt:stop(ConnPid1),
+    stop_peer(Node),
     ok.
 
 %% This one tests that broker tries to select another shared subscriber
@@ -737,14 +792,16 @@ t_qos1_random_dispatch_if_all_members_are_down(Config) when is_list(Config) ->
     [Pid1, Pid2] = emqx_shared_sub:subscribers(Group, Topic),
     ?assert(is_process_alive(Pid1)),
     ?assert(is_process_alive(Pid2)),
+    ?retry(100, 10, ?assertEqual(disconnected, get_channel_info(conn_state, ClientId1))),
+    ?retry(100, 10, ?assertEqual(disconnected, get_channel_info(conn_state, ClientId2))),
 
     {ok, _} = emqtt:publish(ConnPub, Topic, <<"hello11">>, 1),
     ?retry(
         100,
         10,
         begin
-            Msgs1 = emqx_mqueue:to_list(get_mqueue(Pid1)),
-            Msgs2 = emqx_mqueue:to_list(get_mqueue(Pid2)),
+            Msgs1 = emqx_mqueue:to_list(get_mqueue(ClientId1)),
+            Msgs2 = emqx_mqueue:to_list(get_mqueue(ClientId2)),
             %% assert the message is in mqueue (because socket is closed)
             ?assertMatch([#message{payload = <<"hello11">>}], Msgs1 ++ Msgs2)
         end
@@ -752,8 +809,11 @@ t_qos1_random_dispatch_if_all_members_are_down(Config) when is_list(Config) ->
     emqtt:stop(ConnPub),
     ok.
 
-get_mqueue(ConnPid) ->
-    emqx_connection:info({channel, {session, mqueue}}, sys:get_state(ConnPid)).
+get_mqueue(Client) ->
+    get_channel_info({session, mqueue}, Client).
+
+get_channel_info(Info, Client) ->
+    emqx_cth_broker:connection_info({channel, Info}, Client).
 
 %% No ack, QoS 2 subscriptions,
 %% client1 receives one message, send pubrec, then suspend
@@ -889,7 +949,8 @@ t_session_takeover(Config) when is_list(Config) ->
     %% with the same client ID, start another client
     {ok, ConnPid2} = emqtt:start_link(Opts),
     {ok, _} = emqtt:connect(ConnPid1),
-    emqtt:subscribe(ConnPid1, {<<"$share/t1/", Topic/binary>>, _QoS = 1}),
+    SharedTopic = format_share(<<"t1">>, Topic),
+    emqtt:subscribe(ConnPid1, {SharedTopic, _QoS = 1}),
     Message1 = emqx_message:make(<<"dummypub">>, 2, Topic, <<"hello1">>),
     Message2 = emqx_message:make(<<"dummypub">>, 2, Topic, <<"hello2">>),
     Message3 = emqx_message:make(<<"dummypub">>, 2, Topic, <<"hello3">>),
@@ -910,9 +971,10 @@ t_session_takeover(Config) when is_list(Config) ->
     {true, _} = last_message(<<"hello2">>, [ConnPid2]),
     %% We may or may not recv dup hello2 due to QoS1 redelivery
     _ = last_message(<<"hello2">>, [ConnPid2]),
-    {true, _} = last_message(<<"hello3">>, [ConnPid2]),
-    {true, _} = last_message(<<"hello4">>, [ConnPid2]),
+    {true, _} = last_message(<<"hello3">>, [ConnPid2], 5_000),
+    {true, _} = last_message(<<"hello4">>, [ConnPid2], 5_000),
     ?assertEqual([], collect_msgs(timer:seconds(2))),
+    emqtt:unsubscribe(ConnPid2, SharedTopic),
     emqtt:stop(ConnPid2),
     ok.
 
@@ -1182,10 +1244,14 @@ collect_msgs(Acc, Timeout) ->
     end.
 
 ensure_config(Strategy) ->
-    ensure_config(Strategy, _AckEnabled = true).
+    ensure_config(Strategy, _InitialStickyPick = random, _AckEnabled = true).
 
-ensure_config(Strategy, AckEnabled) ->
+ensure_config(Strategy, AckEnabled) when is_boolean(AckEnabled) ->
+    ensure_config(Strategy, _InitialStickyPick = random, AckEnabled).
+
+ensure_config(Strategy, InitialStickyPick, AckEnabled) ->
     emqx_config:put([mqtt, shared_subscription_strategy], Strategy),
+    emqx_config:put([mqtt, shared_subscription_initial_sticky_pick], InitialStickyPick),
     emqx_config:put([broker, shared_dispatch_ack_enabled], AckEnabled),
     ok.
 
@@ -1195,9 +1261,24 @@ ensure_node_config(Node, Strategy) ->
 ensure_group_config(Group2Strategy) ->
     lists:foreach(
         fun({Group, Strategy}) ->
-            emqx_config:force_put(
-                [broker, shared_subscription_group, Group, strategy], Strategy, unsafe
-            )
+            if
+                is_tuple(Strategy) ->
+                    {PrimaryStrategy, InitialStickyPick} = Strategy,
+                    emqx_config:force_put(
+                        [broker, shared_subscription_group, Group, strategy],
+                        PrimaryStrategy,
+                        unsafe
+                    ),
+                    emqx_config:force_put(
+                        [broker, shared_subscription_group, Group, initial_sticky_pick],
+                        InitialStickyPick,
+                        unsafe
+                    );
+                true ->
+                    emqx_config:force_put(
+                        [broker, shared_subscription_group, Group, strategy], Strategy, unsafe
+                    )
+            end
         end,
         maps:to_list(Group2Strategy)
     ).
@@ -1247,7 +1328,15 @@ recv_msgs(Count, Msgs) ->
 start_peer(Name, Port) ->
     {ok, Node} = emqx_cth_peer:start_link(
         Name,
-        ebin_path()
+        emqx_common_test_helpers:ebin_path(),
+        _Envs = [],
+        _WaitBootTimeout = timer:seconds(20),
+        %% In CI, when stopping and starting nodes, apparently sometimes `gen_rpc' (or the
+        %% VM itself) doesn't have time to properly close listen sockets, so we may get
+        %% `eaddrinuse' errors when (re)starting `gen_rpc'.  Using an integer shutdown here
+        %% makes `init:stop' be called instead of `erlang:halt', so listeners may have the
+        %% chance to properly shutdown before starting the next test case.
+        #{shutdown => 5_000}
     ),
     pong = net_adm:ping(Node),
     setup_node(Node, Port),
@@ -1260,9 +1349,6 @@ stop_peer(Node) ->
 host() ->
     [_, Host] = string:tokens(atom_to_list(node()), "@"),
     Host.
-
-ebin_path() ->
-    ["-pa" | code:get_path()].
 
 setup_node(Node, Port) ->
     EnvHandler =
@@ -1291,6 +1377,10 @@ setup_node(Node, Port) ->
     Node = emqx_rpc:call(Node, erlang, node, []),
     rpc:call(Node, mria, join, [node()]),
     ok.
+
+get_tcp_mqtt_port(Node) ->
+    {_Host, Port} = erpc:call(Node, emqx_config, get, [[listeners, tcp, default, bind]]),
+    Port.
 
 pair_gen_rpc(Node, LocalPort, RemotePort) ->
     _ = rpc:call(Node, application, load, [gen_rpc]),

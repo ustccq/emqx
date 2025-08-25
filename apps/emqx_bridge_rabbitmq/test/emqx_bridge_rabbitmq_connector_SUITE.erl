@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_rabbitmq_connector_SUITE).
@@ -7,7 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include("emqx_connector.hrl").
+-include("../../emqx_connector/include/emqx_connector.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -52,9 +52,9 @@ init_per_group(Group, Config) ->
 end_per_group(Group, Config) ->
     emqx_bridge_rabbitmq_test_utils:end_per_group(Group, Config).
 
-% %%------------------------------------------------------------------------------
-% %% Testcases
-% %%------------------------------------------------------------------------------
+%%------------------------------------------------------------------------------
+%% Testcases
+%%------------------------------------------------------------------------------
 
 t_lifecycle(Config) ->
     perform_lifecycle_check(
@@ -124,9 +124,9 @@ perform_lifecycle_check(ResourceID, InitialConfig, TestConfig) ->
     % Should not even be able to get the resource data out of ets now unlike just stopping.
     ?assertEqual({error, not_found}, emqx_resource:get_instance(ResourceID)).
 
-% %%------------------------------------------------------------------------------
-% %% Helpers
-% %%------------------------------------------------------------------------------
+%%------------------------------------------------------------------------------
+%% Helpers
+%%------------------------------------------------------------------------------
 
 check_config(Config) ->
     {ok, #{config := CheckedConfig}} =
@@ -139,7 +139,7 @@ create_local_resource(ResourceID, CheckedConfig) ->
         ?CONNECTOR_RESOURCE_GROUP,
         emqx_bridge_rabbitmq_connector,
         CheckedConfig,
-        #{}
+        #{spawn_buffer_workers => true}
     ),
     Bridge.
 
@@ -151,7 +151,7 @@ perform_query(PoolName, Channel) ->
     ok = emqx_resource:query(PoolName, {ChannelId, payload()}),
     %% Get the message from queue:
     SendData = test_data(),
-    RecvData = receive_message_from_rabbitmq(Channel),
+    #{payload := RecvData} = receive_message_from_rabbitmq(Channel),
     ?assertMatch(SendData, RecvData),
     ?assertEqual(ok, emqx_resource_manager:remove_channel(PoolName, ChannelId)),
     ok.
@@ -183,6 +183,8 @@ rabbitmq_action_config() ->
         parameters => #{
             delivery_mode => non_persistent,
             exchange => rabbit_mq_exchange(),
+            headers_template => [],
+            properties_template => [],
             payload_template => <<"${.payload}">>,
             publish_confirmation_timeout => 30000,
             routing_key => rabbit_mq_routing_key(),

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_iotdb_action_info).
 
@@ -53,7 +53,7 @@ bridge_v1_config_to_action_config(BridgeV1Config, ConnectorName) ->
     ).
 
 bridge_v1_config_to_connector_config(BridgeV1Config) ->
-    ConnectorKeys = schema_keys(emqx_bridge_iotdb_connector, config),
+    ConnectorKeys = schema_keys(emqx_bridge_iotdb_connector, "config_restapi"),
     emqx_utils_maps:update_if_present(
         <<"resource_opts">>,
         fun emqx_connector_schema:project_to_connector_resource_opts/1,

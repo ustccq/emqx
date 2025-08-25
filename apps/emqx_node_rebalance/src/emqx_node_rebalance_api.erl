@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_node_rebalance_api).
 
@@ -8,7 +8,7 @@
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
--include_lib("emqx_utils/include/emqx_utils_api.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
 
 %% Swagger specs from hocon schema
 -export([
@@ -46,10 +46,8 @@
 -import(hoconsc, [mk/2, ref/1, ref/2]).
 -import(emqx_dashboard_swagger, [error_codes/2]).
 
--define(BAD_REQUEST, 'BAD_REQUEST').
 -define(NODE_EVACUATING, 'NODE_EVACUATING').
 -define(RPC_ERROR, 'RPC_ERROR').
--define(NOT_FOUND, 'NOT_FOUND').
 -define(TAGS, [<<"Load Rebalance">>]).
 
 %%--------------------------------------------------------------------
@@ -257,7 +255,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
     end.
 
 '/load_rebalance/:node/start'(post, #{bindings := #{node := NodeBin}, body := Params0}) ->
-    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+    with_node(NodeBin, fun(Node) ->
         Params1 = translate(rebalance_start, Params0),
         with_nodes_at_key(nodes, Params1, fun(Params2) ->
             wrap_rpc(
@@ -267,7 +265,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
     end).
 
 '/load_rebalance/:node/stop'(post, #{bindings := #{node := NodeBin}}) ->
-    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+    with_node(NodeBin, fun(Node) ->
         wrap_rpc(
             Node, emqx_node_rebalance_api_proto_v2:node_rebalance_stop(Node)
         )
@@ -276,7 +274,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
 '/load_rebalance/:node/evacuation/start'(post, #{
     bindings := #{node := NodeBin}, body := Params0
 }) ->
-    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+    with_node(NodeBin, fun(Node) ->
         Params1 = translate(rebalance_evacuation_start, Params0),
         with_nodes_at_key(migrate_to, Params1, fun(Params2) ->
             wrap_rpc(
@@ -289,7 +287,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
     end).
 
 '/load_rebalance/:node/evacuation/stop'(post, #{bindings := #{node := NodeBin}}) ->
-    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+    with_node(NodeBin, fun(Node) ->
         wrap_rpc(
             Node, emqx_node_rebalance_api_proto_v2:node_rebalance_evacuation_stop(Node)
         )
@@ -298,7 +296,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
 '/load_rebalance/:node/purge/start'(post, #{
     bindings := #{node := NodeBin}, body := Params0
 }) ->
-    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+    with_node(NodeBin, fun(Node) ->
         Params1 = translate(purge_start, Params0),
         wrap_rpc(
             Node,
@@ -309,7 +307,7 @@ schema("/load_rebalance/:node/evacuation/stop") ->
     end).
 
 '/load_rebalance/:node/purge/stop'(post, #{bindings := #{node := NodeBin}}) ->
-    emqx_utils_api:with_node(NodeBin, fun(Node) ->
+    with_node(NodeBin, fun(Node) ->
         wrap_rpc(
             Node, emqx_node_rebalance_api_proto_v2:node_rebalance_purge_stop(Node)
         )
@@ -439,11 +437,27 @@ fields(rebalance_start) ->
                     required => false
                 }
             )},
+        {conn_evict_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    desc => ?DESC(conn_evict_rpc_timeout),
+                    required => false
+                }
+            )},
         {sess_evict_rate,
             mk(
                 pos_integer(),
                 #{
                     desc => ?DESC(sess_evict_rate),
+                    required => false
+                }
+            )},
+        {sess_evict_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    desc => ?DESC(sess_evict_rpc_timeout),
                     required => false
                 }
             )},
@@ -614,11 +628,27 @@ fields(local_status_enabled) ->
                     required => false
                 }
             )},
+        {connection_eviction_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    desc => ?DESC(local_status_connection_eviction_rpc_timeout),
+                    required => false
+                }
+            )},
         {session_eviction_rate,
             mk(
                 pos_integer(),
                 #{
                     desc => ?DESC(local_status_session_eviction_rate),
+                    required => false
+                }
+            )},
+        {session_eviction_rpc_timeout,
+            mk(
+                emqx_schema:timeout_duration_s(),
+                #{
+                    desc => ?DESC(local_status_session_eviction_rpc_timeout),
                     required => false
                 }
             )},
@@ -869,3 +899,6 @@ response_schema() ->
     ).
 
 roots() -> [].
+
+with_node(NodeBin, Fn) ->
+    emqx_mgmt_api_lib:with_node(NodeBin, Fn).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_parser_v20220101).
@@ -11,6 +11,7 @@
 
 -define(DIGEST_TYPE, sha256).
 -define(LICENSE_VERSION, <<"220111">>).
+-define(MAX_EVALUATION_UPTIME_DAYS, 30).
 
 %% This is the earliest license start date for version 220111
 %% in theory it should  be the same as ?LICENSE_VERSION (20220111),
@@ -25,7 +26,8 @@
     customer_type/1,
     license_type/1,
     expiry_date/1,
-    max_connections/1
+    max_sessions/1,
+    max_uptime_seconds/1
 ]).
 
 %%------------------------------------------------------------------------------
@@ -51,7 +53,7 @@ dump(
         email := Email,
         deployment := Deployment,
         date_start := DateStart,
-        max_connections := MaxConns
+        max_sessions := MaxSessions
     } = License
 ) ->
     DateExpiry = expiry_date(License),
@@ -62,7 +64,7 @@ dump(
         {customer, Customer},
         {email, Email},
         {deployment, Deployment},
-        {max_connections, MaxConns},
+        {max_sessions, MaxSessions},
         {start_at, format_date(DateStart)},
         {expiry_at, format_date(DateExpiry)},
         {type, format_type(Type)},
@@ -74,13 +76,13 @@ summary(
     #{
         deployment := Deployment,
         date_start := DateStart,
-        max_connections := MaxConns
+        max_sessions := MaxSessions
     } = License
 ) ->
     DateExpiry = expiry_date(License),
     #{
         deployment => Deployment,
-        max_connections => MaxConns,
+        max_sessions => MaxSessions,
         start_at => format_date(DateStart),
         expiry_at => format_date(DateExpiry)
     }.
@@ -94,8 +96,16 @@ expiry_date(#{date_start := DateStart, days := Days}) ->
         calendar:date_to_gregorian_days(DateStart) + Days
     ).
 
-max_connections(#{max_connections := MaxConns}) ->
-    MaxConns.
+max_uptime_seconds(License) ->
+    case customer_type(License) of
+        ?EVALUATION_CUSTOMER ->
+            ?MAX_EVALUATION_UPTIME_DAYS * 24 * 60 * 60;
+        _ ->
+            infinity
+    end.
+
+max_sessions(#{max_sessions := MaxSessions}) ->
+    MaxSessions.
 
 %%------------------------------------------------------------------------------
 %% Private functions
@@ -131,18 +141,20 @@ parse_payload(Payload) ->
         string:split(string:trim(Payload), <<"\n">>, all)
     ),
     case Lines of
-        [?LICENSE_VERSION, Type, CType, Customer, Email, Deployment, DateStart, Days, MaxConns] ->
+        [?LICENSE_VERSION, Type, CType, Customer, Email, Deployment, DateStart, Days, MaxSessions] ->
+            TypeParseRes = parse_type(Type),
+            CTypeParseRes = parse_customer_type(CType),
             collect_fields([
-                {type, parse_type(Type)},
-                {customer_type, parse_customer_type(CType)},
+                {type, TypeParseRes},
+                {customer_type, CTypeParseRes},
                 {customer, {ok, Customer}},
                 {email, {ok, Email}},
                 {deployment, {ok, Deployment}},
                 {date_start, parse_date_start(DateStart)},
                 {days, parse_days(Days)},
-                {max_connections, parse_max_connections(MaxConns)}
+                {max_sessions, parse_max_sessions(TypeParseRes, CTypeParseRes, MaxSessions)}
             ]);
-        [_Version, _Type, _CType, _Customer, _Email, _Deployment, _DateStart, _Days, _MaxConns] ->
+        [_Version, _Type, _CType, _Customer, _Email, _Deployment, _DateStart, _Days, _MaxSessions] ->
             {error, invalid_version};
         _ ->
             {error, unexpected_number_of_fields}
@@ -180,11 +192,26 @@ parse_days(DaysStr) ->
         _ -> {error, invalid_int_value}
     end.
 
-parse_max_connections(MaxConnStr) ->
-    case parse_int(MaxConnStr) of
-        {ok, MaxConns} when MaxConns > 0 -> {ok, MaxConns};
-        _ -> {error, invalid_connection_limit}
+parse_max_sessions(TypeParseRes, CTypeParseRes, MaxSessionsStr) ->
+    case parse_int(MaxSessionsStr) of
+        {ok, 0} ->
+            {ok, resolve_default_max_sessions(TypeParseRes, CTypeParseRes)};
+        {ok, MaxSessions} when MaxSessions > 0 ->
+            {ok, MaxSessions};
+        _ ->
+            {error, invalid_connection_limit}
     end.
+
+resolve_default_max_sessions({ok, ?COMMUNITY}, _) ->
+    ?DEFAULT_MAX_SESSIONS_LTYPE2;
+resolve_default_max_sessions(_, {ok, ?BUSINESS_CRITICAL_CUSTOMER}) ->
+    ?DEFAULT_MAX_SESSIONS_CTYPE3;
+resolve_default_max_sessions(_, {ok, ?EVALUATION_CUSTOMER}) ->
+    ?DEFAULT_MAX_SESSIONS_CTYPE10;
+resolve_default_max_sessions({ok, _}, {ok, _}) ->
+    {error, invalid_connection_limit};
+resolve_default_max_sessions(_BadType, _BadCType) ->
+    {ok, 0}.
 
 parse_int(Str0) ->
     Str = iolist_to_binary(string:replace(Str0, ",", "")),
@@ -219,5 +246,6 @@ format_date({Year, Month, Day}) ->
         )
     ).
 
+format_type(?COMMUNITY) -> <<"community">>;
 format_type(?OFFICIAL) -> <<"official">>;
 format_type(?TRIAL) -> <<"trial">>.

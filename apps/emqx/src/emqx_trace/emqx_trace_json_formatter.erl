@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_trace_json_formatter).
 
@@ -34,7 +22,7 @@
     Config :: config().
 format(
     LogMap,
-    #{payload_encode := PEncode} = Config
+    #{payload_fmt_opts := PayloadFmtOpts} = Config
 ) ->
     LogMap0 = emqx_logger_textfmt:evaluate_lazy_values(LogMap),
     LogMap1 = maybe_format_msg(LogMap0, Config),
@@ -42,8 +30,8 @@ format(
     %% an external call to create the JSON text
     Time = emqx_utils_calendar:now_to_rfc3339(microsecond),
     LogMap2 = LogMap1#{time => Time},
-    LogMap3 = prepare_log_map(LogMap2, PEncode),
-    [emqx_logger_jsonfmt:best_effort_json(LogMap3, [force_utf8]), "\n"].
+    LogMap3 = prepare_log_data(LogMap2, PayloadFmtOpts),
+    [emqx_utils_json:best_effort_json(LogMap3, [force_utf8]), "\n"].
 
 %%%-----------------------------------------------------------------
 %%% Helper Functions
@@ -85,11 +73,29 @@ do_maybe_format_msg({report, Report} = Msg, #{report_cb := Cb} = Meta, Config) -
 do_maybe_format_msg(Msg, Meta, Config) ->
     emqx_logger_jsonfmt:format_msg(Msg, Meta, Config).
 
-prepare_log_map(LogMap, PEncode) ->
-    NewKeyValuePairs = [prepare_key_value(K, V, PEncode) || {K, V} <- maps:to_list(LogMap)],
-    maps:from_list(NewKeyValuePairs).
+prepare_log_data(LogMap, PayloadFmtOpts) when is_map(LogMap) ->
+    NewKeyValuePairs = lists:flatmap(
+        fun({K, V}) ->
+            case prepare_key_value(K, V, PayloadFmtOpts) of
+                KV when is_tuple(KV) ->
+                    [KV];
+                KVs when is_list(KVs) ->
+                    KVs
+            end
+        end,
+        maps:to_list(LogMap)
+    ),
+    maps:from_list(NewKeyValuePairs);
+prepare_log_data(V, PayloadFmtOpts) when is_list(V) ->
+    [prepare_log_data(Item, PayloadFmtOpts) || Item <- V];
+prepare_log_data(V, PayloadFmtOpts) when is_tuple(V) ->
+    List = erlang:tuple_to_list(V),
+    PreparedList = [prepare_log_data(Item, PayloadFmtOpts) || Item <- List],
+    erlang:list_to_tuple(PreparedList);
+prepare_log_data(V, _PayloadFmtOpts) ->
+    V.
 
-prepare_key_value(host, {I1, I2, I3, I4} = IP, _PEncode) when
+prepare_key_value(host, {I1, I2, I3, I4} = IP, _PayloadFmtOpts) when
     is_integer(I1),
     is_integer(I2),
     is_integer(I3),
@@ -97,7 +103,7 @@ prepare_key_value(host, {I1, I2, I3, I4} = IP, _PEncode) when
 ->
     %% We assume this is an IP address
     {host, unicode:characters_to_binary(inet:ntoa(IP))};
-prepare_key_value(host, {I1, I2, I3, I4, I5, I6, I7, I8} = IP, _PEncode) when
+prepare_key_value(host, {I1, I2, I3, I4, I5, I6, I7, I8} = IP, _PayloadFmtOpts) when
     is_integer(I1),
     is_integer(I2),
     is_integer(I3),
@@ -109,25 +115,27 @@ prepare_key_value(host, {I1, I2, I3, I4, I5, I6, I7, I8} = IP, _PEncode) when
 ->
     %% We assume this is an IP address
     {host, unicode:characters_to_binary(inet:ntoa(IP))};
-prepare_key_value(payload = K, V, PEncode) ->
+prepare_key_value(payload = K, V, PayloadFmtOpts) ->
+    {NewV, PEncode1} =
+        try
+            format_payload(V, PayloadFmtOpts)
+        catch
+            _:_ ->
+                V
+        end,
+    [{K, NewV}, {payload_encode, PEncode1}];
+prepare_key_value(<<"payload">>, V, PayloadFmtOpts) ->
+    prepare_key_value(payload, V, PayloadFmtOpts);
+prepare_key_value(packet = K, V, PayloadFmtOpts) ->
     NewV =
         try
-            format_payload(V, PEncode)
+            format_packet(V, PayloadFmtOpts)
         catch
             _:_ ->
                 V
         end,
     {K, NewV};
-prepare_key_value(packet = K, V, PEncode) ->
-    NewV =
-        try
-            format_packet(V, PEncode)
-        catch
-            _:_ ->
-                V
-        end,
-    {K, NewV};
-prepare_key_value(K, {recoverable_error, Msg} = OrgV, PEncode) ->
+prepare_key_value(K, {recoverable_error, Msg} = OrgV, PayloadFmtOpts) ->
     try
         prepare_key_value(
             K,
@@ -136,13 +144,13 @@ prepare_key_value(K, {recoverable_error, Msg} = OrgV, PEncode) ->
                 msg => Msg,
                 additional_info => <<"The operation may be retried.">>
             },
-            PEncode
+            PayloadFmtOpts
         )
     catch
         _:_ ->
             {K, OrgV}
     end;
-prepare_key_value(rule_ids = K, V, _PEncode) ->
+prepare_key_value(rule_ids = K, V, _PayloadFmtOpts) ->
     NewV =
         try
             format_map_set_to_list(V)
@@ -151,7 +159,7 @@ prepare_key_value(rule_ids = K, V, _PEncode) ->
                 V
         end,
     {K, NewV};
-prepare_key_value(client_ids = K, V, _PEncode) ->
+prepare_key_value(client_ids = K, V, _PayloadFmtOpts) ->
     NewV =
         try
             format_map_set_to_list(V)
@@ -160,30 +168,25 @@ prepare_key_value(client_ids = K, V, _PEncode) ->
                 V
         end,
     {K, NewV};
-prepare_key_value(action_id = K, V, _PEncode) ->
+prepare_key_value(action_id = K, V, _PayloadFmtOpts) ->
     try
         {action_info, format_action_info(V)}
     catch
         _:_ ->
             {K, V}
     end;
-prepare_key_value(K, V, PEncode) when is_map(V) ->
-    {K, prepare_log_map(V, PEncode)};
-prepare_key_value(K, V, _PEncode) ->
-    {K, V}.
+prepare_key_value(K, V, PayloadFmtOpts) ->
+    {K, prepare_log_data(V, PayloadFmtOpts)}.
 
 format_packet(undefined, _) -> "";
-format_packet(Packet, Encode) -> emqx_packet:format(Packet, Encode).
+format_packet(Packet, PayloadFmtOpts) -> emqx_packet:format(Packet, PayloadFmtOpts).
 
-format_payload(undefined, _) ->
-    "";
-format_payload(_, hidden) ->
-    "******";
-format_payload(Payload, text) when ?MAX_PAYLOAD_FORMAT_LIMIT(Payload) ->
-    unicode:characters_to_list(Payload);
-format_payload(Payload, hex) when ?MAX_PAYLOAD_FORMAT_LIMIT(Payload) -> binary:encode_hex(Payload);
-format_payload(<<Part:?TRUNCATED_PAYLOAD_SIZE/binary, _/binary>> = Payload, Type) ->
-    emqx_packet:format_truncated_payload(Part, byte_size(Payload), Type).
+format_payload(undefined, #{payload_encode := Type}) ->
+    {"", Type};
+format_payload(Payload, PayloadFmtOpts) when is_binary(Payload) ->
+    emqx_packet:format_payload(Payload, PayloadFmtOpts);
+format_payload(Payload, #{payload_encode := Type}) ->
+    {Payload, Type}.
 
 format_map_set_to_list(Map) ->
     Items = [
@@ -201,7 +204,7 @@ format_map_set_to_list(Map) ->
 format_action_info(#{mod := _Mod, func := _Func} = FuncCall) ->
     FuncCall;
 format_action_info(V) ->
-    [<<"action">>, Type, Name | _] = binary:split(V, <<":">>, [global]),
+    #{type := Type, name := Name} = emqx_resource:parse_channel_id(V),
     #{
         type => Type,
         name => Name

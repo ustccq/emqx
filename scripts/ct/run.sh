@@ -9,16 +9,18 @@ cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
 help() {
     echo
-    echo "-h|--help:              To display this usage info"
-    echo "--app lib_dir/app_name: For which app to run start docker-compose, and run common tests"
-    echo "--console:              Start EMQX in console mode but do not run test cases"
-    echo "--attach:               Attach to the Erlang docker container without running any test case"
-    echo "--stop:                 Stop running containers for the given app"
-    echo "--only-up:              Only start the testbed but do not run CT"
-    echo "--keep-up:              Keep the testbed running after CT"
-    echo "--ci:                   Set this flag in GitHub action to enforce no tests are skipped"
-    echo "--:                     If any, all args after '--' are passed to rebar3 ct"
-    echo "                        otherwise it runs the entire app's CT"
+    echo '-h|--help:              To display this usage info'
+    echo '--app lib_dir/app_name: For which app to run start docker-compose, and run common tests'
+    echo '--console:              Start EMQX in console mode but do not run test cases'
+    echo '--attach:               Attach to the Erlang docker container without running any test case'
+    echo '--stop:                 Stop running containers for the given app'
+    echo '--only-up:              Only start the testbed but do not run CT'
+    echo '--keep-up:              Keep the testbed running after CT'
+    echo '--ci:                   Set this flag in GitHub action to enforce no tests are skipped'
+    echo '--:                     If any, all args after '--' are passed to rebar3 ct'
+    echo '                        otherwise it runs the entire app'\''s CT by mix'
+    # shellcheck disable=SC2016
+    echo '                        (will run `make ${WHICH_APP}-ct`)'
 }
 
 set +e
@@ -39,8 +41,9 @@ ONLY_UP='no'
 ATTACH='no'
 STOP='no'
 IS_CI='no'
-ODBC_REQUEST='no'
-UP='up'
+SQLSERVER_ODBC_REQUEST='no'
+SNOWFLAKE_ODBC_REQUEST='no'
+UP='up --wait'
 while [ "$#" -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -73,7 +76,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --ci)
             IS_CI='yes'
-            UP='up --quiet-pull'
+            UP='up --wait --quiet-pull'
             shift 1
             ;;
         --)
@@ -102,44 +105,7 @@ fi
 
 ERLANG_CONTAINER='erlang'
 DOCKER_CT_ENVS_FILE="${WHICH_APP}/docker-ct"
-
-if [ -f "${WHICH_APP}/BSL.txt" ]; then
-    if [ -n "${PROFILE:-}" ] && [ "${PROFILE}" != 'emqx-enterprise' ]; then
-        echo "bad_profile: PROFILE=${PROFILE} will not work for app ${WHICH_APP}"
-        exit 1
-    fi
-fi
-
-if [ -z "${PROFILE+x}" ]; then
-    case "${WHICH_APP}" in
-        apps/emqx)
-            export PROFILE='emqx-enterprise'
-            ;;
-        apps/emqx_bridge)
-            export PROFILE='emqx-enterprise'
-            ;;
-        # emqx_connector test suite is using kafka bridge which is only available in emqx-enterprise
-        apps/emqx_connector)
-            export PROFILE='emqx-enterprise'
-            ;;
-        apps/emqx_dashboard)
-            export PROFILE='emqx-enterprise'
-            ;;
-        apps/emqx_rule_engine)
-            export PROFILE='emqx-enterprise'
-            ;;
-        apps/*)
-            if [[ -f "${WHICH_APP}/BSL.txt" ]]; then
-                export PROFILE='emqx-enterprise'
-            else
-                export PROFILE='emqx'
-            fi
-            ;;
-        *)
-            export PROFILE="${PROFILE:-emqx}"
-            ;;
-    esac
-fi
+PROFILE='emqx-enterprise'
 
 if [ -f "$DOCKER_CT_ENVS_FILE" ]; then
     # shellcheck disable=SC2002
@@ -200,13 +166,14 @@ for dep in ${CT_DEPS}; do
             FILES+=( '.ci/docker-compose-file/docker-compose-dynamo.yaml' )
             ;;
         rocketmq)
-            FILES+=( '.ci/docker-compose-file/docker-compose-rocketmq.yaml' )
+            FILES+=( '.ci/docker-compose-file/docker-compose-rocketmq.yaml'
+                     '.ci/docker-compose-file/docker-compose-rocketmq-ssl.yaml' )
             ;;
         cassandra)
             FILES+=( '.ci/docker-compose-file/docker-compose-cassandra.yaml' )
             ;;
         sqlserver)
-            ODBC_REQUEST='yes'
+            SQLSERVER_ODBC_REQUEST='yes'
             FILES+=( '.ci/docker-compose-file/docker-compose-sqlserver.yaml' )
             ;;
         opents)
@@ -231,9 +198,6 @@ for dep in ${CT_DEPS}; do
         gcp_emulator)
             FILES+=( '.ci/docker-compose-file/docker-compose-gcp-emulator.yaml' )
             ;;
-        hstreamdb)
-            FILES+=( '.ci/docker-compose-file/docker-compose-hstreamdb.yaml' )
-            ;;
         kinesis)
             FILES+=( '.ci/docker-compose-file/docker-compose-kinesis.yaml' )
             ;;
@@ -246,9 +210,49 @@ for dep in ${CT_DEPS}; do
         otel)
             FILES+=( '.ci/docker-compose-file/docker-compose-otel.yaml' )
             ;;
-	elasticsearch)
-	    FILES+=( '.ci/docker-compose-file/docker-compose-elastic-search-tls.yaml' )
-	    ;;
+        elasticsearch)
+            FILES+=( '.ci/docker-compose-file/docker-compose-elastic-search-tls.yaml' )
+            ;;
+        azurite)
+            FILES+=( '.ci/docker-compose-file/docker-compose-azurite.yaml' )
+            ;;
+        couchbase)
+            FILES+=( '.ci/docker-compose-file/docker-compose-couchbase.yaml' )
+            ;;
+        kdc)
+            FILES+=( '.ci/docker-compose-file/docker-compose-kdc.yaml' )
+            ;;
+        datalayers)
+            FILES+=( '.ci/docker-compose-file/docker-compose-datalayers-tcp.yaml'
+                     '.ci/docker-compose-file/docker-compose-datalayers-tls.yaml' )
+            ;;
+        snowflake)
+            if [[ -z "${SNOWFLAKE_ACCOUNT_ID:-}" ]]; then
+                echo "Snowflake environment requested, but SNOWFLAKE_ACCOUNT_ID is undefined"
+                echo "Will NOT install Snowflake's ODBC drivers"
+            else
+                SNOWFLAKE_ODBC_REQUEST='yes'
+            fi
+            ;;
+        schema-registry)
+          FILES+=( '.ci/docker-compose-file/docker-compose-confluent-schema-registry.yaml' )
+            ;;
+        iceberg)
+            FILES+=( '.ci/docker-compose-file/docker-compose-iceberg.yaml' )
+            ;;
+        doris)
+            FILES+=( '.ci/docker-compose-file/docker-compose-doris.yaml'
+                     '.ci/docker-compose-file/docker-compose-doris-tls.yaml' )
+            ;;
+        bigquery)
+            FILES+=( '.ci/docker-compose-file/docker-compose-bigquery.yaml' )
+            ;;
+        alloydb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-alloydb.yaml' )
+            ;;
+        cockroachdb)
+            FILES+=( '.ci/docker-compose-file/docker-compose-cockroachdb.yaml' )
+            ;;
         *)
             echo "unknown_ct_dependency $dep"
             exit 1
@@ -256,10 +260,16 @@ for dep in ${CT_DEPS}; do
     esac
 done
 
-if [ "$ODBC_REQUEST" = 'yes' ]; then
-    INSTALL_ODBC="./scripts/install-msodbc-driver.sh"
+if [ "$SQLSERVER_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ]; then
+    INSTALL_SQLSERVER_ODBC="./scripts/install-msodbc-driver.sh"
 else
-    INSTALL_ODBC="echo 'msodbc driver not requested'"
+    INSTALL_SQLSERVER_ODBC="echo 'msodbc driver not requested'"
+fi
+
+if [ "$SNOWFLAKE_ODBC_REQUEST" = 'yes' ] && [ "$STOP" = 'no' ]; then
+    INSTALL_SNOWFLAKE_ODBC="./scripts/install-snowflake-driver.sh"
+else
+    INSTALL_SNOWFLAKE_ODBC="echo 'snowflake driver not requested'"
 fi
 
 for file in "${FILES[@]}"; do
@@ -282,7 +292,7 @@ if [ "$STOP" = 'no' ]; then
     rm -f '.ci/docker-compose-file/redis/*.log'
     set +e
     # shellcheck disable=2086 # no quotes for UP
-    $DC $UP -d --build --remove-orphans
+    $DC $UP -d -t 0 --build --remove-orphans
     RESULT=$?
     if [ $RESULT -ne 0 ]; then
         mkdir -p _build/test/logs
@@ -296,15 +306,18 @@ fi
 
 if [ "$DOCKER_USER" != "root" ]; then
     # the user must exist inside the container for `whoami` to work
-    docker exec -i $TTY -u root:root "$ERLANG_CONTAINER" bash -c \
-          "useradd --uid $DOCKER_USER -M -d / emqx && \
-           mkdir -p /.cache /.hex /.mix && \
-           chown $DOCKER_USER /.cache /.hex /.mix && \
-           openssl rand -base64 -hex 16 > /.erlang.cookie && \
-           chown $DOCKER_USER /.erlang.cookie && \
-           chmod 0400 /.erlang.cookie && \
-           chown -R $DOCKER_USER /var/lib/secret && \
-           $INSTALL_ODBC" || true
+  docker exec -i $TTY -u root:root \
+         -e "SFACCOUNT=${SFACCOUNT:-myorg-myacc}" \
+         "$ERLANG_CONTAINER" bash -c \
+         "useradd --uid $DOCKER_USER -M -d / emqx || true && \
+          mkdir -p /.cache /.hex /.mix && \
+          chown $DOCKER_USER /.cache /.hex /.mix && \
+          chown $DOCKER_USER -R /usr/local/lib/rustup /usr/local/cargo && \
+          openssl rand -base64 -hex 16 > /.erlang.cookie && \
+          chown $DOCKER_USER /.erlang.cookie && \
+          chmod 0400 /.erlang.cookie && \
+          $INSTALL_SQLSERVER_ODBC && \
+          $INSTALL_SNOWFLAKE_ODBC" || true
 fi
 
 if [ "$ONLY_UP" = 'yes' ]; then
@@ -314,7 +327,7 @@ fi
 set +e
 
 if [ "$STOP" = 'yes' ]; then
-    $DC down --remove-orphans
+    $DC down -t 0 --remove-orphans
 elif [ "$ATTACH" = 'yes' ]; then
     docker exec -it "$ERLANG_CONTAINER" bash
 elif [ "$CONSOLE" = 'yes' ]; then
@@ -327,7 +340,7 @@ else
                     -e ENABLE_COVER_COMPILE="${ENABLE_COVER_COMPILE:-}" \
                     -e CT_COVER_EXPORT_PREFIX="${CT_COVER_EXPORT_PREFIX:-}" \
                     -i $TTY "$ERLANG_CONTAINER" \
-                    bash -c "BUILD_WITHOUT_QUIC=1 make ${WHICH_APP}-ct"
+                    bash -c "make ${WHICH_APP}-ct"
     else
         # this is an ad-hoc run
         docker exec -e IS_CI="$IS_CI" \

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_prometheus_config).
 
@@ -100,6 +88,7 @@ to_collectors(Conf) ->
 post_config_update(?PROMETHEUS, _Req, New, Old, AppEnvs) ->
     update_prometheus(AppEnvs),
     _ = update_push_gateway(New),
+    ok = emqx_prometheus_auth:update_latency_metrics(New),
     update_auth(New, Old);
 post_config_update(_ConfPath, _Req, _NewConf, _OldConf, _AppEnvs) ->
     ok.
@@ -138,7 +127,7 @@ update_push_gateway(Prometheus) ->
     end.
 
 update_auth(#{enable_basic_auth := New}, #{enable_basic_auth := Old}) when New =/= Old ->
-    emqx_dashboard_listener:delay_job(regenerate),
+    emqx_dashboard:regenerate_dispatch_after_config_update(),
     ok;
 update_auth(_, _) ->
     ok.

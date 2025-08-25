@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer_api_SUITE).
@@ -76,7 +65,6 @@ t_config(_Config) ->
     ?assertMatch(
         #{
             backend := _,
-            enable := _,
             max_payload_size := _,
             msg_clear_interval := _,
             msg_expiry_interval := _
@@ -84,22 +72,17 @@ t_config(_Config) ->
         ReturnConf
     ),
 
-    UpdateConf = fun(Enable) ->
-        RawConf = emqx_utils_json:decode(ConfJson, [return_maps]),
-        UpdateJson = RawConf#{<<"enable">> := Enable},
-        {ok, UpdateResJson} = request_api(
-            put,
-            Path,
-            [],
-            auth_header_(),
-            UpdateJson
-        ),
-        UpdateRawConf = emqx_utils_json:decode(UpdateResJson, [return_maps]),
-        ?assertEqual(Enable, maps:get(<<"enable">>, UpdateRawConf))
-    end,
-
-    UpdateConf(false),
-    UpdateConf(true).
+    RawConf = emqx_utils_json:decode(ConfJson),
+    UpdateJson = RawConf#{<<"max_payload_size">> => 54321},
+    {ok, UpdateResJson} = request_api(
+        put,
+        Path,
+        [],
+        auth_header_(),
+        UpdateJson
+    ),
+    UpdateRawConf = emqx_utils_json:decode(UpdateResJson),
+    ?assertEqual(54321, maps:get(<<"max_payload_size">>, UpdateRawConf)).
 
 t_messages1(Config) ->
     C = ?config(client, Config),
@@ -314,15 +297,14 @@ t_lookup_and_delete(Config) ->
 t_change_storage_type(_Config) ->
     Path = api_path(["mqtt", "retainer"]),
     {ok, ConfJson} = request_api(get, Path),
-    RawConf = emqx_utils_json:decode(ConfJson, [return_maps]),
+    RawConf = emqx_utils_json:decode(ConfJson),
     %% pre-conditions
     ?assertMatch(
         #{
             <<"backend">> := #{
                 <<"type">> := <<"built_in_database">>,
                 <<"storage_type">> := <<"ram">>
-            },
-            <<"enable">> := true
+            }
         },
         RawConf
     ),
@@ -361,14 +343,13 @@ t_change_storage_type(_Config) ->
         auth_header_(),
         ChangedConf
     ),
-    UpdatedRawConf = emqx_utils_json:decode(UpdateResJson, [return_maps]),
+    UpdatedRawConf = emqx_utils_json:decode(UpdateResJson),
     ?assertMatch(
         #{
             <<"backend">> := #{
                 <<"type">> := <<"built_in_database">>,
                 <<"storage_type">> := <<"disc">>
-            },
-            <<"enable">> := true
+            }
         },
         UpdatedRawConf
     ),
@@ -424,12 +405,29 @@ t_match_and_clean(Config) ->
     {ok, LookupJson2} = request_api(get, API),
     ?assertMatch(#{data := []}, decode_json(LookupJson2)).
 
+%% Checks that we can see `$SYS' messages in the API.
+%% https://emqx.atlassian.net/browse/EMQX-13399
+t_retained_sys_messages(_Config) ->
+    Msg0 = emqx_message:make(emqx_sys, <<"$SYS/brokers">>, atom_to_binary(node())),
+    Msg = emqx_message:set_flags(#{sys => true, retain => true}, Msg0),
+    _ = emqx:publish(Msg),
+    API = api_path(["mqtt", "retainer", "messages"]),
+    {ok, LookupJson} = request_api(get, API, "", auth_header_()),
+    ?assertMatch(
+        #{
+            data := [_ | _],
+            meta := #{count := N}
+        } when N > 0,
+        decode_json(LookupJson)
+    ),
+    ok.
+
 %%--------------------------------------------------------------------
 %% Internal funcs
 %%--------------------------------------------------------------------
 
 decode_json(Data) ->
-    BinJson = emqx_utils_json:decode(Data, [return_maps]),
+    BinJson = emqx_utils_json:decode(Data),
     emqx_utils_maps:unsafe_atom_key_map(BinJson).
 
 raw_systopic_conf() ->

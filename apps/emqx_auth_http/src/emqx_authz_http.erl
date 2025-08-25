@@ -1,78 +1,67 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_http).
-
--include_lib("emqx/include/logger.hrl").
--include_lib("emqx/include/emqx_placeholder.hrl").
--include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -behaviour(emqx_authz_source).
 
 %% AuthZ Callbacks
 -export([
-    description/0,
     create/1,
-    update/1,
+    update/2,
     destroy/1,
     authorize/4,
-    merge_defaults/1
+    format_for_api/1
 ]).
+
+-include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_placeholder.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include("emqx_auth_http.hrl").
 
 -ifdef(TEST).
 -compile(export_all).
 -compile(nowarn_export_all).
 -endif.
 
+-define(VAR_ACCESS, "access").
+-define(LEGACY_SUBSCRIBE_ACTION, 1).
+-define(LEGACY_PUBLISH_ACTION, 2).
+
 -define(ALLOWED_VARS, [
     ?VAR_USERNAME,
     ?VAR_CLIENTID,
     ?VAR_PEERHOST,
+    ?VAR_PEERPORT,
     ?VAR_PROTONAME,
     ?VAR_MOUNTPOINT,
     ?VAR_TOPIC,
     ?VAR_ACTION,
     ?VAR_CERT_SUBJECT,
     ?VAR_CERT_CN_NAME,
-    ?VAR_NS_CLIENT_ATTRS
-]).
-
--define(ALLOWED_VARS_RICH_ACTIONS, [
+    ?VAR_CERT_PEM,
+    ?VAR_ACCESS,
+    ?VAR_NS_CLIENT_ATTRS,
+    ?VAR_ZONE,
+    ?VAR_LISTENER,
     ?VAR_QOS,
     ?VAR_RETAIN
 ]).
 
-description() ->
-    "AuthZ with http".
+create(Source) ->
+    ResourceId = emqx_authz_utils:make_resource_id(?AUTHZ_TYPE),
+    State = new_state(ResourceId, Source),
+    ok = emqx_authz_utils:create_resource(emqx_bridge_http_connector, State),
+    State.
 
-create(Config) ->
-    NConfig = parse_config(Config),
-    ResourceId = emqx_authn_utils:make_resource_id(?MODULE),
-    {ok, _Data} = emqx_authz_utils:create_resource(ResourceId, emqx_bridge_http_connector, NConfig),
-    NConfig#{annotations => #{id => ResourceId}}.
+update(#{resource_id := ResourceId} = _State, Source) ->
+    State = new_state(ResourceId, Source),
+    ok = emqx_authz_utils:update_resource(emqx_bridge_http_connector, State),
+    State.
 
-update(Config) ->
-    NConfig = parse_config(Config),
-    case emqx_authz_utils:update_resource(emqx_bridge_http_connector, NConfig) of
-        {error, Reason} -> error({load_config_error, Reason});
-        {ok, Id} -> NConfig#{annotations => #{id => Id}}
-    end.
-
-destroy(#{annotations := #{id := Id}}) ->
-    emqx_authz_utils:remove_resource(Id).
+destroy(#{resource_id := ResourceId}) ->
+    emqx_authz_utils:remove_resource(ResourceId).
 
 authorize(
     Client,
@@ -80,14 +69,22 @@ authorize(
     Topic,
     #{
         type := http,
-        annotations := #{id := ResourceID},
+        resource_id := ResourceId,
+        cache_key_template := CacheKeyTemplate,
         method := Method,
         request_timeout := RequestTimeout
-    } = Config
+    } = State
 ) ->
-    case generate_request(Action, Topic, Client, Config) of
+    Values = client_vars(Client, Action, Topic),
+    case emqx_auth_http_utils:generate_request(State, Values) of
         {ok, Request} ->
-            case emqx_resource:simple_sync_query(ResourceID, {Method, Request, RequestTimeout}) of
+            CacheKey = emqx_auth_template:cache_key(Values, CacheKeyTemplate),
+            Response = emqx_authz_utils:cached_simple_sync_query(
+                CacheKey,
+                ResourceId,
+                {Method, Request, RequestTimeout}
+            ),
+            case Response of
                 {ok, 204, _Headers} ->
                     {matched, allow};
                 {ok, 200, Headers, Body} ->
@@ -99,6 +96,9 @@ authorize(
                                 content_type => ContentType,
                                 body => Body
                             }),
+                            nomatch;
+                        {error, Reason} ->
+                            ?tp(error, bad_authz_http_response, #{reason => Reason}),
                             nomatch;
                         Result ->
                             {matched, Result}
@@ -113,7 +113,7 @@ authorize(
                     ?tp(authz_http_request_failure, #{error => Reason}),
                     ?SLOG(error, #{
                         msg => "http_server_query_failed",
-                        resource => ResourceID,
+                        resource => ResourceId,
                         reason => Reason
                     }),
                     ignore
@@ -126,18 +126,18 @@ authorize(
             ignore
     end.
 
-merge_defaults(#{<<"headers">> := Headers} = Source) ->
+format_for_api(#{<<"headers">> := Headers} = Source) ->
     NewHeaders =
         case Source of
             #{<<"method">> := <<"get">>} ->
-                (emqx_authz_http_schema:headers_no_content_type(converter))(Headers);
+                emqx_auth_http_utils:convert_headers_no_content_type(Headers);
             #{<<"method">> := <<"post">>} ->
-                (emqx_authz_http_schema:headers(converter))(Headers);
+                emqx_auth_http_utils:convert_headers(Headers);
             _ ->
                 Headers
         end,
     Source#{<<"headers">> => NewHeaders};
-merge_defaults(Source) ->
+format_for_api(Source) ->
     Source.
 
 log_nomtach_msg(Status, Headers, Body) ->
@@ -151,46 +151,56 @@ log_nomtach_msg(Status, Headers, Body) ->
         }
     ).
 
-parse_config(
+new_state(
+    ResourceId,
     #{
         url := RawUrl,
         method := Method,
-        headers := Headers,
+        headers := Headers0,
         request_timeout := ReqTimeout
-    } = Conf
+    } = Source
 ) ->
-    {RequestBase, Path, Query} = emqx_auth_utils:parse_url(RawUrl),
-    Conf#{
-        method => Method,
-        request_base => RequestBase,
-        headers => Headers,
-        base_path_template => emqx_auth_utils:parse_str(Path, allowed_vars()),
-        base_query_template => emqx_auth_utils:parse_deep(
-            cow_qs:parse_qs(Query),
-            allowed_vars()
+    {RequestBase, Path, Query} = emqx_auth_http_utils:parse_url(RawUrl),
+    {BasePathVars, BasePathTemplate} = emqx_auth_template:parse_str(Path, ?ALLOWED_VARS),
+    {BaseQueryVars, BaseQueryTemplate} = emqx_auth_template:parse_deep(
+        cow_qs:parse_qs(Query),
+        ?ALLOWED_VARS
+    ),
+    {BodyVars, BodyTemplate} =
+        emqx_auth_template:parse_deep(
+            emqx_utils_maps:binary_key_map(maps:get(body, Source, #{})),
+            ?ALLOWED_VARS
         ),
-        body_template =>
-            emqx_auth_utils:parse_deep(
-                emqx_utils_maps:binary_key_map(maps:get(body, Conf, #{})),
-                allowed_vars()
-            ),
+    Headers = maps:to_list(emqx_auth_http_utils:transform_header_name(Headers0)),
+    {HeadersVars, HeadersTemplate} = emqx_authn_utils:parse_deep(Headers),
+    Vars = BasePathVars ++ BaseQueryVars ++ BodyVars ++ HeadersVars,
+    CacheKeyTemplate = emqx_auth_template:cache_key_template(Vars),
+    ResourceConfig = emqx_authz_utils:cleanup_resource_config(
+        [url, method, request_timeout, body],
+        Source#{
+            request_base => RequestBase,
+            pool_type => random
+        }
+    ),
+    emqx_authz_utils:init_state(Source, #{
+        resource_config => ResourceConfig,
+        resource_id => ResourceId,
+        method => Method,
+        headers_template => HeadersTemplate,
+        base_path_template => BasePathTemplate,
+        base_query_template => BaseQueryTemplate,
+        body_template => BodyTemplate,
         request_timeout => ReqTimeout,
-        %% pool_type default value `random`
-        pool_type => random
-    }.
-
-generate_request(Action, Topic, Client, Config) ->
-    Values = client_vars(Client, Action, Topic),
-    emqx_auth_utils:generate_request(Config, Values).
+        cache_key_template => CacheKeyTemplate
+    }).
 
 client_vars(Client, Action, Topic) ->
     Vars = emqx_authz_utils:vars_for_rule_query(Client, Action),
-    Vars#{topic => Topic}.
+    add_legacy_access_var(Vars#{topic => Topic}).
 
-allowed_vars() ->
-    allowed_vars(emqx_authz:feature_available(rich_actions)).
-
-allowed_vars(true) ->
-    ?ALLOWED_VARS ++ ?ALLOWED_VARS_RICH_ACTIONS;
-allowed_vars(false) ->
-    ?ALLOWED_VARS.
+add_legacy_access_var(#{action := subscribe} = Vars) ->
+    Vars#{access => ?LEGACY_SUBSCRIBE_ACTION};
+add_legacy_access_var(#{action := publish} = Vars) ->
+    Vars#{access => ?LEGACY_PUBLISH_ACTION};
+add_legacy_access_var(Vars) ->
+    Vars.

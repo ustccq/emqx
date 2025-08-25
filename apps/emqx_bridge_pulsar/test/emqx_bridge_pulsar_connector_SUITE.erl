@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_pulsar_connector_SUITE).
 
@@ -53,7 +53,7 @@ only_once_tests() ->
 
 init_per_suite(Config) ->
     %% Ensure enterprise bridge module is loaded
-    _ = emqx_bridge_enterprise:module_info(),
+    emqx_utils:interactive_load(emqx_bridge_enterprise),
     %% TODO
     %% This is needed to ensure that filenames generated deep inside pulsar/replayq
     %% will not exceed 256 characters, because replayq eventually turns them into atoms.
@@ -148,7 +148,6 @@ common_end_per_group(Config) ->
     ProxyHost = ?config(proxy_host, Config),
     ProxyPort = ?config(proxy_port, Config),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-    delete_all_bridges(),
     ok.
 
 init_per_testcase(TestCase, Config) ->
@@ -163,7 +162,8 @@ end_per_testcase(_Testcase, Config) ->
             ProxyHost = ?config(proxy_host, Config),
             ProxyPort = ?config(proxy_port, Config),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            delete_all_bridges(),
+            emqx_bridge_v2_testlib:delete_all_rules(),
+            emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
             stop_consumer(Config),
             %% in CI, apparently this needs more time since the
             %% machines struggle with all the containers running...
@@ -175,7 +175,8 @@ end_per_testcase(_Testcase, Config) ->
 
 common_init_per_testcase(TestCase, Config0) ->
     ct:timetrap(timer:seconds(60)),
-    delete_all_bridges(),
+    ok = emqx_bridge_v2_testlib:delete_all_rules(),
+    ok = emqx_bridge_v2_SUITE:delete_all_bridges_and_connectors(),
     UniqueNum = integer_to_binary(erlang:unique_integer()),
     PulsarTopic =
         <<
@@ -196,14 +197,6 @@ common_init_per_testcase(TestCase, Config0) ->
         {pulsar_config, PulsarConfig}
         | Config
     ].
-
-delete_all_bridges() ->
-    lists:foreach(
-        fun(#{name := Name, type := Type}) ->
-            emqx_bridge:remove(Type, Name)
-        end,
-        emqx_bridge:list()
-    ).
 
 %%------------------------------------------------------------------------------
 %% Helper fns
@@ -294,7 +287,7 @@ create_bridge(Config, Overrides) ->
     Name = ?config(pulsar_name, Config),
     PulsarConfig0 = ?config(pulsar_config, Config),
     PulsarConfig = emqx_utils_maps:deep_merge(PulsarConfig0, Overrides),
-    emqx_bridge:create(Type, Name, PulsarConfig).
+    emqx_bridge_testlib:create_bridge_api(Type, Name, PulsarConfig).
 
 delete_bridge(Config) ->
     Type = ?BRIDGE_TYPE_BIN,
@@ -317,7 +310,9 @@ create_bridge_api(Config, Overrides) ->
     Res =
         case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params, Opts) of
             {ok, {Status, Headers, Body0}} ->
-                {ok, {Status, Headers, emqx_utils_json:decode(Body0, [return_maps])}};
+                TypeV1 = emqx_action_info:bridge_v1_type_to_action_type(TypeBin),
+                _ = emqx_bridge_v2_testlib:kickoff_action_health_check(TypeV1, Name),
+                {ok, {Status, Headers, emqx_utils_json:decode(Body0)}};
             {error, {Status, Headers, Body0}} ->
                 {error, {Status, Headers, emqx_bridge_testlib:try_decode_error(Body0)}};
             Error ->
@@ -342,7 +337,7 @@ update_bridge_api(Config, Overrides) ->
     ct:pal("updating bridge (via http): ~p", [Params]),
     Res =
         case emqx_mgmt_api_test_util:request_api(put, Path, "", AuthHeader, Params, Opts) of
-            {ok, {_Status, _Headers, Body0}} -> {ok, emqx_utils_json:decode(Body0, [return_maps])};
+            {ok, {_Status, _Headers, Body0}} -> {ok, emqx_utils_json:decode(Body0)};
             Error -> Error
         end,
     ct:pal("bridge update result: ~p", [Res]),
@@ -400,7 +395,7 @@ start_consumer(TestCase, Config) ->
         cacertfile => filename:join([CertsPath, "cacert.pem"])
     },
     Opts = #{enable_ssl => UseTLS, ssl_opts => emqx_tls_lib:to_client_opts(SSLOpts)},
-    {ok, _ClientPid} = pulsar:ensure_supervised_client(ConsumerClientId, [URL], Opts),
+    {ok, _} = pulsar:ensure_supervised_client(ConsumerClientId, [URL], Opts),
     ConsumerOpts = Opts#{
         cb_init_args => #{send_to => self()},
         cb_module => pulsar_echo_consumer,
@@ -484,7 +479,7 @@ create_rule_and_action_http(Config) ->
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     ct:pal("rule action params: ~p", [Params]),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -497,6 +492,29 @@ receive_consumed(Timeout) ->
         ct:fail("no message consumed")
     end.
 
+receive_consumed_until_seqno(SeqNo, Timeout) ->
+    do_receive_consumed_until_seqno(SeqNo, Timeout, _Acc = #{}).
+
+do_receive_consumed_until_seqno(SeqNo, _Timeout, Acc) when map_size(Acc) == SeqNo ->
+    maps:values(Acc);
+do_receive_consumed_until_seqno(SeqNo, Timeout, Acc0) ->
+    receive
+        {pulsar_message, #{payloads := Payloads0}} ->
+            Payloads = lists:map(fun try_decode_json/1, Payloads0),
+            %% Pulsar apparently may resend some duplicate messages during/after
+            %% connectivity problems.
+            Acc = lists:foldl(
+                fun(#{<<"payload">> := N} = P, AccIn) ->
+                    AccIn#{N => P}
+                end,
+                Acc0,
+                Payloads
+            ),
+            do_receive_consumed_until_seqno(SeqNo, Timeout, Acc)
+    after Timeout ->
+        maps:values(Acc0)
+    end.
+
 flush_consumed() ->
     receive
         {pulsar_message, _} -> flush_consumed()
@@ -504,7 +522,7 @@ flush_consumed() ->
     end.
 
 try_decode_json(Payload) ->
-    case emqx_utils_json:safe_decode(Payload, [return_maps]) of
+    case emqx_utils_json:safe_decode(Payload) of
         {error, _} ->
             Payload;
         {ok, JSON} ->
@@ -512,13 +530,18 @@ try_decode_json(Payload) ->
     end.
 
 cluster(Config) ->
-    Apps = [
-        {emqx, #{override_env => [{boot_modules, [broker]}]}}
-        | ?APPS
-    ],
+    Apps = [emqx | ?APPS],
     Nodes = emqx_cth_cluster:start(
         [
-            {emqx_bridge_pulsar_impl_producer1, #{apps => Apps}},
+            {emqx_bridge_pulsar_impl_producer1, #{
+                apps => Apps ++
+                    [
+                        emqx_management,
+                        emqx_mgmt_api_test_util:emqx_dashboard(
+                            "dashboard.listeners.http.bind = 28083"
+                        )
+                    ]
+            }},
             {emqx_bridge_pulsar_impl_producer2, #{apps => Apps}}
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
@@ -560,7 +583,6 @@ t_start_and_produce_ok(Config) ->
                 create_bridge(Config)
             ),
             {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
             %% Publish using local topic.
             Message0 = emqx_message:make(ClientId, QoS, MQTTTopic, Payload),
             emqx:publish(Message0),
@@ -843,7 +865,8 @@ do_t_send_with_failure(Config, FailureType) ->
                         ?wait_async_action(
                             emqx:publish(Message0),
                             #{
-                                ?snk_kind := pulsar_producer_on_query_async,
+                                ?snk_kind := "pulsar_producer_query_enter",
+                                mode := async,
                                 ?snk_span := {complete, _}
                             },
                             5_000
@@ -970,7 +993,11 @@ t_producer_process_crash(Config) ->
             {_, {ok, _}} =
                 ?wait_async_action(
                     emqx:publish(Message0),
-                    #{?snk_kind := pulsar_producer_on_query_async, ?snk_span := {complete, _}},
+                    #{
+                        ?snk_kind := "pulsar_producer_query_enter",
+                        mode := async,
+                        ?snk_span := {complete, _}
+                    },
                     5_000
                 ),
             Data0 = receive_consumed(20_000),
@@ -1010,7 +1037,7 @@ t_resource_manager_crash_after_producers_started(Config) ->
             end),
             %% even if the resource manager is dead, we can still
             %% clear the allocated resources.
-            {{error, {config_update_crashed, {killed, _}}}, {ok, _}} =
+            {_, {ok, _}} =
                 ?wait_async_action(
                     create_bridge(Config),
                     #{?snk_kind := pulsar_bridge_stopped, instance_id := InstanceId} when
@@ -1018,7 +1045,6 @@ t_resource_manager_crash_after_producers_started(Config) ->
                     10_000
                 ),
             ?assertEqual([], get_pulsar_producers()),
-            ?assertMatch({error, bridge_not_found}, delete_bridge(Config)),
             ok
         end,
         []
@@ -1044,14 +1070,13 @@ t_resource_manager_crash_before_producers_started(Config) ->
             end),
             %% even if the resource manager is dead, we can still
             %% clear the allocated resources.
-            {{error, {config_update_crashed, _}}, {ok, _}} =
+            {_, {ok, _}} =
                 ?wait_async_action(
                     create_bridge(Config),
                     #{?snk_kind := pulsar_bridge_stopped},
                     10_000
                 ),
             ?assertEqual([], get_pulsar_producers()),
-            ?assertMatch({error, bridge_not_found}, delete_bridge(Config)),
             ok
         end,
         []
@@ -1172,8 +1197,7 @@ t_resilience(Config) ->
     ?check_trace(
         begin
             {ok, _} = create_bridge(Config),
-            {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
+            {ok, _} = create_rule_and_action_http(Config),
             ResourceId = resource_id(Config),
             ?retry(
                 _Sleep0 = 1_000,
@@ -1234,13 +1258,30 @@ t_resilience(Config) ->
                     {done, SeqNo} -> SeqNo
                 after 1_000 -> ct:fail("producer didn't stop!")
                 end,
-            Consumed = lists:flatmap(
-                fun(_) -> receive_consumed(10_000) end, lists:seq(1, NumProduced)
-            ),
-            ?assertEqual(NumProduced, length(Consumed)),
-            ExpectedPayloads = lists:map(fun integer_to_binary/1, lists:seq(1, NumProduced)),
+            Consumed = receive_consumed_until_seqno(NumProduced, _Timeout = 10_000),
             ?assertEqual(
-                ExpectedPayloads, lists:map(fun(#{<<"payload">> := P}) -> P end, Consumed)
+                NumProduced,
+                length(Consumed),
+                #{
+                    num_produced => NumProduced,
+                    consumed => Consumed
+                }
+            ),
+            ExpectedPayloads = lists:map(fun integer_to_binary/1, lists:seq(1, NumProduced)),
+            ConsumedPayloads = lists:sort(
+                fun(ABin, BBin) -> binary_to_integer(ABin) =< binary_to_integer(BBin) end,
+                lists:map(
+                    fun(#{<<"payload">> := P}) -> P end,
+                    Consumed
+                )
+            ),
+            ?assertEqual(
+                ExpectedPayloads,
+                ConsumedPayloads,
+                #{
+                    missing => ExpectedPayloads -- ConsumedPayloads,
+                    unexpected => ConsumedPayloads -- ExpectedPayloads
+                }
             ),
             ok
         end,

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_sso).
@@ -92,7 +92,8 @@ provider(Backend) ->
 backends() ->
     #{
         ldap => emqx_dashboard_sso_ldap,
-        saml => emqx_dashboard_sso_saml
+        saml => emqx_dashboard_sso_saml,
+        oidc => emqx_dashboard_sso_oidc
     }.
 
 format(Args) ->

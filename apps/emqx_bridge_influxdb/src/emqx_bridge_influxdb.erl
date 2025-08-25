@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_influxdb).
 
@@ -123,6 +123,7 @@ basic_connector_values() ->
     #{
         enable => true,
         server => <<"127.0.0.1:8086">>,
+        pool_size => 8,
         ssl => #{enable => false}
     }.
 
@@ -297,7 +298,7 @@ to_influx_lines(RawLines) ->
                 io_lib:format("Unable to parse InfluxDB line protocol: ~p", [RawLines])
             ),
             ?SLOG(error, #{msg => Msg, error_reason => Reason, stacktrace => Stacktrace}),
-            throw(Msg)
+            {error, Msg}
     end.
 
 -define(MEASUREMENT_ESC_CHARS, [$,, $\s]).

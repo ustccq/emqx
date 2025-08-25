@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_coap_api_SUITE).
@@ -100,7 +88,7 @@ t_send_request_api(_) ->
             Req
         ),
         #{<<"token">> := RToken, <<"payload">> := RPayload} =
-            emqx_utils_json:decode(Response, [return_maps]),
+            emqx_utils_json:decode(Response),
         ?assertEqual(Token, RToken),
         ?assertEqual(Payload, RPayload)
     end,
@@ -207,7 +195,8 @@ test_recv_coap_request(UdpSock) ->
 test_send_coap_response(UdpSock, Host, Port, Code, Content, Request) ->
     is_list(Host) orelse error("Host is not a string"),
     {ok, IpAddr} = inet:getaddr(Host, inet),
-    Response = emqx_coap_message:piggyback(Code, Content, Request),
+    Response0 = emqx_coap_message:piggyback(Code, Content, Request),
+    Response = Response0#coap_message{options = #{uri_query => [<<"clientid=client1">>]}},
     ?LOGT("test_send_coap_response Response=~p", [Response]),
     Binary = emqx_coap_frame:serialize_pkt(Response, undefined),
     ok = gen_udp:send(UdpSock, IpAddr, Port, Binary).

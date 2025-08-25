@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_crl_cache_SUITE).
@@ -113,13 +113,47 @@ init_per_testcase(TestCase, Config) when
         {tc_apps, Apps}
         | Config
     ];
+init_per_testcase(t_evict_after_failure_threshold = TestCase, Config) ->
+    case emqx_common_test_helpers:is_standalone_test() of
+        true ->
+            %% We use `emqx_utils` here.
+            {skip, standalone_not_supported};
+        false ->
+            ct:timetrap({seconds, 30}),
+            ok = snabbkaffe:start_trace(),
+            DataDir = ?config(data_dir, Config),
+            {CRLPem, CRLDer} = read_crl(filename:join(DataDir, "intermediate-not-revoked.crl.pem")),
+            ok = meck:new(emqx_crl_cache, [passthrough, no_history, no_link]),
+            mock_success_http_response(CRLPem),
+            FailureThreshold = <<"1s">>,
+            Apps = start_emqx_with_crl_cache(
+                #{
+                    is_cached => true,
+                    overrides => #{
+                        crl_cache => #{
+                            refresh_interval => <<"300ms">>,
+                            failure_threshold => FailureThreshold
+                        }
+                    }
+                },
+                TestCase,
+                Config
+            ),
+            [
+                {crl_pem, CRLPem},
+                {crl_der, CRLDer},
+                {tc_apps, Apps},
+                {failure_threshold, FailureThreshold}
+                | Config
+            ]
+    end;
 init_per_testcase(t_refresh_config = TestCase, Config) ->
     ct:timetrap({seconds, 30}),
     ok = snabbkaffe:start_trace(),
     DataDir = ?config(data_dir, Config),
     {CRLPem, CRLDer} = read_crl(filename:join(DataDir, "intermediate-revoked.crl.pem")),
     TestPid = self(),
-    ok = meck:new(emqx_crl_cache, [non_strict, passthrough, no_history, no_link]),
+    ok = meck:new(emqx_crl_cache, [passthrough, no_history, no_link]),
     meck:expect(
         emqx_crl_cache,
         http_get,
@@ -138,14 +172,15 @@ init_per_testcase(t_refresh_config = TestCase, Config) ->
     ];
 init_per_testcase(TestCase, Config) when
     TestCase =:= t_update_listener;
+    TestCase =:= t_update_listener_enable_disable;
     TestCase =:= t_validations
 ->
     ct:timetrap({seconds, 30}),
     ok = snabbkaffe:start_trace(),
     %% when running emqx standalone tests, we can't use those
     %% features.
-    case does_module_exist(emqx_management) of
-        true ->
+    case emqx_common_test_helpers:is_standalone_test() of
+        false ->
             DataDir = ?config(data_dir, Config),
             CRLFile = filename:join([DataDir, "intermediate-revoked.crl.pem"]),
             {ok, CRLPem} = file:read_file(CRLFile),
@@ -165,7 +200,7 @@ init_per_testcase(TestCase, Config) when
                     {emqx_conf, #{config => #{listeners => #{ssl => #{default => ListenerConf}}}}},
                     emqx,
                     emqx_management,
-                    {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+                    emqx_mgmt_api_test_util:emqx_dashboard()
                 ],
                 #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
             ),
@@ -174,7 +209,7 @@ init_per_testcase(TestCase, Config) when
                 {tc_apps, Apps}
                 | Config
             ];
-        false ->
+        true ->
             [{skip_does_not_apply, true} | Config]
     end;
 init_per_testcase(_TestCase, Config) ->
@@ -183,7 +218,7 @@ init_per_testcase(_TestCase, Config) ->
     DataDir = ?config(data_dir, Config),
     {CRLPem, CRLDer} = read_crl(filename:join(DataDir, "intermediate-revoked.crl.pem")),
     TestPid = self(),
-    ok = meck:new(emqx_crl_cache, [non_strict, passthrough, no_history, no_link]),
+    ok = meck:new(emqx_crl_cache, [passthrough, no_history, no_link]),
     meck:expect(
         emqx_crl_cache,
         http_get,
@@ -206,6 +241,7 @@ read_crl(Filename) ->
 
 end_per_testcase(TestCase, Config) when
     TestCase =:= t_update_listener;
+    TestCase =:= t_update_listener_enable_disable;
     TestCase =:= t_validations
 ->
     Skip = proplists:get_bool(skip_does_not_apply, Config),
@@ -227,11 +263,35 @@ end_per_testcase(_TestCase, Config) ->
         proplists:get_value(tc_apps, Config)
     ),
     catch meck:unload([emqx_crl_cache]),
+    case whereis(emqx_crl_cache) of
+        Pid when is_pid(Pid) ->
+            MRef = monitor(process, Pid),
+            unlink(Pid),
+            exit(Pid, kill),
+            receive
+                {'DOWN', MRef, process, Pid, _} ->
+                    ok
+            end;
+        _ ->
+            ok
+    end,
     ok.
 
 %%--------------------------------------------------------------------
 %% Helper functions
 %%--------------------------------------------------------------------
+
+mock_success_http_response(CRLPem) ->
+    TestPid = self(),
+    meck:expect(
+        emqx_crl_cache,
+        http_get,
+        fun(URL, _HTTPTimeout) ->
+            ct:pal("http get crl ~p", [URL]),
+            TestPid ! {http_get, iolist_to_binary(URL)},
+            {ok, {{"HTTP/1.0", 200, "OK"}, [], CRLPem}}
+        end
+    ).
 
 does_module_exist(Mod) ->
     case erlang:module_loaded(Mod) of
@@ -334,7 +394,11 @@ start_emqx_with_crl_cache(#{is_cached := IsCached} = Opts, TC, Config) ->
     case IsCached of
         true ->
             %% wait the cache to be filled
-            emqx_crl_cache:refresh(?DEFAULT_URL),
+            {_, {ok, _}} =
+                ?wait_async_action(
+                    emqx_crl_cache:refresh(?DEFAULT_URL),
+                    #{?snk_kind := "emqx_ssl_crl_cache_inserted"}
+                ),
             ?assertReceive({http_get, <<?DEFAULT_URL>>});
         false ->
             %% ensure cache is empty
@@ -356,7 +420,7 @@ request(Method, Url, QueryParams, Body) ->
     Opts = #{return_all => true},
     case emqx_mgmt_api_test_util:request_api(Method, Url, QueryParams, AuthHeader, Body, Opts) of
         {ok, {Reason, Headers, BodyR}} ->
-            {ok, {Reason, Headers, emqx_utils_json:decode(BodyR, [return_maps])}};
+            {ok, {Reason, Headers, emqx_utils_json:decode(BodyR)}};
         Error ->
             Error
     end.
@@ -421,6 +485,21 @@ ensure_ssl_manager_alive() ->
         true = is_pid(whereis(ssl_manager))
     ).
 
+now_ms() ->
+    erlang:system_time(millisecond).
+
+%% Since some events in this suite might come from different processes, relying on time
+%% ordering might be flaky.
+sort_trace(Trace) ->
+    lists:sort(
+        fun(#{?snk_kind := K1} = E1, #{?snk_kind := K2} = E2) ->
+            S1 = maps:get(?snk_span, E1, undefined),
+            S2 = maps:get(?snk_span, E2, undefined),
+            {K1, S1} =< {K2, S2}
+        end,
+        Trace
+    ).
+
 %%--------------------------------------------------------------------
 %% Test cases
 %%--------------------------------------------------------------------
@@ -463,6 +542,7 @@ t_manual_refresh(Config) ->
     emqx_config_handler:start_link(),
     {ok, _} = emqx_crl_cache:start_link(),
     URL = "http://localhost/crl.pem",
+    URLBin = iolist_to_binary(URL),
     ok = snabbkaffe:start_trace(),
     ?wait_async_action(
         ?assertEqual(ok, emqx_crl_cache:refresh(URL)),
@@ -470,10 +550,7 @@ t_manual_refresh(Config) ->
         5_000
     ),
     ok = snabbkaffe:stop(),
-    ?assertEqual(
-        [{"crl.pem", [CRLDer]}],
-        ets:tab2list(Ref)
-    ),
+    ?assertEqual([{URLBin, [CRLDer]}], ets:tab2list(Ref)),
     emqx_config_handler:stop(),
     ok.
 
@@ -496,7 +573,7 @@ t_refresh_request_error(_Config) ->
         ),
         fun(Trace) ->
             ?assertMatch(
-                [#{error := {bad_response, #{code := 404}}}],
+                [#{error := {bad_response, #{code := 404}}} | _],
                 ?of_kind(crl_refresh_failure, Trace)
             ),
             ok
@@ -554,7 +631,7 @@ t_refresh_http_error(_Config) ->
         ),
         fun(Trace) ->
             ?assertMatch(
-                [#{error := {http_error, timeout}}],
+                [#{error := {http_error, timeout}} | _],
                 ?of_kind(crl_refresh_failure, Trace)
             ),
             ok
@@ -577,13 +654,14 @@ t_evict(_Config) ->
     emqx_config_handler:start_link(),
     {ok, _} = emqx_crl_cache:start_link(),
     URL = "http://localhost/crl.pem",
+    URLBin = iolist_to_binary(URL),
     ?wait_async_action(
         ?assertEqual(ok, emqx_crl_cache:refresh(URL)),
         #{?snk_kind := crl_cache_insert},
         5_000
     ),
     Ref = get_crl_cache_table(),
-    ?assertMatch([{"crl.pem", _}], ets:tab2list(Ref)),
+    ?assertMatch([{URLBin, _}], ets:tab2list(Ref)),
     {ok, {ok, _}} = ?wait_async_action(
         emqx_crl_cache:evict(URL),
         #{?snk_kind := crl_cache_evict}
@@ -679,21 +757,16 @@ t_cache_overflow(Config) ->
             ?assertMatch(
                 [
                     #{
-                        ?snk_kind := mqtt_client_connection,
-                        ?snk_span := start,
-                        client_num := 1
-                    },
-                    #{
-                        ?snk_kind := new_crl_url_inserted,
-                        url := URL1
-                    },
-                    #{
                         ?snk_kind := crl_cache_ensure_timer,
                         url := URL1
                     },
                     #{
+                        ?snk_kind := crl_cache_ensure_timer,
+                        url := URL2
+                    },
+                    #{
                         ?snk_kind := mqtt_client_connection,
-                        ?snk_span := {complete, ok},
+                        ?snk_span := start,
                         client_num := 1
                     },
                     #{
@@ -702,20 +775,25 @@ t_cache_overflow(Config) ->
                         client_num := 2
                     },
                     #{
-                        ?snk_kind := new_crl_url_inserted,
-                        url := URL2
-                    },
-                    #{
-                        ?snk_kind := crl_cache_ensure_timer,
-                        url := URL2
+                        ?snk_kind := mqtt_client_connection,
+                        ?snk_span := {complete, ok},
+                        client_num := 1
                     },
                     #{
                         ?snk_kind := mqtt_client_connection,
                         ?snk_span := {complete, ok},
                         client_num := 2
+                    },
+                    #{
+                        ?snk_kind := new_crl_url_inserted,
+                        url := URL1
+                    },
+                    #{
+                        ?snk_kind := new_crl_url_inserted,
+                        url := URL2
                     }
                 ],
-                Trace1
+                sort_trace(Trace1)
             ),
             Trace2 = of_kinds(
                 trace_between(Trace, first_reconnections, first_eviction),
@@ -730,13 +808,13 @@ t_cache_overflow(Config) ->
                     },
                     #{
                         ?snk_kind := mqtt_client_connection,
-                        ?snk_span := {complete, ok},
-                        client_num := 1
+                        ?snk_span := start,
+                        client_num := 2
                     },
                     #{
                         ?snk_kind := mqtt_client_connection,
-                        ?snk_span := start,
-                        client_num := 2
+                        ?snk_span := {complete, ok},
+                        client_num := 1
                     },
                     #{
                         ?snk_kind := mqtt_client_connection,
@@ -744,7 +822,7 @@ t_cache_overflow(Config) ->
                         client_num := 2
                     }
                 ],
-                Trace2
+                sort_trace(Trace2)
             ),
             Trace3 = of_kinds(
                 trace_between(Trace, first_eviction, second_eviction),
@@ -753,12 +831,7 @@ t_cache_overflow(Config) ->
             ?assertMatch(
                 [
                     #{
-                        ?snk_kind := mqtt_client_connection,
-                        ?snk_span := start,
-                        client_num := 3
-                    },
-                    #{
-                        ?snk_kind := new_crl_url_inserted,
+                        ?snk_kind := crl_cache_ensure_timer,
                         url := URL3
                     },
                     #{
@@ -766,12 +839,8 @@ t_cache_overflow(Config) ->
                         oldest_url := URL1
                     },
                     #{
-                        ?snk_kind := crl_cache_ensure_timer,
-                        url := URL3
-                    },
-                    #{
                         ?snk_kind := mqtt_client_connection,
-                        ?snk_span := {complete, ok},
+                        ?snk_span := start,
                         client_num := 3
                     },
                     #{
@@ -783,9 +852,18 @@ t_cache_overflow(Config) ->
                         ?snk_kind := mqtt_client_connection,
                         ?snk_span := {complete, ok},
                         client_num := 3
+                    },
+                    #{
+                        ?snk_kind := mqtt_client_connection,
+                        ?snk_span := {complete, ok},
+                        client_num := 3
+                    },
+                    #{
+                        ?snk_kind := new_crl_url_inserted,
+                        url := URL3
                     }
                 ],
-                Trace3
+                sort_trace(Trace3)
             ),
             Trace4 = of_kinds(
                 trace_between(Trace, second_eviction, test_end),
@@ -794,12 +872,7 @@ t_cache_overflow(Config) ->
             ?assertMatch(
                 [
                     #{
-                        ?snk_kind := mqtt_client_connection,
-                        ?snk_span := start,
-                        client_num := 1
-                    },
-                    #{
-                        ?snk_kind := new_crl_url_inserted,
+                        ?snk_kind := crl_cache_ensure_timer,
                         url := URL1
                     },
                     #{
@@ -807,16 +880,21 @@ t_cache_overflow(Config) ->
                         oldest_url := URL2
                     },
                     #{
-                        ?snk_kind := crl_cache_ensure_timer,
-                        url := URL1
+                        ?snk_kind := mqtt_client_connection,
+                        ?snk_span := start,
+                        client_num := 1
                     },
                     #{
                         ?snk_kind := mqtt_client_connection,
                         ?snk_span := {complete, ok},
                         client_num := 1
+                    },
+                    #{
+                        ?snk_kind := new_crl_url_inserted,
+                        url := URL1
                     }
                 ],
-                Trace4
+                sort_trace(Trace4)
             ),
             ok
         end
@@ -873,6 +951,7 @@ t_revoked(Config) ->
     ClientCert = filename:join(DataDir, "client-revoked.cert.pem"),
     ClientKey = filename:join(DataDir, "client-revoked.key.pem"),
     {ok, C} = emqtt:start_link([
+        {connect_timeout, 2},
         {ssl, true},
         {ssl_opts, [
             {certfile, ClientCert},
@@ -884,6 +963,8 @@ t_revoked(Config) ->
     unlink(C),
     case emqtt:connect(C) of
         {error, {ssl_error, _Sock, {tls_alert, {certificate_revoked, _}}}} ->
+            ok;
+        {error, {tls_alert, {certificate_revoked, _}}} ->
             ok;
         {error, closed} ->
             %% this happens due to an unidentified race-condition
@@ -1046,14 +1127,180 @@ do_t_validations(_Config) ->
         ),
     {error, {_, _, ResRaw1}} = update_listener_via_api(ListenerId, ListenerData1),
     #{<<"code">> := <<"BAD_REQUEST">>, <<"message">> := MsgRaw1} =
-        emqx_utils_json:decode(ResRaw1, [return_maps]),
+        emqx_utils_json:decode(ResRaw1),
     ?assertMatch(
         #{
             <<"kind">> := <<"validation_error">>,
             <<"reason">> :=
                 <<"verify must be verify_peer when CRL check is enabled">>
         },
-        emqx_utils_json:decode(MsgRaw1, [return_maps])
+        emqx_utils_json:decode(MsgRaw1)
     ),
+
+    ok.
+
+%% Checks that if CRL is ever enabled and then disabled, clients can connect, even if they
+%% would otherwise not have their corresponding CRLs cached and fail with `{bad_crls,
+%% no_relevant_crls}`.
+t_update_listener_enable_disable(Config) ->
+    case proplists:get_bool(skip_does_not_apply, Config) of
+        true ->
+            ct:pal("skipping as this test does not apply in this profile"),
+            ok;
+        false ->
+            do_t_update_listener_enable_disable(Config)
+    end.
+
+do_t_update_listener_enable_disable(Config) ->
+    DataDir = ?config(data_dir, Config),
+    Keyfile = filename:join([DataDir, "server.key.pem"]),
+    Certfile = filename:join([DataDir, "server.cert.pem"]),
+    Cacertfile = filename:join([DataDir, "ca-chain.cert.pem"]),
+    ClientCert = filename:join(DataDir, "client.cert.pem"),
+    ClientKey = filename:join(DataDir, "client.key.pem"),
+
+    ListenerId = "ssl:default",
+    %% Enable CRL
+    {ok, {{_, 200, _}, _, ListenerData0}} = get_listener_via_api(ListenerId),
+    CRLConfig0 =
+        #{
+            <<"ssl_options">> =>
+                #{
+                    <<"keyfile">> => Keyfile,
+                    <<"certfile">> => Certfile,
+                    <<"cacertfile">> => Cacertfile,
+                    <<"enable_crl_check">> => true,
+                    <<"fail_if_no_peer_cert">> => true
+                }
+        },
+    ListenerData1 = emqx_utils_maps:deep_merge(ListenerData0, CRLConfig0),
+    {ok, {_, _, ListenerData2}} = update_listener_via_api(ListenerId, ListenerData1),
+    ?assertMatch(
+        #{
+            <<"ssl_options">> :=
+                #{
+                    <<"enable_crl_check">> := true,
+                    <<"verify">> := <<"verify_peer">>,
+                    <<"fail_if_no_peer_cert">> := true
+                }
+        },
+        ListenerData2
+    ),
+
+    %% Disable CRL
+    CRLConfig1 =
+        #{
+            <<"ssl_options">> =>
+                #{
+                    <<"keyfile">> => Keyfile,
+                    <<"certfile">> => Certfile,
+                    <<"cacertfile">> => Cacertfile,
+                    <<"enable_crl_check">> => false,
+                    <<"fail_if_no_peer_cert">> => true
+                }
+        },
+    ListenerData3 = emqx_utils_maps:deep_merge(ListenerData2, CRLConfig1),
+    {ok, {_, _, ListenerData4}} = update_listener_via_api(ListenerId, ListenerData3),
+    ?assertMatch(
+        #{
+            <<"ssl_options">> :=
+                #{
+                    <<"enable_crl_check">> := false,
+                    <<"verify">> := <<"verify_peer">>,
+                    <<"fail_if_no_peer_cert">> := true
+                }
+        },
+        ListenerData4
+    ),
+
+    %% Now the client that would be blocked tries to connect and should now be allowed.
+    {ok, C} = emqtt:start_link([
+        {ssl, true},
+        {ssl_opts, [
+            {certfile, ClientCert},
+            {keyfile, ClientKey},
+            {verify, verify_none}
+        ]},
+        {port, 8883}
+    ]),
+    ?assertMatch({ok, _}, emqtt:connect(C)),
+    emqtt:stop(C),
+
+    ?assertNotReceive({http_get, _}),
+
+    ok.
+
+%% Verifies that we evict an URL that hits the failure threshold, instead of continuing to
+%% try and refresh it and flood logs.
+t_evict_after_failure_threshold(Config) ->
+    CRLPem = ?config(crl_pem, Config),
+    ct:pal("checking failure threshold crossed"),
+    Ref = get_crl_cache_table(),
+    ?assertMatch([_], ets:tab2list(Ref)),
+    %% Sanity check: refesh is happening
+    ?assertReceive({http_get, _}),
+    %% Now refresh starts failing
+    TestPid = self(),
+    meck:expect(
+        emqx_crl_cache,
+        http_get,
+        fun(URL, _HTTPTimeout) ->
+            TestPid ! {http_get, URL},
+            {error, timeout}
+        end
+    ),
+    ?block_until(#{?snk_kind := "crl_cache_evicted_url_due_to_failure_threshold"}),
+    ?drainMailbox(),
+    %% Should no longer refresh this URL
+    ?assertNotReceive({http_get, _}, 750),
+
+    %% Check that we reset the failure count if it succeeds before threshold is reached.
+    ct:pal("checking failure reset"),
+    mock_success_http_response(CRLPem),
+    {_, {ok, _}} =
+        ?wait_async_action(
+            emqx_crl_cache:refresh(?DEFAULT_URL),
+            #{?snk_kind := "emqx_ssl_crl_cache_inserted"}
+        ),
+    ?assertReceive({http_get, <<?DEFAULT_URL>>}),
+    %% Fail just before threshold
+    {ok, Agent} = emqx_utils_agent:start_link(undefined),
+    meck:expect(
+        emqx_crl_cache,
+        http_get,
+        fun(URL, _HTTPTimeout) ->
+            TestPid ! {http_get, URL},
+            FirstFailure = emqx_utils_agent:get_and_update(Agent, fun
+                (undefined) ->
+                    {undefined, now_ms()};
+                (T) ->
+                    {T, T}
+            end),
+            RefreshIntervalMS = 300,
+            FailureThresholdMS = 1_000,
+            case
+                is_integer(FirstFailure) andalso
+                    now_ms() >= FirstFailure + FailureThresholdMS - RefreshIntervalMS
+            of
+                true ->
+                    TestPid ! succeeded,
+                    {ok, {{"HTTP/1.0", 200, "OK"}, [], CRLPem}};
+                false ->
+                    TestPid ! failed,
+                    {error, timeout}
+            end
+        end
+    ),
+    %% At least one failure before succeeding
+    ?assertReceive(failed),
+    ?assertReceive(succeeded, 2_000),
+    ?assertReceive(succeeded),
+    _ = ?drainMailbox(),
+    %% Can fail again
+    emqx_utils_agent:get_and_update(Agent, fun(_N) -> {unused, undefined} end),
+    ?assertReceive(failed),
+    ?assertReceive(succeeded, 2_000),
+    ?assertReceive(succeeded),
+    _ = ?drainMailbox(),
 
     ok.

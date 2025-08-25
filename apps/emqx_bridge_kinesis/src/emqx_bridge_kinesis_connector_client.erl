@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_kinesis_connector_client).
@@ -42,24 +42,32 @@
 %% The default timeout for Kinesis API calls is 10 seconds,
 %% but this value for `gen_server:call` is 5s,
 %% so we should adjust timeout for `gen_server:call`
--define(HEALTH_CHECK_TIMEOUT, 15000).
+-ifdef(TEST).
+-define(HEALTH_CHECK_TIMEOUT, 1_000).
+-else.
+-define(HEALTH_CHECK_TIMEOUT, 15_000).
+-endif.
 
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+-spec connection_status(pid()) -> {ok, ?status_connected} | {error, timeout | term()}.
 connection_status(Pid) ->
     try
         gen_server:call(Pid, connection_status, ?HEALTH_CHECK_TIMEOUT)
     catch
-        _:_ ->
+        exit:{timeout, _} ->
             {error, timeout}
     end.
 
+-spec connection_status(pid(), binary()) ->
+    {ok, ?status_connected} | {error, timeout | unhealthy_target | term()}.
 connection_status(Pid, StreamName) ->
     try
         gen_server:call(Pid, {connection_status, StreamName}, ?HEALTH_CHECK_TIMEOUT)
     catch
-        _:_ ->
+        exit:{timeout, _} ->
             {error, timeout}
     end.
 
@@ -119,14 +127,8 @@ init(#{
             Config0#aws_config{retry_num = MaxRetries}
         end
     ),
-    % check the connection
-    case erlcloud_kinesis:list_streams() of
-        {ok, _} ->
-            {ok, State};
-        {error, Reason} ->
-            ?tp(kinesis_init_failed, #{instance_id => InstanceId, reason => Reason}),
-            {stop, Reason}
-    end.
+    %% Leave checking the connection to health checks
+    {ok, State}.
 
 handle_call({connection_status, StreamName}, _From, State) ->
     Status = get_status(StreamName),
@@ -135,8 +137,8 @@ handle_call(connection_status, _From, State) ->
     Status =
         case erlcloud_kinesis:list_streams() of
             {ok, _ListStreamsResult} ->
-                {ok, connected};
-            Error ->
+                {ok, ?status_connected};
+            {error, Error} ->
                 {error, Error}
         end,
     {reply, Status, State};
@@ -166,10 +168,10 @@ code_change(_OldVsn, State, _Extra) ->
 get_status(StreamName) ->
     case erlcloud_kinesis:describe_stream(StreamName) of
         {ok, _} ->
-            {ok, connected};
+            {ok, ?status_connected};
         {error, {<<"ResourceNotFoundException">>, _}} ->
             {error, unhealthy_target};
-        Error ->
+        {error, Error} ->
             {error, Error}
     end.
 

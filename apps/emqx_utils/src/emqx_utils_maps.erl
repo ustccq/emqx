@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,17 +28,21 @@
     deep_put/3,
     deep_remove/2,
     diff_maps/2,
+    get_lazy/3,
     if_only_to_toggle_enable/2,
     indent/3,
     jsonable_map/1,
     jsonable_map/2,
     key_comparer/1,
     put_if/4,
+    put_new/3,
     rename/3,
     safe_atom_key_map/1,
     unindent/2,
     unsafe_atom_key_map/1,
-    update_if_present/3
+    update_if_present/3,
+    printable_props/1,
+    find_key/2
 ]).
 
 -export_type([config_key/0, config_key_path/0]).
@@ -316,6 +320,11 @@ put_if(Acc, K, V, true) ->
 put_if(Acc, _K, _V, false) ->
     Acc.
 
+put_new(K, _V, M) when is_map_key(K, M) ->
+    M;
+put_new(K, V, M) ->
+    maps:put(K, V, M).
+
 rename(OldKey, NewKey, Map) ->
     case maps:find(OldKey, Map) of
         {ok, Value} ->
@@ -351,3 +360,69 @@ unindent(Key, Map) ->
         maps:remove(Key, Map),
         maps:get(Key, Map, #{})
     ).
+
+-spec get_lazy(term(), map(), fun(() -> term())) -> term().
+get_lazy(Key, Map, DefFn) ->
+    case maps:find(Key, Map) of
+        {ok, Val} -> Val;
+        error -> DefFn()
+    end.
+
+% @doc Convert a mqtt prop map to a map that can be printed as JSON.
+% The map is converted to a map with atom keys and JSONable values.
+-spec printable_props(map()) -> map().
+printable_props(undefined) ->
+    #{};
+printable_props(Headers) ->
+    maps:fold(
+        fun
+            (K, V0, AccIn) when K =:= peerhost; K =:= peername; K =:= sockname ->
+                AccIn#{K => ntoa(V0)};
+            ('User-Property', V0, AccIn) when is_list(V0) ->
+                AccIn#{
+                    %% The 'User-Property' field is for the convenience of querying properties
+                    %% using the '.' syntax, e.g. "SELECT 'User-Property'.foo as foo"
+                    %% However, this does not allow duplicate property keys. To allow
+                    %% duplicate keys, we have to use the 'User-Property-Pairs' field instead.
+                    'User-Property' => maps:from_list(V0),
+                    'User-Property-Pairs' => [
+                        #{
+                            key => Key,
+                            value => Value
+                        }
+                     || {Key, Value} <- V0
+                    ]
+                };
+            (_K, V, AccIn) when is_tuple(V) ->
+                %% internal headers
+                AccIn;
+            (K, V, AccIn) ->
+                AccIn#{K => V}
+        end,
+        #{'User-Property' => #{}},
+        Headers
+    ).
+
+-doc """
+Inverse of `maps:find'. Search for the key that has the given value.
+If there are multiple keys that have the matching value, it returns
+any of them.
+""".
+-spec find_key(Value, #{Key => Value}) -> {ok, Key} | undefined.
+find_key(Value, Map) ->
+    Go = fun Go(Val, It0) ->
+        case maps:next(It0) of
+            {Key, Val, _} ->
+                {ok, Key};
+            {_, _, It} ->
+                Go(Val, It);
+            none ->
+                undefined
+        end
+    end,
+    Go(Value, maps:iterator(Map)).
+
+ntoa(undefined) ->
+    undefined;
+ntoa(IpOrIpPort) ->
+    iolist_to_binary(emqx_utils:ntoa(IpOrIpPort)).

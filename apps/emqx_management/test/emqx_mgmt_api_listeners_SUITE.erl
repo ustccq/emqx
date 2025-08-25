@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_listeners_SUITE).
 
@@ -74,13 +62,10 @@ init_group_apps(Config, CTConfig) ->
         [
             {emqx_conf, Config},
             emqx_management,
-            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+            emqx_mgmt_api_test_util:emqx_dashboard()
         ],
-        #{
-            work_dir => emqx_cth_suite:work_dir(CTConfig)
-        }
+        #{work_dir => emqx_cth_suite:work_dir(CTConfig)}
     ),
-    {ok, _} = emqx_common_test_http:create_default_app(),
     [{suite_apps, Apps} | CTConfig].
 
 end_per_group(_Group, Config) ->
@@ -421,6 +406,35 @@ t_update_listener_zone(_Config) ->
     ?assertMatch({error, {_, 400, _}}, request(put, Path, [], AddConf1)),
     ?assertMatch(#{<<"zone">> := <<"zone1">>}, request(put, Path, [], AddConf2)).
 
+t_update_listener_max_conn_rate({init, Config}) ->
+    Config;
+t_update_listener_max_conn_rate({'end', _Config}) ->
+    ok;
+t_update_listener_max_conn_rate(_Config) ->
+    ListenerId = <<"tcp:default">>,
+    Path = emqx_mgmt_api_test_util:api_path(["listeners", ListenerId]),
+    Conf = request(get, Path, [], []),
+    %% check there is no limiter by default
+    ?assertNotMatch(#{<<"max_conn_rate">> := _}, Conf),
+    %% Update to infinity
+    UpdateConfToInfinity = Conf#{<<"max_conn_rate">> => <<"infinity">>},
+    ?assertMatch(
+        #{<<"max_conn_rate">> := <<"infinity">>},
+        request(put, Path, [], UpdateConfToInfinity)
+    ),
+    %% Update to 42/s
+    UpdateConfTo42PerSec = Conf#{<<"max_conn_rate">> => <<"42/s">>},
+    ?assertMatch(
+        #{<<"max_conn_rate">> := <<"42/s">>},
+        request(put, Path, [], UpdateConfTo42PerSec)
+    ),
+    %% Update back to infinity
+    UpdateConfToInfinity = Conf#{<<"max_conn_rate">> => <<"infinity">>},
+    ?assertMatch(
+        #{<<"max_conn_rate">> := <<"infinity">>},
+        request(put, Path, [], UpdateConfToInfinity)
+    ).
+
 t_delete_nonexistent_listener(Config) when is_list(Config) ->
     NonExist = emqx_mgmt_api_test_util:api_path(["listeners", "tcp:nonexistent"]),
     ?assertMatch(
@@ -473,8 +487,8 @@ t_update_validation_error_message(Config) when is_list(Config) ->
     Result1 = request(put, NewPath, [], WrongConf1, #{return_all => true}),
     ?assertMatch({error, {{_, 400, _}, _Headers, _Body}}, Result1),
     {error, {{_, _Code, _}, _Headers, Body1}} = Result1,
-    #{<<"message">> := RawMsg1} = emqx_utils_json:decode(Body1, [return_maps]),
-    Msg1 = emqx_utils_json:decode(RawMsg1, [return_maps]),
+    #{<<"message">> := RawMsg1} = emqx_utils_json:decode(Body1),
+    Msg1 = emqx_utils_json:decode(RawMsg1),
     %% No confusing union type errors.
     ?assertNotMatch(#{<<"mismatches">> := _}, Msg1),
     ?assertMatch(
@@ -505,7 +519,7 @@ request(Method, Url, QueryParams, Body) ->
 request(Method, Url, QueryParams, Body, Opts) ->
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     case emqx_mgmt_api_test_util:request_api(Method, Url, QueryParams, AuthHeader, Body, Opts) of
-        {ok, Res} -> emqx_utils_json:decode(Res, [return_maps]);
+        {ok, Res} -> emqx_utils_json:decode(Res);
         Error -> Error
     end.
 
@@ -526,8 +540,8 @@ list_pem_dir(Type, Name) ->
     file:list_dir(Dir).
 
 data_file(Name) ->
-    Dir = code:lib_dir(emqx, test),
-    {ok, Bin} = file:read_file(filename:join([Dir, "data", Name])),
+    Dir = code:lib_dir(emqx),
+    {ok, Bin} = file:read_file(filename:join([Dir, "test", "data", Name])),
     Bin.
 
 cert_file(Name) ->

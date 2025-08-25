@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_v2_kafka_consumer_SUITE).
@@ -10,6 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("kafka_protocol/include/kpro.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -35,15 +36,19 @@ matrix_cases() ->
     ].
 
 init_per_suite(Config) ->
-    emqx_bridge_kafka_impl_consumer_SUITE:init_per_suite(Config).
+    [
+        {proxy_host, "toxiproxy"},
+        {proxy_port, 8474}
+        | emqx_bridge_kafka_impl_consumer_SUITE:init_per_suite(Config)
+    ].
 
 end_per_suite(Config) ->
     emqx_bridge_kafka_impl_consumer_SUITE:end_per_suite(Config).
 
-init_per_testcase(TestCase, Config) ->
-    common_init_per_testcase(TestCase, Config).
-
-common_init_per_testcase(TestCase, Config0) ->
+init_per_testcase(TestCase, Config0) ->
+    ProxyHost = ?config(proxy_host, Config0),
+    ProxyPort = ?config(proxy_port, Config0),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     ct:timetrap({seconds, 60}),
     UniqueNum = integer_to_binary(erlang:unique_integer()),
     Name = <<(atom_to_binary(TestCase))/binary, UniqueNum/binary>>,
@@ -63,9 +68,7 @@ common_init_per_testcase(TestCase, Config0) ->
         {source_config, SourceConfig},
         {connector_name, Name},
         {connector_type, ?CONNECTOR_TYPE_BIN},
-        {connector_config, ConnectorConfig},
-        {proxy_host, "toxiproxy"},
-        {proxy_port, 8474}
+        {connector_config, ConnectorConfig}
         | Config1
     ].
 
@@ -148,6 +151,9 @@ ensure_topic_and_producers(ConnectorConfig, SourceConfig, TestCase, TCConfig) ->
         num_partitions => 1
     }),
     ok = emqx_bridge_kafka_impl_consumer_SUITE:ensure_topics(CreateConfig),
+    %% Apparently, Kafka in 2+ brokers needs a moment to replicate kafka creation...  We
+    %% need to wait or else starting producers to quickly will crash...
+    ct:sleep(500),
     ProducerConfigs = emqx_bridge_kafka_impl_consumer_SUITE:start_producers(TestCase, CreateConfig),
     [{kafka_producers, ProducerConfigs} | TCConfig].
 
@@ -207,8 +213,9 @@ source_config(Overrides0) ->
                 #{
                     <<"key_encoding_mode">> => <<"none">>,
                     <<"max_batch_bytes">> => <<"896KB">>,
+                    <<"max_wait_time">> => <<"500ms">>,
                     <<"max_rejoin_attempts">> => <<"5">>,
-                    <<"offset_reset_policy">> => <<"latest">>,
+                    <<"offset_reset_policy">> => <<"earliest">>,
                     <<"topic">> => <<"please override">>,
                     <<"value_encoding_mode">> => <<"none">>
                 },
@@ -217,7 +224,62 @@ source_config(Overrides0) ->
                 <<"resume_interval">> => <<"2s">>
             }
         },
-    maps:merge(CommonConfig, Overrides).
+    emqx_utils_maps:deep_merge(CommonConfig, Overrides).
+
+create_connector_api(Config) ->
+    create_connector_api(Config, _Overrides = #{}).
+
+create_connector_api(Config, Overrides) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_connector_api(
+            Config, Overrides
+        )
+    ).
+
+probe_source_api(Config, Overrides) ->
+    #{
+        kind := Kind,
+        type := Type,
+        name := Name
+    } = emqx_bridge_v2_testlib:get_common_values(Config),
+    SourceConfig = ?config(source_config, Config),
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:probe_bridge_api(
+            Kind,
+            Type,
+            Name,
+            emqx_utils_maps:deep_merge(SourceConfig, Overrides)
+        )
+    ).
+
+get_source_api(Config) ->
+    #{
+        type := Type,
+        name := Name
+    } = emqx_bridge_v2_testlib:get_common_values(Config),
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:get_source_api(
+            Type, Name
+        )
+    ).
+
+%% For things like listing groups, apparently different brokers return different
+%% responses, and we need to query more than one...
+all_bootstrap_hosts() ->
+    [
+        {<<"kafka-1.emqx.net">>, 9092},
+        {<<"kafka-2.emqx.net">>, 9092}
+    ].
+
+get_groups() ->
+    lists:foldl(
+        fun(Endpoint, Acc) ->
+            {ok, Groups} = brod:list_groups(Endpoint, _ConnOpts = #{}),
+            Groups ++ Acc
+        end,
+        [],
+        all_bootstrap_hosts()
+    ).
 
 %%------------------------------------------------------------------------------
 %% Testcases
@@ -234,7 +296,7 @@ t_start_stop(matrix) ->
         [tls, sasl_auth_plain]
     ];
 t_start_stop(Config) ->
-    ok = emqx_bridge_v2_testlib:t_start_stop(Config, kafka_consumer_subcriber_and_client_stopped),
+    ok = emqx_bridge_v2_testlib:t_start_stop(Config, "kafka_consumer_stopped"),
     ok.
 
 t_create_via_http(Config) ->
@@ -279,6 +341,7 @@ t_consume(Config) ->
     ok = emqx_bridge_v2_testlib:t_consume(
         Config,
         #{
+            test_timeout => timer:seconds(20),
             consumer_ready_tracepoint => ?match_n_events(
                 NumPartitions,
                 #{?snk_kind := kafka_consumer_subscriber_init}
@@ -352,19 +415,100 @@ t_bad_bootstrap_host(Config) ->
     ),
     ok.
 
+%% Checks that a group id is automatically generated if a custom one is not provided in
+%% the config.
+t_absent_group_id(Config) ->
+    ?check_trace(
+        begin
+            SourceConfig = ?config(source_config, Config),
+            SourceName = ?config(source_name, Config),
+            ?assertEqual(
+                undefined,
+                emqx_utils_maps:deep_get(
+                    [<<"parameters">>, <<"group_id">>],
+                    SourceConfig,
+                    undefined
+                )
+            ),
+            {ok, {{_, 201, _}, _, _}} = emqx_bridge_v2_testlib:create_bridge_api(Config),
+            ?retry(
+                1_000,
+                10,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}},
+                    get_source_api(Config)
+                )
+            ),
+            GroupId = emqx_bridge_kafka_impl_consumer:consumer_group_id(#{}, SourceName),
+            ct:pal("generated group id: ~p", [GroupId]),
+            ?retry(1_000, 10, begin
+                Groups = get_groups(),
+                ?assertMatch(
+                    [_],
+                    [Group || Group = {_, Id, _} <- Groups, Id == GroupId],
+                    #{groups => Groups}
+                )
+            end),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Checks that a group id is automatically generated if an empty string is provided in the
+%% config.
+t_empty_group_id(Config) ->
+    ?check_trace(
+        begin
+            SourceName = ?config(source_name, Config),
+            {ok, {{_, 201, _}, _, _}} =
+                emqx_bridge_v2_testlib:create_bridge_api(
+                    Config,
+                    #{<<"parameters">> => #{<<"group_id">> => <<"">>}}
+                ),
+            ?retry(
+                1_000,
+                10,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}},
+                    get_source_api(Config)
+                )
+            ),
+            GroupId = emqx_bridge_kafka_impl_consumer:consumer_group_id(#{}, SourceName),
+            ct:pal("generated group id: ~p", [GroupId]),
+            ?retry(1_000, 10, begin
+                Groups = get_groups(),
+                ?assertMatch(
+                    [_],
+                    [Group || Group = {_, Id, _} <- Groups, Id == GroupId],
+                    #{groups => Groups}
+                )
+            end),
+            ok
+        end,
+        []
+    ),
+    ok.
+
 t_custom_group_id(Config) ->
     ?check_trace(
         begin
-            #{<<"bootstrap_hosts">> := BootstrapHosts} = ?config(connector_config, Config),
             CustomGroupId = <<"my_group_id">>,
             {ok, {{_, 201, _}, _, _}} =
                 emqx_bridge_v2_testlib:create_bridge_api(
                     Config,
                     #{<<"parameters">> => #{<<"group_id">> => CustomGroupId}}
                 ),
-            [Endpoint] = emqx_bridge_kafka_impl:hosts(BootstrapHosts),
-            ?retry(100, 10, begin
-                {ok, Groups} = brod:list_groups(Endpoint, _ConnOpts = #{}),
+            ?retry(
+                1_000,
+                10,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}},
+                    get_source_api(Config)
+                )
+            ),
+            ?retry(1_000, 10, begin
+                Groups = get_groups(),
                 ?assertMatch(
                     [_],
                     [Group || Group = {_, Id, _} <- Groups, Id == CustomGroupId],
@@ -374,5 +518,120 @@ t_custom_group_id(Config) ->
             ok
         end,
         []
+    ),
+    ok.
+
+%% Currently, brod treats a consumer process to a specific topic as a singleton (per
+%% client id / connector), meaning that the first subscriber to a given topic will define
+%% the consumer options for all other consumers, and those options persist even after the
+%% original consumer group is terminated.  We enforce that, if the user wants to consume
+%% multiple times from the same topic, then they must create a different connector.
+t_repeated_topics(Config) ->
+    ?check_trace(
+        begin
+            %% first source is fine
+            {ok, {{_, 201, _}, _, _}} =
+                emqx_bridge_v2_testlib:create_bridge_api(Config),
+            %% second source fails to create
+            Name2 = <<"duplicated">>,
+            {201, #{<<"error">> := Error}} =
+                emqx_bridge_v2_testlib:create_source_api([{source_name, Name2} | Config]),
+            ?assertEqual(
+                match,
+                re:run(Error, <<"Topics .* already exist in other sources">>, [{capture, none}]),
+                #{error => Error}
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Verifies that we return an error containing information to debug connection issues when
+%% one of the partition leaders is unreachable.
+t_pretty_api_dry_run_reason(Config) ->
+    ProxyHost = ?config(proxy_host, Config),
+    ProxyPort = ?config(proxy_port, Config),
+    ProxyName = "kafka_2_plain",
+    ?check_trace(
+        begin
+            {ok, {{_, 201, _}, _, _}} =
+                emqx_bridge_v2_testlib:create_bridge_api(Config),
+            emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
+                Res = probe_source_api(
+                    Config,
+                    #{<<"parameters">> => #{<<"topic">> => <<"test-topic-three-partitions">>}}
+                ),
+                ?assertMatch({400, _}, Res),
+                {400, #{<<"message">> := Msg}} = Res,
+                LeaderUnavailable =
+                    match ==
+                        re:run(
+                            Msg,
+                            <<"Leader for partition . unavailable; reason: ">>,
+                            [{capture, none}]
+                        ),
+                %% In CI, if this tests runs soon enough, Kafka may not be stable yet, and
+                %% this failure might occur.
+                CoordinatorFailure =
+                    match ==
+                        re:run(
+                            Msg,
+                            <<"shutdown,coordinator_failure">>,
+                            [{capture, none}]
+                        ),
+                ?assert(LeaderUnavailable or CoordinatorFailure, #{message => Msg})
+            end),
+            %% Wait for recovery; avoids affecting other test cases due to Kafka restabilizing...
+            ?retry(
+                1_000,
+                10,
+                ?assertMatch(
+                    {200, #{<<"status">> := <<"connected">>}},
+                    get_source_api(Config)
+                )
+            ),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Exercises the code path where we use MSK IAM authentication.
+%% Unfortunately, there seems to be no good way to accurately test this as it would
+%% require running this in an EC2 instance to pass, and also to have a Kafka cluster
+%% configured to use MSK IAM authentication.
+t_msk_iam_authn(Config) ->
+    %% We mock the innermost call with the SASL authentication made by the OAuth plugin to
+    %% try and exercise most of the code.
+    emqx_bridge_v2_kafka_producer_SUITE:mock_iam_metadata_v2_calls(),
+    ok = meck:new(emqx_bridge_kafka_msk_iam_authn, [passthrough]),
+    emqx_common_test_helpers:with_mock(
+        kpro_lib,
+        send_and_recv,
+        fun(Req, Sock, Mod, ClientId, Timeout) ->
+            case Req of
+                #kpro_req{api = sasl_handshake} ->
+                    #{error_code => no_error};
+                #kpro_req{api = sasl_authenticate} ->
+                    #{error_code => no_error, session_lifetime_ms => 99999};
+                _ ->
+                    meck:passthrough([Req, Sock, Mod, ClientId, Timeout])
+            end
+        end,
+        fun() ->
+            ?assertMatch(
+                {201, #{<<"status">> := <<"connected">>}},
+                create_connector_api(
+                    Config,
+                    #{<<"authentication">> => <<"msk_iam">>}
+                )
+            ),
+            %% Must have called our callback
+            ?assertMatch(
+                [{_, {_, token_callback, _}, {ok, #{token := <<_/binary>>}}}],
+                meck:history(emqx_bridge_kafka_msk_iam_authn)
+            )
+        end
     ),
     ok.

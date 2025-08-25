@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_sso_manager).
@@ -17,9 +17,8 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2,
-    code_change/3,
-    format_status/2
+    handle_continue/2,
+    terminate/2
 ]).
 
 -export([
@@ -44,7 +43,7 @@
 -define(MOD_TAB, emqx_dashboard_sso).
 -define(MOD_KEY_PATH, [dashboard, sso]).
 -define(MOD_KEY_PATH(Sub), [dashboard, sso, Sub]).
--define(RESOURCE_GROUP, <<"emqx_dashboard_sso">>).
+-define(RESOURCE_GROUP, <<"dashboard_sso">>).
 -define(NO_ERROR, <<>>).
 -define(DEFAULT_RESOURCE_OPTS, #{
     start_after_created => false
@@ -106,7 +105,14 @@ get_backend_status(Backend, _) ->
     end.
 
 update(Backend, Config) ->
-    update_config(Backend, {?FUNCTION_NAME, Backend, Config}).
+    UpdateConf =
+        case emqx:get_raw_config(?MOD_KEY_PATH(Backend), #{}) of
+            RawConf when is_map(RawConf) ->
+                emqx_utils:deobfuscate(Config, RawConf);
+            null ->
+                Config
+        end,
+    update_config(Backend, {?FUNCTION_NAME, Backend, UpdateConf}).
 delete(Backend) ->
     update_config(Backend, {?FUNCTION_NAME, Backend}).
 
@@ -154,8 +160,7 @@ init([]) ->
             {read_concurrency, true}
         ]
     ),
-    start_backend_services(),
-    {ok, #{}}.
+    {ok, #{}, {continue, start_backend_services}}.
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -167,15 +172,15 @@ handle_cast(_Request, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
+handle_continue(start_backend_services, State) ->
+    start_backend_services(),
+    {noreply, State};
+handle_continue(_Info, State) ->
+    {noreply, State}.
+
 terminate(_Reason, _State) ->
     remove_handler(),
     ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-format_status(_Opt, Status) ->
-    Status.
 
 %%------------------------------------------------------------------------------
 %% Internal functions
@@ -241,8 +246,8 @@ pre_config_update(_, {delete, _Backend}, undefined) ->
 pre_config_update(_, {delete, _Backend}, _OldConf) ->
     {ok, null}.
 
-post_config_update(_, UpdateReq, NewConf, _OldConf, _AppEnvs) ->
-    _ = on_config_update(UpdateReq, NewConf),
+post_config_update(Path, UpdateReq, NewConf, _OldConf, _AppEnvs) ->
+    _ = on_config_update(Path, UpdateReq, NewConf),
     ok.
 
 propagated_post_config_update(
@@ -264,7 +269,7 @@ propagated_post_config_update(
             Error
     end.
 
-on_config_update({update, Backend, _RawConfig}, Config) ->
+on_config_update(_Path, {update, Backend, _RawConfig}, Config) ->
     Provider = provider(Backend),
     case lookup(Backend) of
         undefined ->
@@ -285,7 +290,7 @@ on_config_update({update, Backend, _RawConfig}, Config) ->
                 end
             )
     end;
-on_config_update({delete, Backend}, _NewConf) ->
+on_config_update(_Path, {delete, Backend}, _NewConf) ->
     case lookup(Backend) of
         undefined ->
             on_backend_updated(Backend, {error, not_exists}, undefined);
@@ -298,7 +303,11 @@ on_config_update({delete, Backend}, _NewConf) ->
                     ets:delete(?MOD_TAB, Backend)
                 end
             )
-    end.
+    end;
+on_config_update([dashboard, sso, BackendAtom] = Path, '$remove', Undefined) ->
+    on_config_update(Path, {delete, BackendAtom}, Undefined);
+on_config_update(_Path, _Req, _Conf) ->
+    ok.
 
 lookup(Backend) ->
     case ets:lookup(?MOD_TAB, Backend) of

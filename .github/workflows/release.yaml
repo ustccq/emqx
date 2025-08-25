@@ -8,7 +8,7 @@ on:
       tag:
         type: string
         required: true
-      publish_release_artefacts:
+      publish_release_artifacts:
         type: boolean
         required: true
         default: false
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   upload:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       checks: write
@@ -31,34 +31,33 @@ jobs:
     strategy:
       fail-fast: false
     steps:
-      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      - uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
-      - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.inputs.tag }}
       - name: Detect profile
         id: profile
         run: |
-          if git describe --tags --match '[v|e]*' --exact; then
-            REF=$(git describe --tags --match '[v|e]*' --exact)
+          if git describe --tags --match 'e*' --exact; then
+            REF=$(git describe --tags --match 'e*' --exact)
           else
-            echo "Only release tags matching '[v|e]*' are supported"
+            echo "Only release tags matching 'e*' are supported"
             exit 1
           fi
           case "$REF" in
-            v*)
-              echo "profile=emqx" >> $GITHUB_OUTPUT
-              echo "version=$(./pkg-vsn.sh emqx)" >> $GITHUB_OUTPUT
-              echo "ref_name=v$(./pkg-vsn.sh emqx)" >> "$GITHUB_ENV"
-              echo "s3dir=emqx-ce" >> $GITHUB_OUTPUT
-              ;;
             e*)
               echo "profile=emqx-enterprise" >> $GITHUB_OUTPUT
               echo "version=$(./pkg-vsn.sh emqx-enterprise)" >> $GITHUB_OUTPUT
               echo "ref_name=e$(./pkg-vsn.sh emqx-enterprise)" >> "$GITHUB_ENV"
+              if [[ $ref_name =~ ^e[6-9]+\.[0-9]+\.[0-9]+-M[0-9]+\.[0-9]+.*$ ]]; then
+                echo "internal_release=true" >> $GITHUB_ENV
+              else
+                echo "internal_release=false" >> $GITHUB_ENV
+              fi
               echo "s3dir=emqx-ee" >> $GITHUB_OUTPUT
               ;;
           esac
@@ -75,7 +74,7 @@ jobs:
           tag_name: "${{ env.ref_name }}"
           skip_existing: true
       - name: update to emqx.io
-        if: startsWith(env.ref_name, 'v') && ((github.event_name == 'release' && !github.event.release.prerelease) || inputs.publish_release_artefacts)
+        if: (github.event_name == 'release' &&  !github.event.release.prerelease && env.internal_release == 'false') || inputs.publish_release_artifacts
         run: |
           set -eux
           curl -w %{http_code} \
@@ -86,28 +85,21 @@ jobs:
                -d "{\"repo\":\"emqx/emqx\", \"tag\": \"${{ env.ref_name }}\" }" \
                ${{ secrets.EMQX_IO_RELEASE_API }}
       - name: Push to packagecloud.io
-        if: (github.event_name == 'release' && !github.event.release.prerelease) || inputs.publish_release_artefacts
+        if: (github.event_name == 'release' && !github.event.release.prerelease && env.internal_release == 'false') || inputs.publish_release_artifacts
         env:
           PROFILE: ${{ steps.profile.outputs.profile }}
           VERSION: ${{ steps.profile.outputs.version }}
           PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
         run: |
           set -eu
-          REPO=$PROFILE
-          if [ $PROFILE = 'emqx-enterprise' ]; then
-              REPO='emqx-enterprise5'
-          fi
+          REPO='emqx-enterprise5'
           function push() {
             docker run -t --rm -e PACKAGECLOUD_TOKEN=$PACKAGECLOUD_TOKEN -v $(pwd)/$2:/w/$2 -w /w ghcr.io/emqx/package_cloud push emqx/$REPO/$1 $2
           }
-          push "debian/buster" "packages/$PROFILE-$VERSION-debian10-amd64.deb"
-          push "debian/buster" "packages/$PROFILE-$VERSION-debian10-arm64.deb"
           push "debian/bullseye" "packages/$PROFILE-$VERSION-debian11-amd64.deb"
           push "debian/bullseye" "packages/$PROFILE-$VERSION-debian11-arm64.deb"
           push "debian/bookworm" "packages/$PROFILE-$VERSION-debian12-amd64.deb"
           push "debian/bookworm" "packages/$PROFILE-$VERSION-debian12-arm64.deb"
-          push "ubuntu/bionic" "packages/$PROFILE-$VERSION-ubuntu18.04-amd64.deb"
-          push "ubuntu/bionic" "packages/$PROFILE-$VERSION-ubuntu18.04-arm64.deb"
           push "ubuntu/focal" "packages/$PROFILE-$VERSION-ubuntu20.04-amd64.deb"
           push "ubuntu/focal" "packages/$PROFILE-$VERSION-ubuntu20.04-arm64.deb"
           push "ubuntu/jammy" "packages/$PROFILE-$VERSION-ubuntu22.04-amd64.deb"
@@ -125,20 +117,13 @@ jobs:
           push "amazon/2023" "packages/$PROFILE-$VERSION-amzn2023-amd64.rpm"
           push "amazon/2023" "packages/$PROFILE-$VERSION-amzn2023-arm64.rpm"
 
-  rerun-apps-version-check:
-    runs-on: ubuntu-22.04
-    if: github.repository_owner == 'emqx' && github.event_name == 'release'
-    needs:
-      - upload
-    permissions:
-      pull-requests: read
-      checks: write
-      actions: write
-    steps:
-      - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
-      - name: trigger re-run of app versions check on open PRs
-        shell: bash
+      - name: Upload to snap store
+        if: (github.event_name == 'release' && !github.event.release.prerelease && env.internal_release == 'false') || inputs.publish_release_artifacts
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROFILE: ${{ steps.profile.outputs.profile }}
+          VERSION: ${{ steps.profile.outputs.version }}
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         run: |
-          python3 scripts/rerun-apps-version-check.py
+          sudo snap install snapcraft --classic
+          snapcraft upload --release=stable "packages/${PROFILE}_${VERSION}_amd64.snap"
+          snapcraft upload --release=stable "packages/${PROFILE}_${VERSION}_arm64.snap"

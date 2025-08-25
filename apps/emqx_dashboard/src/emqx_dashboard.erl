@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard).
@@ -22,30 +10,141 @@
     stop_listeners/1,
     stop_listeners/0,
     list_listeners/0,
-    wait_for_listeners/0
+    listeners_status/0,
+    regenerate_dispatch_after_config_update/0
 ]).
 
 %% Authorization
--export([authorize/1]).
+-export([authorize/2]).
+-export([get_namespace/1]).
 
 -include_lib("emqx/include/logger.hrl").
--include_lib("emqx/include/http_api.hrl").
+-include_lib("emqx_dashboard/include/emqx_dashboard_rbac.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
 -include_lib("emqx/include/emqx_release.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -define(EMQX_MIDDLE, emqx_dashboard_middleware).
+
+-type listener_name() :: atom().
+-type listener_configs() :: #{listener_name() => emqx_config:config()}.
+
+%% See `minirest_handler:do_authorize`.
+-type handler_info() :: #{
+    method := atom(),
+    module := module(),
+    function := atom()
+}.
+%% Todo: refine keys/values.
+-type request() :: map().
+
+-type auth_meta() :: #{
+    auth_type := jwt_token | api_key,
+    source := binary(),
+    namespace := ?global_ns | binary(),
+    actor := emqx_dashboard_rbac:actor_context()
+}.
+
+-export_type([listener_name/0, listener_configs/0, handler_info/0, request/0]).
 
 %%--------------------------------------------------------------------
 %% Start/Stop Listeners
 %%--------------------------------------------------------------------
 
+-spec start_listeners() -> ok | {error, [listener_name()]}.
 start_listeners() ->
     start_listeners(listeners()).
 
+-spec stop_listeners() -> ok.
 stop_listeners() ->
     stop_listeners(listeners()).
 
+-spec start_listeners(listener_configs()) ->
+    ok | {error, [listener_name()]}.
 start_listeners(Listeners) ->
-    {ok, _} = application:ensure_all_started(minirest),
+    %% NOTE
+    %% Before starting the listeners, we do not generate the full dispatch upfront,
+    %% because the listeners may fail to start and the generation may appear useless.
+    InitDispatch = init_dispatch(),
+    {OkListeners, ErrListeners} =
+        lists:foldl(
+            fun({Name, Protocol, Bind, RanchOptions, ProtoOpts}, {OkAcc, ErrAcc}) ->
+                Options = #{
+                    dispatch => InitDispatch,
+                    swagger_support => emqx:get_config([dashboard, swagger_support], true),
+                    protocol => Protocol,
+                    protocol_options => ProtoOpts
+                },
+                Minirest = minirest_option(Options),
+                case minirest:start(Name, RanchOptions, Minirest) of
+                    {ok, _} ->
+                        ?ULOG("Listener ~ts on ~ts started.~n", [
+                            Name, emqx_listeners:format_bind(Bind)
+                        ]),
+                        {[Name | OkAcc], ErrAcc};
+                    {error, _Reason} ->
+                        %% NOTE
+                        %% Don't record the reason because minirest already does(too much logs noise).
+                        {OkAcc, [Name | ErrAcc]}
+                end
+            end,
+            {[], []},
+            listeners(ensure_ssl_cert(Listeners))
+        ),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(OkListeners),
+    case ErrListeners of
+        [] ->
+            ok;
+        _ ->
+            {error, ErrListeners}
+    end.
+
+-spec stop_listeners(listener_configs()) -> ok.
+stop_listeners(Listeners) ->
+    lists:foreach(
+        fun({Name, _, Bind, _, _}) ->
+            case minirest:stop(Name) of
+                ok ->
+                    ?ULOG("Stop listener ~ts on ~ts successfully.~n", [
+                        Name, emqx_listeners:format_bind(Bind)
+                    ]);
+                {error, not_found} ->
+                    ?SLOG(warning, #{msg => "stop_listener_failed", name => Name, bind => Bind})
+            end
+        end,
+        listeners(Listeners)
+    ).
+
+-spec listeners_status() -> #{started := [listener_name()], stopped := [listener_name()]}.
+listeners_status() ->
+    ListenerNames = [
+        Name
+     || {Name, _Protocol, _Bind, _RanchOptions, _ProtoOpts} <- list_listeners()
+    ],
+    {Started, Stopped} = lists:partition(fun is_listener_started/1, ListenerNames),
+    #{started => Started, stopped => Stopped}.
+
+-spec regenerate_dispatch_after_config_update() -> ok.
+regenerate_dispatch_after_config_update() ->
+    #{started := Listeners} = listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch_after_config_update(Listeners).
+
+%%--------------------------------------------------------------------
+%% internal
+%%--------------------------------------------------------------------
+
+is_listener_started(Name) ->
+    try ranch_server:get_listener_sup(Name) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end.
+
+init_dispatch() ->
+    static_dispatch() ++ dynamic_dispatch().
+
+minirest_option(Options) ->
     Authorization = {?MODULE, authorize},
     GlobalSpec = #{
         openapi => "3.0.0",
@@ -68,65 +167,19 @@ start_listeners(Listeners) ->
             }
         }
     },
-    BaseMinirest = #{
-        base_path => emqx_dashboard_swagger:base_path(),
-        modules => minirest_api:find_api_modules(apps()),
-        authorization => Authorization,
-        log => audit_log_fun(),
-        security => [#{'basicAuth' => []}, #{'bearerAuth' => []}],
-        swagger_global_spec => GlobalSpec,
-        dispatch => dispatch(),
-        middlewares => [?EMQX_MIDDLE, cowboy_router, cowboy_handler],
-        swagger_support => emqx:get_config([dashboard, swagger_support], true)
-    },
-    {OkListeners, ErrListeners} =
-        lists:foldl(
-            fun({Name, Protocol, Bind, RanchOptions, ProtoOpts}, {OkAcc, ErrAcc}) ->
-                Minirest = BaseMinirest#{protocol => Protocol, protocol_options => ProtoOpts},
-                case minirest:start(Name, RanchOptions, Minirest) of
-                    {ok, _} ->
-                        ?ULOG("Listener ~ts on ~ts started.~n", [
-                            Name, emqx_listeners:format_bind(Bind)
-                        ]),
-                        {[Name | OkAcc], ErrAcc};
-                    {error, _Reason} ->
-                        %% Don't record the reason because minirest already does(too much logs noise).
-                        {OkAcc, [Name | ErrAcc]}
-                end
-            end,
-            {[], []},
-            listeners(ensure_ssl_cert(Listeners))
-        ),
-    case ErrListeners of
-        [] ->
-            optvar:set(emqx_dashboard_listeners_ready, OkListeners),
-            ok;
-        _ ->
-            {error, ErrListeners}
-    end.
-
-stop_listeners(Listeners) ->
-    optvar:unset(emqx_dashboard_listeners_ready),
-    [
-        begin
-            case minirest:stop(Name) of
-                ok ->
-                    ?ULOG("Stop listener ~ts on ~ts successfully.~n", [
-                        Name, emqx_listeners:format_bind(Bind)
-                    ]);
-                {error, not_found} ->
-                    ?SLOG(warning, #{msg => "stop_listener_failed", name => Name, bind => Bind})
-            end
-        end
-     || {Name, _, Bind, _, _} <- listeners(Listeners)
-    ],
-    ok.
-
-wait_for_listeners() ->
-    optvar:read(emqx_dashboard_listeners_ready).
-
-%%--------------------------------------------------------------------
-%% internal
+    Base =
+        #{
+            base_path => emqx_dashboard_swagger:base_path(),
+            modules => minirest_api:find_api_modules(apps()),
+            authorization => Authorization,
+            log => audit_log_fun(),
+            security => [#{'basicAuth' => []}, #{'bearerAuth' => []}],
+            swagger_global_spec => GlobalSpec,
+            dispatch => static_dispatch(),
+            middlewares => [?EMQX_MIDDLE, cowboy_router, cowboy_handler],
+            swagger_support => true
+        },
+    maps:merge(Base, Options).
 
 apps() ->
     [
@@ -178,7 +231,7 @@ ranch_opts(Options) ->
     SocketOpts = maps:fold(
         fun filter_false/3,
         [],
-        maps:without([inet6, ipv6_v6only, proxy_header | Keys], Options)
+        maps:without([inet6, ipv6_v6only, proxy_header, user_lookup_fun | Keys], Options)
     ),
     InetOpts =
         case Options of
@@ -211,37 +264,16 @@ filter_false(K, V, S) -> [{K, V} | S].
 listener_name(Protocol) ->
     list_to_atom(atom_to_list(Protocol) ++ ":dashboard").
 
--dialyzer({no_match, [audit_log_fun/0]}).
-
 audit_log_fun() ->
-    case emqx_release:edition() of
-        ee -> fun emqx_dashboard_audit:log/2;
-        ce -> undefined
-    end.
+    emqx_dashboard_audit:log_fun().
 
--if(?EMQX_RELEASE_EDITION =/= ee).
-
-%% dialyzer complains about the `unauthorized_role' clause...
--dialyzer({no_match, [authorize/1, api_key_authorize/3]}).
-
--endif.
-
-authorize(Req) ->
+-spec authorize(request(), handler_info()) -> {ok, auth_meta()} | {integer(), term(), term()}.
+authorize(Req, HandlerInfo) ->
     case cowboy_req:parse_header(<<"authorization">>, Req) of
         {basic, Username, Password} ->
-            api_key_authorize(Req, Username, Password);
+            api_key_authorize(Req, HandlerInfo, Username, Password);
         {bearer, Token} ->
-            case emqx_dashboard_admin:verify_token(Req, Token) of
-                {ok, Username} ->
-                    {ok, #{auth_type => jwt_token, source => Username}};
-                {error, token_timeout} ->
-                    {401, 'TOKEN_TIME_OUT', <<"Token expired, get new token by POST /login">>};
-                {error, not_found} ->
-                    {401, 'BAD_TOKEN', <<"Get a token by POST /login">>};
-                {error, unauthorized_role} ->
-                    {403, 'UNAUTHORIZED_ROLE',
-                        <<"You don't have permission to access this resource">>}
-            end;
+            jwt_token_bearer_authorize(Req, HandlerInfo, Token);
         _ ->
             return_unauthorized(
                 <<"AUTHORIZATION_HEADER_ERROR">>,
@@ -257,14 +289,24 @@ return_unauthorized(Code, Message) ->
         },
         #{code => Code, message => Message}}.
 
+get_namespace(#{auth_meta := #{?namespace := Namespace}} = _Request) when is_binary(Namespace) ->
+    Namespace;
+get_namespace(#{} = _Request) ->
+    ?global_ns.
+
 listeners() ->
     emqx_conf:get([dashboard, listeners], #{}).
 
-api_key_authorize(Req, Key, Secret) ->
-    Path = cowboy_req:path(Req),
-    case emqx_mgmt_auth:authorize(Path, Req, Key, Secret) of
-        ok ->
-            {ok, #{auth_type => api_key, source => Key}};
+api_key_authorize(Req, HandlerInfo, Key, Secret) ->
+    case emqx_mgmt_auth:authorize(HandlerInfo, Req, Key, Secret) of
+        {ok, ActorContext} ->
+            AuthnMeta = #{
+                auth_type => api_key,
+                source => Key,
+                namespace => maps:get(?namespace, ActorContext, ?global_ns),
+                actor => ActorContext
+            },
+            {ok, AuthnMeta};
         {error, <<"not_allowed">>, Resource} ->
             return_unauthorized(
                 ?API_KEY_NOT_ALLOW,
@@ -280,15 +322,30 @@ api_key_authorize(Req, Key, Secret) ->
             )
     end.
 
+jwt_token_bearer_authorize(Req, HandlerInfo, Token) ->
+    case emqx_dashboard_admin:verify_token(Req, HandlerInfo, Token) of
+        {ok, #{actor := Username} = ActorContext} ->
+            AuthnMeta = #{
+                auth_type => jwt_token,
+                source => Username,
+                namespace => maps:get(?namespace, ActorContext, ?global_ns),
+                actor => ActorContext
+            },
+            {ok, AuthnMeta};
+        {error, token_timeout} ->
+            {401, 'TOKEN_TIME_OUT', <<"Token expired, get new token by POST /login">>};
+        {error, not_found} ->
+            {401, 'BAD_TOKEN', <<"Get a token by POST /login">>};
+        {error, unauthorized_role} ->
+            {403, 'UNAUTHORIZED_ROLE', <<"You don't have permission to access this resource">>}
+    end.
+
 ensure_ssl_cert(Listeners = #{https := Https0 = #{ssl_options := SslOpts}}) ->
     SslOpt1 = maps:from_list(emqx_tls_lib:to_server_opts(tls, SslOpts)),
     Https1 = maps:remove(ssl_options, Https0),
     Listeners#{https => maps:merge(Https1, SslOpt1)};
 ensure_ssl_cert(Listeners) ->
     Listeners.
-
-dispatch() ->
-    static_dispatch() ++ dynamic_dispatch().
 
 static_dispatch() ->
     StaticFiles = ["/editor.worker.js", "/json.worker.js", "/version"],

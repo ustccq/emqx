@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_clickhouse_SUITE).
@@ -7,14 +7,23 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--define(APP, emqx_bridge_clickhouse).
--define(CLICKHOUSE_HOST, "clickhouse").
--define(CLICKHOUSE_PORT, "8123").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 %% See comment in
 %% apps/emqx_bridge_clickhouse/test/emqx_bridge_clickhouse_connector_SUITE.erl for how to
 %% run this without bringing up the whole CI infrastucture
+
+-define(CLICKHOUSE_HOST, "clickhouse").
+-define(CLICKHOUSE_PORT, "8123").
+
+-define(TYPE, <<"clickhouse">>).
+
+-define(PROXY_HOST, "toxiproxy").
+-define(PROXY_PORT, 8474).
+-define(PROXY_NAME, "clickhouse").
 
 %%------------------------------------------------------------------------------
 %% Common Test Setup, Teardown and Testcase List
@@ -25,17 +34,26 @@ init_per_suite(Config) ->
     Port = list_to_integer(clickhouse_port()),
     case emqx_common_test_helpers:is_tcp_server_available(Host, Port) of
         true ->
-            emqx_common_test_helpers:render_and_load_app_config(emqx_conf),
-            ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_bridge]),
-            ok = emqx_connector_test_helpers:start_apps([emqx_resource, ?APP]),
-            snabbkaffe:fix_ct_logging(),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_clickhouse,
+                    emqx_connector,
+                    emqx_bridge,
+                    emqx_rule_engine,
+                    emqx_management,
+                    emqx_mgmt_api_test_util:emqx_dashboard()
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
             %% Create the db table
             Conn = start_clickhouse_connection(),
             % erlang:monitor,sb
             {ok, _, _} = clickhouse:query(Conn, sql_create_database(), #{}),
             {ok, _, _} = clickhouse:query(Conn, sql_create_table(), []),
             clickhouse:query(Conn, sql_find_key(42), []),
-            [{clickhouse_connection, Conn} | Config];
+            [{apps, Apps}, {clickhouse_connection, Conn} | Config];
         false ->
             case os:getenv("IS_CI") of
                 "yes" ->
@@ -74,14 +92,18 @@ start_clickhouse_connection() ->
 end_per_suite(Config) ->
     ClickhouseConnection = proplists:get_value(clickhouse_connection, Config),
     clickhouse:stop(ClickhouseConnection),
-    ok = emqx_connector_test_helpers:stop_apps([?APP, emqx_resource]),
-    ok = emqx_common_test_helpers:stop_apps([emqx_bridge, emqx_conf]).
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Config) ->
+    emqx_common_test_helpers:reset_proxy(?PROXY_HOST, ?PROXY_PORT),
     reset_table(Config),
     Config.
 
 end_per_testcase(_, Config) ->
+    emqx_common_test_helpers:reset_proxy(?PROXY_HOST, ?PROXY_PORT),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     reset_table(Config),
     ok.
 
@@ -125,6 +147,9 @@ clickhouse_url() ->
     Port = clickhouse_port(),
     erlang:iolist_to_binary(["http://", Host, ":", Port]).
 
+parse_insert(SQL) ->
+    emqx_bridge_clickhouse_connector:split_clickhouse_insert_sql(SQL).
+
 clickhouse_config(Config) ->
     SQL = maps:get(sql, Config, sql_insert_template_for_bridge()),
     BatchSeparator = maps:get(batch_value_separator, Config, <<", ">>),
@@ -167,15 +192,44 @@ parse_and_check(ConfigString, BridgeType, Name) ->
     RetConfig.
 
 make_bridge(Config) ->
+    make_bridge(Config, #{}).
+
+make_bridge(Config, Overrides) ->
     Type = <<"clickhouse">>,
     Name = atom_to_binary(?MODULE),
-    BridgeConfig = clickhouse_config(Config),
-    {ok, _} = emqx_bridge:create(
+    BridgeConfig = maps:merge(clickhouse_config(Config), Overrides),
+    {ok, _} = emqx_bridge_testlib:create_bridge_api(
         Type,
         Name,
         BridgeConfig
     ),
     emqx_bridge_resource:bridge_id(Type, Name).
+
+connector_config(_Config) ->
+    Name = <<"clickhouse">>,
+    InnerConfigMap = #{
+        <<"enable">> => true,
+        <<"connect_timeout">> => <<"1s">>,
+        <<"database">> => <<"mqtt">>,
+        <<"username">> => <<"default">>,
+        <<"password">> => <<"public">>,
+        <<"pool_size">> => 1,
+        <<"url">> => <<"toxiproxy:8123">>,
+        <<"resource_opts">> => emqx_bridge_v2_testlib:common_connector_resource_opts()
+    },
+    emqx_bridge_v2_testlib:parse_and_check_connector(?TYPE, Name, InnerConfigMap).
+
+create_connector_api(Config, Overrides) ->
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_connector_api(Config, Overrides)
+    ).
+
+get_connector_api(Config) ->
+    Type = emqx_bridge_v2_testlib:get_value(connector_type, Config),
+    Name = emqx_bridge_v2_testlib:get_value(connector_name, Config),
+    emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:get_connector_api(Type, Name)
+    ).
 
 delete_bridge() ->
     Type = <<"clickhouse">>,
@@ -231,6 +285,139 @@ t_make_delete_bridge(_Config) ->
     false = lists:any(IsRightName, BridgesAfterDelete),
     ok.
 
+t_parse_insert_sql_template(_Config) ->
+    ?assertEqual(
+        <<"(${tagvalues},${date})"/utf8>>,
+        parse_insert(
+            <<"insert into tag_VALUES(tag_values,Timestamp) values (${tagvalues},${date})"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id}, 'Иван', 25)"/utf8>>,
+        parse_insert(
+            <<"INSERT INTO Values_таблица (идентификатор, имя, возраст)   VALUES \t (${id}, 'Иван', 25)  "/utf8>>
+        )
+    ),
+    %% with `;` suffix, bug-to-bug compatibility
+    ?assertEqual(
+        <<"(${id}, 'Иван', 25)"/utf8>>,
+        parse_insert(
+            <<"INSERT INTO Values_таблица (идентификатор, имя, возраст)   VALUES \t (${id}, 'Иван', 25);  "/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id},'李四', 35)"/utf8>>,
+        parse_insert(
+            <<"  inSErt into 表格(标识,名字,年龄)values(${id},'李四', 35) ; "/utf8>>
+        )
+    ),
+
+    %% `values` in column name
+    ?assertEqual(
+        <<"(${tagvalues},${date}  )"/utf8>>,
+        parse_insert(
+            <<"insert into PI.dbo.tags(tag_values,Timestamp) values (${tagvalues},${date}  )"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${payload}, FROM_UNIXTIME((${timestamp}/1000)))">>,
+        parse_insert(
+            <<"INSERT INTO mqtt_test(payload, arrived) VALUES (${payload}, FROM_UNIXTIME((${timestamp}/1000)))"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id},'Алексей',30)"/utf8>>,
+        parse_insert(
+            <<"insert into таблица (идентификатор,имя,возраст) VALUES(${id},'Алексей',30)"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id}, '张三', 22)"/utf8>>,
+        parse_insert(
+            <<"INSERT into 表格 (标识, 名字, 年龄) VALUES (${id}, '张三', 22)"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${id},'李四', 35)"/utf8>>,
+        parse_insert(
+            <<"  inSErt into 表格(标识,名字,年龄)values(${id},'李四', 35)"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(   ${tagvalues},   ${date} )"/utf8>>,
+        parse_insert(
+            <<"insert into PI.dbo.tags( tag_value,Timestamp)  VALUES\t\t(   ${tagvalues},   ${date} )"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${tagvalues},${date})"/utf8>>,
+        parse_insert(
+            <<"insert into PI.dbo.tags(tag_value , Timestamp )vALues(${tagvalues},${date})"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${one}, ${two},${three})"/utf8>>,
+        parse_insert(
+            <<"inSErt  INTO  table75 (column1, column2, column3) values (${one}, ${two},${three})"/utf8>>
+        )
+    ),
+    ?assertEqual(
+        <<"(${tag1},   ${tag2}  )">>,
+        parse_insert(
+            <<"INSERT Into some_table      values\t(${tag1},   ${tag2}  )">>
+        )
+    ),
+    ?assertEqual(
+        <<"(2, 2)">>,
+        parse_insert(
+            <<"INSERT INTO insert_select_testtable (* EXCEPT(b)) Values (2, 2)">>
+        )
+    ),
+    ?assertEqual(
+        <<"(2, 2), (3, ${five})">>,
+        parse_insert(
+            <<"INSERT INTO insert_select_testtable (* EXCEPT(b))Values(2, 2), (3, ${five})">>
+        )
+    ),
+
+    %% `format`
+    ?assertEqual(
+        <<"[(${key}, \"${data}\", ${timestamp})]">>,
+        parse_insert(
+            <<"INSERT INTO mqtt_test(key, data, arrived)",
+                " FORMAT JSONCompactEachRow [(${key}, \"${data}\", ${timestamp})]">>
+        )
+    ),
+    ?assertEqual(
+        <<"(v11, v12, v13), (v21, v22, v23)">>,
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT Values (v11, v12, v13), (v21, v22, v23)">>
+        )
+    ),
+
+    ?assertEqual(
+        <<"👋    .."/utf8>>,
+        %% Only check if FORMAT_DATA existed after `FORMAT FORMAT_NAME`
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT AnyFORMAT  👋    .."/utf8>>
+        )
+    ),
+
+    ErrMsg = <<"The SQL template should be an SQL INSERT statement but it is something else.">>,
+    %% No `FORMAT_DATA`
+    ?assertError(
+        ErrMsg,
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT Values">>
+        )
+    ),
+    ?assertError(
+        ErrMsg,
+        parse_insert(
+            <<"INSERT INTO   mqtt_test(key, data, arrived) FORMAT Values  ">>
+        )
+    ).
+
 t_send_message_query(Config) ->
     BridgeID = make_bridge(#{enable_batch => false}),
     Key = 42,
@@ -239,6 +426,21 @@ t_send_message_query(Config) ->
     emqx_bridge:send_message(BridgeID, Payload),
     %% Check that the data got to the database
     check_key_in_clickhouse(Key, Config),
+    delete_bridge(),
+    ok.
+
+t_undefined_vars_as_null(Config) ->
+    BridgeID = make_bridge(#{enable_batch => false}, #{<<"undefined_vars_as_null">> => true}),
+    Key = 42,
+    Payload = #{key => Key, data => undefined, timestamp => 10000},
+    %% This will use the SQL template included in the bridge
+    emqx_bridge:send_message(BridgeID, Payload),
+    %% Check that the data got to the database
+    check_key_in_clickhouse(Key, Config),
+    ClickhouseConnection = proplists:get_value(clickhouse_connection, Config),
+    SQL = io_lib:format("SELECT data FROM mqtt.mqtt_test WHERE key = ~p", [Key]),
+    {ok, 200, ResultString} = clickhouse:query(ClickhouseConnection, SQL, []),
+    ?assertMatch(<<"null">>, iolist_to_binary(string:trim(ResultString))),
     delete_bridge(),
     ok.
 
@@ -253,6 +455,37 @@ t_send_simple_batch_alternative_format(Config) ->
             batch_value_separator => <<"">>
         }
     ).
+
+%% Checks that we handle timeouts during health checks
+t_connector_health_check_timeout(Config) ->
+    ConnectorConfig = [
+        {connector_type, ?TYPE},
+        {connector_name, atom_to_binary(?FUNCTION_NAME)},
+        {connector_config, connector_config(Config)}
+    ],
+    %% Create the connector without problems
+    {201, #{<<"status">> := <<"connected">>}} = create_connector_api(ConnectorConfig, #{}),
+    %% Now wait until a health check fails
+    emqx_common_test_helpers:with_failure(
+        timeout,
+        ?PROXY_NAME,
+        ?PROXY_HOST,
+        ?PROXY_PORT,
+        fun() ->
+            ?retry(
+                1_000,
+                5,
+                ?assertMatch(
+                    {200, #{
+                        <<"status">> := <<"connecting">>,
+                        <<"status_reason">> := <<"health check timeout">>
+                    }},
+                    get_connector_api(ConnectorConfig)
+                )
+            )
+        end
+    ),
+    ok.
 
 send_simple_batch_helper(Config, BridgeConfigExt) ->
     BridgeConf = maps:merge(

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_api_schema).
@@ -21,10 +9,15 @@
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include("rule_engine.hrl").
 
 -export([check_params/2]).
 
 -export([namespace/0, roots/0, fields/1]).
+
+-ifdef(TEST).
+-export([event_to_event_type/1]).
+-endif.
 
 -type tag() :: rule_creation | rule_test | rule_engine | rule_apply_test.
 
@@ -32,14 +25,29 @@
 check_params(Params, Tag) ->
     BTag = atom_to_binary(Tag),
     Opts = #{atom_key => true, required => false},
-    try hocon_tconf:check_plain(?MODULE, #{BTag => Params}, Opts, [Tag]) of
+    SchemaMod = ?MODULE,
+    try hocon_tconf:check_plain(SchemaMod, #{BTag => Params}, Opts, [Tag]) of
         #{Tag := Checked} -> {ok, Checked}
     catch
+        throw:{SchemaMod, [Reason]} ->
+            ?SLOG(
+                info,
+                #{
+                    msg => "check_rule_params_failed",
+                    reason => Reason
+                },
+                #{tag => ?TAG}
+            ),
+            {error, Reason};
         throw:Reason ->
-            ?SLOG(error, #{
-                msg => "check_rule_params_failed",
-                reason => Reason
-            }),
+            ?SLOG(
+                info,
+                #{
+                    msg => "check_rule_params_failed",
+                    reason => Reason
+                },
+                #{tag => ?TAG}
+            ),
             {error, Reason}
     end.
 
@@ -77,8 +85,29 @@ fields("rule_info") ->
                     desc => ?DESC("ri_created_at"),
                     example => "2021-12-01T15:00:43.153+08:00"
                 }
+            )},
+        {"last_modified_at",
+            sc(
+                binary(),
+                #{
+                    desc => ?DESC("ri_last_modified_at"),
+                    example => "2021-12-24T15:00:44.153+08:00"
+                }
+            )},
+        {"action_details",
+            sc(
+                hoconsc:array(ref("action_details")),
+                #{
+                    desc => ?DESC("ri_action_details")
+                }
             )}
     ] ++ fields("rule_creation");
+fields("action_details") ->
+    [
+        {"type", sc(binary(), #{desc => ?DESC("ri_action_details_type")})},
+        {"name", sc(binary(), #{desc => ?DESC("ri_action_details_name")})},
+        {"status", sc(binary(), #{desc => ?DESC("ri_action_details_status")})}
+    ];
 fields("rule_metrics") ->
     [
         rule_id(),
@@ -160,6 +189,10 @@ fields("metrics") ->
         {"actions.failed.unknown",
             sc(non_neg_integer(), #{
                 desc => ?DESC("metrics_actions_failed_unknown")
+            })},
+        {"actions.discarded",
+            sc(non_neg_integer(), #{
+                desc => ?DESC("metrics_actions_discarded")
             })}
     ];
 fields("node_metrics") ->
@@ -324,34 +357,111 @@ fields("ctx_schema_validation_failed") ->
     Event = 'schema.validation_failed',
     [
         {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
         {"validation", sc(binary(), #{desc => ?DESC("event_validation")})}
         | msg_event_common_fields()
+    ];
+fields("ctx_message_transformation_failed") ->
+    Event = 'message.transformation_failed',
+    [
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
+        {"transformation", sc(binary(), #{desc => ?DESC("event_transformation")})}
+        | msg_event_common_fields()
+    ];
+fields("ctx_alarm_activated") ->
+    Event = 'alarm.activated',
+    [
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
+        {"name", sc(binary(), #{desc => ?DESC("alarm_name")})},
+        {"message", sc(binary(), #{desc => ?DESC("alarm_message")})},
+        {"details", sc(map(), #{desc => ?DESC("alarm_details")})},
+        {"activated_at", sc(integer(), #{desc => ?DESC("alarm_activated_at")})}
+    ];
+fields("ctx_alarm_deactivated") ->
+    Event = 'alarm.deactivated',
+    [
+        {"event_type", event_type_sc(Event)},
+        {"event", event_sc(Event)},
+        {"name", sc(binary(), #{desc => ?DESC("alarm_name")})},
+        {"message", sc(binary(), #{desc => ?DESC("alarm_message")})},
+        {"details", sc(map(), #{desc => ?DESC("alarm_details")})},
+        {"activated_at", sc(integer(), #{desc => ?DESC("alarm_activated_at")})},
+        {"deactivated_at", sc(integer(), #{desc => ?DESC("alarm_deactivated_at")})}
     ].
 
 rule_input_message_context() ->
     {"context",
         sc(
-            hoconsc:union([
-                ref("ctx_pub"),
-                ref("ctx_sub"),
-                ref("ctx_unsub"),
-                ref("ctx_delivered"),
-                ref("ctx_acked"),
-                ref("ctx_dropped"),
-                ref("ctx_connected"),
-                ref("ctx_disconnected"),
-                ref("ctx_connack"),
-                ref("ctx_check_authz_complete"),
-                ref("ctx_check_authn_complete"),
-                ref("ctx_bridge_mqtt"),
-                ref("ctx_delivery_dropped"),
-                ref("ctx_schema_validation_failed")
-            ]),
+            hoconsc:union(rule_test_context_union(rule_test_context_refs())),
             #{
                 desc => ?DESC("test_context"),
                 default => #{}
             }
         )}.
+
+rule_test_context_refs() ->
+    [
+        ref("ctx_pub"),
+        ref("ctx_sub"),
+        ref("ctx_unsub"),
+        ref("ctx_delivered"),
+        ref("ctx_acked"),
+        ref("ctx_dropped"),
+        ref("ctx_connected"),
+        ref("ctx_disconnected"),
+        ref("ctx_connack"),
+        ref("ctx_check_authz_complete"),
+        ref("ctx_check_authn_complete"),
+        ref("ctx_bridge_mqtt"),
+        ref("ctx_delivery_dropped"),
+        ref("ctx_schema_validation_failed"),
+        ref("ctx_message_transformation_failed"),
+        ref("ctx_alarm_activated"),
+        ref("ctx_alarm_deactivated")
+    ].
+
+rule_test_context_union(Refs) ->
+    Index = lists:foldl(
+        fun(?R_REF(?MODULE, Struct) = Ref, Acc) ->
+            {"event_type", Sc} = lists:keyfind("event_type", 1, fields(Struct)),
+            Type = hocon_schema:field_schema(Sc, type),
+            Acc#{atom_to_binary(Type) => Ref}
+        end,
+        #{},
+        Refs
+    ),
+    fun
+        (all_union_members) ->
+            maps:values(Index);
+        ({value, V}) ->
+            case V of
+                #{<<"event_type">> := T} ->
+                    do_find_event_type(T, Index);
+                #{event_type := T0} ->
+                    T = emqx_utils_conv:bin(T0),
+                    do_find_event_type(T, Index);
+                _ ->
+                    throw(#{
+                        field_name => event_type,
+                        value => undefined,
+                        reason => <<"unknown event type">>
+                    })
+            end
+    end.
+
+do_find_event_type(T, Index) ->
+    case maps:find(T, Index) of
+        error ->
+            throw(#{
+                field_name => event_type,
+                value => T,
+                reason => <<"unknown event type">>
+            });
+        {ok, Ref} ->
+            [Ref]
+    end.
 
 qos() ->
     {"qos", sc(emqx_schema:qos(), #{desc => ?DESC("event_qos")})}.

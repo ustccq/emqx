@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_registry_serde_SUITE).
 
@@ -10,14 +10,12 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
--include("emqx_schema_registry.hrl").
-
 -import(emqx_common_test_helpers, [on_exit/1]).
 
--define(APPS, [emqx_conf, emqx_rule_engine, emqx_schema_registry]).
--define(INVALID_JSON, #{
-    reason := #{expected := "emqx_schema:json_binary()"},
-    kind := validation_error
+-define(INVALID_JSON(REASON), #{
+    kind := validation_error,
+    reason := REASON,
+    matched_type := "schema_registry:" ++ _
 }).
 
 %%------------------------------------------------------------------------------
@@ -28,19 +26,30 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_config:save_schema_mod_and_names(emqx_schema_registry_schema),
-    emqx_mgmt_api_test_util:init_suite(?APPS),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_schema_registry,
+            emqx_rule_engine
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite(lists:reverse(?APPS)),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
+
 init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
     emqx_common_test_helpers:call_janitor(),
+    snabbkaffe:start_trace(),
     clear_schemas(),
+    snabbkaffe:stop(),
     ok.
 
 %%------------------------------------------------------------------------------
@@ -50,7 +59,15 @@ end_per_testcase(_TestCase, _Config) ->
 clear_schemas() ->
     maps:foreach(
         fun(Name, _Schema) ->
-            ok = emqx_schema_registry:delete_schema(Name)
+            NameBin = emqx_utils_conv:bin(Name),
+            {ok, {ok, _}} =
+                ?wait_async_action(
+                    emqx_schema_registry:delete_schema(Name),
+                    #{
+                        ?snk_kind := "schema_registry_serde_deleted",
+                        name := NameBin
+                    }
+                )
         end,
         emqx_schema_registry:list_schemas()
     ).
@@ -127,7 +144,10 @@ t_avro_invalid_json_schema(_Config) ->
     SerdeName = my_serde,
     Params = schema_params(avro),
     WrongParams = Params#{source := <<"{">>},
-    ?assertMatch({error, ?INVALID_JSON}, emqx_schema_registry:add_schema(SerdeName, WrongParams)),
+    ?assertMatch(
+        {error, ?INVALID_JSON("Truncated JSON value")},
+        emqx_schema_registry:add_schema(SerdeName, WrongParams)
+    ),
     ok.
 
 t_avro_invalid_schema(_Config) ->
@@ -155,13 +175,13 @@ t_serde_not_found(_Config) ->
     ),
     ?assertError(
         {serde_not_found, NonexistentSerde},
-        emqx_schema_registry_serde:handle_rule_function(schema_check, [
+        emqx_schema_registry_serde:rsf_schema_check([
             NonexistentSerde, EncodeData
         ])
     ),
     ?assertError(
         {serde_not_found, NonexistentSerde},
-        emqx_schema_registry_serde:handle_rule_function(schema_check, [
+        emqx_schema_registry_serde:rsf_schema_check([
             NonexistentSerde, DecodeData
         ])
     ),
@@ -200,13 +220,76 @@ t_protobuf_invalid_schema(_Config) ->
     ),
     ok.
 
+%% Checks that we unload code and clear code generation cache after destroying a protobuf
+%% serde.
+t_destroy_protobuf(_Config) ->
+    SerdeName = ?FUNCTION_NAME,
+    SerdeNameBin = atom_to_binary(SerdeName),
+    ?check_trace(
+        #{timetrap => 5_000},
+        begin
+            Params = schema_params(protobuf),
+            ok = emqx_schema_registry:add_schema(SerdeName, Params),
+            {ok, {ok, _}} =
+                ?wait_async_action(
+                    emqx_schema_registry:delete_schema(SerdeName),
+                    #{?snk_kind := serde_destroyed, name := SerdeNameBin}
+                ),
+            %% Create again to check we don't hit the cache.
+            ok = emqx_schema_registry:add_schema(SerdeName, Params),
+            {ok, {ok, _}} =
+                ?wait_async_action(
+                    emqx_schema_registry:delete_schema(SerdeName),
+                    #{?snk_kind := serde_destroyed, name := SerdeNameBin}
+                ),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([], ?of_kind(schema_registry_protobuf_cache_hit, Trace)),
+            ?assertMatch([_ | _], ?of_kind("schema_registry_protobuf_cache_destroyed", Trace)),
+            ok
+        end
+    ),
+    ok.
+
+%% Checks that we don't leave entries lingering in the protobuf code cache table when
+%% updating the source of a serde.
+t_update_protobuf_cache(_Config) ->
+    SerdeName = ?FUNCTION_NAME,
+    ?check_trace(
+        #{timetrap => 5_000},
+        begin
+            #{source := Source0} = Params0 = schema_params(protobuf),
+            ok = emqx_schema_registry:add_schema(SerdeName, Params0),
+            %% Now we touch the source so protobuf needs to be recompiled.
+            Source1 = <<Source0/binary, "\n\n">>,
+            Params1 = Params0#{source := Source1},
+            {ok, {ok, _}} =
+                ?wait_async_action(
+                    emqx_schema_registry:add_schema(SerdeName, Params1),
+                    #{?snk_kind := "schema_registry_protobuf_cache_destroyed"}
+                ),
+            ok
+        end,
+        fun(Trace) ->
+            ?assertMatch([], ?of_kind(schema_registry_protobuf_cache_hit, Trace)),
+            ?assertMatch([_, _ | _], ?of_kind(schema_registry_protobuf_cache_miss, Trace)),
+            ?assertMatch([_ | _], ?of_kind("schema_registry_protobuf_cache_destroyed", Trace)),
+            ok
+        end
+    ),
+    ok.
+
 t_json_invalid_schema(_Config) ->
     SerdeName = invalid_json,
     Params = schema_params(json),
     BadParams1 = Params#{source := <<"not valid json value">>},
     BadParams2 = Params#{source := <<"\"not an object\"">>},
     BadParams3 = Params#{source := <<"{\"foo\": 1}">>},
-    ?assertMatch({error, ?INVALID_JSON}, emqx_schema_registry:add_schema(SerdeName, BadParams1)),
+    ?assertMatch(
+        {error, ?INVALID_JSON("Invalid JSON literal")},
+        emqx_schema_registry:add_schema(SerdeName, BadParams1)
+    ),
     ?assertMatch(
         {error, {post_config_update, _, {invalid_json_schema, bad_schema_object}}},
         emqx_schema_registry:add_schema(SerdeName, BadParams2)
@@ -229,14 +312,38 @@ t_json_validation(_Config) ->
     SerdeName = my_json_schema,
     Params = schema_params(json),
     ok = emqx_schema_registry:add_schema(SerdeName, Params),
-    F = fun(Fn, Data) ->
-        emqx_schema_registry_serde:handle_rule_function(Fn, [SerdeName, Data])
+    CheckFn = fun(Data) ->
+        emqx_schema_registry_serde:rsf_schema_check([SerdeName, Data])
     end,
     OK = #{<<"foo">> => 1, <<"bar">> => 2},
     NotOk = #{<<"bar">> => 2},
-    ?assert(F(schema_check, OK)),
-    ?assert(F(schema_check, <<"{\"foo\": 1, \"bar\": 2}">>)),
-    ?assertNot(F(schema_check, NotOk)),
-    ?assertNot(F(schema_check, <<"{\"bar\": 2}">>)),
-    ?assertNot(F(schema_check, <<"{\"foo\": \"notinteger\", \"bar\": 2}">>)),
+    ?assert(CheckFn(OK)),
+    ?assert(CheckFn(<<"{\"foo\": 1, \"bar\": 2}">>)),
+    ?assertNot(CheckFn(NotOk)),
+    ?assertNot(CheckFn(<<"{\"bar\": 2}">>)),
+    ?assertNot(CheckFn(<<"{\"foo\": \"notinteger\", \"bar\": 2}">>)),
+    ok.
+
+t_is_existing_type(_Config) ->
+    JsonName = <<"myjson">>,
+    ?assertNot(emqx_schema_registry:is_existing_type(JsonName)),
+    ok = emqx_schema_registry:add_schema(JsonName, schema_params(json)),
+    AvroName = <<"myavro">>,
+    ?assertNot(emqx_schema_registry:is_existing_type(AvroName)),
+    ok = emqx_schema_registry:add_schema(AvroName, schema_params(avro)),
+    ProtobufName = <<"myprotobuf">>,
+    MessageType = <<"Person">>,
+    ?assertNot(emqx_schema_registry:is_existing_type(ProtobufName)),
+    ok = emqx_schema_registry:add_schema(ProtobufName, schema_params(protobuf)),
+    %% JSON Schema: no inner names
+    ?assert(emqx_schema_registry:is_existing_type(JsonName)),
+    ?assertNot(emqx_schema_registry:is_existing_type(JsonName, [JsonName])),
+    %% Avro: no inner names
+    ?assert(emqx_schema_registry:is_existing_type(AvroName)),
+    ?assertNot(emqx_schema_registry:is_existing_type(AvroName, [AvroName])),
+    %% Protobuf: one level of message types
+    ?assert(emqx_schema_registry:is_existing_type(ProtobufName)),
+    ?assertNot(emqx_schema_registry:is_existing_type(ProtobufName, [ProtobufName])),
+    ?assert(emqx_schema_registry:is_existing_type(ProtobufName, [MessageType])),
+    ?assertNot(emqx_schema_registry:is_existing_type(ProtobufName, [MessageType, MessageType])),
     ok.

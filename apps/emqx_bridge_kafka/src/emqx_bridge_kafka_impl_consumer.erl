@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_kafka_impl_consumer).
 
@@ -7,6 +7,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     query_mode/1,
     on_start/2,
@@ -26,7 +27,7 @@
 ]).
 
 -ifdef(TEST).
--export([consumer_group_id/2]).
+-export([consumer_group_id/2, make_client_id/1]).
 -endif.
 
 -include_lib("emqx/include/logger.hrl").
@@ -53,6 +54,7 @@
     group_id => binary(),
     key_encoding_mode := encoding_mode(),
     max_batch_bytes := emqx_schema:bytesize(),
+    max_wait_time := non_neg_integer(),
     max_rejoin_attempts := non_neg_integer(),
     offset_commit_interval_seconds := pos_integer(),
     offset_reset_policy := offset_reset_policy(),
@@ -82,6 +84,7 @@
 -type encoding_mode() :: none | base64.
 -type consumer_init_data() :: #{
     hookpoints := [binary()],
+    namespace := emqx_bridge_v2:maybe_namespace(),
     key_encoding_mode := encoding_mode(),
     resource_id := source_resource_id(),
     topic_mapping := #{
@@ -95,6 +98,7 @@
 }.
 -type consumer_state() :: #{
     hookpoints := [binary()],
+    namespace := emqx_bridge_v2:maybe_namespace(),
     kafka_topic := kafka_topic(),
     key_encoding_mode := encoding_mode(),
     resource_id := source_resource_id(),
@@ -126,6 +130,7 @@
 %%-------------------------------------------------------------------------------------
 %% `emqx_resource' API
 %%-------------------------------------------------------------------------------------
+resource_type() -> kafka_consumer.
 
 callback_mode() ->
     async_if_possible.
@@ -139,14 +144,12 @@ on_start(ConnectorResId, Config) ->
     #{
         authentication := Auth,
         bootstrap_hosts := BootstrapHosts0,
-        connector_type := ConnectorType,
-        connector_name := ConnectorName,
         socket_opts := SocketOpts0,
         ssl := SSL
     } = Config,
     BootstrapHosts = emqx_bridge_kafka_impl:hosts(BootstrapHosts0),
     %% Note: this is distinct per node.
-    ClientID = make_client_id(ConnectorResId, ConnectorType, ConnectorName),
+    ClientID = make_client_id(ConnectorResId),
     ClientOpts0 =
         case Auth of
             none -> [];
@@ -155,7 +158,7 @@ on_start(ConnectorResId, Config) ->
     ClientOpts = add_ssl_opts(ClientOpts0, SSL),
     SocketOpts = emqx_bridge_kafka_impl:socket_opts(SocketOpts0),
     ClientOpts1 = [{extra_sock_opts, SocketOpts} | ClientOpts],
-    ok = emqx_resource:allocate_resource(ConnectorResId, ?kafka_client_id, ClientID),
+    ok = emqx_resource:allocate_resource(ConnectorResId, ?MODULE, ?kafka_client_id, ClientID),
     case brod:start_client(BootstrapHosts, ClientID, ClientOpts1) of
         ok ->
             ?tp(
@@ -182,7 +185,7 @@ on_start(ConnectorResId, Config) ->
     }}.
 
 -spec on_stop(connector_resource_id(), connector_state()) -> ok.
-on_stop(ConnectorResId, _State = undefined) ->
+on_stop(ConnectorResId, _State) ->
     SubscribersStopped =
         maps:fold(
             fun
@@ -198,38 +201,21 @@ on_stop(ConnectorResId, _State = undefined) ->
         ),
     case SubscribersStopped > 0 of
         true ->
-            ?tp(kafka_consumer_subcriber_and_client_stopped, #{}),
+            ?tp(kafka_consumer_subcriber_and_client_stopped, #{instance_id => ConnectorResId}),
+            ?tp("kafka_consumer_stopped", #{instance_id => ConnectorResId}),
             ok;
         false ->
-            ?tp(kafka_consumer_just_client_stopped, #{}),
+            ?tp(kafka_consumer_just_client_stopped, #{instance_id => ConnectorResId}),
+            ?tp("kafka_consumer_stopped", #{instance_id => ConnectorResId}),
             ok
-    end;
-on_stop(ConnectorResId, State) ->
-    #{
-        installed_sources := InstalledSources,
-        kafka_client_id := ClientID
-    } = State,
-    maps:foreach(
-        fun(_SourceResId, #{subscriber_id := SubscriberId}) ->
-            stop_subscriber(SubscriberId)
-        end,
-        InstalledSources
-    ),
-    stop_client(ClientID),
-    ?tp(kafka_consumer_subcriber_and_client_stopped, #{instance_id => ConnectorResId}),
-    ok.
+    end.
 
 -spec on_get_status(connector_resource_id(), connector_state()) ->
     ?status_connected | ?status_disconnected.
-on_get_status(_ConnectorResId, State = #{kafka_client_id := ClientID}) ->
+on_get_status(_ConnectorResId, #{kafka_client_id := ClientID}) ->
     case whereis(ClientID) of
         Pid when is_pid(Pid) ->
-            case check_client_connectivity(Pid) of
-                {Status, Reason} ->
-                    {Status, State, Reason};
-                Status ->
-                    Status
-            end;
+            check_client_connectivity(Pid);
         _ ->
             ?status_disconnected
     end;
@@ -248,7 +234,7 @@ on_add_channel(ConnectorResId, ConnectorState0, SourceResId, SourceConfig) ->
         kafka_client_id := ClientID,
         installed_sources := InstalledSources0
     } = ConnectorState0,
-    case start_consumer(SourceConfig, ConnectorResId, SourceResId, ClientID) of
+    case start_consumer(SourceConfig, ConnectorResId, SourceResId, ClientID, ConnectorState0) of
         {ok, SourceState} ->
             InstalledSources = InstalledSources0#{SourceResId => SourceState},
             ConnectorState = ConnectorState0#{installed_sources := InstalledSources},
@@ -287,7 +273,7 @@ on_get_channels(ConnectorResId) ->
     source_resource_id(),
     connector_state()
 ) ->
-    ?status_connected | ?status_disconnected.
+    ?status_connected | {?status_disconnected | ?status_connecting, _Msg :: binary()}.
 on_get_channel_status(
     _ConnectorResId,
     SourceResId,
@@ -324,6 +310,7 @@ handle_message(Message, State) ->
 do_handle_message(Message, State) ->
     #{
         hookpoints := Hookpoints,
+        namespace := Namespace,
         kafka_topic := KafkaTopic,
         key_encoding_mode := KeyEncodingMode,
         resource_id := SourceResId,
@@ -341,7 +328,12 @@ do_handle_message(Message, State) ->
     },
     LegacyMQTTConfig = maps:get(KafkaTopic, TopicMapping, #{}),
     legacy_maybe_publish_mqtt_message(LegacyMQTTConfig, SourceResId, FullMessage),
-    lists:foreach(fun(Hookpoint) -> emqx_hooks:run(Hookpoint, [FullMessage]) end, Hookpoints),
+    lists:foreach(
+        fun(Hookpoint) ->
+            emqx_hooks:run(Hookpoint, [FullMessage, Namespace])
+        end,
+        Hookpoints
+    ),
     emqx_resource_metrics:received_inc(SourceResId),
     %% note: just `ack' does not commit the offset to the
     %% kafka consumer group.
@@ -378,40 +370,22 @@ make_subscriber_id(BridgeName) ->
     BridgeNameBin = to_bin(BridgeName),
     <<"kafka_subscriber:", BridgeNameBin/binary>>.
 
-ensure_consumer_supervisor_started() ->
-    Mod = emqx_bridge_kafka_consumer_sup,
-    ChildSpec =
-        #{
-            id => Mod,
-            start => {Mod, start_link, []},
-            restart => permanent,
-            shutdown => infinity,
-            type => supervisor,
-            modules => [Mod]
-        },
-    case supervisor:start_child(emqx_bridge_sup, ChildSpec) of
-        {ok, _Pid} ->
-            ok;
-        {error, already_present} ->
-            ok;
-        {error, {already_started, _Pid}} ->
-            ok
-    end.
-
 -spec start_consumer(
     source_config(),
     connector_resource_id(),
     source_resource_id(),
-    brod:client_id()
+    brod:client_id(),
+    connector_state()
 ) ->
     {ok, source_state()} | {error, term()}.
-start_consumer(Config, ConnectorResId, SourceResId, ClientID) ->
+start_consumer(Config, ConnectorResId, SourceResId, ClientID, ConnState) ->
     #{
         bridge_name := BridgeName,
         hookpoints := Hookpoints,
         parameters := #{
             key_encoding_mode := KeyEncodingMode,
             max_batch_bytes := MaxBatchBytes,
+            max_wait_time := MaxWaitTime,
             max_rejoin_attempts := MaxRejoinAttempts,
             offset_commit_interval_seconds := OffsetCommitInterval,
             offset_reset_policy := OffsetResetPolicy0,
@@ -419,10 +393,11 @@ start_consumer(Config, ConnectorResId, SourceResId, ClientID) ->
             value_encoding_mode := ValueEncodingMode
         } = Params0
     } = Config,
-    ok = ensure_consumer_supervisor_started(),
+    #{namespace := Namespace} = emqx_resource:parse_channel_id(SourceResId),
     ?tp(kafka_consumer_sup_started, #{}),
     TopicMapping = ensure_topic_mapping(Params0),
     InitialState = #{
+        namespace => Namespace,
         key_encoding_mode => KeyEncodingMode,
         hookpoints => Hookpoints,
         resource_id => SourceResId,
@@ -432,7 +407,7 @@ start_consumer(Config, ConnectorResId, SourceResId, ClientID) ->
     %% note: the group id should be the same for all nodes in the
     %% cluster, so that the load gets distributed between all
     %% consumers and we don't repeat messages in the same cluster.
-    GroupID = consumer_group_id(Params0, BridgeName),
+    GroupId = consumer_group_id(Params0, BridgeName),
     %% earliest or latest
     BeginOffset = OffsetResetPolicy0,
     OffsetResetPolicy =
@@ -443,6 +418,7 @@ start_consumer(Config, ConnectorResId, SourceResId, ClientID) ->
     ConsumerConfig = [
         {begin_offset, BeginOffset},
         {max_bytes, MaxBatchBytes},
+        {max_wait_time, MaxWaitTime},
         {offset_reset_policy, OffsetResetPolicy}
     ],
     GroupConfig = [
@@ -450,10 +426,11 @@ start_consumer(Config, ConnectorResId, SourceResId, ClientID) ->
         {offset_commit_interval_seconds, OffsetCommitInterval}
     ],
     KafkaTopics = maps:keys(TopicMapping),
+    ensure_no_repeated_topics(KafkaTopics, ConnState),
     GroupSubscriberConfig =
         #{
             client => ClientID,
-            group_id => GroupID,
+            group_id => GroupId,
             topics => KafkaTopics,
             cb_module => ?MODULE,
             init_data => InitialState,
@@ -487,6 +464,30 @@ start_consumer(Config, ConnectorResId, SourceResId, ClientID) ->
                 reason => emqx_utils:redact(Reason)
             }),
             {error, Reason}
+    end.
+
+%% Currently, brod treats a consumer process to a specific topic as a singleton (per
+%% client id / connector), meaning that the first subscriber to a given topic will define
+%% the consumer options for all other consumers, and those options persist even after the
+%% original consumer group is terminated.  We enforce that, if the user wants to consume
+%% multiple times from the same topic, then they must create a different connector.
+ensure_no_repeated_topics(KafkaTopics, ConnState) ->
+    #{installed_sources := Sources} = ConnState,
+    InstalledTopics = lists:flatmap(fun(#{kafka_topics := Ts}) -> Ts end, maps:values(Sources)),
+    case KafkaTopics -- InstalledTopics of
+        KafkaTopics ->
+            %% all new topics
+            ok;
+        NewTopics ->
+            ExistingTopics0 = KafkaTopics -- NewTopics,
+            ExistingTopics = lists:join(<<", ">>, ExistingTopics0),
+            Message = iolist_to_binary([
+                <<"Topics ">>,
+                ExistingTopics,
+                <<" already exist in other sources associated with this connector.">>,
+                <<" If you want to repeat topics, create new connector and source(s).">>
+            ]),
+            throw(Message)
     end.
 
 %% This is to ensure backwards compatibility with the deprectated topic mapping.
@@ -537,8 +538,8 @@ do_get_status(ClientID, [KafkaTopic | RestTopics], SubscriberId) ->
             case do_get_topic_status(ClientID, KafkaTopic, SubscriberId, NPartitions) of
                 ?status_connected ->
                     do_get_status(ClientID, RestTopics, SubscriberId);
-                ?status_disconnected ->
-                    ?status_disconnected
+                {Status, Message} when Status =/= ?status_connected ->
+                    {Status, Message}
             end;
         {error, {client_down, Context}} ->
             case infer_client_error(Context) of
@@ -566,33 +567,44 @@ do_get_status(_ClientID, _KafkaTopics = [], _SubscriberId) ->
     ?status_connected.
 
 -spec do_get_topic_status(brod:client_id(), binary(), subscriber_id(), pos_integer()) ->
-    ?status_connected | ?status_disconnected.
+    ?status_connected | {?status_disconnected | ?status_connecting, _Msg :: binary()}.
 do_get_topic_status(ClientID, KafkaTopic, SubscriberId, NPartitions) ->
     Results =
         lists:map(
             fun(N) ->
-                brod_client:get_leader_connection(ClientID, KafkaTopic, N)
+                {N, brod_client:get_leader_connection(ClientID, KafkaTopic, N)}
             end,
             lists:seq(0, NPartitions - 1)
         ),
-    AllLeadersOk =
-        length(Results) > 0 andalso
-            lists:all(
-                fun
-                    ({ok, _}) ->
-                        true;
-                    (_) ->
-                        false
-                end,
-                Results
-            ),
     WorkersAlive = are_subscriber_workers_alive(SubscriberId),
-    case AllLeadersOk andalso WorkersAlive of
-        true ->
+    case check_leader_connection_results(Results) of
+        ok when WorkersAlive ->
             ?status_connected;
-        false ->
-            ?status_disconnected
+        {error, no_leaders} ->
+            {?status_disconnected, <<"No leaders available (no partitions?)">>};
+        {error, {N, Reason}} ->
+            Msg = iolist_to_binary(
+                io_lib:format(
+                    "Leader for partition ~b unavailable; reason: ~0p",
+                    [N, emqx_utils:redact(Reason)]
+                )
+            ),
+            {?status_disconnected, Msg};
+        ok when not WorkersAlive ->
+            {?status_connecting, <<"Subscription workers restarting">>}
     end.
+
+check_leader_connection_results(Results) ->
+    emqx_utils:foldl_while(
+        fun
+            ({_N, {ok, _}}, _Acc) ->
+                {cont, ok};
+            ({N, {error, Reason}}, _Acc) ->
+                {halt, {error, {N, Reason}}}
+        end,
+        {error, no_leaders},
+        Results
+    ).
 
 are_subscriber_workers_alive(SubscriberId) ->
     try
@@ -600,7 +612,9 @@ are_subscriber_workers_alive(SubscriberId) ->
         case lists:keyfind(SubscriberId, 1, Children) of
             false ->
                 false;
-            {_, Pid, _, _} ->
+            {_, undefined, _, _} ->
+                false;
+            {_, Pid, _, _} when is_pid(Pid) ->
                 Workers = brod_group_subscriber_v2:get_workers(Pid),
                 %% we can't enforce the number of partitions on a single
                 %% node, as the group might be spread across an emqx
@@ -608,6 +622,8 @@ are_subscriber_workers_alive(SubscriberId) ->
                 lists:all(fun is_process_alive/1, maps:values(Workers))
         end
     catch
+        exit:{noproc, _} ->
+            false;
         exit:{shutdown, _} ->
             %% may happen if node is shutting down
             false
@@ -625,21 +641,13 @@ log_when_error(Fun, Log) ->
     end.
 
 -spec consumer_group_id(#{group_id => binary(), any() => term()}, atom() | binary()) -> binary().
-consumer_group_id(#{group_id := GroupId}, _BridgeName) when is_binary(GroupId) ->
+consumer_group_id(#{group_id := GroupId}, _BridgeName) when
+    is_binary(GroupId) andalso GroupId =/= <<"">>
+->
     GroupId;
 consumer_group_id(_ConsumerParams, BridgeName0) ->
     BridgeName = to_bin(BridgeName0),
     <<"emqx-kafka-consumer-", BridgeName/binary>>.
-
--spec is_dry_run(connector_resource_id()) -> boolean().
-is_dry_run(ConnectorResId) ->
-    TestIdStart = string:find(ConnectorResId, ?TEST_ID_PREFIX),
-    case TestIdStart of
-        nomatch ->
-            false;
-        _ ->
-            string:equal(TestIdStart, ConnectorResId)
-    end.
 
 -spec check_client_connectivity(pid()) ->
     ?status_connected
@@ -674,12 +682,31 @@ maybe_clean_error(Reason) ->
             Reason
     end.
 
--spec make_client_id(connector_resource_id(), binary(), atom() | binary()) -> atom().
-make_client_id(ConnectorResId, BridgeType, BridgeName) ->
-    case is_dry_run(ConnectorResId) of
+%% Client ID is better to be unique to make it easier for Kafka side trouble shooting.
+-spec make_client_id(connector_resource_id()) -> atom().
+make_client_id(ConnectorResId) ->
+    case emqx_resource:is_dry_run(ConnectorResId) of
         false ->
-            ClientID0 = emqx_bridge_kafka_impl:make_client_id(BridgeType, BridgeName),
-            binary_to_atom(ClientID0);
+            #{
+                type := Type,
+                name := Name,
+                namespace := Namespace
+            } = emqx_connector_resource:parse_connector_id(ConnectorResId),
+            NSTag =
+                case is_binary(Namespace) of
+                    true -> <<"ns:", Namespace/binary, ":">>;
+                    false -> <<"">>
+                end,
+            binary_to_atom(
+                iolist_to_binary([
+                    NSTag,
+                    to_bin(Type),
+                    ":",
+                    to_bin(Name),
+                    ":",
+                    atom_to_list(node())
+                ])
+            );
         true ->
             %% It is a dry run and we don't want to leak too many
             %% atoms.
@@ -744,6 +771,7 @@ infer_client_error(Error) ->
 allocate_subscriber_id(ConnectorResId, SourceResId, SubscriberId) ->
     ok = emqx_resource:allocate_resource(
         ConnectorResId,
+        ?MODULE,
         {?kafka_subscriber_id, SourceResId},
         SubscriberId
     ).

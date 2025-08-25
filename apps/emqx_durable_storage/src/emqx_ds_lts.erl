@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ds_lts).
@@ -20,12 +8,25 @@
 -export([
     trie_create/1, trie_create/0,
     destroy/1,
+    trie_dump/2,
     trie_restore/2,
     trie_update/2,
     trie_copy_learned_paths/2,
     topic_key/3,
     match_topics/2,
-    lookup_topic_key/2
+    lookup_topic_key/2,
+    reverse_lookup/2,
+    info/2,
+    info/1,
+
+    insert_wildcard/2,
+
+    updated_topics/2,
+
+    threshold_fun/1,
+
+    compress_topic/3,
+    decompress_topic/2
 ]).
 
 %% Debug:
@@ -33,18 +34,27 @@
 
 -export_type([
     options/0,
+    level/0,
     static_key/0,
+    varying/0,
     trie/0,
-    msg_storage_key/0
+    dump/0,
+    msg_storage_key/0,
+    learned_structure/0,
+    threshold_spec/0,
+    threshold_fun/0
 ]).
 
 -include_lib("stdlib/include/ms_transform.hrl").
 
+-elvis([{elvis_style, nesting_level, disable}]).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
--endif.
 
 -elvis([{elvis_style, variable_naming_convention, disable}]).
+-elvis([{elvis_style, dont_repeat_yourself, disable}]).
+-endif.
 
 %%================================================================================
 %% Type declarations
@@ -54,41 +64,76 @@
 -define(EOT, []).
 -define(PLUS, '+').
 
--type edge() :: binary() | ?EOT | ?PLUS.
+-type level() :: binary() | ''.
 
-%% Fixed size binary
--type static_key() :: non_neg_integer().
+-type edge() :: level() | ?EOT | ?PLUS.
 
+%% Fixed size binary or integer, depending on the options:
+-type static_key() :: non_neg_integer() | binary().
+
+%% Trie roots:
 -define(PREFIX, prefix).
--type state() :: static_key() | ?PREFIX.
+-define(PREFIX_SPECIAL, special).
+%% Special prefix root for reverse lookups:
+-define(rlookup, rlookup).
+-define(rlookup(STATIC), {?rlookup, STATIC}).
 
--type varying() :: [binary() | ?PLUS].
+-type state() :: static_key() | ?PREFIX | ?PREFIX_SPECIAL.
+
+-type varying() :: [level() | ?PLUS].
 
 -type msg_storage_key() :: {static_key(), varying()}.
 
--type threshold_fun() :: fun((non_neg_integer()) -> non_neg_integer()).
+-type threshold_spec() ::
+    %% Simple spec that maps level (depth) to a threshold.
+    %% For example, `{simple, {inf, 20}}` means that 0th level has infinite
+    %% threshold while all other levels' threshold is 20.
+    {simple, tuple()}
+    %% Callback function:
+    | {mf, module(), atom()}.
+
+-type root_token() :: undefined | binary().
+
+-type threshold_fun() :: fun((_Depth :: non_neg_integer(), root_token()) -> non_neg_integer()).
 
 -type persist_callback() :: fun((_Key, _Val) -> ok).
+
+-type learned_structure() :: [level() | ?PLUS, ...].
 
 -type options() ::
     #{
         persist_callback => persist_callback(),
-        static_key_size => pos_integer()
+        %% If set, static key is an integer that fits in a given nubmer of bits:
+        static_key_bits => pos_integer(),
+        %% If set, static key is a _binary_ of a given length:
+        static_key_bytes => pos_integer(),
+        reverse_lookups => boolean()
     }.
+
+-type dump() :: [{_Key, _Val}].
 
 -record(trie, {
     persist :: persist_callback(),
+    is_binary_key :: boolean(),
     static_key_size :: pos_integer(),
     trie :: ets:tid(),
-    stats :: ets:tid()
+    stats :: ets:tid(),
+    rlookups = false :: boolean()
 }).
 
 -opaque trie() :: #trie{}.
 
--record(trans, {
-    key :: {state(), edge()},
-    next :: state()
-}).
+-record(trans, {key, next}).
+
+-type trans() ::
+    #trans{
+        key :: {state(), edge()},
+        next :: state()
+    }
+    | #trans{
+        key :: {?rlookup, static_key()},
+        next :: [level() | ?PLUS]
+    }.
 
 %%================================================================================
 %% API functions
@@ -97,21 +142,31 @@
 %% @doc Create an empty trie
 -spec trie_create(options()) -> trie().
 trie_create(UserOpts) ->
-    Defaults = #{
-        persist_callback => fun(_, _) -> ok end,
-        static_key_size => 8
-    },
-    #{
-        persist_callback := Persist,
-        static_key_size := StaticKeySize
-    } = maps:merge(Defaults, UserOpts),
-    Trie = ets:new(trie, [{keypos, #trans.key}, set, public]),
+    Persist = maps:get(
+        persist_callback,
+        UserOpts,
+        fun(_, _) -> ok end
+    ),
+    Rlookups = maps:get(reverse_lookups, UserOpts, false),
+    IsBinaryKey =
+        case UserOpts of
+            #{static_key_bits := StaticKeySize} ->
+                false;
+            #{static_key_bytes := StaticKeySize} ->
+                true;
+            _ ->
+                StaticKeySize = 16,
+                true
+        end,
+    Trie = ets:new(trie, [{keypos, #trans.key}, set, public, {read_concurrency, true}]),
     Stats = ets:new(stats, [{keypos, 1}, set, public]),
     #trie{
         persist = Persist,
+        is_binary_key = IsBinaryKey,
         static_key_size = StaticKeySize,
         trie = Trie,
-        stats = Stats
+        stats = Stats,
+        rlookups = Rlookups
     }.
 
 -spec trie_create() -> trie().
@@ -120,17 +175,16 @@ trie_create() ->
 
 -spec destroy(trie()) -> ok.
 destroy(#trie{trie = Trie, stats = Stats}) ->
-    catch ets:delete(Trie),
-    catch ets:delete(Stats),
-    ok.
+    emqx_ds_lib:ets_delete(Trie),
+    emqx_ds_lib:ets_delete(Stats).
 
 %% @doc Restore trie from a dump
--spec trie_restore(options(), [{_Key, _Val}]) -> trie().
+-spec trie_restore(options(), dump()) -> trie().
 trie_restore(Options, Dump) ->
     trie_update(trie_create(Options), Dump).
 
 %% @doc Update a trie with a dump of operations (used for replication)
--spec trie_update(trie(), [{_Key, _Val}]) -> trie().
+-spec trie_update(trie(), dump()) -> trie().
 trie_update(Trie, Dump) ->
     lists:foreach(
         fun({{StateFrom, Token}, StateTo}) ->
@@ -140,30 +194,69 @@ trie_update(Trie, Dump) ->
     ),
     Trie.
 
+-spec trie_dump(trie(), _Filter :: all | wildcard) -> dump().
+trie_dump(Trie, Filter) ->
+    case Filter of
+        all ->
+            Fun = fun(_) -> true end;
+        wildcard ->
+            Fun = fun(L) -> lists:member(?PLUS, L) end
+    end,
+    Paths = lists:filter(
+        fun(Path) ->
+            Fun(tokens_of_path(Path))
+        end,
+        paths(Trie)
+    ),
+    RlookupIdx = lists:filter(
+        fun({_, Tokens}) ->
+            Fun(Tokens)
+        end,
+        all_emanating(Trie, ?rlookup)
+    ),
+    lists:flatten([Paths, RlookupIdx]).
+
 -spec trie_copy_learned_paths(trie(), trie()) -> trie().
 trie_copy_learned_paths(OldTrie, NewTrie) ->
-    WildcardPaths = [P || P <- paths(OldTrie), contains_wildcard(P)],
     lists:foreach(
         fun({{StateFrom, Token}, StateTo}) ->
             trie_insert(NewTrie, StateFrom, Token, StateTo)
         end,
-        lists:flatten(WildcardPaths)
+        trie_dump(OldTrie, wildcard)
     ),
     NewTrie.
 
 %% @doc Lookup the topic key. Create a new one, if not found.
--spec topic_key(trie(), threshold_fun(), [binary() | '']) -> msg_storage_key().
+-spec topic_key(trie(), threshold_fun(), [level()]) -> msg_storage_key().
+topic_key(Trie, ThresholdFun, [<<"$", _/bytes>> | L] = Tokens) ->
+    %% [MQTT-4.7.2-1]
+    %% Put any topic starting with `$` into a separate _special_ root.
+    %% Using a special root only when the topic and the filter start with $<X>
+    %% prevents special topics from matching with + or # pattern, but not with
+    %% $<X>/+ or $<X>/# pattern. See also `match_topics/2`.
+    do_topic_key(Trie, ThresholdFun, 0, ?PREFIX_SPECIAL, Tokens, topic_root(L), [], []);
 topic_key(Trie, ThresholdFun, Tokens) ->
-    do_topic_key(Trie, ThresholdFun, 0, ?PREFIX, Tokens, []).
+    do_topic_key(Trie, ThresholdFun, 0, ?PREFIX, Tokens, topic_root(Tokens), [], []).
 
 %% @doc Return an exisiting topic key if it exists.
--spec lookup_topic_key(trie(), [binary()]) -> {ok, msg_storage_key()} | undefined.
+-spec lookup_topic_key(trie(), [level()]) -> {ok, msg_storage_key()} | undefined.
+lookup_topic_key(Trie, [<<"$", _/bytes>> | _] = Tokens) ->
+    %% [MQTT-4.7.2-1]
+    %% See also `match_topics/2`.
+    do_lookup_topic_key(Trie, ?PREFIX_SPECIAL, Tokens, []);
 lookup_topic_key(Trie, Tokens) ->
     do_lookup_topic_key(Trie, ?PREFIX, Tokens, []).
 
 %% @doc Return list of keys of topics that match a given topic filter
--spec match_topics(trie(), [binary() | '+' | '#']) ->
+-spec match_topics(trie(), [level() | '+' | '#']) ->
     [msg_storage_key()].
+match_topics(Trie, [<<"$", _/bytes>> | _] = TopicFilter) ->
+    %% [MQTT-4.7.2-1]
+    %% Any topics starting with `$` should belong to a separate _special_ root.
+    %% Using a special root only when the topic and the filter start with $<X>
+    %% prevents special topics from matching with + or # pattern, but not with
+    %% $<X>/+ or $<X>/# pattern.
+    do_match_topics(Trie, ?PREFIX_SPECIAL, [], TopicFilter);
 match_topics(Trie, TopicFilter) ->
     do_match_topics(Trie, ?PREFIX, [], TopicFilter).
 
@@ -194,7 +287,8 @@ dump_to_dot(#trie{trie = Trie, stats = Stats}, Filename) ->
     {ok, FD} = file:open(Filename, [write]),
     Print = fun
         (?PREFIX) -> "prefix";
-        (NodeId) -> integer_to_binary(NodeId, 16)
+        (Bin) when is_binary(Bin) -> Bin;
+        (NodeId) when is_integer(NodeId) -> integer_to_binary(NodeId, 16)
     end,
     io:format(FD, "digraph {~n", []),
     lists:foreach(
@@ -213,11 +307,111 @@ dump_to_dot(#trie{trie = Trie, stats = Stats}, Filename) ->
     io:format(FD, "}~n", []),
     file:close(FD).
 
+-spec reverse_lookup(trie(), static_key()) -> {ok, learned_structure()} | undefined.
+reverse_lookup(#trie{rlookups = false}, _) ->
+    error({badarg, reverse_lookups_disabled});
+reverse_lookup(#trie{trie = Trie}, StaticKey) ->
+    case ets:lookup(Trie, ?rlookup(StaticKey)) of
+        [#trans{next = Next}] ->
+            {ok, Next};
+        [] ->
+            undefined
+    end.
+
+%% @doc Get information about the trie.
+%%
+%% Note: `reverse_lookups' must be enabled to get the number of
+%% topics.
+-spec info(trie(), size | topics) -> _.
+info(#trie{rlookups = true, stats = Stats}, topics) ->
+    case ets:lookup(Stats, ?rlookup) of
+        [{_, N}] -> N;
+        [] -> 0
+    end;
+info(#trie{}, topics) ->
+    undefined;
+info(#trie{trie = T}, size) ->
+    ets:info(T, size).
+
+%% @doc Return size of the trie
+-spec info(trie()) -> proplists:proplist().
+info(Trie) ->
+    [
+        {size, info(Trie, size)},
+        {topics, info(Trie, topics)}
+    ].
+
+-spec threshold_fun(threshold_spec()) -> threshold_fun().
+threshold_fun({simple, Thresholds}) ->
+    S = tuple_size(Thresholds),
+    fun(Depth, _Parent) ->
+        element(min(Depth + 1, S), Thresholds)
+    end;
+threshold_fun({mf, Mod, Fun}) ->
+    fun Mod:Fun/2.
+
+%%%%%%%% Topic compression %%%%%%%%%%
+
+%% @doc Given topic structure for the static LTS index (as returned by
+%% `reverse_lookup'), compress a topic filter to exclude static
+%% levels:
+-spec compress_topic(static_key(), learned_structure(), emqx_ds:topic_filter()) ->
+    [emqx_ds_lts:level() | '+'].
+compress_topic(StaticKey, TopicStructure, TopicFilter) ->
+    compress_topic(StaticKey, TopicStructure, TopicFilter, []).
+
+%% @doc Given topic structure and a compressed topic filter, return
+%% the original* topic filter.
+%%
+%% * '#' will be replaced with '+'s
+-spec decompress_topic(learned_structure(), [level() | '+']) ->
+    emqx_ds:topic_filter().
+decompress_topic(TopicStructure, Topic) ->
+    decompress_topic(TopicStructure, Topic, []).
+
+-spec updated_topics(trie(), dump()) -> [emqx_ds:topic_filter()].
+updated_topics(#trie{rlookups = true}, Dump) ->
+    lists:filtermap(
+        fun
+            ({{?rlookup, _StaticIdx}, UpdatedTF}) ->
+                {true, UpdatedTF};
+            ({{_StateFrom, _Token}, _StateTo}) ->
+                false
+        end,
+        Dump
+    ).
+
+-spec insert_wildcard(trie(), [binary() | '+']) -> ok.
+insert_wildcard(Trie, TF) ->
+    %% Craft a special threshold function that returns 0 for topic
+    %% levels corresponding to '+'s in the filter or `infinity'
+    %% otherwise:
+    LevelThresholds = [
+        case I of
+            '+' -> 0;
+            _ when is_binary(I) -> infinity
+        end
+     || I <- TF
+    ],
+    ThresholdFun = fun(Depth, _Parent) ->
+        lists:nth(Depth + 1, LevelThresholds)
+    end,
+    %% Insert a dummy topic that corresponds to the given topic filter:
+    DummyTopic = [
+        case I of
+            '+' -> <<>>;
+            _ -> I
+        end
+     || I <- TF
+    ],
+    _ = topic_key(Trie, ThresholdFun, DummyTopic),
+    ok.
+
 %%================================================================================
 %% Internal exports
 %%================================================================================
 
--spec trie_next(trie(), state(), binary() | ?EOT) -> {Wildcard, state()} | undefined when
+-spec trie_next(trie(), state(), level() | ?EOT) -> {Wildcard, state()} | undefined when
     Wildcard :: boolean().
 trie_next(#trie{trie = Trie}, State, ?EOT) ->
     case ets:lookup(Trie, {State, ?EOT}) of
@@ -243,22 +437,26 @@ trie_next(#trie{trie = Trie}, State, Token) ->
     NChildren :: non_neg_integer(),
     Updated :: false | NChildren.
 trie_insert(Trie, State, Token) ->
-    trie_insert(Trie, State, Token, get_id_for_key(Trie, State, Token)).
+    NextState = get_id_for_key(Trie, State, Token),
+    trie_insert(Trie, State, Token, NextState).
 
 %%================================================================================
 %% Internal functions
 %%================================================================================
 
--spec trie_insert(trie(), state(), edge(), state()) -> {Updated, state()} when
-    NChildren :: non_neg_integer(),
-    Updated :: false | NChildren.
+-spec trie_insert
+    (trie(), state(), edge(), state()) -> {Updated, state()} when
+        NChildren :: non_neg_integer(),
+        Updated :: false | NChildren;
+    (trie(), ?rlookup, static_key(), [level() | '+']) ->
+        {false | non_neg_integer(), state()}.
 trie_insert(#trie{trie = Trie, stats = Stats, persist = Persist}, State, Token, NewState) ->
     Key = {State, Token},
     Rec = #trans{
         key = Key,
         next = NewState
     },
-    case ets:insert_new(Trie, Rec) of
+    case ets_insert_new(Trie, Rec) of
         true ->
             ok = Persist(Key, NewState),
             Inc =
@@ -274,8 +472,9 @@ trie_insert(#trie{trie = Trie, stats = Stats, persist = Persist}, State, Token, 
             {false, NextState}
     end.
 
+%% @doc Get storage static key
 -spec get_id_for_key(trie(), state(), edge()) -> static_key().
-get_id_for_key(#trie{static_key_size = Size}, State, Token) when Size =< 32 ->
+get_id_for_key(#trie{is_binary_key = IsBin, static_key_size = Size}, State, Token) ->
     %% Requirements for the return value:
     %%
     %% It should be globally unique for the `{State, Token}` pair. Other
@@ -291,11 +490,21 @@ get_id_for_key(#trie{static_key_size = Size}, State, Token) when Size =< 32 ->
     %% If we want to impress computer science crowd, sorry, I mean to
     %% minimize storage requirements, we can even employ Huffman coding
     %% based on the frequency of messages.
-    <<Int:(Size * 8), _/bytes>> = crypto:hash(sha256, term_to_binary([State | Token])),
-    Int.
+    Hash = crypto:hash(sha256, term_to_binary([State | Token])),
+    case IsBin of
+        false ->
+            %% Note: for backward compatibility with bitstream_lts
+            %% layout we allow the key to be an integer. But this also
+            %% changes the semantics of `static_key_size` from number
+            %% of bytes to bits:
+            <<Int:Size, _/bytes>> = Hash,
+            Int;
+        true ->
+            element(1, erlang:split_binary(Hash, Size))
+    end.
 
 %% erlfmt-ignore
--spec do_match_topics(trie(), state(), [binary() | '+'], [binary() | '+' | '#']) ->
+-spec do_match_topics(trie(), state(), [level() | '+'], [level() | '+' | '#']) ->
           list().
 do_match_topics(Trie, State, Varying, []) ->
     case trie_next(Trie, State, ?EOT) of
@@ -329,7 +538,7 @@ do_match_topics(Trie, State, Varying, [Level | Rest]) ->
         Emanating
     ).
 
--spec do_lookup_topic_key(trie(), state(), [binary()], [binary()]) ->
+-spec do_lookup_topic_key(trie(), state(), [level()], [level()]) ->
     {ok, msg_storage_key()} | undefined.
 do_lookup_topic_key(Trie, State, [], Varying) ->
     case trie_next(Trie, State, ?EOT) of
@@ -348,41 +557,88 @@ do_lookup_topic_key(Trie, State, [Tok | Rest], Varying) ->
             undefined
     end.
 
-do_topic_key(Trie, _, _, State, [], Varying) ->
+do_topic_key(Trie, ThresholdFun, Depth, State, [], Root, Tokens, Varying) ->
     %% We reached the end of topic. Assert: Trie node that corresponds
     %% to EOT cannot be a wildcard.
-    {_, false, Static} = trie_next_(Trie, State, ?EOT),
+    {Updated, false, Static} = trie_next_(Trie, ThresholdFun, Depth, Root, State, ?EOT),
+    _ =
+        case Trie#trie.rlookups andalso Updated of
+            false ->
+                ok;
+            _ ->
+                trie_insert(Trie, rlookup, Static, lists:reverse(Tokens))
+        end,
     {Static, lists:reverse(Varying)};
-do_topic_key(Trie, ThresholdFun, Depth, State, [Tok | Rest], Varying0) ->
-    % TODO: it's not necessary to call it every time.
-    Threshold = ThresholdFun(Depth),
+do_topic_key(Trie, ThresholdFun, Depth, State, [Tok | Rest], Root, Tokens, Varying0) ->
+    {_, IsWildcard, NextState} = trie_next_(Trie, ThresholdFun, Depth, Root, State, Tok),
     Varying =
-        case trie_next_(Trie, State, Tok) of
-            {NChildren, _, NextState} when is_integer(NChildren), NChildren >= Threshold ->
-                %% Number of children for the trie node reached the
-                %% threshold, we need to insert wildcard here.
-                {_, _WildcardState} = trie_insert(Trie, State, ?PLUS),
+        case IsWildcard of
+            false ->
                 Varying0;
-            {_, false, NextState} ->
-                Varying0;
-            {_, true, NextState} ->
+            true ->
                 %% This topic level is marked as wildcard in the trie,
                 %% we need to add it to the varying part of the key:
                 [Tok | Varying0]
         end,
-    do_topic_key(Trie, ThresholdFun, Depth + 1, NextState, Rest, Varying).
+    TokOrWildcard =
+        case IsWildcard of
+            true -> ?PLUS;
+            false -> Tok
+        end,
+    do_topic_key(
+        Trie,
+        ThresholdFun,
+        Depth + 1,
+        NextState,
+        Rest,
+        Root,
+        [TokOrWildcard | Tokens],
+        Varying
+    ).
 
-%% @doc Has side effects! Inserts missing elements
--spec trie_next_(trie(), state(), binary() | ?EOT) -> {New, Wildcard, state()} when
+%% @doc Has side effects! Inserts missing elements.
+-spec trie_next_(
+    trie(), threshold_fun(), non_neg_integer(), root_token(), state(), binary() | ?EOT
+) ->
+    {New, IsWildcard, state()}
+when
     New :: false | non_neg_integer(),
-    Wildcard :: boolean().
-trie_next_(Trie, State, Token) ->
+    IsWildcard :: boolean().
+trie_next_(Trie, ThresholdFun, Depth, Parent, State, Token) ->
     case trie_next(Trie, State, Token) of
-        {Wildcard, NextState} ->
-            {false, Wildcard, NextState};
+        {IsWildcard, NextState} ->
+            {false, IsWildcard, NextState};
         undefined ->
-            {Updated, NextState} = trie_insert(Trie, State, Token),
-            {Updated, false, NextState}
+            case Token of
+                ?EOT ->
+                    %% EOT token is special, we never treat it as the
+                    %% wildcard:
+                    {Updated, NextState} = trie_insert(Trie, State, ?EOT),
+                    {Updated, false, NextState};
+                _ ->
+                    %% For any other token, we may consider inserting
+                    %% the wildcard:
+                    case ThresholdFun(Depth, Parent) of
+                        0 ->
+                            %% Wildcard threshold is 0, we can insert
+                            %% ?PLUS immediately:
+                            {Updated, NextState} = trie_insert(Trie, State, ?PLUS),
+                            {Updated, true, NextState};
+                        Threshold ->
+                            %% For other wildcard thresholds we first
+                            %% insert the original token, then
+                            %% `?PLUS', if threshold was reached:
+                            {Updated, NextState} = trie_insert(Trie, State, Token),
+                            _ =
+                                is_integer(Updated) andalso Updated >= Threshold andalso
+                                    %% Topic structure has been
+                                    %% learned. Next topic with the
+                                    %% same prefix will be treated as
+                                    %% a wildcard:
+                                    trie_insert(Trie, State, ?PLUS),
+                            {Updated, false, NextState}
+                    end
+            end
     end.
 
 %% @doc Return all edges emanating from a node:
@@ -438,12 +694,56 @@ follow_path(#trie{} = T, State, Path) ->
         all_emanating(T, State)
     ).
 
-contains_wildcard([{{_State, ?PLUS}, _Next} | _Rest]) ->
-    true;
-contains_wildcard([_ | Rest]) ->
-    contains_wildcard(Rest);
-contains_wildcard([]) ->
-    false.
+tokens_of_path([{{_State, Token}, _Next} | Rest]) ->
+    [Token | tokens_of_path(Rest)];
+tokens_of_path([]) ->
+    [].
+
+%% Wrapper for type checking only:
+-compile({inline, ets_insert_new/2}).
+-spec ets_insert_new(ets:tid(), trans()) -> boolean().
+ets_insert_new(Tid, Trans) ->
+    ets:insert_new(Tid, Trans).
+
+compress_topic(_StaticKey, [], [], Acc) ->
+    lists:reverse(Acc);
+compress_topic(StaticKey, TStructL0, ['#'], Acc) ->
+    case TStructL0 of
+        [] ->
+            lists:reverse(Acc);
+        ['+' | TStructL] ->
+            compress_topic(StaticKey, TStructL, ['#'], ['+' | Acc]);
+        [_ | TStructL] ->
+            compress_topic(StaticKey, TStructL, ['#'], Acc)
+    end;
+compress_topic(StaticKey, ['+' | TStructL], [Level | TopicL], Acc) ->
+    compress_topic(StaticKey, TStructL, TopicL, [Level | Acc]);
+compress_topic(StaticKey, [Struct | TStructL], [Level | TopicL], Acc) when
+    Level =:= '+'; Level =:= Struct
+->
+    compress_topic(StaticKey, TStructL, TopicL, Acc);
+compress_topic(StaticKey, TStructL, TopicL, _Acc) ->
+    %% Topic is mismatched with the structure. This should never
+    %% happen. LTS got corrupted?
+    Err = #{
+        msg => 'Topic structure mismatch',
+        static_key => StaticKey,
+        input => TopicL,
+        structure => TStructL
+    },
+    throw({unrecoverable, Err}).
+
+decompress_topic(['+' | TStructL], [Level | TopicL], Acc) ->
+    decompress_topic(TStructL, TopicL, [Level | Acc]);
+decompress_topic([StaticLevel | TStructL], TopicL, Acc) ->
+    decompress_topic(TStructL, TopicL, [StaticLevel | Acc]);
+decompress_topic([], [], Acc) ->
+    lists:reverse(Acc).
+
+topic_root([]) ->
+    undefined;
+topic_root([A | _]) ->
+    A.
 
 %%================================================================================
 %% Tests
@@ -549,8 +849,8 @@ topic_key_test() ->
     T = trie_create(),
     try
         Threshold = 4,
-        ThresholdFun = fun(0) -> 1000;
-                          (_) -> Threshold
+        ThresholdFun = fun(0, _Parent) -> 1000;
+                          (_, _Parent) -> Threshold
                        end,
         %% Test that bottom layer threshold is high:
         lists:foreach(
@@ -595,13 +895,26 @@ topic_key_test() ->
         dump_to_dot(T, filename:join("_build", atom_to_list(?FUNCTION_NAME) ++ ".dot"))
     end.
 
+insert_wildcard_test() ->
+    T = trie_create(),
+    ?assertMatch(ok, insert_wildcard(T, ['+', <<"pub">>, '+'])),
+    ThresholdFun = fun(_, _) -> infinity end,
+    ?assertMatch(
+        {_, [<<"foo">>, <<"bar">>]},
+        test_key(T, ThresholdFun, [<<"foo">>, <<"pub">>, <<"bar">>, <<"quux">>])
+    ),
+    ?assertMatch(
+        {_, [<<"foo">>]},
+        test_key(T, ThresholdFun, [<<"foo">>, <<"bar">>])
+    ).
+
 %% erlfmt-ignore
 topic_match_test() ->
     T = trie_create(),
     try
         Threshold = 2,
-        ThresholdFun = fun(0) -> 1000;
-                          (_) -> Threshold
+        ThresholdFun = fun(0, _Parent) -> 1000;
+                          (_, _Parent) -> Threshold
                        end,
         {S1, []} = test_key(T, ThresholdFun, [1]),
         {S11, []} = test_key(T, ThresholdFun, [1, 1]),
@@ -646,26 +959,159 @@ topic_match_test() ->
         dump_to_dot(T, filename:join("_build", atom_to_list(?FUNCTION_NAME) ++ ".dot"))
     end.
 
+%% erlfmt-ignore
+rlookup_test() ->
+    T = trie_create(#{reverse_lookups => true}),
+    Threshold = 2,
+    ThresholdFun = fun(0, _Parent) -> 1000;
+                      (_, _Parent) -> Threshold
+                   end,
+    {S1, []} = test_key(T, ThresholdFun, [1]),
+    {S11, []} = test_key(T, ThresholdFun, [1, 1]),
+    {S12, []} = test_key(T, ThresholdFun, [1, 2]),
+    {S111, []} = test_key(T, ThresholdFun, [1, 1, 1]),
+    {S11e, []} = test_key(T, ThresholdFun, [1, 1, '']),
+    %% Now add learned wildcards:
+    {S21, []} = test_key(T, ThresholdFun, [2, 1]),
+    {S22, []} = test_key(T, ThresholdFun, [2, 2]),
+    {S2_, [<<"3">>]} = test_key(T, ThresholdFun, [2, 3]),
+    {S2_11, [<<"3">>]} = test_key(T, ThresholdFun, [2, 3, 1, 1]),
+    {S2_12, [<<"4">>]} = test_key(T, ThresholdFun, [2, 4, 1, 2]),
+    {S2_1_, [<<"3">>, <<"3">>]} = test_key(T, ThresholdFun, [2, 3, 1, 3]),
+    %% Check reverse matching:
+    ?assertEqual({ok, [<<"1">>]}, reverse_lookup(T, S1)),
+    ?assertEqual({ok, [<<"1">>, <<"1">>]}, reverse_lookup(T, S11)),
+    ?assertEqual({ok, [<<"1">>, <<"2">>]}, reverse_lookup(T, S12)),
+    ?assertEqual({ok, [<<"1">>, <<"1">>, <<"1">>]}, reverse_lookup(T, S111)),
+    ?assertEqual({ok, [<<"1">>, <<"1">>, '']}, reverse_lookup(T, S11e)),
+    ?assertEqual({ok, [<<"2">>, <<"1">>]}, reverse_lookup(T, S21)),
+    ?assertEqual({ok, [<<"2">>, <<"2">>]}, reverse_lookup(T, S22)),
+    ?assertEqual({ok, [<<"2">>, '+']}, reverse_lookup(T, S2_)),
+    ?assertEqual({ok, [<<"2">>, '+', <<"1">>, <<"1">>]}, reverse_lookup(T, S2_11)),
+    ?assertEqual({ok, [<<"2">>, '+', <<"1">>, <<"2">>]}, reverse_lookup(T, S2_12)),
+    ?assertEqual({ok, [<<"2">>, '+', <<"1">>, '+']}, reverse_lookup(T, S2_1_)),
+    %% Dump and restore trie to make sure rlookup still works:
+    T1 = trie_restore(#{reverse_lookups => true}, trie_dump(T, all)),
+    destroy(T),
+    ?assertEqual({ok, [<<"2">>, <<"1">>]}, reverse_lookup(T1, S21)),
+    ?assertEqual({ok, [<<"2">>, '+', <<"1">>, '+']}, reverse_lookup(T1, S2_1_)).
+
+updated_topics_test() ->
+    %% Trie updates are sent as messages to self:
+    T = trie_create(#{
+        reverse_lookups => true,
+        persist_callback => fun(Key, Val) ->
+            self() ! {?FUNCTION_NAME, Key, Val},
+            ok
+        end
+    }),
+    %% Dump trie updates from the mailbox:
+    Ops = fun F() ->
+        receive
+            {?FUNCTION_NAME, K, V} -> [{K, V} | F()]
+        after 0 -> []
+        end
+    end,
+    Threshold = 2,
+    ThresholdFun = fun
+        (0, _) -> 1000;
+        (_, _) -> Threshold
+    end,
+    %% Singleton topics:
+    test_key(T, ThresholdFun, [1]),
+    ?assertMatch(
+        [[<<"1">>]],
+        updated_topics(T, Ops())
+    ),
+    %% Check that events are only sent once:
+    test_key(T, ThresholdFun, [1]),
+    ?assertMatch(
+        [],
+        updated_topics(T, Ops())
+    ),
+    test_key(T, ThresholdFun, [1, 1]),
+    ?assertMatch(
+        [[<<"1">>, <<"1">>]],
+        updated_topics(T, Ops())
+    ),
+    test_key(T, ThresholdFun, [1, 2]),
+    ?assertMatch(
+        [[<<"1">>, <<"2">>]],
+        updated_topics(T, Ops())
+    ),
+    %% Upgrade to wildcard:
+    test_key(T, ThresholdFun, [1, 3]),
+    ?assertMatch(
+        [[<<"1">>, '+']],
+        updated_topics(T, Ops())
+    ),
+    test_key(T, ThresholdFun, [1, 4]),
+    ?assertMatch(
+        [],
+        updated_topics(T, Ops())
+    ).
+
+n_topics_test() ->
+    Threshold = 3,
+    ThresholdFun = fun
+        (0, _) -> 1000;
+        (_, _) -> Threshold
+    end,
+
+    T = trie_create(#{reverse_lookups => true}),
+    ?assertEqual(0, info(T, topics)),
+    {S11, []} = test_key(T, ThresholdFun, [1, 1]),
+    {S11, []} = test_key(T, ThresholdFun, [1, 1]),
+    ?assertEqual(1, info(T, topics)),
+
+    {S12, []} = test_key(T, ThresholdFun, [1, 2]),
+    {S12, []} = test_key(T, ThresholdFun, [1, 2]),
+    ?assertEqual(2, info(T, topics)),
+
+    {_S13, []} = test_key(T, ThresholdFun, [1, 3]),
+    ?assertEqual(3, info(T, topics)),
+
+    {S1_, [_]} = test_key(T, ThresholdFun, [1, 4]),
+    ?assertEqual(4, info(T, topics)),
+
+    {S1_, [_]} = test_key(T, ThresholdFun, [1, 5]),
+    {S1_, [_]} = test_key(T, ThresholdFun, [1, 6]),
+    {S1_, [_]} = test_key(T, ThresholdFun, [1, 7]),
+    ?assertEqual(4, info(T, topics)),
+
+    ?assertMatch(
+        [{size, N}, {topics, 4}] when is_integer(N),
+        info(T)
+    ).
+
 -define(keys_history, topic_key_history).
 
-%% erlfmt-ignore
 assert_match_topics(Trie, Filter0, Expected) ->
-    Filter = lists:map(fun(I) when is_integer(I) -> integer_to_binary(I);
-                          (I) -> I
-                       end,
-                       Filter0),
+    Filter = lists:map(
+        fun
+            (I) when is_integer(I) -> integer_to_binary(I);
+            (I) -> I
+        end,
+        Filter0
+    ),
     Matched = match_topics(Trie, Filter),
-    ?assertMatch( #{missing := [], unexpected := []}
-                , #{ missing    => Expected -- Matched
-                   , unexpected => Matched -- Expected
-                   }
-                , Filter
-                ).
+    ?assertMatch(
+        #{
+            missing := [],
+            unexpected := []
+        },
+        #{
+            missing => Expected -- Matched,
+            unexpected => Matched -- Expected
+        },
+        Filter
+    ).
 
 %% erlfmt-ignore
 test_key(Trie, Threshold, Topic0) ->
     Topic = lists:map(fun('') -> '';
-                         (I) -> integer_to_binary(I)
+                         (I) when is_integer(I) -> integer_to_binary(I);
+                         (Bin) when is_binary(Bin) -> Bin
                       end,
                       Topic0),
     Ret = topic_key(Trie, Threshold, Topic),
@@ -700,8 +1146,8 @@ paths_test() ->
     T = trie_create(),
     Threshold = 4,
     ThresholdFun = fun
-        (0) -> 1000;
-        (_) -> Threshold
+        (0, _) -> 1000;
+        (_, _) -> Threshold
     end,
     PathsToInsert =
         [
@@ -761,11 +1207,16 @@ paths_test() ->
     ),
 
     %% Test filter function for paths containing wildcards
-    WildcardPaths = lists:filter(fun contains_wildcard/1, Paths),
+    WildcardPaths = lists:filter(
+        fun(Path) ->
+            lists:member(?PLUS, tokens_of_path(Path))
+        end,
+        Paths
+    ),
     FormattedWildcardPaths = lists:map(fun format_path/1, WildcardPaths),
     ?assertEqual(
-        sets:from_list(FormattedWildcardPaths, [{version, 2}]),
         sets:from_list(lists:map(FormatPathSpec, ExpectedWildcardPaths), [{version, 2}]),
+        sets:from_list(FormattedWildcardPaths, [{version, 2}]),
         #{
             expected => ExpectedWildcardPaths,
             wildcards => FormattedWildcardPaths
@@ -783,13 +1234,140 @@ paths_test() ->
     #trie{trie = Tab2} = T2,
     Dump1 = sets:from_list(ets:tab2list(Tab1), [{version, 2}]),
     Dump2 = sets:from_list(ets:tab2list(Tab2), [{version, 2}]),
-    ?assertEqual(Dump1, Dump2),
-
-    ok.
+    ?assertEqual(Dump1, Dump2).
 
 format_path([{{_State, Edge}, _Next} | Rest]) ->
     [Edge | format_path(Rest)];
 format_path([]) ->
     [].
+
+compress_topic_test() ->
+    %% Structure without wildcards:
+    ?assertEqual([], compress_topic(42, [], [])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, <<"bar">>], [<<"foo">>, <<"bar">>])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, ''], [<<"foo">>, ''])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, ''], [<<"foo">>, '+'])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, ''], ['+', '+'])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, <<"bar">>, ''], ['#'])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, <<"bar">>, ''], [<<"foo">>, <<"bar">>, '#'])),
+    ?assertEqual([], compress_topic(42, [<<"foo">>, <<"bar">>, ''], ['+', '#'])),
+    ?assertEqual(
+        [], compress_topic(42, [<<"foo">>, <<"bar">>, ''], [<<"foo">>, <<"bar">>, '', '#'])
+    ),
+    %% With wildcards:
+    ?assertEqual(
+        [<<"1">>], compress_topic(42, [<<"foo">>, '+', <<"bar">>], [<<"foo">>, <<"1">>, <<"bar">>])
+    ),
+    ?assertEqual(
+        [<<"1">>, <<"2">>],
+        compress_topic(
+            42,
+            [<<"foo">>, '+', <<"bar">>, '+', <<"baz">>],
+            [<<"foo">>, <<"1">>, <<"bar">>, <<"2">>, <<"baz">>]
+        )
+    ),
+    ?assertEqual(
+        ['+', <<"2">>],
+        compress_topic(
+            42,
+            [<<"foo">>, '+', <<"bar">>, '+', <<"baz">>],
+            [<<"foo">>, '+', <<"bar">>, <<"2">>, <<"baz">>]
+        )
+    ),
+    ?assertEqual(
+        ['+', '+'],
+        compress_topic(
+            42,
+            [<<"foo">>, '+', <<"bar">>, '+', <<"baz">>],
+            [<<"foo">>, '+', <<"bar">>, '+', <<"baz">>]
+        )
+    ),
+    ?assertEqual(
+        ['+', '+'],
+        compress_topic(
+            42,
+            [<<"foo">>, '+', <<"bar">>, '+', <<"baz">>],
+            ['#']
+        )
+    ),
+    ?assertEqual(
+        ['+', '+'],
+        compress_topic(
+            42,
+            [<<"foo">>, '+', <<"bar">>, '+', <<"baz">>],
+            [<<"foo">>, '+', '+', '#']
+        )
+    ),
+    %% Mismatch:
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, [<<"foo">>], [<<"bar">>])),
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, [], [<<"bar">>])),
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, [<<"foo">>], [])),
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, ['', ''], ['', '', ''])),
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, ['', ''], [<<"foo">>, '#'])),
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, ['', ''], ['+', '+', '+', '#'])),
+    ?assertException(_, {unrecoverable, _}, compress_topic(42, ['+'], [<<"bar">>, '+'])),
+    ?assertException(
+        _, {unrecoverable, _}, compress_topic(42, [<<"foo">>, '+'], [<<"bar">>, <<"baz">>])
+    ).
+
+decompress_topic_test() ->
+    %% Structure without wildcards:
+    ?assertEqual([], decompress_topic([], [])),
+    ?assertEqual(
+        [<<"foo">>, '', <<"bar">>],
+        decompress_topic([<<"foo">>, '', <<"bar">>], [])
+    ),
+    %% With wildcards:
+    ?assertEqual(
+        [<<"foo">>, '', <<"bar">>, <<"baz">>],
+        decompress_topic([<<"foo">>, '+', <<"bar">>, '+'], ['', <<"baz">>])
+    ),
+    ?assertEqual(
+        [<<"foo">>, '+', <<"bar">>, '+', ''],
+        decompress_topic([<<"foo">>, '+', <<"bar">>, '+', ''], ['+', '+'])
+    ).
+
+%% This testcase verifies arguments passed to the wildcard threshold
+%% callback:
+threshold_cb_test() ->
+    T = trie_create(),
+    %% Create a callback function that sends its argement to the process:
+    ThresholdFun = fun(Depth, Root) ->
+        self() ! {?FUNCTION_NAME, Depth, Root},
+        infinity
+    end,
+    %% Collect the messages:
+    Recv = fun F() ->
+        receive
+            {?FUNCTION_NAME, Depth, Root} ->
+                [{Depth, Root} | F()]
+        after 0 ->
+            []
+        end
+    end,
+    %% Empty topic:
+    _ = test_key(T, ThresholdFun, []),
+    ?assertMatch([], Recv()),
+    %% Single level:
+    _ = test_key(T, ThresholdFun, [1]),
+    ?assertMatch([{0, <<"1">>}], Recv()),
+    %% Multiple levels:
+    _ = test_key(T, ThresholdFun, [0, 1, 2, 3]),
+    ?assertMatch([{0, <<"0">>}, {1, <<"0">>}, {2, <<"0">>}, {3, <<"0">>}], Recv()).
+
+%% This test verifies that changing the threshold doesn't affect the
+%% nodes that already exist:
+change_threshold_test() ->
+    Threshold0 = fun(_, _) -> 0 end,
+    ThresholdInf = fun(_, _) -> infinity end,
+    T = trie_create(#{reverse_lookups => true}),
+    %% Infinity -> 0
+    {S11, []} = test_key(T, ThresholdInf, [1, 1]),
+    {S11, []} = test_key(T, Threshold0, [1, 1]),
+    %% 0 -> Infinity
+    {S1_, [W2]} = test_key(T, Threshold0, [1, 2]),
+    {S1_, [W2]} = test_key(T, ThresholdInf, [1, 2]),
+    {S__, [W2, W1]} = test_key(T, Threshold0, [2, 1]),
+    {S__, [W2, W1]} = test_key(T, ThresholdInf, [2, 1]).
 
 -endif.

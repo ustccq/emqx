@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_kinesis_impl_producer_SUITE).
@@ -10,6 +10,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -define(BRIDGE_TYPE, kinesis_producer).
 -define(BRIDGE_TYPE_BIN, <<"kinesis_producer">>).
@@ -42,11 +44,21 @@ init_per_suite(Config) ->
     ProxyName = "kinesis",
     SecretFile = filename:join(?config(priv_dir, Config), "secret"),
     ok = file:write_file(SecretFile, <<?KINESIS_SECRET_KEY>>),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:start_apps([emqx_resource, emqx_bridge, emqx_rule_engine]),
-    {ok, _} = application:ensure_all_started(emqx_connector),
-    emqx_mgmt_api_test_util:init_suite(),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_bridge_kinesis,
+            emqx_connector,
+            emqx_bridge,
+            emqx_rule_engine,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
     [
+        {apps, Apps},
         {proxy_host, ProxyHost},
         {proxy_port, ProxyPort},
         {kinesis_port, list_to_integer(os:getenv("KINESIS_PORT", integer_to_list(?KINESIS_PORT)))},
@@ -55,11 +67,9 @@ init_per_suite(Config) ->
         | Config
     ].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite(),
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([emqx_bridge, emqx_resource, emqx_rule_engine]),
-    _ = application:stop(emqx_connector),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_group(with_batch, Config) ->
@@ -83,6 +93,7 @@ init_per_testcase(TestCase, Config0) ->
             _ -> 30
         end,
     ct:timetrap({seconds, TimeTrap}),
+    emqx_bridge_v2_testlib:delete_all_rules(),
     delete_all_bridges(),
     Tid = install_telemetry_handler(TestCase),
     put(telemetry_table, Tid),
@@ -92,6 +103,7 @@ init_per_testcase(TestCase, Config0) ->
 
 end_per_testcase(_TestCase, Config) ->
     ok = snabbkaffe:stop(),
+    emqx_bridge_v2_testlib:delete_all_rules(),
     delete_all_bridges(),
     delete_stream(Config),
     emqx_common_test_helpers:call_janitor(),
@@ -160,7 +172,7 @@ kinesis_config(Config) ->
             "\n   max_retries = ~b"
             "\n   pool_size = 1"
             "\n   resource_opts = {"
-            "\n     health_check_interval = \"3s\""
+            "\n     health_check_interval = \"1s\""
             "\n     request_ttl = 30s"
             "\n     resume_interval = 1s"
             "\n     metrics_flush_interval = \"700ms\""
@@ -229,7 +241,7 @@ create_bridge_http(Config, KinesisConfigOverrides) ->
     ct:pal("probe result: ~p", [ProbeResult]),
     Res =
         case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-            {ok, Res0} -> {ok, emqx_utils_json:decode(Res0, [return_maps])};
+            {ok, Res0} -> {ok, emqx_utils_json:decode(Res0)};
             Error -> Error
         end,
     ct:pal("bridge creation result: ~p", [Res]),
@@ -249,7 +261,7 @@ create_bridge(Config, KinesisConfigOverrides, Removes) ->
     KinesisConfig1 = emqx_utils_maps:deep_merge(KinesisConfig0, KinesisConfigOverrides),
     KinesisConfig = emqx_utils_maps:deep_remove(Removes, KinesisConfig1),
     ct:pal("creating bridge: ~p", [KinesisConfig]),
-    Res = emqx_bridge:create(TypeBin, Name, KinesisConfig),
+    Res = emqx_bridge_testlib:create_bridge_api(TypeBin, Name, KinesisConfig),
     ct:pal("bridge creation result: ~p", [Res]),
     Res.
 
@@ -263,7 +275,7 @@ create_rule_and_action_http(Config) ->
     Path = emqx_mgmt_api_test_util:api_path(["rules"]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -409,9 +421,13 @@ assert_metrics(ExpectedMetrics, ResourceId) ->
     CurrentMetrics = current_metrics(ResourceId),
     TelemetryTable = get(telemetry_table),
     RecordedEvents = ets:tab2list(TelemetryTable),
-    ?assertEqual(ExpectedMetrics, Metrics, #{
-        current_metrics => CurrentMetrics, recorded_events => RecordedEvents
-    }),
+    ?retry(
+        1_000,
+        10,
+        ?assertEqual(ExpectedMetrics, Metrics, #{
+            current_metrics => CurrentMetrics, recorded_events => RecordedEvents
+        })
+    ),
     ok.
 
 assert_empty_metrics(ResourceId) ->
@@ -493,8 +509,23 @@ to_str(Int) when is_integer(Int) ->
 to_bin(Str) when is_list(Str) ->
     erlang:list_to_binary(Str).
 
+health_check(Type, Name) ->
+    emqx_bridge_v2_testlib:force_health_check(#{
+        type => Type,
+        name => Name,
+        namespace => ?global_ns,
+        kind => action
+    }).
+
+id(Type, Name) ->
+    emqx_bridge_v2_testlib:lookup_chan_id_in_conf(#{
+        kind => action,
+        type => Type,
+        name => Name
+    }).
+
 %%------------------------------------------------------------------------------
-%% Testcases
+%% Test cases
 %%------------------------------------------------------------------------------
 
 t_create_via_http(Config) ->
@@ -511,17 +542,23 @@ t_start_failed_then_fix(Config) ->
     ProxyName = ?config(proxy_name, Config),
     Name = ?config(kinesis_name, Config),
     emqx_common_test_helpers:with_failure(down, ProxyName, ProxyHost, ProxyPort, fun() ->
-        ct:sleep(1000),
-        ?wait_async_action(
-            create_bridge(Config),
-            #{?snk_kind := emqx_bridge_kinesis_impl_producer_start_failed},
-            20_000
+        ct:sleep(500),
+        ?assertMatch(
+            {ok,
+                {{_, 201, _}, _, #{
+                    <<"status">> := <<"disconnected">>,
+                    <<"status_reason">> := <<"Connection refused">>
+                }}},
+            create_bridge(Config)
         )
     end),
     ?retry(
         _Sleep1 = 1_000,
         _Attempts1 = 30,
-        ?assertMatch(#{status := connected}, emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name))
+        ?assertMatch(
+            #{status := ?status_connected},
+            health_check(?BRIDGE_V2_TYPE_BIN, Name)
+        )
     ),
     ok.
 
@@ -529,7 +566,7 @@ t_stop(Config) ->
     Name = ?config(kinesis_name, Config),
     {ok, _} = create_bridge(Config),
     ?check_trace(
-        ?wait_async_action(
+        {_, {ok, _}} = ?wait_async_action(
             emqx_bridge_resource:stop(?BRIDGE_TYPE, Name),
             #{?snk_kind := kinesis_stop},
             5_000
@@ -544,7 +581,9 @@ t_stop(Config) ->
 t_get_status_ok(Config) ->
     Name = ?config(kinesis_name, Config),
     {ok, _} = create_bridge(Config),
-    ?assertMatch(#{status := connected}, emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)),
+    ?assertMatch(
+        #{status := ?status_connected}, health_check(?BRIDGE_V2_TYPE_BIN, Name)
+    ),
     ok.
 
 t_create_unhealthy(Config) ->
@@ -553,10 +592,10 @@ t_create_unhealthy(Config) ->
     {ok, _} = create_bridge(Config),
     ?assertMatch(
         #{
-            status := disconnected,
+            status := ?status_disconnected,
             error := {unhealthy_target, _}
         },
-        emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)
+        health_check(?BRIDGE_V2_TYPE_BIN, Name)
     ),
     ok.
 
@@ -565,9 +604,9 @@ t_get_status_unhealthy(Config) ->
     {ok, _} = create_bridge(Config),
     ?assertMatch(
         #{
-            status := connected
+            status := ?status_connected
         },
-        emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)
+        health_check(?BRIDGE_V2_TYPE_BIN, Name)
     ),
     delete_stream(Config),
     ?retry(
@@ -576,10 +615,10 @@ t_get_status_unhealthy(Config) ->
         fun() ->
             ?assertMatch(
                 #{
-                    status := disconnected,
+                    status := ?status_disconnected,
                     error := {unhealthy_target, _}
                 },
-                emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)
+                health_check(?BRIDGE_V2_TYPE_BIN, Name)
             )
         end
     ),
@@ -590,9 +629,8 @@ t_publish_success(Config) ->
     TelemetryTable = ?config(telemetry_table, Config),
     Name = ?config(kinesis_name, Config),
     ?assertMatch({ok, _}, create_bridge(Config)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    {ok, _} = create_rule_and_action_http(Config),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ActionId),
     ShardIt = get_shard_iterator(Config),
     Payload = <<"payload">>,
@@ -628,9 +666,8 @@ t_publish_success_with_template(Config) ->
             <<"partition_key">> => <<"${payload.key}">>
         },
     ?assertMatch({ok, _}, create_bridge(Config, Overrides)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    {ok, _} = create_rule_and_action_http(Config),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ActionId),
     ShardIt = get_shard_iterator(Config),
     Payload = <<"{\"key\":\"my_key\", \"data\":\"my_data\"}">>,
@@ -661,9 +698,8 @@ t_publish_multiple_msgs_success(Config) ->
     TelemetryTable = ?config(telemetry_table, Config),
     Name = ?config(kinesis_name, Config),
     ?assertMatch({ok, _}, create_bridge(Config)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    {ok, _} = create_rule_and_action_http(Config),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ActionId),
     ShardIt = get_shard_iterator(Config),
     lists:foreach(
@@ -710,9 +746,8 @@ t_publish_unhealthy(Config) ->
     TelemetryTable = ?config(telemetry_table, Config),
     Name = ?config(kinesis_name, Config),
     ?assertMatch({ok, _}, create_bridge(Config)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    {ok, _} = create_rule_and_action_http(Config),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ActionId),
     ShardIt = get_shard_iterator(Config),
     Payload = <<"payload">>,
@@ -741,10 +776,10 @@ t_publish_unhealthy(Config) ->
     ),
     ?assertMatch(
         #{
-            status := disconnected,
+            status := ?status_disconnected,
             error := {unhealthy_target, _}
         },
-        emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)
+        health_check(?BRIDGE_V2_TYPE_BIN, Name)
     ),
     ok.
 
@@ -753,9 +788,8 @@ t_publish_big_msg(Config) ->
     TelemetryTable = ?config(telemetry_table, Config),
     Name = ?config(kinesis_name, Config),
     ?assertMatch({ok, _}, create_bridge(Config)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    {ok, _} = create_rule_and_action_http(Config),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ActionId),
     % Maximum size is 1MB. Using 1MB + 1 here.
     Payload = binary:copy(<<"a">>, 1 * 1024 * 1024 + 1),
@@ -788,17 +822,16 @@ t_publish_connection_down(Config0) ->
     TelemetryTable = ?config(telemetry_table, Config),
     Name = ?config(kinesis_name, Config),
     ?assertMatch({ok, _}, create_bridge(Config)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
+    {ok, _} = create_rule_and_action_http(Config),
     ?retry(
         _Sleep1 = 1_000,
         _Attempts1 = 30,
         ?assertMatch(
-            #{status := connected},
-            emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)
+            #{status := ?status_connected},
+            health_check(?BRIDGE_V2_TYPE_BIN, Name)
         )
     ),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ActionId),
     ShardIt = get_shard_iterator(Config),
     Payload = <<"payload">>,
@@ -822,15 +855,13 @@ t_publish_connection_down(Config0) ->
         _Sleep3 = 1_000,
         _Attempts3 = 20,
         ?assertMatch(
-            #{status := connected},
-            emqx_bridge_v2:health_check(?BRIDGE_V2_TYPE_BIN, Name)
+            #{status := ?status_connected},
+            health_check(?BRIDGE_V2_TYPE_BIN, Name)
         )
     ),
     Record = wait_record(Config, ShardIt, 2000, 10),
     %% to avoid test flakiness
     wait_telemetry_event(TelemetryTable, retried_success, ResourceId),
-    wait_until_gauge_is(queuing, 0, 500),
-    wait_until_gauge_is(inflight, 0, 500),
     assert_metrics(
         #{
             dropped => 0,
@@ -861,7 +892,7 @@ t_wrong_server(Config) ->
                 <<"health_check_interval">> => <<"60s">>
             }
         },
-    % probe
+    %% probe
     KinesisConfig = emqx_utils_maps:deep_merge(KinesisConfig0, Overrides),
     Params = KinesisConfig#{<<"type">> => TypeBin, <<"name">> => Name},
     ProbePath = emqx_mgmt_api_test_util:api_path(["bridges_probe"]),
@@ -870,14 +901,20 @@ t_wrong_server(Config) ->
         {error, {_, 400, _}},
         emqx_mgmt_api_test_util:request_api(post, ProbePath, "", AuthHeader, Params)
     ),
-    % create
-    ?wait_async_action(
+    %% create
+    {ok,
+        {{_, 201, _}, _, #{
+            <<"status">> := <<"disconnected">>,
+            <<"status_reason">> := ErrMsg
+        }}} =
         create_bridge(Config, Overrides),
-        #{?snk_kind := start_pool_failed},
-        30_000
+    ?assertEqual(
+        match,
+        re:run(ErrMsg, <<"Could not resolve host">>, [{capture, none}]),
+        #{msg => ErrMsg}
     ),
     ?assertMatch(
-        {ok, _, #{error := {start_pool_failed, ResourceId, _}}},
+        {ok, _, #{error := nxdomain}},
         emqx_resource_manager:lookup_cached(ResourceId)
     ),
     ok.
@@ -896,19 +933,25 @@ t_access_denied(Config) ->
         list_streams,
         fun() -> {error, AccessError} end,
         fun() ->
-            % probe
+            %% probe
             ?assertMatch(
                 {error, {_, 400, _}},
                 emqx_mgmt_api_test_util:request_api(post, ProbePath, "", AuthHeader, Params)
             ),
-            % create
-            ?wait_async_action(
+            %% create
+            {ok,
+                {{_, 201, _}, _, #{
+                    <<"status">> := <<"disconnected">>,
+                    <<"status_reason">> := ErrMsg
+                }}} =
                 create_bridge(Config),
-                #{?snk_kind := kinesis_init_failed},
-                30_000
+            ?assertEqual(
+                match,
+                re:run(ErrMsg, <<"AccessDeniedException">>, [{capture, none}]),
+                #{msg => ErrMsg}
             ),
             ?assertMatch(
-                {ok, _, #{error := {start_pool_failed, ResourceId, AccessError}}},
+                {ok, _, #{error := {<<"AccessDeniedException">>, <<"">>}}},
                 emqx_resource_manager:lookup_cached(ResourceId)
             ),
             ok
@@ -922,9 +965,8 @@ t_empty_payload_template(Config) ->
     Removes = [<<"payload_template">>],
     Name = ?config(kinesis_name, Config),
     ?assertMatch({ok, _}, create_bridge(Config, #{}, Removes)),
-    {ok, #{<<"id">> := RuleId}} = create_rule_and_action_http(Config),
-    emqx_common_test_helpers:on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-    ActionId = emqx_bridge_v2:id(?BRIDGE_V2_TYPE_BIN, Name),
+    {ok, _} = create_rule_and_action_http(Config),
+    ActionId = id(?BRIDGE_V2_TYPE_BIN, Name),
     assert_empty_metrics(ResourceId),
     ShardIt = get_shard_iterator(Config),
     Payload = <<"payload">>,
@@ -950,7 +992,7 @@ t_empty_payload_template(Config) ->
     Data = proplists:get_value(<<"Data">>, Record),
     ?assertMatch(
         #{<<"payload">> := <<"payload">>, <<"topic">> := ?TOPIC},
-        emqx_utils_json:decode(Data, [return_maps])
+        emqx_utils_json:decode(Data)
     ),
     ok.
 

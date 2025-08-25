@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_prometheus_data_SUITE).
@@ -24,10 +12,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(LOGT(Format, Args), ct:pal("TEST_SUITE: " ++ Format, Args)).
-
 %% erlfmt-ignore
--define(EMQX_CONF, <<"
+-define(EMQX_CONF_CONFIG, <<"
 authentication = [
   {
     backend = built_in_database
@@ -77,16 +63,41 @@ rule_engine {
 }
 ">>).
 
+%% erlfmt-ignore
+-define(EMQX_CONFIG, <<"
+durable_sessions.enable = true
+durable_storage.messages {
+  backend = builtin_local
+}
+">>).
+
+%% erlfmt-ignore
+-define(EMQX_DS_RAFT_CONFIG, <<"
+durable_sessions.enable = true
+durable_storage.messages {
+  backend = builtin_raft
+  n_shards = 8
+}
+">>).
+
 all() ->
-    lists:flatten([
+    [
+        {group, general},
+        {group, ds_raft}
+    ].
+
+groups() ->
+    TCs = [t_collect_prom_data],
+    GeneralGroups = [
         {group, '/prometheus/stats'},
         {group, '/prometheus/auth'},
         {group, '/prometheus/data_integration'},
-        [{group, '/prometheus/schema_validation'} || emqx_release:edition() == ee]
-    ]).
-
-groups() ->
-    TCs = emqx_common_test_helpers:all(?MODULE),
+        {group, '/prometheus/schema_validation'},
+        {group, '/prometheus/message_transformation'}
+    ],
+    DSGroups = [
+        {group, '/prometheus/stats'}
+    ],
     AcceptGroups = [
         {group, 'text/plain'},
         {group, 'application/json'}
@@ -97,10 +108,13 @@ groups() ->
         {group, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED}
     ],
     [
+        {general, GeneralGroups},
+        {ds_raft, DSGroups},
         {'/prometheus/stats', ModeGroups},
         {'/prometheus/auth', ModeGroups},
         {'/prometheus/data_integration', ModeGroups},
         {'/prometheus/schema_validation', ModeGroups},
+        {'/prometheus/message_transformation', ModeGroups},
         {?PROM_DATA_MODE__NODE, AcceptGroups},
         {?PROM_DATA_MODE__ALL_NODES_AGGREGATED, AcceptGroups},
         {?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED, AcceptGroups},
@@ -109,57 +123,43 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:clear_screen(),
-    meck:new(emqx_retainer, [non_strict, passthrough, no_history, no_link]),
-    meck:expect(emqx_retainer, retained_count, fun() -> 0 end),
-    meck:expect(
-        emqx_authz_file,
-        acl_conf_file,
-        fun() ->
-            emqx_common_test_helpers:deps_path(emqx_auth, "etc/acl.conf")
-        end
-    ),
-    ok = emqx_prometheus_SUITE:maybe_meck_license(),
+    emqx_prometheus_SUITE:maybe_meck_license(),
     emqx_prometheus_SUITE:start_mock_pushgateway(9091),
+    Config.
 
-    application:load(emqx_auth),
+end_per_suite(_Config) ->
+    emqx_prometheus_SUITE:maybe_unmeck_license(),
+    emqx_prometheus_SUITE:stop_mock_pushgateway().
+
+init_per_group(general = GroupName, Config) ->
     Apps = emqx_cth_suite:start(
-        lists:flatten([
-            emqx,
-            {emqx_conf, ?EMQX_CONF},
+        [
+            {emqx, ?EMQX_CONFIG},
+            {emqx_conf, ?EMQX_CONF_CONFIG},
             emqx_auth,
             emqx_auth_mnesia,
             emqx_rule_engine,
             emqx_bridge_http,
             emqx_connector,
-            [
-                {emqx_schema_validation, #{config => schema_validation_config()}}
-             || emqx_release:edition() == ee
-            ],
-            {emqx_prometheus, emqx_prometheus_SUITE:legacy_conf_default()}
+            {emqx_schema_validation, #{config => schema_validation_config()}},
+            {emqx_message_transformation, #{config => message_transformation_config()}},
+            {emqx_prometheus, emqx_prometheus_SUITE:legacy_conf_default()},
+            emqx_management
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(GroupName, Config)}
+    ),
+    [{apps, Apps} | Config];
+init_per_group(ds_raft = GroupName, Config) ->
+    Apps = emqx_cth_suite:start(
+        lists:flatten([
+            {emqx, ?EMQX_DS_RAFT_CONFIG},
+            emqx_conf,
+            {emqx_prometheus, emqx_prometheus_SUITE:legacy_conf_default()},
+            emqx_management
         ]),
-        #{
-            work_dir => filename:join(?config(priv_dir, Config), ?MODULE)
-        }
+        #{work_dir => emqx_cth_suite:work_dir(GroupName, Config)}
     ),
-
-    [{apps, Apps} | Config].
-
-end_per_suite(Config) ->
-    meck:unload([emqx_retainer]),
-    emqx_prometheus_SUITE:maybe_unmeck_license(),
-    emqx_prometheus_SUITE:stop_mock_pushgateway(),
-    {ok, _} = emqx:update_config(
-        [authorization],
-        #{
-            <<"no_match">> => <<"allow">>,
-            <<"cache">> => #{<<"enable">> => <<"true">>},
-            <<"sources">> => []
-        }
-    ),
-    emqx_cth_suite:stop(?config(apps, Config)),
-    ok.
-
+    [{apps, Apps} | Config];
 init_per_group('/prometheus/stats', Config) ->
     [{module, emqx_prometheus} | Config];
 init_per_group('/prometheus/auth', Config) ->
@@ -168,6 +168,8 @@ init_per_group('/prometheus/data_integration', Config) ->
     [{module, emqx_prometheus_data_integration} | Config];
 init_per_group('/prometheus/schema_validation', Config) ->
     [{module, emqx_prometheus_schema_validation} | Config];
+init_per_group('/prometheus/message_transformation', Config) ->
+    [{module, emqx_prometheus_message_transformation} | Config];
 init_per_group(?PROM_DATA_MODE__NODE, Config) ->
     [{mode, ?PROM_DATA_MODE__NODE} | Config];
 init_per_group(?PROM_DATA_MODE__ALL_NODES_AGGREGATED, Config) ->
@@ -181,30 +183,16 @@ init_per_group('application/json', Config) ->
 init_per_group(_Group, Config) ->
     Config.
 
+end_per_group(general, Config) ->
+    emqx_cth_suite:stop(?config(apps, Config));
+end_per_group(ds_raft, Config) ->
+    emqx_cth_suite:stop(?config(apps, Config));
 end_per_group(_Group, _Config) ->
     ok.
 
-init_per_testcase(t_collect_prom_data, Config) ->
-    meck:new(emqx_utils, [non_strict, passthrough, no_history, no_link]),
-    meck:expect(emqx_utils, gen_id, fun() -> "fake" end),
-
-    meck:new(emqx, [non_strict, passthrough, no_history, no_link]),
-    meck:expect(
-        emqx,
-        data_dir,
-        fun() ->
-            {data_dir, Data} = lists:keyfind(data_dir, 1, Config),
-            Data
-        end
-    ),
-    Config;
 init_per_testcase(_, Config) ->
     Config.
 
-end_per_testcase(t_collect_prom_data, _Config) ->
-    meck:unload(emqx_utils),
-    meck:unload(emqx),
-    ok;
 end_per_testcase(_, _Config) ->
     ok.
 
@@ -286,31 +274,30 @@ accept('application/json') ->
 do_assert_prom_data([], _Mode) ->
     ok;
 do_assert_prom_data([Metric | RestDataL], Mode) ->
-    [_MetricNamme | _] = Metric,
+    [_MetricName | _] = Metric,
     assert_stats_metric_labels(Metric, Mode),
     do_assert_prom_data(RestDataL, Mode).
 
 assert_stats_metric_labels([MetricName | R] = _Metric, Mode) ->
-    case maps:get(Mode, metric_meta(MetricName), undefined) of
+    %% The last element is the value
+    LabelCount = length(R) - 1,
+    ExpectedLabelCount = maps:get(Mode, metric_meta(MetricName), undefined),
+    case ExpectedLabelCount of
         %% for uncatched metrics (by prometheus.erl)
         undefined ->
             ok;
-        N when is_integer(N) ->
-            case N =:= length(lists:droplast(R)) of
-                true ->
-                    ok;
-                false ->
-                    ct:print(
-                        "====================~n"
-                        "%% Metric: ~p~n"
-                        "%% Expect labels count: ~p in Mode: ~p~n"
-                        "%% But got labels: ~p~n",
-                        [_Metric, N, Mode, length(lists:droplast(R))]
-                    )
-            end,
-            ?assertEqual(N, length(lists:droplast(R)))
+        LabelCount ->
+            ok;
+        _ ->
+            ct:fail(
+                "Label count mismatch for metric: ~p and mode: ~p, expected: ~p, got: ~p",
+                [MetricName, Mode, ExpectedLabelCount, LabelCount]
+            )
     end.
 
+-define(is_time(BIN), binary_part(BIN, byte_size(BIN), -4) == <<"time">>).
+
+-define(meta(AGGRE), ?meta(AGGRE, AGGRE, AGGRE + 1)).
 -define(meta(NODE, AGGRE, UNAGGRE), #{
     ?PROM_DATA_MODE__NODE => NODE,
     ?PROM_DATA_MODE__ALL_NODES_AGGREGATED => AGGRE,
@@ -335,14 +322,21 @@ metric_meta(<<"emqx_vm_run_queue">>) -> ?meta(0, 1, 1);
 metric_meta(<<"emqx_vm_process_messages_in_queues">>) -> ?meta(0, 1, 1);
 metric_meta(<<"emqx_vm_total_memory">>) -> ?meta(0, 1, 1);
 metric_meta(<<"emqx_vm_used_memory">>) -> ?meta(0, 1, 1);
+metric_meta(<<"emqx_vm_mnesia_tm_mailbox_size">>) -> ?meta(0, 1, 1);
+metric_meta(<<"emqx_vm_broker_pool_max_mailbox_size">>) -> ?meta(0, 1, 1);
 metric_meta(<<"emqx_cluster_nodes_running">>) -> ?meta(0, 1, 1);
 metric_meta(<<"emqx_cluster_nodes_stopped">>) -> ?meta(0, 1, 1);
+metric_meta(<<"emqx_conf_sync_txid">>) -> ?meta(0, 1, 1);
 %% END
 metric_meta(<<"emqx_cert_expiry_at">>) -> ?meta(2, 2, 2);
 metric_meta(<<"emqx_license_expiry_at">>) -> ?meta(0, 0, 0);
+%% broker instr
+metric_meta(<<"emqx_instr_", _Tail/binary>>) -> #{};
 %% mria metric with label `shard` and `node` when not in mode `node`
 metric_meta(<<"emqx_mria_", _Tail/binary>>) -> ?meta(1, 2, 2);
 %% `/prometheus/auth`
+metric_meta(<<"emqx_authn_latency_bucket">>) -> ?meta(2, 2, 3);
+metric_meta(<<"emqx_authz_latency_bucket">>) -> ?meta(2, 2, 3);
 metric_meta(<<"emqx_authn_users_count">>) -> ?meta(1, 1, 1);
 metric_meta(<<"emqx_authn_", _Tail/binary>>) -> ?meta(1, 1, 2);
 metric_meta(<<"emqx_authz_rules_count">>) -> ?meta(1, 1, 1);
@@ -350,6 +344,7 @@ metric_meta(<<"emqx_authz_", _Tail/binary>>) -> ?meta(1, 1, 2);
 metric_meta(<<"emqx_banned_count">>) -> ?meta(0, 0, 0);
 %% `/prometheus/data_integration`
 metric_meta(<<"emqx_rules_count">>) -> ?meta(0, 0, 0);
+metric_meta(<<"emqx_actions_count">>) -> ?meta(0, 0, 0);
 metric_meta(<<"emqx_connectors_count">>) -> ?meta(0, 0, 0);
 metric_meta(<<"emqx_schema_registrys_count">>) -> ?meta(0, 0, 0);
 metric_meta(<<"emqx_rule_", _Tail/binary>>) -> ?meta(1, 1, 2);
@@ -357,6 +352,38 @@ metric_meta(<<"emqx_action_", _Tail/binary>>) -> ?meta(1, 1, 2);
 metric_meta(<<"emqx_connector_", _Tail/binary>>) -> ?meta(1, 1, 2);
 %% `/prometheus/schema_validation`
 metric_meta(<<"emqx_schema_validation_", _Tail/binary>>) -> ?meta(1, 1, 2);
+%% `/prometheus/message_transformation`
+metric_meta(<<"emqx_message_transformation_", _Tail/binary>>) -> ?meta(1, 1, 2);
+%% DS metrics
+metric_meta(<<"emqx_ds_buffer_", Tail/binary>>) when ?is_time(Tail) -> ?meta(3);
+metric_meta(<<"emqx_ds_buffer_latency">>) -> ?meta(3);
+metric_meta(<<"emqx_ds_buffer_", _Tail/binary>>) -> ?meta(2);
+metric_meta(<<"emqx_ds_store_batch_time">>) -> ?meta(2);
+metric_meta(<<"emqx_ds_builtin_next_time">>) -> ?meta(2);
+metric_meta(<<"emqx_ds_subs_fanout_time">>) -> ?meta(2);
+metric_meta(<<"emqx_ds_subs_stuck_total">>) -> ?meta(1);
+metric_meta(<<"emqx_ds_subs_unstuck_total">>) -> ?meta(1);
+metric_meta(<<"emqx_ds_subs_request_sharing", _Tail/binary>>) -> ?meta(4);
+metric_meta(<<"emqx_ds_subs_", Tail/binary>>) when ?is_time(Tail) -> ?meta(4);
+metric_meta(<<"emqx_ds_subs", _Tail/binary>>) -> ?meta(3);
+metric_meta(<<"emqx_ds_storage", _Tail/binary>>) -> ?meta(1);
+%% DS Raft metrics
+metric_meta(<<"emqx_ds_raft_cluster_sites_num">>) -> ?meta(1, 1, 1);
+metric_meta(<<"emqx_ds_raft_db_sites_num">>) -> ?meta(2, 2, 2);
+metric_meta(<<"emqx_ds_raft_db_shards_online_num">>) -> ?meta(1);
+metric_meta(<<"emqx_ds_raft_db", _Tail/binary>>) -> ?meta(1, 1, 1);
+metric_meta(<<"emqx_ds_raft_shard_transitions">>) -> ?meta(4);
+metric_meta(<<"emqx_ds_raft_shard_transition_errors">>) -> ?meta(2);
+metric_meta(<<"emqx_ds_raft_shard_transition_queue_len">>) -> ?meta(3, 3, 3);
+metric_meta(<<"emqx_ds_raft_shard", _Tail/binary>>) -> ?meta(2, 2, 2);
+metric_meta(<<"emqx_ds_raft_snapshot_reads">>) -> ?meta(3);
+metric_meta(<<"emqx_ds_raft_snapshot_writes">>) -> ?meta(3);
+metric_meta(<<"emqx_ds_raft_snapshot", _Tail/binary>>) -> ?meta(2);
+metric_meta(<<"emqx_ds_raft_rasrv_state_changes">>) -> ?meta(3);
+metric_meta(<<"emqx_ds_raft_rasrv_replication_msgs">>) -> ?meta(3);
+metric_meta(<<"emqx_ds_raft_rasrv_index", _Tail/binary>>) -> ?meta(3);
+metric_meta(<<"emqx_ds_raft_rasrv", _Tail/binary>>) -> ?meta(2);
+metric_meta(<<"emqx_ds", _Tail/binary>>) -> ?meta(2);
 %% normal emqx metrics
 metric_meta(<<"emqx_", _Tail/binary>>) -> ?meta(0, 0, 1);
 metric_meta(_) -> #{}.
@@ -382,6 +409,8 @@ assert_json_data__messages(M, Mode) when
             emqx_messages_dropped := _,
             emqx_messages_dropped_expired := _,
             emqx_messages_dropped_no_subscribers := _,
+            emqx_messages_dropped_quota_exceeded := _,
+            emqx_messages_dropped_receive_maximum := _,
             emqx_messages_forward := _,
             emqx_messages_retained := _,
             emqx_messages_delayed := _,
@@ -438,10 +467,27 @@ assert_json_data__olp(M, Mode) when
 assert_json_data__olp(Ms, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED) when is_list(Ms) ->
     ok.
 
-assert_json_data__client(M, Mode) when
-    (Mode =:= ?PROM_DATA_MODE__NODE orelse
-        Mode =:= ?PROM_DATA_MODE__ALL_NODES_AGGREGATED)
+assert_json_data__client(Ms, Mode) when
+    (Mode =:= ?PROM_DATA_MODE__NODE orelse Mode =:= ?PROM_DATA_MODE__ALL_NODES_AGGREGATED) andalso
+        is_list(Ms)
 ->
+    ?assertMatch(
+        [
+            #{
+                emqx_client_connect := _,
+                emqx_client_connack := _,
+                emqx_client_connected := _,
+                emqx_client_authenticate := _,
+                emqx_client_auth_anonymous := _,
+                emqx_client_authorize := _,
+                emqx_client_subscribe := _,
+                emqx_client_unsubscribe := _,
+                emqx_client_disconnected := _
+            }
+        ],
+        Ms
+    );
+assert_json_data__client(#{} = M, ?PROM_DATA_MODE__NODE) ->
     ?assertMatch(
         #{
             emqx_client_connect := _,
@@ -583,7 +629,6 @@ assert_json_data__packets(M, Mode) when
             emqx_packets_pingresp_sent := _,
             emqx_packets_subscribe_received := _,
             emqx_bytes_received := _,
-            emqx_packets_publish_dropped := _,
             emqx_packets_publish_received := _,
             emqx_packets_connack_sent := _,
             emqx_packets_connack_auth_error := _,
@@ -639,6 +684,29 @@ assert_json_data__certs(Ms, _) ->
         Ms
     ).
 
+assert_json_data__cluster_rpc(Ms, Mode) when
+    Mode =:= ?PROM_DATA_MODE__NODE;
+    Mode =:= ?PROM_DATA_MODE__ALL_NODES_AGGREGATED
+->
+    ?assertMatch(
+        #{
+            emqx_conf_sync_txid := _
+        },
+        Ms
+    );
+assert_json_data__cluster_rpc(Ms, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED) ->
+    lists:foreach(
+        fun(M) ->
+            ?assertMatch(
+                #{
+                    emqx_conf_sync_txid := _
+                },
+                M
+            )
+        end,
+        Ms
+    ).
+
 eval_foreach_assert(FunctionName, Ms) ->
     Fun = fun() ->
         ok = lists:foreach(
@@ -648,12 +716,12 @@ eval_foreach_assert(FunctionName, Ms) ->
     end,
     Fun().
 
--if(?EMQX_RELEASE_EDITION == ee).
 %% license always map
 assert_json_data__license(M, _) ->
-    ?assertMatch(#{emqx_license_expiry_at := _}, M).
--else.
--endif.
+    case emqx_release:edition() of
+        ce -> ok;
+        ee -> ?assertMatch(#{emqx_license_expiry_at := _}, M)
+    end.
 
 -define(assert_node_foreach(Ms), lists:foreach(fun(M) -> ?assertMatch(#{node := _}, M) end, Ms)).
 
@@ -801,27 +869,28 @@ assert_json_data__connectors(Ms, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED) when
 ->
     ?assert_node_foreach(Ms).
 
--if(?EMQX_RELEASE_EDITION == ee).
 assert_json_data__data_integration_overview(M, _) ->
-    ?assertMatch(
-        #{
-            emqx_connectors_count := _,
-            emqx_rules_count := _,
-            emqx_schema_registrys_count := _
-        },
-        M
-    ).
-
--else.
-assert_json_data__data_integration_overview(M, _) ->
-    ?assertMatch(
-        #{
-            emqx_connectors_count := _,
-            emqx_rules_count := _
-        },
-        M
-    ).
--endif.
+    case emqx_release:edition() of
+        ee ->
+            ?assertMatch(
+                #{
+                    emqx_connectors_count := _,
+                    emqx_rules_count := _,
+                    emqx_actions_count := _,
+                    emqx_schema_registrys_count := _
+                },
+                M
+            );
+        ce ->
+            ?assertMatch(
+                #{
+                    emqx_connectors_count := _,
+                    emqx_rules_count := _,
+                    emqx_actions_count := _
+                },
+                M
+            )
+    end.
 
 assert_json_data__schema_validations(Ms, _) ->
     lists:foreach(
@@ -833,6 +902,23 @@ assert_json_data__schema_validations(Ms, _) ->
                     emqx_schema_validation_matched := _,
                     emqx_schema_validation_failed := _,
                     emqx_schema_validation_succeeded := _
+                },
+                M
+            )
+        end,
+        Ms
+    ).
+
+assert_json_data__message_transformations(Ms, _) ->
+    lists:foreach(
+        fun(M) ->
+            ?assertMatch(
+                #{
+                    validation_name := _,
+                    emqx_message_transformation_enable := _,
+                    emqx_message_transformation_matched := _,
+                    emqx_message_transformation_failed := _,
+                    emqx_message_transformation_succeeded := _
                 },
                 M
             )
@@ -857,6 +943,25 @@ schema_validation_config() ->
     #{
         <<"schema_validation">> => #{
             <<"validations">> => [Validation]
+        }
+    }.
+
+message_transformation_config() ->
+    Transformation = #{
+        <<"enable">> => true,
+        <<"name">> => <<"my_transformation">>,
+        <<"topics">> => [<<"t/#">>],
+        <<"failure_action">> => <<"drop">>,
+        <<"operations">> => [
+            #{
+                <<"key">> => <<"topic">>,
+                <<"value">> => <<"concat([topic, '/', payload.t])">>
+            }
+        ]
+    },
+    #{
+        <<"message_transformation">> => #{
+            <<"transformations">> => [Transformation]
         }
     }.
 

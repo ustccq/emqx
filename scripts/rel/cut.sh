@@ -12,16 +12,20 @@ cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 usage() {
     cat <<EOF
 $0 RELEASE_GIT_TAG [option]
-RELEASE_GIT_TAG is a 'v*' or 'e*' tag for example:
-  v5.1.1
-  e5.1.0-beta.6
+RELEASE_GIT_TAG is a 'e*' tag, for example:
+  e5.8.7-alpha.1
+  e5.9.1-beta.6
+  e6.0.0-M1.202507-rc.1
+  e6.0.0
 
 options:
   -h|--help:         Print this usage.
 
   -b|--base:         Specify the current release base branch, can be one of
-                     release-55
-                     release-56
+                     release-58
+                     release-59
+                     release-510
+                     release-60
                      NOTE: this option should be used when --dryrun.
 
   --dryrun:          Do not actually create the git tag.
@@ -36,7 +40,12 @@ options:
 For 5.X series the current working branch must be 'release-5X'
       --.--[  master  ]---------------------------.-----------.---
          \\                                      /
-          \`---[release-5X]----(v5.4.0 | e5.4.0)
+          \`---[release-5X]----------------e5.10.0
+
+For 6.X series the current working branch must be 'release-6X'
+      --.--[  master  ]---------------------------.-----------.---
+         \\                                      /
+          \`---[release-6X]----------------e6.0.0
 EOF
 }
 
@@ -55,11 +64,6 @@ logmsg() {
 TAG="${1:-}"
 
 case "$TAG" in
-    v*)
-        TAG_PREFIX='v'
-        PROFILE='emqx'
-        SKIP_APPUP='yes'
-        ;;
     e*)
         TAG_PREFIX='e'
         PROFILE='emqx-enterprise'
@@ -117,23 +121,17 @@ done
 rel_branch() {
     local tag="$1"
     case "$tag" in
-        v5.5.*)
-            echo 'release-55'
+        e5.8.*)
+            echo 'release-58'
             ;;
-        e5.5.*)
-            echo 'release-55'
+        e5.9.*)
+            echo 'release-59'
             ;;
-        v5.6.*)
-            echo 'release-56'
+        e5.10.*)
+            echo 'release-510'
             ;;
-        e5.6.*)
-            echo 'release-56'
-            ;;
-        v5.7.*)
-            echo 'release-57'
-            ;;
-        e5.7.*)
-            echo 'release-57'
+        e6.0.*)
+            echo 'release-60'
             ;;
         *)
             logerr "Unsupported version tag $TAG"
@@ -141,6 +139,18 @@ rel_branch() {
             ;;
     esac
 }
+
+assert_profile() {
+    local tag="$1"
+    local allowed_prefix
+    # allow only 'e' tags for now
+    allowed_prefix='e'
+    if [[ "${tag}" != "${allowed_prefix}"* ]]; then
+        logerr "Expecting a '${allowed_prefix}' tag on this commit"
+        exit 1
+    fi
+}
+assert_profile "$TAG"
 
 ## Ensure the current work branch
 assert_work_branch() {
@@ -184,15 +194,39 @@ assert_tag_absent() {
 }
 assert_tag_absent "$TAG"
 
+bump_vsn() {
+    local new_version="$1"
+    local emqx_release_file_path="apps/emqx/include/emqx_release.hrl"
+    local chart_file_path="deploy/charts/emqx-enterprise/Chart.yaml"
+
+    # don't use -i since it has different syntax in GNU and BSD versions
+    sed "s/-define(EMQX_RELEASE_EE, \"[^\"]*\")\./-define(EMQX_RELEASE_EE, \"$new_version\")./g" "$emqx_release_file_path" > "${emqx_release_file_path}.tmp"
+    mv "${emqx_release_file_path}.tmp" "$emqx_release_file_path"
+
+    sed "s/^version: [0-9][0-9.]*[a-zA-Z0-9.-]*$/version: $new_version/g; s/^appVersion: [0-9][0-9.]*[a-zA-Z0-9.-]*$/appVersion: $new_version/g" "$chart_file_path" > "${chart_file_path}.tmp"
+    mv "${chart_file_path}.tmp" "$chart_file_path"
+
+    git add "$emqx_release_file_path" "$chart_file_path"
+    git diff --staged
+    if [ "$DRYRUN" != 'yes' ]; then
+        local commit_msg="chore: bump version to $new_version"
+        # Ask for confirmation before committing
+        read -r -p "git commit -m \"$commit_msg\" - Proceed? (y/n): " CONFIRM
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            git commit -m "$commit_msg"
+        fi
+    fi
+}
+
 RELEASE_VSN=$(./pkg-vsn.sh "$PROFILE" --release)
 
 ## Assert package version is updated to the tag which is being created
 assert_release_version() {
     local tag="$1"
     if [ "${TAG_PREFIX}${RELEASE_VSN}" != "${tag}" ]; then
-        logerr "The release version ($RELEASE_VSN) is different from the desired git tag."
-        logerr "Update the release version in emqx_release.hrl"
-        exit 1
+        logmsg "The release version ($RELEASE_VSN) is different from the desired git tag."
+        logmsg "Updating the release version in emqx_release.hrl and Chart.yaml"
+        bump_vsn "${tag#e}"
     fi
 }
 assert_release_version "$TAG"
@@ -208,7 +242,7 @@ SYNC_REMOTES_ARGS=
 ./scripts/rel/check-chart-vsn.sh "$PROFILE"
 
 ## Check if app versions are bumped
-./scripts/apps-version-check.sh
+./scripts/apps-version-check.exs
 
 ## Ensure appup files are updated
 if [ "$SKIP_APPUP" = 'no' ]; then
@@ -273,9 +307,6 @@ case "$TAG" in
         check_bpapi
         check_changelog
         ;;
-    v*)
-        check_changelog
-        ;;
 esac
 
 if [ "$DRYRUN" = 'yes' ]; then
@@ -283,6 +314,6 @@ if [ "$DRYRUN" = 'yes' ]; then
 else
     git tag "$TAG"
     logmsg "$TAG is created OK."
-    logwarn "Don't forget to push the tag!"
+    logwarn "Don't forget to push the tag to emqx.git:"
     echo "git push origin $TAG"
 fi

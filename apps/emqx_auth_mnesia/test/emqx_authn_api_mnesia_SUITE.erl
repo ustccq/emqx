@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_api_mnesia_SUITE).
@@ -51,6 +40,7 @@ end_per_testcase(_, Config) ->
 init_per_suite(Config) ->
     Apps = emqx_cth_suite:start(
         [
+            emqx_ctl,
             emqx,
             emqx_conf,
             emqx_auth,
@@ -127,7 +117,7 @@ test_authenticator_users(PathPrefix) ->
                     <<"success">> := 0,
                     <<"failed">> := 1
                 }
-            } = emqx_utils_json:decode(PageData0, [return_maps]);
+            } = emqx_utils_json:decode(PageData0);
         ["listeners", 'tcp:default'] ->
             #{
                 <<"metrics">> := #{
@@ -135,7 +125,7 @@ test_authenticator_users(PathPrefix) ->
                     <<"success">> := 0,
                     <<"nomatch">> := 1
                 }
-            } = emqx_utils_json:decode(PageData0, [return_maps])
+            } = emqx_utils_json:decode(PageData0)
     end,
 
     InvalidUsers = [
@@ -158,7 +148,7 @@ test_authenticator_users(PathPrefix) ->
     lists:foreach(
         fun(User) ->
             {ok, 201, UserData} = request(post, UsersUri, User),
-            CreatedUser = emqx_utils_json:decode(UserData, [return_maps]),
+            CreatedUser = emqx_utils_json:decode(UserData),
             ?assertMatch(#{<<"user_id">> := _}, CreatedUser)
         end,
         ValidUsers
@@ -185,7 +175,7 @@ test_authenticator_users(PathPrefix) ->
                     <<"success">> := 1,
                     <<"failed">> := 1
                 }
-            } = emqx_utils_json:decode(PageData01, [return_maps]);
+            } = emqx_utils_json:decode(PageData01);
         ["listeners", 'tcp:default'] ->
             #{
                 <<"metrics">> := #{
@@ -193,7 +183,7 @@ test_authenticator_users(PathPrefix) ->
                     <<"success">> := 1,
                     <<"nomatch">> := 1
                 }
-            } = emqx_utils_json:decode(PageData01, [return_maps])
+            } = emqx_utils_json:decode(PageData01)
     end,
 
     {ok, 200, Page1Data} = request(get, UsersUri ++ "?page=1&limit=2"),
@@ -207,7 +197,7 @@ test_authenticator_users(PathPrefix) ->
                 <<"count">> := 3
             }
     } =
-        emqx_utils_json:decode(Page1Data, [return_maps]),
+        emqx_utils_json:decode(Page1Data),
 
     {ok, 200, Page2Data} = request(get, UsersUri ++ "?page=2&limit=2"),
 
@@ -219,7 +209,7 @@ test_authenticator_users(PathPrefix) ->
                 <<"limit">> := 2,
                 <<"count">> := 3
             }
-    } = emqx_utils_json:decode(Page2Data, [return_maps]),
+    } = emqx_utils_json:decode(Page2Data),
 
     ?assertEqual(2, length(Page1Users)),
     ?assertEqual(1, length(Page2Users)),
@@ -239,7 +229,7 @@ test_authenticator_users(PathPrefix) ->
                 <<"limit">> := 3,
                 <<"count">> := 1
             }
-    } = emqx_utils_json:decode(Super1Data, [return_maps]),
+    } = emqx_utils_json:decode(Super1Data),
 
     ?assertEqual(
         [<<"u2">>],
@@ -256,7 +246,7 @@ test_authenticator_users(PathPrefix) ->
                 <<"limit">> := 3,
                 <<"count">> := 2
             }
-    } = emqx_utils_json:decode(Super2Data, [return_maps]),
+    } = emqx_utils_json:decode(Super2Data),
 
     ?assertEqual(
         [<<"u1">>, <<"u3">>],
@@ -283,7 +273,7 @@ test_authenticator_user(PathPrefix) ->
 
     {ok, 200, UserData} = request(get, UsersUri ++ "/u1"),
 
-    FetchedUser = emqx_utils_json:decode(UserData, [return_maps]),
+    FetchedUser = emqx_utils_json:decode(UserData),
     ?assertMatch(#{<<"user_id">> := <<"u1">>}, FetchedUser),
     ?assertNotMatch(#{<<"password">> := _}, FetchedUser),
 
@@ -324,27 +314,35 @@ test_authenticator_import_users(PathPrefix) ->
         {filenam, "user-credentials.json", <<>>}
     ]),
 
-    Dir = code:lib_dir(emqx_auth, test),
-    JSONFileName = filename:join([Dir, <<"data/user-credentials.json">>]),
-    CSVFileName = filename:join([Dir, <<"data/user-credentials.csv">>]),
+    Dir = code:lib_dir(emqx_auth),
+    JSONFileName = filename:join([Dir, <<"test/data/user-credentials.json">>]),
+    CSVFileName = filename:join([Dir, <<"test/data/user-credentials.csv">>]),
 
     {ok, JSONData} = file:read_file(JSONFileName),
-    {ok, 204, _} = multipart_formdata_request(ImportUri, [], [
+    {ok, 200, Result1} = multipart_formdata_request(ImportUri, [], [
         {filename, "user-credentials.json", JSONData}
     ]),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2}, emqx_utils_json:decode(Result1)
+    ),
 
     {ok, CSVData} = file:read_file(CSVFileName),
-    {ok, 204, _} = multipart_formdata_request(ImportUri, [], [
+    {ok, 200, Result2} = multipart_formdata_request(ImportUri, [], [
         {filename, "user-credentials.csv", CSVData}
     ]),
+    ?assertMatch(
+        #{<<"total">> := 2, <<"success">> := 2}, emqx_utils_json:decode(Result2)
+    ),
 
     %% test application/json
-    {ok, 204, _} = request(post, ImportUri ++ "?type=hash", emqx_utils_json:decode(JSONData)),
-    {ok, JSONData1} = file:read_file(filename:join([Dir, <<"data/user-credentials-plain.json">>])),
-    {ok, 204, _} = request(post, ImportUri ++ "?type=plain", emqx_utils_json:decode(JSONData1)),
+    {ok, 200, _} = request(post, ImportUri ++ "?type=hash", emqx_utils_json:decode(JSONData)),
+    {ok, JSONData1} = file:read_file(
+        filename:join([Dir, <<"test/data/user-credentials-plain.json">>])
+    ),
+    {ok, 200, _} = request(post, ImportUri ++ "?type=plain", emqx_utils_json:decode(JSONData1)),
 
     %% test application/json; charset=utf-8
-    {ok, 204, _} = request_with_charset(post, ImportUri ++ "?type=plain", JSONData1),
+    {ok, 200, _} = request_with_charset(post, ImportUri ++ "?type=plain", JSONData1),
     ok.
 
 %%------------------------------------------------------------------------------

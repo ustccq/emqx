@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_subscription_SUITE).
 
@@ -38,44 +26,45 @@
 
 all() ->
     [
-        {group, mem},
-        {group, persistent}
+        {group, persistence_disabled},
+        {group, persistence_enabled}
     ].
 
 groups() ->
     AllTCs = emqx_common_test_helpers:all(?MODULE),
     CommonTCs = AllTCs -- persistent_only_tcs(),
     [
-        {mem, CommonTCs},
-        %% Shared subscriptions are currently not supported:
-        {persistent,
-            (CommonTCs -- [t_list_with_shared_sub, t_subscription_api]) ++ persistent_only_tcs()}
+        {persistence_disabled, CommonTCs},
+        %% Persistent shared subscriptions are an EE app.
+        %% So they are tested outside emqx_management app which is CE.
+        {persistence_enabled,
+            (CommonTCs --
+                [t_list_with_shared_sub, t_list_with_invalid_match_topic, t_subscription_api]) ++
+                persistent_only_tcs()}
     ].
 
 persistent_only_tcs() ->
     [
-        t_mixed_persistent_sessions
+        t_mixed_persistent_sessions,
+        t_many_persistent_sessions
     ].
 
 init_per_suite(Config) ->
-    Apps = emqx_cth_suite:start(
-        [
-            {emqx,
-                "durable_sessions {\n"
-                "    enable = true\n"
-                "    renew_streams_interval = 10ms\n"
-                "}"},
-            emqx_management,
-            emqx_mgmt_api_test_util:emqx_dashboard()
-        ],
-        #{work_dir => emqx_cth_suite:work_dir(Config)}
-    ),
-    [{apps, Apps} | Config].
+    DurableSessionsOpts = #{
+        <<"enable">> => true,
+        <<"checkpoint_interval">> => 0
+    },
+    ExtraApps = [
+        emqx_management,
+        emqx_mgmt_api_test_util:emqx_dashboard()
+    ],
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    emqx_common_test_helpers:start_apps_ds(Config, ExtraApps, Opts).
 
 end_per_suite(Config) ->
-    ok = emqx_cth_suite:stop(?config(apps, Config)).
+    emqx_common_test_helpers:stop_apps_ds(Config).
 
-init_per_group(persistent, Config) ->
+init_per_group(persistence_enabled, Config) ->
     ClientConfig = #{
         username => ?USERNAME,
         clientid => ?CLIENTID,
@@ -83,8 +72,9 @@ init_per_group(persistent, Config) ->
         clean_start => true,
         properties => #{'Session-Expiry-Interval' => 300}
     },
+    _ = emqx_persistent_message:wait_readiness(5_000),
     [{client_config, ClientConfig}, {durable, true} | Config];
-init_per_group(mem, Config) ->
+init_per_group(persistence_disabled, Config) ->
     ClientConfig = #{
         username => ?USERNAME, clientid => ?CLIENTID, proto_ver => v5, clean_start => true
     },
@@ -119,11 +109,10 @@ t_subscription_api(Config) ->
     Path = emqx_mgmt_api_test_util:api_path(["subscriptions"]),
     timer:sleep(100),
     {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path),
-    Data = emqx_utils_json:decode(Response, [return_maps]),
+    Data = emqx_utils_json:decode(Response),
     Meta = maps:get(<<"meta">>, Data),
     ?assertEqual(1, maps:get(<<"page">>, Meta)),
     ?assertEqual(emqx_mgmt:default_row_limit(), maps:get(<<"limit">>, Meta)),
-    ?assertEqual(2, maps:get(<<"count">>, Meta), Data),
     Subscriptions = maps:get(<<"data">>, Data),
     ?assertEqual(length(Subscriptions), 2),
     Sort =
@@ -175,6 +164,8 @@ t_mixed_persistent_sessions(Config) ->
 
     {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(PersistentClient, <<"t/1">>, 1),
     {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(MemClient, <<"t/1">>, 1),
+    emqx_persistent_session_ds:sync(PersistentClient),
+    ct:sleep(1000),
 
     %% First page with sufficient limit should have both mem and DS clients.
     ?assertMatch(
@@ -182,10 +173,7 @@ t_mixed_persistent_sessions(Config) ->
             {{_, 200, _}, _, #{
                 <<"data">> := [_, _],
                 <<"meta">> :=
-                    #{
-                        <<"hasnext">> := false,
-                        <<"count">> := 2
-                    }
+                    #{<<"hasnext">> := false}
             }}},
         get_subs(#{page => "1"})
     ),
@@ -211,6 +199,42 @@ t_mixed_persistent_sessions(Config) ->
 
     ok.
 
+t_many_persistent_sessions(Config) ->
+    ClientConfig = ?config(client_config, Config),
+    Clients = lists:map(
+        fun(I) ->
+            IBin = integer_to_binary(I),
+            {ok, Client} = emqtt:start_link(ClientConfig#{clientid => <<"sub_", IBin/binary>>}),
+            {ok, _} = emqtt:connect(Client),
+            ok = lists:foreach(
+                fun(IT) ->
+                    ITBin = integer_to_binary(IT),
+                    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(
+                        Client, <<"t/", IBin/binary, "/", ITBin/binary>>, 1
+                    )
+                end,
+                lists:seq(1, 30)
+            ),
+            Client
+        end,
+        lists:seq(1, 5)
+    ),
+    ct:sleep(100),
+    ok = lists:foreach(
+        fun(Client) -> emqtt:disconnect(Client) end,
+        Clients
+    ),
+    ct:sleep(100),
+    {ok,
+        {{_, 200, _}, _, #{
+            <<"data">> := Data
+        }}} = get_subs(#{page => "1", limit => "1000"}),
+    ?assertEqual(
+        150,
+        length(Data)
+    ),
+    ok.
+
 t_subscription_fuzzy_search(Config) ->
     Client = proplists:get_value(client, Config),
     Durable = atom_to_list(?config(durable, Config)),
@@ -221,7 +245,9 @@ t_subscription_fuzzy_search(Config) ->
         <<"topic/foo/bar">>,
         <<"topic/foo/baz">>
     ],
-    _ = [{ok, _, _} = emqtt:subscribe(Client, T) || T <- Topics],
+    [{ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(Client, T, ?QOS_1) || T <- Topics],
+    emqx_persistent_session_ds:sync(Client),
+    ct:sleep(1000),
 
     Headers = emqx_mgmt_api_test_util:auth_header_(),
     MatchQs = [
@@ -235,8 +261,8 @@ t_subscription_fuzzy_search(Config) ->
     ?assertEqual(1, maps:get(<<"page">>, MatchMeta1)),
     ?assertEqual(emqx_mgmt:default_row_limit(), maps:get(<<"limit">>, MatchMeta1)),
     %% count is undefined in fuzzy searching
-    ?assertNot(maps:is_key(<<"count">>, MatchMeta1)),
-    ?assertMatch(3, length(maps:get(<<"data">>, MatchData1))),
+    ?assertNot(maps:is_key(<<"count">>, MatchMeta1), MatchData1),
+    ?assertMatch(3, length(maps:get(<<"data">>, MatchData1)), MatchData1),
     ?assertEqual(false, maps:get(<<"hasnext">>, MatchMeta1)),
 
     LimitMatchQuery = [
@@ -313,7 +339,7 @@ t_list_with_invalid_match_topic(Config) ->
             {error, {R, _H, Body}} = emqx_mgmt_api_test_util:request_api(
                 get, path(), uri_string:compose_query(QS), Headers, [], #{return_all => true}
             ),
-            {error, {R, _H, emqx_utils_json:decode(Body, [return_maps])}}
+            {error, {R, _H, emqx_utils_json:decode(Body)}}
         end
     ),
     ok.
@@ -321,7 +347,7 @@ t_list_with_invalid_match_topic(Config) ->
 request_json(Method, Query, Headers) when is_list(Query) ->
     Qs = uri_string:compose_query(Query),
     {ok, MatchRes} = emqx_mgmt_api_test_util:request_api(Method, path(), Qs, Headers),
-    emqx_utils_json:decode(MatchRes, [return_maps]).
+    emqx_utils_json:decode(MatchRes).
 
 path() ->
     emqx_mgmt_api_test_util:api_path(["subscriptions"]).
@@ -345,7 +371,7 @@ request(Method, Path, Params, QueryParams) ->
             {ok, {Status, Headers, Body}};
         {error, {Status, Headers, Body0}} ->
             Body =
-                case emqx_utils_json:safe_decode(Body0, [return_maps]) of
+                case emqx_utils_json:safe_decode(Body0) of
                     {ok, Decoded0 = #{<<"message">> := Msg0}} ->
                         Msg = maybe_json_decode(Msg0),
                         Decoded0#{<<"message">> := Msg};
@@ -360,7 +386,7 @@ request(Method, Path, Params, QueryParams) ->
     end.
 
 maybe_json_decode(X) ->
-    case emqx_utils_json:safe_decode(X, [return_maps]) of
+    case emqx_utils_json:safe_decode(X) of
         {ok, Decoded} -> Decoded;
         {error, _} -> X
     end.

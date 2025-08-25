@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_http_api).
@@ -28,7 +28,9 @@
 namespace() -> "license_http_api".
 
 api_spec() ->
-    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => false}).
+    emqx_dashboard_swagger:spec(?MODULE, #{
+        check_schema => fun emqx_dashboard_swagger:validate_content_type_json/2
+    }).
 
 paths() ->
     [
@@ -113,7 +115,7 @@ sample_license_info_response() ->
         email => "contact@foo.com",
         expiry => false,
         expiry_at => "2295-10-27",
-        max_connections => 10,
+        max_sessions => 10,
         start_at => "2022-01-11",
         type => "trial"
     }.
@@ -123,8 +125,7 @@ error_msg(Code, Msg) ->
 
 %% read license info
 '/license'(get, _Params) ->
-    License = maps:from_list(emqx_license_checker:dump()),
-    {200, License};
+    {200, license_info()};
 %% set/update license
 '/license'(post, #{body := #{<<"key">> := Key}}) ->
     case emqx_license:update_key(Key) of
@@ -137,11 +138,15 @@ error_msg(Code, Msg) ->
                 },
                 #{tag => "LICENSE"}
             ),
-            {400, error_msg(?BAD_REQUEST, <<"Bad license key">>)};
+            Msg =
+                case is_atom(Error) of
+                    true -> atom_to_binary(Error);
+                    false -> <<"Bad license key, see logs for more details">>
+                end,
+            {400, error_msg(?BAD_REQUEST, Msg)};
         {ok, _} ->
             ?SLOG(info, #{msg => "updated_license_key"}, #{tag => "LICENSE"}),
-            License = maps:from_list(emqx_license_checker:dump()),
-            {200, License}
+            {200, license_info()}
     end;
 '/license'(post, _Params) ->
     {400, error_msg(?BAD_REQUEST, <<"Invalid request params">>)}.
@@ -187,3 +192,8 @@ get_setting() ->
         false ->
             maps:remove(<<"dynamic_max_connections">>, Result)
     end.
+
+license_info() ->
+    #{max_sessions := Max} = Dump = maps:from_list(emqx_license_checker:dump()),
+    %% For API backward compatibility
+    Dump#{max_connections => Max}.

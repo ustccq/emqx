@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_slow_subs_api_SUITE).
@@ -46,9 +34,9 @@ all() ->
 init_per_suite(Config) ->
     Apps = emqx_cth_suite:start(
         [
+            emqx_conf,
             emqx,
             emqx_auth,
-            emqx_conf,
             emqx_management,
             {emqx_slow_subs, ?CONF_DEFAULT},
             {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
@@ -86,7 +74,7 @@ t_get_history(_) ->
         "page=1&limit=10",
         auth_header_()
     ),
-    #{<<"data">> := [First | _]} = emqx_utils_json:decode(Data, [return_maps]),
+    #{<<"data">> := [First | _]} = emqx_utils_json:decode(Data),
 
     ?assertMatch(
         #{
@@ -141,7 +129,7 @@ t_settting(_) ->
     ?assertEqual(Expect, GetReturn).
 
 decode_json(Data) ->
-    emqx_utils_json:decode(Data, [return_maps]).
+    emqx_utils_json:decode(Data).
 
 request_api(Method, Url, Auth) ->
     request_api(Method, Url, [], Auth, []).

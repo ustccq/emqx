@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_events).
@@ -30,12 +18,16 @@
     unload/1,
     event_names/0,
     event_name/1,
+    match_event_names/1,
+    expand_legacy_event_topics/1,
     event_topics_enum/0,
     event_topic/1,
     eventmsg_publish/1
 ]).
 
 -export([
+    on_alarm_activated/2,
+    on_alarm_deactivated/2,
     on_client_connected/3,
     on_client_disconnected/4,
     on_client_connack/4,
@@ -45,11 +37,12 @@
     on_session_unsubscribed/4,
     on_message_publish/2,
     on_message_dropped/4,
+    on_message_transformation_failed/3,
     on_schema_validation_failed/3,
     on_message_delivered/3,
     on_message_acked/3,
     on_delivery_dropped/4,
-    on_bridge_message_received/2
+    on_bridge_message_received/3
 ]).
 
 -export([
@@ -61,8 +54,7 @@
 -ifdef(TEST).
 -export([
     reason/1,
-    hook_fun/1,
-    printable_maps/1
+    hook_fun/1
 ]).
 -endif.
 
@@ -70,9 +62,12 @@
 
 event_names() ->
     [
+        'alarm.activated',
+        'alarm.deactivated',
         'client.connected',
         'client.disconnected',
         'client.connack',
+        'client.check_authn_complete',
         'client.check_authz_complete',
         'session.subscribed',
         'session.unsubscribed',
@@ -80,40 +75,67 @@ event_names() ->
         'message.delivered',
         'message.acked',
         'message.dropped',
+        'message.transformation_failed',
         'schema.validation_failed',
         'delivery.dropped'
     ].
 
-%% for documentation purposes
 event_topics_enum() ->
     [
+        '$events/sys/alarm_activated',
+        '$events/sys/alarm_deactivated',
+        '$events/client/connected',
+        '$events/client/disconnected',
+        '$events/client/connack',
+        '$events/auth/check_authn_complete',
+        '$events/auth/check_authz_complete',
+        '$events/session/subscribed',
+        '$events/session/unsubscribed',
+        '$events/message/delivered',
+        '$events/message/acked',
+        '$events/message/dropped',
+        '$events/message/delivery_dropped',
+        '$events/message_transformation/failed',
+        '$events/schema_validation/failed',
+        %% Topics below are kept for backwards compatibility.
         '$events/client_connected',
         '$events/client_disconnected',
         '$events/client_connack',
+        '$events/client_check_authn_complete',
         '$events/client_check_authz_complete',
         '$events/session_subscribed',
         '$events/session_unsubscribed',
         '$events/message_delivered',
         '$events/message_acked',
         '$events/message_dropped',
-        '$events/schema_validation_failed',
-        '$events/delivery_dropped'
+        '$events/delivery_dropped',
+        '$events/message_transformation_failed',
+        '$events/schema_validation_failed'
         % '$events/message_publish' % not possible to use in SELECT FROM
     ].
 
 reload() ->
-    lists:foreach(
-        fun(Rule) ->
-            ok = emqx_rule_engine:load_hooks_for_rule(Rule)
+    maps:foreach(
+        fun(_Namespace, Rules) ->
+            lists:foreach(
+                fun(Rule) ->
+                    ok = emqx_rule_engine:load_hooks_for_rule(Rule)
+                end,
+                Rules
+            )
         end,
-        emqx_rule_engine:get_rules()
+        emqx_rule_engine:get_rules_from_all_namespaces()
     ).
 
 load(Topic) ->
-    HookPoint = event_name(Topic),
-    HookFun = hook_fun_name(HookPoint),
-    emqx_hooks:put(
-        HookPoint, {?MODULE, HookFun, [#{event_topic => Topic}]}, ?HP_RULE_ENGINE
+    lists:foreach(
+        fun(HookPoint) ->
+            HookFun = hook_fun_name(HookPoint),
+            emqx_hooks:put(
+                HookPoint, {?MODULE, HookFun, [#{event_topic => Topic}]}, ?HP_RULE_ENGINE
+            )
+        end,
+        match_event_names(Topic)
     ).
 
 unload() ->
@@ -124,13 +146,27 @@ unload() ->
         event_names()
     ).
 
-unload(Topic) ->
-    HookPoint = event_name(Topic),
-    emqx_hooks:del(HookPoint, {?MODULE, hook_fun_name(HookPoint)}).
+unload(EventName) ->
+    emqx_hooks:del(EventName, {?MODULE, hook_fun_name(EventName)}).
 
 %%--------------------------------------------------------------------
 %% Callbacks
 %%--------------------------------------------------------------------
+
+on_alarm_activated(AlarmActivatedContext, Conf) ->
+    apply_event(
+        'alarm.activated',
+        fun() -> eventmsg_alarm_activated(AlarmActivatedContext) end,
+        Conf
+    ).
+
+on_alarm_deactivated(AlarmDeactivatedContext, Conf) ->
+    apply_event(
+        'alarm.deactivated',
+        fun() -> eventmsg_alarm_deactivated(AlarmDeactivatedContext) end,
+        Conf
+    ).
+
 on_message_publish(Message = #message{topic = Topic}, _Conf) ->
     case ignore_sys_message(Message) of
         true ->
@@ -139,17 +175,22 @@ on_message_publish(Message = #message{topic = Topic}, _Conf) ->
             case emqx_rule_engine:get_rules_for_topic(Topic) of
                 [] ->
                     ok;
-                Rules ->
+                EnrichedRules ->
                     %% ENVs are the fields that can't be refereced by the SQL, but can be used
                     %% from actions. e.g. The 'headers' field in the internal record `#message{}`.
                     {Columns, Envs} = eventmsg_publish(Message),
-                    emqx_rule_runtime:apply_rules(Rules, Columns, Envs)
+                    emqx_rule_runtime:apply_rules(EnrichedRules, Columns, Envs)
             end
     end,
     {ok, Message}.
 
-on_bridge_message_received(Message, Conf = #{event_topic := BridgeTopic}) ->
-    apply_event(BridgeTopic, fun() -> with_basic_columns(BridgeTopic, Message, #{}) end, Conf).
+on_bridge_message_received(Message, Namespace, Conf = #{event_topic := BridgeTopic}) ->
+    apply_event_namespaced(
+        Namespace,
+        BridgeTopic,
+        fun() -> with_basic_columns(BridgeTopic, Message, #{}) end,
+        Conf
+    ).
 
 on_client_connected(ClientInfo, ConnInfo, Conf) ->
     apply_event(
@@ -237,6 +278,19 @@ on_message_dropped(Message, _, Reason, Conf) ->
     end,
     {ok, Message}.
 
+on_message_transformation_failed(Message, TransformationContext, Conf) ->
+    case ignore_sys_message(Message) of
+        true ->
+            ok;
+        false ->
+            apply_event(
+                'message.transformation_failed',
+                fun() -> eventmsg_transformation_failed(Message, TransformationContext) end,
+                Conf
+            )
+    end,
+    {ok, Message}.
+
 on_schema_validation_failed(Message, ValidationContext, Conf) ->
     case ignore_sys_message(Message) of
         true ->
@@ -313,17 +367,59 @@ eventmsg_publish(
             username => emqx_message:get_header(username, Message, undefined),
             payload => Payload,
             peerhost => ntoa(emqx_message:get_header(peerhost, Message, undefined)),
+            peername => ntoa(emqx_message:get_header(peername, Message, undefined)),
             topic => Topic,
             qos => QoS,
             flags => Flags,
-            pub_props => printable_maps(emqx_message:get_header(properties, Message, #{})),
-            publish_received_at => Timestamp
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
+            publish_received_at => Timestamp,
+            client_attrs => emqx_message:get_header(client_attrs, Message, #{})
         },
         #{headers => Headers}
     ).
 
+eventmsg_alarm_activated(AlarmActivatedContext) ->
+    #{
+        name := Name,
+        details := Details,
+        message := Message,
+        activated_at := ActivatedAt
+    } = AlarmActivatedContext,
+    with_basic_columns(
+        'alarm.activated',
+        #{
+            name => Name,
+            details => Details,
+            message => Message,
+            activated_at => ActivatedAt
+        },
+        #{}
+    ).
+
+eventmsg_alarm_deactivated(AlarmDectivatedContext) ->
+    #{
+        name := Name,
+        details := Details,
+        message := Message,
+        activated_at := ActivatedAt,
+        deactivated_at := DeactivatedAt
+    } = AlarmDectivatedContext,
+    with_basic_columns(
+        'alarm.deactivated',
+        #{
+            name => Name,
+            details => Details,
+            message => Message,
+            activated_at => ActivatedAt,
+            deactivated_at => DeactivatedAt
+        },
+        #{}
+    ).
+
 eventmsg_connected(
-    _ClientInfo = #{
+    ClientInfo = #{
         clientid := ClientId,
         username := Username,
         is_bridge := IsBridge,
@@ -357,14 +453,15 @@ eventmsg_connected(
             receive_maximum => RcvMax,
             expiry_interval => ExpiryInterval div 1000,
             is_bridge => IsBridge,
-            conn_props => printable_maps(ConnProps),
-            connected_at => ConnectedAt
+            conn_props => emqx_utils_maps:printable_props(ConnProps),
+            connected_at => ConnectedAt,
+            client_attrs => maps:get(client_attrs, ClientInfo, #{})
         },
         #{}
     ).
 
 eventmsg_disconnected(
-    _ClientInfo = #{
+    ClientInfo = #{
         clientid := ClientId,
         username := Username
     },
@@ -373,7 +470,8 @@ eventmsg_disconnected(
         sockname := SockName,
         proto_name := ProtoName,
         proto_ver := ProtoVer,
-        disconnected_at := DisconnectedAt
+        disconnected_at := DisconnectedAt,
+        connected_at := ConnectedAt
     },
     Reason
 ) ->
@@ -387,8 +485,12 @@ eventmsg_disconnected(
             sockname => ntoa(SockName),
             proto_name => ProtoName,
             proto_ver => ProtoVer,
-            disconn_props => printable_maps(maps:get(disconn_props, ConnInfo, #{})),
-            disconnected_at => DisconnectedAt
+            disconn_props => emqx_utils_maps:printable_props(
+                maps:get(disconn_props, ConnInfo, #{})
+            ),
+            disconnected_at => DisconnectedAt,
+            connected_at => ConnectedAt,
+            client_attrs => maps:get(client_attrs, ClientInfo, #{})
         },
         #{}
     ).
@@ -421,16 +523,17 @@ eventmsg_connack(
             proto_ver => ProtoVer,
             keepalive => Keepalive,
             expiry_interval => ExpiryInterval,
-            conn_props => printable_maps(ConnProps)
+            conn_props => emqx_utils_maps:printable_props(ConnProps)
         },
         #{}
     ).
 
 eventmsg_check_authz_complete(
-    _ClientInfo = #{
+    ClientInfo = #{
         clientid := ClientId,
         username := Username,
-        peerhost := PeerHost
+        peerhost := PeerHost,
+        peername := PeerName
     },
     PubSub,
     Topic,
@@ -442,21 +545,22 @@ eventmsg_check_authz_complete(
         #{
             clientid => ClientId,
             username => Username,
+            peername => ntoa(PeerName),
             peerhost => ntoa(PeerHost),
             topic => Topic,
             action => PubSub,
             authz_source => AuthzSource,
-            result => Result
+            result => Result,
+            client_attrs => maps:get(client_attrs, ClientInfo, #{})
         },
         #{}
     ).
 
 eventmsg_check_authn_complete(
-    _ClientInfo = #{
+    ClientInfo = #{
         clientid := ClientId,
         username := Username,
-        peerhost := PeerHost,
-        peerport := PeerPort
+        peername := PeerName
     },
     Result
 ) ->
@@ -472,20 +576,22 @@ eventmsg_check_authn_complete(
         #{
             clientid => ClientId,
             username => Username,
-            peername => ntoa({PeerHost, PeerPort}),
+            peername => ntoa(PeerName),
             reason_code => force_to_bin(Reason),
             is_anonymous => IsAnonymous,
-            is_superuser => IsSuperuser
+            is_superuser => IsSuperuser,
+            client_attrs => maps:get(client_attrs, ClientInfo, #{})
         },
         #{}
     ).
 
 eventmsg_sub_or_unsub(
     Event,
-    _ClientInfo = #{
+    ClientInfo = #{
         clientid := ClientId,
         username := Username,
-        peerhost := PeerHost
+        peerhost := PeerHost,
+        peername := PeerName
     },
     Topic,
     SubOpts = #{qos := QoS}
@@ -497,9 +603,11 @@ eventmsg_sub_or_unsub(
             clientid => ClientId,
             username => Username,
             peerhost => ntoa(PeerHost),
-            PropKey => printable_maps(maps:get(PropKey, SubOpts, #{})),
+            peername => ntoa(PeerName),
+            PropKey => emqx_utils_maps:printable_props(maps:get(PropKey, SubOpts, #{})),
             topic => Topic,
-            qos => QoS
+            qos => QoS,
+            client_attrs => maps:get(client_attrs, ClientInfo, #{})
         },
         #{}
     ).
@@ -526,10 +634,47 @@ eventmsg_dropped(
             username => emqx_message:get_header(username, Message, undefined),
             payload => Payload,
             peerhost => ntoa(emqx_message:get_header(peerhost, Message, undefined)),
+            peername => ntoa(emqx_message:get_header(peername, Message, undefined)),
             topic => Topic,
             qos => QoS,
             flags => Flags,
-            pub_props => printable_maps(emqx_message:get_header(properties, Message, #{})),
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
+            publish_received_at => Timestamp
+        },
+        #{headers => Headers}
+    ).
+
+eventmsg_transformation_failed(
+    Message = #message{
+        id = Id,
+        from = ClientId,
+        qos = QoS,
+        flags = Flags,
+        topic = Topic,
+        headers = Headers,
+        payload = Payload,
+        timestamp = Timestamp
+    },
+    TransformationContext
+) ->
+    #{name := TransformationName} = TransformationContext,
+    with_basic_columns(
+        'message.transformation_failed',
+        #{
+            id => emqx_guid:to_hexstr(Id),
+            transformation => TransformationName,
+            clientid => ClientId,
+            username => emqx_message:get_header(username, Message, undefined),
+            payload => Payload,
+            peername => ntoa(emqx_message:get_header(peername, Message, undefined)),
+            topic => Topic,
+            qos => QoS,
+            flags => Flags,
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
             publish_received_at => Timestamp
         },
         #{headers => Headers}
@@ -558,10 +703,13 @@ eventmsg_validation_failed(
             username => emqx_message:get_header(username, Message, undefined),
             payload => Payload,
             peerhost => ntoa(emqx_message:get_header(peerhost, Message, undefined)),
+            peername => ntoa(emqx_message:get_header(peername, Message, undefined)),
             topic => Topic,
             qos => QoS,
             flags => Flags,
-            pub_props => printable_maps(emqx_message:get_header(properties, Message, #{})),
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
             publish_received_at => Timestamp
         },
         #{headers => Headers}
@@ -570,6 +718,7 @@ eventmsg_validation_failed(
 eventmsg_delivered(
     _ClientInfo = #{
         peerhost := PeerHost,
+        peername := PeerName,
         clientid := ReceiverCId,
         username := ReceiverUsername
     },
@@ -594,10 +743,13 @@ eventmsg_delivered(
             username => ReceiverUsername,
             payload => Payload,
             peerhost => ntoa(PeerHost),
+            peername => ntoa(PeerName),
             topic => Topic,
             qos => QoS,
             flags => Flags,
-            pub_props => printable_maps(emqx_message:get_header(properties, Message, #{})),
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
             publish_received_at => Timestamp
         },
         #{headers => Headers}
@@ -606,6 +758,7 @@ eventmsg_delivered(
 eventmsg_acked(
     _ClientInfo = #{
         peerhost := PeerHost,
+        peername := PeerName,
         clientid := ReceiverCId,
         username := ReceiverUsername
     },
@@ -630,11 +783,16 @@ eventmsg_acked(
             username => ReceiverUsername,
             payload => Payload,
             peerhost => ntoa(PeerHost),
+            peername => ntoa(PeerName),
             topic => Topic,
             qos => QoS,
             flags => Flags,
-            pub_props => printable_maps(emqx_message:get_header(properties, Message, #{})),
-            puback_props => printable_maps(emqx_message:get_header(puback_props, Message, #{})),
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
+            puback_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(puback_props, Message, #{})
+            ),
             publish_received_at => Timestamp
         },
         #{headers => Headers}
@@ -643,6 +801,7 @@ eventmsg_acked(
 eventmsg_delivery_dropped(
     _ClientInfo = #{
         peerhost := PeerHost,
+        peername := PeerName,
         clientid := ReceiverCId,
         username := ReceiverUsername
     },
@@ -669,10 +828,13 @@ eventmsg_delivery_dropped(
             username => ReceiverUsername,
             payload => Payload,
             peerhost => ntoa(PeerHost),
+            peername => ntoa(PeerName),
             topic => Topic,
             qos => QoS,
             flags => Flags,
-            pub_props => printable_maps(emqx_message:get_header(properties, Message, #{})),
+            pub_props => emqx_utils_maps:printable_props(
+                emqx_message:get_header(properties, Message, #{})
+            ),
             publish_received_at => Timestamp
         },
         #{headers => Headers}
@@ -694,15 +856,25 @@ with_basic_columns(EventName, Columns, Envs) when is_map(Columns) ->
 %%--------------------------------------------------------------------
 %% rules applying
 %%--------------------------------------------------------------------
-apply_event(EventName, GenEventMsg, _Conf) ->
-    EventTopic = event_topic(EventName),
-    case emqx_rule_engine:get_rules_for_topic(EventTopic) of
+
+apply_event_namespaced(Namespace, EventName, GenEventMsg, _Conf) ->
+    case emqx_rule_engine:get_enriched_rules_with_matching_event(Namespace, EventName) of
         [] ->
             ok;
-        Rules ->
+        EnrichedRules ->
             %% delay the generating of eventmsg after we have found some rules to apply
             {Columns, Envs} = GenEventMsg(),
-            emqx_rule_runtime:apply_rules(Rules, Columns, Envs)
+            emqx_rule_runtime:apply_rules(EnrichedRules, Columns, Envs)
+    end.
+
+apply_event(EventName, GenEventMsg, _Conf) ->
+    case emqx_rule_engine:get_enriched_rules_with_matching_event_all_namespaces(EventName) of
+        [] ->
+            ok;
+        EnrichedRules ->
+            %% delay the generating of eventmsg after we have found some rules to apply
+            {Columns, Envs} = GenEventMsg(),
+            emqx_rule_runtime:apply_rules(EnrichedRules, Columns, Envs)
     end.
 
 %%--------------------------------------------------------------------
@@ -714,6 +886,8 @@ columns(Event) ->
 event_info() ->
     [
         event_info_message_publish(),
+        event_info_alarm_activated(),
+        event_info_alarm_deactivated(),
         event_info_message_deliver(),
         event_info_message_acked(),
         event_info_message_dropped(),
@@ -728,25 +902,25 @@ event_info() ->
         event_info_bridge_mqtt()
     ] ++ ee_event_info().
 
--if(?EMQX_RELEASE_EDITION == ee).
-%% ELSE (?EMQX_RELEASE_EDITION == ee).
 event_info_schema_validation_failed() ->
     event_info_common(
         'schema.validation_failed',
-        {<<"schema validation failed">>, <<"TODO"/utf8>>},
-        {<<"messages that do not pass configured validations">>, <<"TODO"/utf8>>},
+        {<<"schema validation failed">>, <<"schema 验证失败"/utf8>>},
+        {<<"messages that do not pass configured validations">>, <<"未通过验证的消息"/utf8>>},
         <<"SELECT * FROM \"$events/schema_validation_failed\" WHERE topic =~ 't/#'">>
+    ).
+event_info_message_transformation_failed() ->
+    event_info_common(
+        'message.transformation_failed',
+        {<<"message transformation failed">>, <<"message 验证失败"/utf8>>},
+        {<<"messages that do not pass configured transformation">>, <<"未通过验证的消息"/utf8>>},
+        <<"SELECT * FROM \"$events/message_transformation_failed\" WHERE topic =~ 't/#'">>
     ).
 ee_event_info() ->
     [
-        event_info_schema_validation_failed()
+        event_info_schema_validation_failed(),
+        event_info_message_transformation_failed()
     ].
--else.
-%% END (?EMQX_RELEASE_EDITION == ee).
-
-ee_event_info() ->
-    [].
--endif.
 
 event_info_message_publish() ->
     event_info_common(
@@ -755,19 +929,33 @@ event_info_message_publish() ->
         {<<"message publish">>, <<"消息发布"/utf8>>},
         <<"SELECT payload.msg as msg FROM \"t/#\" WHERE msg = 'hello'">>
     ).
+event_info_alarm_activated() ->
+    event_info_common(
+        'alarm.activated',
+        {<<"alarm activated">>, <<""/utf8>>},
+        {<<"alarm activated">>, <<""/utf8>>},
+        <<"SELECT * FROM \"$events/sys/alarm_activated\" ">>
+    ).
+event_info_alarm_deactivated() ->
+    event_info_common(
+        'alarm.deactivated',
+        {<<"alarm deactivated">>, <<""/utf8>>},
+        {<<"alarm deactivated">>, <<""/utf8>>},
+        <<"SELECT * FROM \"$events/sys/alarm_deactivated\" ">>
+    ).
 event_info_message_deliver() ->
     event_info_common(
         'message.delivered',
         {<<"message delivered">>, <<"消息已投递"/utf8>>},
         {<<"message delivered">>, <<"消息已投递"/utf8>>},
-        <<"SELECT * FROM \"$events/message_delivered\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/message/delivered\" WHERE topic =~ 't/#'">>
     ).
 event_info_message_acked() ->
     event_info_common(
         'message.acked',
         {<<"message acked">>, <<"消息应答"/utf8>>},
         {<<"message acked">>, <<"消息应答"/utf8>>},
-        <<"SELECT * FROM \"$events/message_acked\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/message/acked\" WHERE topic =~ 't/#'">>
     ).
 event_info_message_dropped() ->
     event_info_common(
@@ -775,7 +963,7 @@ event_info_message_dropped() ->
         {<<"message routing-drop">>, <<"消息转发丢弃"/utf8>>},
         {<<"messages are discarded during routing, usually because there are no subscribers">>,
             <<"消息在转发的过程中被丢弃，一般是由于没有订阅者"/utf8>>},
-        <<"SELECT * FROM \"$events/message_dropped\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/message/dropped\" WHERE topic =~ 't/#'">>
     ).
 event_info_delivery_dropped() ->
     event_info_common(
@@ -783,56 +971,56 @@ event_info_delivery_dropped() ->
         {<<"message delivery-drop">>, <<"消息投递丢弃"/utf8>>},
         {<<"messages are discarded during delivery, i.e. because the message queue is full">>,
             <<"消息在投递的过程中被丢弃，比如由于消息队列已满"/utf8>>},
-        <<"SELECT * FROM \"$events/delivery_dropped\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/message/delivery_dropped\" WHERE topic =~ 't/#'">>
     ).
 event_info_client_connected() ->
     event_info_common(
         'client.connected',
         {<<"client connected">>, <<"连接建立"/utf8>>},
         {<<"client connected">>, <<"连接建立"/utf8>>},
-        <<"SELECT * FROM \"$events/client_connected\"">>
+        <<"SELECT * FROM \"$events/client/connected\"">>
     ).
 event_info_client_disconnected() ->
     event_info_common(
         'client.disconnected',
         {<<"client disconnected">>, <<"连接断开"/utf8>>},
         {<<"client disconnected">>, <<"连接断开"/utf8>>},
-        <<"SELECT * FROM \"$events/client_disconnected\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/client/disconnected\"">>
     ).
 event_info_client_connack() ->
     event_info_common(
         'client.connack',
         {<<"client connack">>, <<"连接确认"/utf8>>},
         {<<"client connack">>, <<"连接确认"/utf8>>},
-        <<"SELECT * FROM \"$events/client_connack\"">>
+        <<"SELECT * FROM \"$events/client/connack\"">>
     ).
 event_info_client_check_authz_complete() ->
     event_info_common(
         'client.check_authz_complete',
         {<<"client check authz complete">>, <<"授权结果"/utf8>>},
         {<<"client check authz complete">>, <<"授权结果"/utf8>>},
-        <<"SELECT * FROM \"$events/client_check_authz_complete\"">>
+        <<"SELECT * FROM \"$events/auth/check_authz_complete\"">>
     ).
 event_info_client_check_authn_complete() ->
     event_info_common(
         'client.check_authn_complete',
         {<<"client check authn complete">>, <<"认证结果"/utf8>>},
         {<<"client check authn complete">>, <<"认证结果"/utf8>>},
-        <<"SELECT * FROM \"$events/client_check_authn_complete\"">>
+        <<"SELECT * FROM \"$events/auth/check_authn_complete\"">>
     ).
 event_info_session_subscribed() ->
     event_info_common(
         'session.subscribed',
         {<<"session subscribed">>, <<"会话订阅完成"/utf8>>},
         {<<"session subscribed">>, <<"会话订阅完成"/utf8>>},
-        <<"SELECT * FROM \"$events/session_subscribed\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/session/subscribed\" WHERE topic =~ 't/#'">>
     ).
 event_info_session_unsubscribed() ->
     event_info_common(
         'session.unsubscribed',
         {<<"session unsubscribed">>, <<"会话取消订阅完成"/utf8>>},
         {<<"session unsubscribed">>, <<"会话取消订阅完成"/utf8>>},
-        <<"SELECT * FROM \"$events/session_unsubscribed\" WHERE topic =~ 't/#'">>
+        <<"SELECT * FROM \"$events/session/unsubscribed\" WHERE topic =~ 't/#'">>
     ).
 event_info_bridge_mqtt() ->
     event_info_common(
@@ -862,6 +1050,21 @@ test_columns('message.publish') ->
         {<<"topic">>, [<<"t/a">>, <<"the topic of the MQTT message">>]},
         {<<"qos">>, [1, <<"the QoS of the MQTT message">>]},
         {<<"payload">>, [<<"{\"msg\": \"hello\"}">>, <<"the payload of the MQTT message">>]}
+    ];
+test_columns('alarm.activated') ->
+    [
+        {<<"name">>, [<<"alarm_name">>, <<"name of the alarm">>]},
+        {<<"details">>, [#{<<"extra">> => <<"details">>}, <<"details about the alarm">>]},
+        {<<"message">>, [<<"something is wrong">>, <<"message accompanying alarm">>]},
+        {<<"activated_at">>, [1736512728666, <<"time at which alarm went off">>]}
+    ];
+test_columns('alarm.deactivated') ->
+    [
+        {<<"name">>, [<<"alarm_name">>, <<"name of the alarm">>]},
+        {<<"details">>, [#{<<"extra">> => <<"details">>}, <<"details about the alarm">>]},
+        {<<"message">>, [<<"something is wrong">>, <<"message accompanying alarm">>]},
+        {<<"activated_at">>, [1736512728666, <<"time at which alarm went off">>]},
+        {<<"deactivated_at">>, [1736512728999, <<"time at which alarm was deactivated">>]}
     ];
 test_columns('delivery.dropped') ->
     [{<<"reason">>, [<<"queue_full">>, <<"the reason of dropping">>]}] ++
@@ -908,7 +1111,7 @@ test_columns('client.check_authn_complete') ->
     [
         {<<"clientid">>, [<<"c_emqx">>, <<"the clientid if the client">>]},
         {<<"username">>, [<<"u_emqx">>, <<"the username if the client">>]},
-        {<<"reason_code">>, [<<"sucess">>, <<"the reason code">>]},
+        {<<"reason_code">>, [<<"success">>, <<"the reason code">>]},
         {<<"is_superuser">>, [true, <<"Whether this is a superuser">>]},
         {<<"is_anonymous">>, [false, <<"Whether this is a superuser">>]}
     ];
@@ -930,17 +1133,12 @@ test_columns(<<"$bridges/mqtt", _/binary>>) ->
 test_columns(Event) ->
     ee_test_columns(Event).
 
--if(?EMQX_RELEASE_EDITION == ee).
 ee_test_columns('schema.validation_failed') ->
     [{<<"validation">>, <<"myvalidation">>}] ++
+        test_columns('message.publish');
+ee_test_columns('message.transformation_failed') ->
+    [{<<"transformation">>, <<"mytransformation">>}] ++
         test_columns('message.publish').
-%% ELSE (?EMQX_RELEASE_EDITION == ee).
--else.
--spec ee_test_columns(_) -> no_return().
-ee_test_columns(Event) ->
-    error({unknown_event, Event}).
-%% END (?EMQX_RELEASE_EDITION == ee).
--endif.
 
 columns_with_exam('message.publish') ->
     [
@@ -950,13 +1148,32 @@ columns_with_exam('message.publish') ->
         {<<"username">>, <<"u_emqx">>},
         {<<"payload">>, <<"{\"msg\": \"hello\"}">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
         {<<"topic">>, <<"t/a">>},
         {<<"qos">>, 1},
         {<<"flags">>, #{}},
         {<<"publish_received_at">>, erlang:system_time(millisecond)},
         columns_example_props(pub_props),
         {<<"timestamp">>, erlang:system_time(millisecond)},
-        {<<"node">>, node()}
+        {<<"node">>, node()},
+        columns_example_client_attrs()
+    ];
+columns_with_exam('alarm.activated') ->
+    [
+        {<<"event">>, 'alarm.activated'},
+        {<<"name">>, <<"alarm_name">>},
+        {<<"details">>, #{<<"extra">> => <<"details">>}},
+        {<<"message">>, <<"something is wrong">>},
+        {<<"activated_at">>, 1736512728666}
+    ];
+columns_with_exam('alarm.deactivated') ->
+    [
+        {<<"event">>, 'alarm.deactivated'},
+        {<<"name">>, <<"alarm_name">>},
+        {<<"details">>, #{<<"extra">> => <<"details">>}},
+        {<<"message">>, <<"something is wrong">>},
+        {<<"activated_at">>, 1736512728666},
+        {<<"deactivated_at">>, 1736512728999}
     ];
 columns_with_exam('message.delivered') ->
     columns_message_ack_delivered('message.delivered');
@@ -972,6 +1189,7 @@ columns_with_exam('message.dropped') ->
         {<<"username">>, <<"u_emqx">>},
         {<<"payload">>, <<"{\"msg\": \"hello\"}">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
         {<<"topic">>, <<"t/a">>},
         {<<"qos">>, 1},
         {<<"flags">>, #{}},
@@ -989,6 +1207,24 @@ columns_with_exam('schema.validation_failed') ->
         {<<"username">>, <<"u_emqx">>},
         {<<"payload">>, <<"{\"msg\": \"hello\"}">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
+        {<<"topic">>, <<"t/a">>},
+        {<<"qos">>, 1},
+        {<<"flags">>, #{}},
+        {<<"publish_received_at">>, erlang:system_time(millisecond)},
+        columns_example_props(pub_props),
+        {<<"timestamp">>, erlang:system_time(millisecond)},
+        {<<"node">>, node()}
+    ];
+columns_with_exam('message.transformation_failed') ->
+    [
+        {<<"event">>, 'message.transformation_failed'},
+        {<<"validation">>, <<"my_transformation">>},
+        {<<"id">>, emqx_guid:to_hexstr(emqx_guid:gen())},
+        {<<"clientid">>, <<"c_emqx">>},
+        {<<"username">>, <<"u_emqx">>},
+        {<<"payload">>, <<"{\"msg\": \"hello\"}">>},
+        {<<"peername">>, <<"192.168.0.10:56431">>},
         {<<"topic">>, <<"t/a">>},
         {<<"qos">>, 1},
         {<<"flags">>, #{}},
@@ -1008,6 +1244,7 @@ columns_with_exam('delivery.dropped') ->
         {<<"username">>, <<"u_emqx_2">>},
         {<<"payload">>, <<"{\"msg\": \"hello\"}">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
         {<<"topic">>, <<"t/a">>},
         {<<"qos">>, 1},
         {<<"flags">>, #{}},
@@ -1033,7 +1270,8 @@ columns_with_exam('client.connected') ->
         columns_example_props(conn_props),
         {<<"connected_at">>, erlang:system_time(millisecond)},
         {<<"timestamp">>, erlang:system_time(millisecond)},
-        {<<"node">>, node()}
+        {<<"node">>, node()},
+        columns_example_client_attrs()
     ];
 columns_with_exam('client.disconnected') ->
     [
@@ -1046,13 +1284,15 @@ columns_with_exam('client.disconnected') ->
         {<<"proto_name">>, <<"MQTT">>},
         {<<"proto_ver">>, 5},
         columns_example_props(disconn_props),
+        {<<"connected_at">>, erlang:system_time(millisecond)},
         {<<"disconnected_at">>, erlang:system_time(millisecond)},
         {<<"timestamp">>, erlang:system_time(millisecond)},
-        {<<"node">>, node()}
+        {<<"node">>, node()},
+        columns_example_client_attrs()
     ];
 columns_with_exam('client.connack') ->
     [
-        {<<"event">>, 'client.connected'},
+        {<<"event">>, 'client.connack'},
         {<<"reason_code">>, success},
         {<<"clientid">>, <<"c_emqx">>},
         {<<"username">>, <<"u_emqx">>},
@@ -1074,29 +1314,34 @@ columns_with_exam('client.check_authz_complete') ->
         {<<"clientid">>, <<"c_emqx">>},
         {<<"username">>, <<"u_emqx">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
         {<<"topic">>, <<"t/a">>},
         {<<"action">>, <<"publish">>},
         {<<"authz_source">>, <<"cache">>},
         {<<"result">>, <<"allow">>},
         {<<"timestamp">>, erlang:system_time(millisecond)},
-        {<<"node">>, node()}
+        {<<"node">>, node()},
+        columns_example_client_attrs()
     ];
 columns_with_exam('client.check_authn_complete') ->
     [
-        {<<"event">>, 'client.check_authz_complete'},
+        {<<"event">>, 'client.check_authn_complete'},
         {<<"clientid">>, <<"c_emqx">>},
         {<<"username">>, <<"u_emqx">>},
         {<<"peername">>, <<"192.168.0.10:56431">>},
-        {<<"reason_code">>, <<"sucess">>},
+        {<<"reason_code">>, <<"success">>},
         {<<"is_superuser">>, true},
         {<<"is_anonymous">>, false},
         {<<"timestamp">>, erlang:system_time(millisecond)},
-        {<<"node">>, node()}
+        {<<"node">>, node()},
+        columns_example_client_attrs()
     ];
 columns_with_exam('session.subscribed') ->
-    [columns_example_props(sub_props)] ++ columns_message_sub_unsub('session.subscribed');
+    [columns_example_props(sub_props), columns_example_client_attrs()] ++
+        columns_message_sub_unsub('session.subscribed');
 columns_with_exam('session.unsubscribed') ->
-    [columns_example_props(unsub_props)] ++ columns_message_sub_unsub('session.unsubscribed');
+    [columns_example_props(unsub_props), columns_example_client_attrs()] ++
+        columns_message_sub_unsub('session.unsubscribed');
 columns_with_exam(<<"$bridges/mqtt", _/binary>> = EventName) ->
     [
         {<<"event">>, EventName},
@@ -1121,6 +1366,7 @@ columns_message_sub_unsub(EventName) ->
         {<<"clientid">>, <<"c_emqx">>},
         {<<"username">>, <<"u_emqx">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
         {<<"topic">>, <<"t/a">>},
         {<<"qos">>, 1},
         {<<"timestamp">>, erlang:system_time(millisecond)},
@@ -1137,6 +1383,7 @@ columns_message_ack_delivered(EventName) ->
         {<<"username">>, <<"u_emqx_2">>},
         {<<"payload">>, <<"{\"msg\": \"hello\"}">>},
         {<<"peerhost">>, <<"192.168.0.10">>},
+        {<<"peername">>, <<"192.168.0.10:32781">>},
         {<<"topic">>, <<"t/a">>},
         {<<"qos">>, 1},
         {<<"flags">>, #{}},
@@ -1179,6 +1426,11 @@ columns_example_props_specific(sub_props) ->
 columns_example_props_specific(unsub_props) ->
     #{}.
 
+columns_example_client_attrs() ->
+    {<<"client_attrs">>, #{
+        <<"test">> => <<"example">>
+    }}.
+
 %%--------------------------------------------------------------------
 %% Helper functions
 %%--------------------------------------------------------------------
@@ -1189,7 +1441,10 @@ hook_fun_name(HookPoint) ->
     HookFunName.
 
 %% return static function references to help static code checks
-hook_fun(?BRIDGE_HOOKPOINT(_)) -> fun ?MODULE:on_bridge_message_received/2;
+hook_fun(?BRIDGE_HOOKPOINT(_)) -> fun ?MODULE:on_bridge_message_received/3;
+hook_fun(?SOURCE_HOOKPOINT(_)) -> fun ?MODULE:on_bridge_message_received/3;
+hook_fun('alarm.activated') -> fun ?MODULE:on_alarm_activated/2;
+hook_fun('alarm.deactivated') -> fun ?MODULE:on_alarm_deactivated/2;
 hook_fun('client.connected') -> fun ?MODULE:on_client_connected/3;
 hook_fun('client.disconnected') -> fun ?MODULE:on_client_disconnected/4;
 hook_fun('client.connack') -> fun ?MODULE:on_client_connack/4;
@@ -1200,6 +1455,7 @@ hook_fun('session.unsubscribed') -> fun ?MODULE:on_session_unsubscribed/4;
 hook_fun('message.delivered') -> fun ?MODULE:on_message_delivered/3;
 hook_fun('message.acked') -> fun ?MODULE:on_message_acked/3;
 hook_fun('message.dropped') -> fun ?MODULE:on_message_dropped/4;
+hook_fun('message.transformation_failed') -> fun ?MODULE:on_message_transformation_failed/3;
 hook_fun('schema.validation_failed') -> fun ?MODULE:on_schema_validation_failed/3;
 hook_fun('delivery.dropped') -> fun ?MODULE:on_delivery_dropped/4;
 hook_fun('message.publish') -> fun ?MODULE:on_message_publish/2;
@@ -1213,14 +1469,87 @@ reason(_) -> internal_error.
 force_to_bin(Bin) when is_binary(Bin) ->
     Bin;
 force_to_bin(Term) ->
-    emqx_utils_conv:bin(io_lib:format("~p", [Term])).
+    try
+        emqx_utils_conv:bin(Term)
+    catch
+        _:_ ->
+            emqx_utils_conv:bin(lists:flatten(io_lib:format("~p", [Term])))
+    end.
 
 ntoa(undefined) ->
     undefined;
 ntoa(IpOrIpPort) ->
     iolist_to_binary(emqx_utils:ntoa(IpOrIpPort)).
 
+match_event_names(<<"$events/", _/binary>> = TopicFilter) ->
+    lists:filtermap(
+        fun(TopicAtom) ->
+            Topic = atom_to_binary(TopicAtom),
+            case emqx_topic:match(Topic, TopicFilter) of
+                true -> {true, event_name(Topic)};
+                false -> false
+            end
+        end,
+        event_topics_enum()
+    );
+match_event_names(Topic) ->
+    [event_name(Topic)].
+
+-doc """
+Existing rules may reference legacy (non-namepsace) event topics (e.g.:
+`$events/client_connected` instead of `$events/client/connected`).  In rule testing, we
+may need to expand such legacy topics to the newer versions so that the rule matches
+during testing.
+""".
+expand_legacy_event_topics(<<"$events/client_connected">> = Legacy) ->
+    [Legacy, <<"$events/client/connected">>];
+expand_legacy_event_topics(<<"$events/client_disconnected">> = Legacy) ->
+    [Legacy, <<"$events/client/disconnected">>];
+expand_legacy_event_topics(<<"$events/client_connack">> = Legacy) ->
+    [Legacy, <<"$events/client/connack">>];
+expand_legacy_event_topics(<<"$events/client_check_authz_complete">> = Legacy) ->
+    [Legacy, <<"$events/auth/check_authz_complete">>];
+expand_legacy_event_topics(<<"$events/client_check_authn_complete">> = Legacy) ->
+    [Legacy, <<"$events/auth/check_authn_complete">>];
+expand_legacy_event_topics(<<"$events/session_subscribed">> = Legacy) ->
+    [Legacy, <<"$events/session/subscribed">>];
+expand_legacy_event_topics(<<"$events/session_unsubscribed">> = Legacy) ->
+    [Legacy, <<"$events/session/unsubscribed">>];
+expand_legacy_event_topics(<<"$events/message_delivered">> = Legacy) ->
+    [Legacy, <<"$events/message/delivered">>];
+expand_legacy_event_topics(<<"$events/message_acked">> = Legacy) ->
+    [Legacy, <<"$events/message/acked">>];
+expand_legacy_event_topics(<<"$events/message_dropped">> = Legacy) ->
+    [Legacy, <<"$events/message/dropped">>];
+expand_legacy_event_topics(<<"$events/delivery_dropped">> = Legacy) ->
+    [Legacy, <<"$events/message/delivery_dropped">>];
+expand_legacy_event_topics(<<"$events/message_transformation_failed">> = Legacy) ->
+    [Legacy, <<"$events/message_transformation/failed">>];
+expand_legacy_event_topics(<<"$events/schema_validation_failed">> = Legacy) ->
+    [Legacy, <<"$events/schema_validation/failed">>];
+expand_legacy_event_topics(EventTopic) ->
+    %% Not a legacy event topic.
+    [EventTopic].
+
+%% Remember to update `event_names` when adding a new topic here.
 event_name(?BRIDGE_HOOKPOINT(_) = Bridge) -> Bridge;
+event_name(?SOURCE_HOOKPOINT(_) = Bridge) -> Bridge;
+event_name(<<"$events/sys/alarm_activated">>) -> 'alarm.activated';
+event_name(<<"$events/sys/alarm_deactivated">>) -> 'alarm.deactivated';
+event_name(<<"$events/client/connected">>) -> 'client.connected';
+event_name(<<"$events/client/disconnected">>) -> 'client.disconnected';
+event_name(<<"$events/client/connack">>) -> 'client.connack';
+event_name(<<"$events/auth/check_authz_complete">>) -> 'client.check_authz_complete';
+event_name(<<"$events/auth/check_authn_complete">>) -> 'client.check_authn_complete';
+event_name(<<"$events/session/subscribed">>) -> 'session.subscribed';
+event_name(<<"$events/session/unsubscribed">>) -> 'session.unsubscribed';
+event_name(<<"$events/message/delivered">>) -> 'message.delivered';
+event_name(<<"$events/message/acked">>) -> 'message.acked';
+event_name(<<"$events/message/dropped">>) -> 'message.dropped';
+event_name(<<"$events/message/delivery_dropped">>) -> 'delivery.dropped';
+event_name(<<"$events/message_transformation/failed">>) -> 'message.transformation_failed';
+event_name(<<"$events/schema_validation/failed">>) -> 'schema.validation_failed';
+%% Topics below are kept for backwards compatibility.
 event_name(<<"$events/client_connected">>) -> 'client.connected';
 event_name(<<"$events/client_disconnected">>) -> 'client.disconnected';
 event_name(<<"$events/client_connack">>) -> 'client.connack';
@@ -1231,56 +1560,32 @@ event_name(<<"$events/session_unsubscribed">>) -> 'session.unsubscribed';
 event_name(<<"$events/message_delivered">>) -> 'message.delivered';
 event_name(<<"$events/message_acked">>) -> 'message.acked';
 event_name(<<"$events/message_dropped">>) -> 'message.dropped';
+event_name(<<"$events/message_transformation_failed">>) -> 'message.transformation_failed';
 event_name(<<"$events/schema_validation_failed">>) -> 'schema.validation_failed';
 event_name(<<"$events/delivery_dropped">>) -> 'delivery.dropped';
+%% Actually not publicly exposed as an event topic, but here for legacy reasons.
 event_name(_) -> 'message.publish'.
 
+%% Remember to update `event_names` when adding a new topic here.
 event_topic(?BRIDGE_HOOKPOINT(_) = Bridge) -> Bridge;
-event_topic('client.connected') -> <<"$events/client_connected">>;
-event_topic('client.disconnected') -> <<"$events/client_disconnected">>;
-event_topic('client.connack') -> <<"$events/client_connack">>;
-event_topic('client.check_authz_complete') -> <<"$events/client_check_authz_complete">>;
-event_topic('client.check_authn_complete') -> <<"$events/client_check_authn_complete">>;
-event_topic('session.subscribed') -> <<"$events/session_subscribed">>;
-event_topic('session.unsubscribed') -> <<"$events/session_unsubscribed">>;
-event_topic('message.delivered') -> <<"$events/message_delivered">>;
-event_topic('message.acked') -> <<"$events/message_acked">>;
-event_topic('message.dropped') -> <<"$events/message_dropped">>;
-event_topic('schema.validation_failed') -> <<"$events/schema_validation_failed">>;
-event_topic('delivery.dropped') -> <<"$events/delivery_dropped">>;
+event_topic(?SOURCE_HOOKPOINT(_) = Bridge) -> Bridge;
+event_topic('alarm.activated') -> <<"$events/sys/alarm_activated">>;
+event_topic('alarm.deactivated') -> <<"$events/sys/alarm_deactivated">>;
+event_topic('client.connected') -> <<"$events/client/connected">>;
+event_topic('client.disconnected') -> <<"$events/client/disconnected">>;
+event_topic('client.connack') -> <<"$events/client/connack">>;
+event_topic('client.check_authz_complete') -> <<"$events/auth/check_authz_complete">>;
+event_topic('client.check_authn_complete') -> <<"$events/auth/check_authn_complete">>;
+event_topic('session.subscribed') -> <<"$events/session/subscribed">>;
+event_topic('session.unsubscribed') -> <<"$events/session/unsubscribed">>;
+event_topic('message.delivered') -> <<"$events/message/delivered">>;
+event_topic('message.acked') -> <<"$events/message/acked">>;
+event_topic('message.dropped') -> <<"$events/message/dropped">>;
+event_topic('delivery.dropped') -> <<"$events/message/delivery_dropped">>;
+event_topic('message.transformation_failed') -> <<"$events/message_transformation/failed">>;
+event_topic('schema.validation_failed') -> <<"$events/schema_validation/failed">>;
+%% Actually not publicly exposed as an event topic, but here for legacy reasons.
 event_topic('message.publish') -> <<"$events/message_publish">>.
-
-printable_maps(undefined) ->
-    #{};
-printable_maps(Headers) ->
-    maps:fold(
-        fun
-            (K, V0, AccIn) when K =:= peerhost; K =:= peername; K =:= sockname ->
-                AccIn#{K => ntoa(V0)};
-            ('User-Property', V0, AccIn) when is_list(V0) ->
-                AccIn#{
-                    %% The 'User-Property' field is for the convenience of querying properties
-                    %% using the '.' syntax, e.g. "SELECT 'User-Property'.foo as foo"
-                    %% However, this does not allow duplicate property keys. To allow
-                    %% duplicate keys, we have to use the 'User-Property-Pairs' field instead.
-                    'User-Property' => maps:from_list(V0),
-                    'User-Property-Pairs' => [
-                        #{
-                            key => Key,
-                            value => Value
-                        }
-                     || {Key, Value} <- V0
-                    ]
-                };
-            (_K, V, AccIn) when is_tuple(V) ->
-                %% internal headers
-                AccIn;
-            (K, V, AccIn) ->
-                AccIn#{K => V}
-        end,
-        #{'User-Property' => #{}},
-        Headers
-    ).
 
 ignore_sys_message(#message{flags = Flags}) ->
     ConfigRootKey = emqx_rule_engine_schema:namespace(),

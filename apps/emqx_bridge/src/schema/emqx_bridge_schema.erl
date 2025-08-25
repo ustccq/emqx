@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_schema).
 
@@ -89,11 +77,10 @@ bridge_api_union(Refs) ->
             end
     end.
 
--if(?EMQX_RELEASE_EDITION == ee).
 enterprise_api_schemas(Method) ->
     %% We *must* do this to ensure the module is really loaded, especially when we use
     %% `call_hocon' from `nodetool' to generate initial configurations.
-    _ = emqx_bridge_enterprise:module_info(),
+    ok = emqx_utils:interactive_load(emqx_bridge_enterprise),
     case erlang:function_exported(emqx_bridge_enterprise, api_schemas, 1) of
         true -> emqx_bridge_enterprise:api_schemas(Method);
         false -> []
@@ -102,19 +89,11 @@ enterprise_api_schemas(Method) ->
 enterprise_fields_bridges() ->
     %% We *must* do this to ensure the module is really loaded, especially when we use
     %% `call_hocon' from `nodetool' to generate initial configurations.
-    _ = emqx_bridge_enterprise:module_info(),
+    ok = emqx_utils:interactive_load(emqx_bridge_enterprise),
     case erlang:function_exported(emqx_bridge_enterprise, fields, 1) of
         true -> emqx_bridge_enterprise:fields(bridges);
         false -> []
     end.
-
--else.
-
-enterprise_api_schemas(_) -> [].
-
-enterprise_fields_bridges() -> [].
-
--endif.
 
 common_bridge_fields() ->
     [
@@ -123,6 +102,7 @@ common_bridge_fields() ->
                 boolean(),
                 #{
                     desc => ?DESC("desc_enable"),
+                    importance => ?IMPORTANCE_NO_DOC,
                     default => true
                 }
             )},

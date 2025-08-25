@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer_cli).
@@ -125,14 +113,19 @@ count() ->
 
 topic(Start, Len) ->
     count(),
-    {ok, _HasNext, Messages} = emqx_retainer:page_read(<<"#">>, Start, Len),
+    {ok, _HasNext, Messages} = emqx_retainer:page_read(undefined, Start, Len),
     [?PRINT("~ts~n", [emqx_message:topic(M)]) || M <- Messages],
     ok.
 
 if_enabled(Fun) ->
-    case emqx_retainer:enabled() of
-        true -> Fun();
-        false -> ?PRINT_MSG("Retainer is not enabled~n")
+    case emqx_retainer:is_enabled() of
+        true ->
+            case emqx_retainer:is_started() of
+                true -> Fun();
+                false -> ?PRINT_MSG("Retainer is enabled but not started~n")
+            end;
+        false ->
+            ?PRINT_MSG("Retainer is not enabled~n")
     end.
 
 if_mnesia_backend(Fun) ->

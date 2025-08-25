@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_router_SUITE).
@@ -27,36 +15,22 @@
 -define(R, emqx_router).
 
 all() ->
-    [
-        {group, routing_schema_v1},
-        {group, routing_schema_v2}
-    ].
+    emqx_common_test_helpers:all(?MODULE).
 
 groups() ->
-    TCs = emqx_common_test_helpers:all(?MODULE),
-    [
-        {routing_schema_v1, [], TCs},
-        {routing_schema_v2, [], TCs}
-    ].
+    [].
 
-init_per_group(GroupName, Config) ->
-    WorkDir = filename:join([?config(priv_dir, Config), ?MODULE, GroupName]),
+init_per_suite(Config) ->
     AppSpecs = [
         {emqx, #{
-            config => mk_config(GroupName),
             override_env => [{boot_modules, [broker]}]
         }}
     ],
-    Apps = emqx_cth_suite:start(AppSpecs, #{work_dir => WorkDir}),
-    [{group_apps, Apps}, {group_name, GroupName} | Config].
+    Apps = emqx_cth_suite:start(AppSpecs, #{work_dir => emqx_cth_suite:work_dir(Config)}),
+    [{suite_apps, Apps} | Config].
 
-end_per_group(_GroupName, Config) ->
-    ok = emqx_cth_suite:stop(?config(group_apps, Config)).
-
-mk_config(routing_schema_v1) ->
-    "broker.routing.storage_schema = v1";
-mk_config(routing_schema_v2) ->
-    "broker.routing.storage_schema = v2".
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
 
 init_per_testcase(_TestCase, Config) ->
     clear_tables(),
@@ -67,14 +41,6 @@ end_per_testcase(_TestCase, _Config) ->
 
 % t_lookup_routes(_) ->
 %     error('TODO').
-
-t_verify_type(Config) ->
-    case ?config(group_name, Config) of
-        routing_schema_v1 ->
-            ?assertEqual(v1, ?R:get_schema_vsn());
-        routing_schema_v2 ->
-            ?assertEqual(v2, ?R:get_schema_vsn())
-    end.
 
 t_add_delete(_) ->
     ?R:add_route(<<"a/b/c">>),
@@ -183,5 +149,5 @@ t_unexpected(_) ->
 clear_tables() ->
     lists:foreach(
         fun mnesia:clear_table/1,
-        [?ROUTE_TAB, ?ROUTE_TAB_FILTERS, ?TRIE]
+        [?ROUTE_TAB, ?ROUTE_TAB_FILTERS]
     ).

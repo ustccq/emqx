@@ -1,16 +1,18 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_redis_connector).
 
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_trace.hrl").
 
 -behaviour(emqx_resource).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_add_channel/4,
     on_remove_channel/3,
@@ -28,7 +30,9 @@
 %% resource callbacks
 %% -------------------------------------------------------------------------------------------------
 
-callback_mode() -> always_sync.
+resource_type() -> emqx_redis:resource_type().
+
+callback_mode() -> emqx_redis:callback_mode().
 
 on_add_channel(
     _InstanceId,
@@ -127,8 +131,8 @@ on_query(
                 #{instance_id => InstId, cmd => Cmd, batch => false, mode => sync, result => Result}
             ),
             Result;
-        Error ->
-            Error
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 on_batch_query(
@@ -143,7 +147,13 @@ on_batch_query(
             [{ChannelID, _} | _] = BatchData,
             emqx_trace:rendered_action_template(
                 ChannelID,
-                #{commands => Cmds, batch => ture}
+                #{
+                    commands => #emqx_trace_format_func_data{
+                        function = fun trace_format_commands/1,
+                        data = Cmds
+                    },
+                    batch => true
+                }
             ),
             Result = query(InstId, {cmds, Cmds}, RedisConnSt),
             ?tp(
@@ -158,9 +168,13 @@ on_batch_query(
                 }
             ),
             Result;
-        Error ->
-            Error
+        {error, Reason} ->
+            {error, Reason}
     end.
+
+trace_format_commands(Commands0) ->
+    Commands1 = [lists:join(" ", C) || C <- Commands0],
+    unicode:characters_to_binary(lists:join("; ", Commands1)).
 
 on_format_query_result({ok, Msg}) ->
     #{result => ok, message => Msg};
@@ -193,11 +207,15 @@ query(InstId, Query, RedisConnSt) ->
     end.
 
 proc_command_template(CommandTemplate, Msg) ->
-    lists:map(
-        fun(ArgTks) ->
-            emqx_placeholder:proc_tmpl(ArgTks, Msg, #{return => full_binary})
-        end,
-        CommandTemplate
+    lists:reverse(
+        lists:foldl(
+            fun(ArgTks, Acc) ->
+                New = proc_tmpl(ArgTks, Msg),
+                lists:reverse(New, Acc)
+            end,
+            [],
+            CommandTemplate
+        )
     ).
 
 preproc_command_template(CommandTemplate) ->
@@ -205,3 +223,18 @@ preproc_command_template(CommandTemplate) ->
         fun emqx_placeholder:preproc_tmpl/1,
         CommandTemplate
     ).
+
+%% This function mimics emqx_placeholder:proc_tmpl/3 but with an
+%% injected special handling of map_to_redis_hset_args result
+%% which is a list of redis command args (all in binary string format)
+proc_tmpl([{var, Phld}], Data) ->
+    case emqx_placeholder:lookup_var(Phld, Data) of
+        [map_to_redis_hset_args | L] ->
+            L;
+        Other ->
+            [emqx_utils_conv:bin(Other)]
+    end;
+proc_tmpl(Tokens, Data) ->
+    %% more than just a var ref, but a string, or a concatenation of string and a var
+    %% this is must be a single arg, format it into a binary
+    [emqx_placeholder:proc_tmpl(Tokens, Data, #{return => full_binary})].

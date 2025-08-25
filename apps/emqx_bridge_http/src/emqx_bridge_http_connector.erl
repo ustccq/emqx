@@ -1,21 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_http_connector).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
@@ -26,6 +15,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -53,10 +43,11 @@
 %% for other http-like connectors.
 -export([redact_request/1]).
 
--export([validate_method/1, join_paths/2, formalize_request/2, transform_result/1]).
+-export([validate_method/1, formalize_request/2, transform_result/1]).
 
 -define(DEFAULT_PIPELINE_SIZE, 100).
 -define(DEFAULT_REQUEST_TIMEOUT_MS, 30_000).
+-define(DEFAULT_MAX_INACTIVE, 10_000).
 
 -define(READACT_REQUEST_NOTE, "the request body is redacted due to security reasons").
 
@@ -112,6 +103,7 @@ fields(config) ->
                     desc => ?DESC("enable_pipelining")
                 }
             )},
+        emqx_connector_schema:ehttpc_max_inactive_sc(),
         {request,
             hoconsc:mk(
                 ref("request"),
@@ -183,6 +175,7 @@ sc(Type, Meta) -> hoconsc:mk(Type, Meta).
 ref(Field) -> hoconsc:ref(?MODULE, Field).
 
 %% ===================================================================
+resource_type() -> webhook.
 
 callback_mode() -> async_if_possible.
 
@@ -224,6 +217,7 @@ on_start(
         {pool_size, PoolSize},
         {transport, Transport},
         {transport_opts, NTransportOpts},
+        {max_inactive, maps:get(max_inactive, Config, ?DEFAULT_MAX_INACTIVE)},
         {enable_pipelining, maps:get(enable_pipelining, Config, ?DEFAULT_PIPELINE_SIZE)}
     ],
 
@@ -234,7 +228,8 @@ on_start(
         port => Port,
         connect_timeout => ConnectTimeout,
         scheme => Scheme,
-        request => preprocess_request(maps:get(request, Config, undefined))
+        request => preprocess_request(maps:get(request, Config, undefined)),
+        installed_actions => #{}
     },
     case start_pool(InstId, PoolOpts) of
         ok ->
@@ -587,14 +582,14 @@ on_get_channels(ResId) ->
 on_get_status(InstId, State) ->
     on_get_status(InstId, State, fun default_health_checker/2).
 
-on_get_status(InstId, #{pool_name := InstId, connect_timeout := Timeout} = State, DoPerWorker) ->
+on_get_status(InstId, #{pool_name := InstId, connect_timeout := Timeout}, DoPerWorker) ->
     case do_get_status(InstId, Timeout, DoPerWorker) of
         ok ->
-            connected;
+            ?status_connected;
         {error, still_connecting} ->
-            connecting;
+            ?status_connecting;
         {error, Reason} ->
-            {disconnected, State, Reason}
+            {?status_disconnected, Reason}
     end.
 
 do_get_status(PoolName, Timeout) ->
@@ -640,8 +635,7 @@ on_get_channel_status(
     _ChannelId,
     State
 ) ->
-    %% XXX: Reuse the connector status
-    on_get_status(InstId, State).
+    on_get_status(InstId, State, fun default_health_checker/2).
 
 on_format_query_result({ok, Status, Headers, Body}) ->
     #{
@@ -742,14 +736,14 @@ process_request_and_action(Request, ActionState, Msg) ->
     Path =
         case PathSuffix of
             "" -> PathPrefix;
-            _ -> join_paths(PathPrefix, PathSuffix)
+            _ -> emqx_utils_uri:join_path(PathPrefix, PathSuffix)
         end,
 
-    HeadersTemplate1 = maps:get(headers, Request),
-    HeadersTemplate2 = maps:get(headers, ActionState),
-    Headers = merge_proplist(
-        render_headers(HeadersTemplate1, RenderTmplFunc, Msg),
-        render_headers(HeadersTemplate2, RenderTmplFunc, Msg)
+    ActionHaders = maps:get(headers, ActionState),
+    BaseHeaders = maps:get(headers, Request),
+    Headers = merge_headers(
+        render_headers(ActionHaders, RenderTmplFunc, Msg),
+        render_headers(BaseHeaders, RenderTmplFunc, Msg)
     ),
     BodyTemplate = maps:get(body, ActionState),
     Body = render_request_body(BodyTemplate, RenderTmplFunc, Msg),
@@ -761,19 +755,11 @@ process_request_and_action(Request, ActionState, Msg) ->
         request_timeout => maps:get(request_timeout, ActionState)
     }.
 
-merge_proplist(Proplist1, Proplist2) ->
-    lists:foldl(
-        fun({K, V}, Acc) ->
-            case lists:keyfind(K, 1, Acc) of
-                false ->
-                    [{K, V} | Acc];
-                {K, _} = {K, V1} ->
-                    [{K, V1} | Acc]
-            end
-        end,
-        Proplist2,
-        Proplist1
-    ).
+merge_headers([], Result) ->
+    Result;
+merge_headers([{K, V} | Rest], Result) ->
+    R = lists:keydelete(K, 1, Result),
+    merge_headers(Rest, [{K, V} | R]).
 
 process_request(
     #{
@@ -831,55 +817,9 @@ formalize_request(Method, BasePath, {Path, Headers, _Body}) when
 ->
     formalize_request(Method, BasePath, {Path, Headers});
 formalize_request(_Method, BasePath, {Path, Headers, Body}) ->
-    {join_paths(BasePath, Path), Headers, Body};
+    {emqx_utils_uri:join_path(BasePath, Path), Headers, Body};
 formalize_request(_Method, BasePath, {Path, Headers}) ->
-    {join_paths(BasePath, Path), Headers}.
-
-%% By default, we cannot treat HTTP paths as "file" or "resource" paths,
-%% because an HTTP server may handle paths like
-%% "/a/b/c/", "/a/b/c" and "/a//b/c" differently.
-%%
-%% So we try to avoid unnecessary path normalization.
-%%
-%% See also: `join_paths_test_/0`
-join_paths(Path1, Path2) ->
-    [without_trailing_slash(Path1), $/, without_starting_slash(Path2)].
-
-without_starting_slash(Path) ->
-    case do_without_starting_slash(Path) of
-        empty -> <<>>;
-        Other -> Other
-    end.
-
-do_without_starting_slash([]) ->
-    empty;
-do_without_starting_slash(<<>>) ->
-    empty;
-do_without_starting_slash([$/ | Rest]) ->
-    Rest;
-do_without_starting_slash([C | _Rest] = Path) when is_integer(C) andalso C =/= $/ ->
-    Path;
-do_without_starting_slash(<<$/, Rest/binary>>) ->
-    Rest;
-do_without_starting_slash(<<C, _Rest/binary>> = Path) when is_integer(C) andalso C =/= $/ ->
-    Path;
-%% On actual lists the recursion should very quickly exhaust
-do_without_starting_slash([El | Rest]) ->
-    case do_without_starting_slash(El) of
-        empty -> do_without_starting_slash(Rest);
-        ElRest -> [ElRest | Rest]
-    end.
-
-without_trailing_slash(Path) ->
-    case iolist_to_binary(Path) of
-        <<>> ->
-            <<>>;
-        B ->
-            case binary:last(B) of
-                $/ -> binary_part(B, 0, byte_size(B) - 1);
-                _ -> B
-            end
-    end.
+    {emqx_utils_uri:join_path(BasePath, Path), Headers}.
 
 to_bin(Bin) when is_binary(Bin) ->
     Bin;
@@ -904,16 +844,16 @@ transform_result(Result) ->
     case Result of
         %% The normal reason happens when the HTTP connection times out before
         %% the request has been fully processed
+        {error, {shutdown, Reason}} ->
+            transform_result({error, Reason});
         {error, Reason} when
             Reason =:= econnrefused;
             Reason =:= timeout;
             Reason =:= normal;
-            Reason =:= {shutdown, normal};
-            Reason =:= {shutdown, closed}
+            Reason =:= closed;
+            %% {closed, "The connection was lost."}
+            element(1, Reason) =:= closed
         ->
-            {error, {recoverable_error, Reason}};
-        {error, {closed, _Message} = Reason} ->
-            %% _Message = "The connection was lost."
             {error, {recoverable_error, Reason}};
         {error, _Reason} ->
             Result;
@@ -1006,9 +946,6 @@ clientid(Msg) -> maps:get(clientid, Msg, undefined).
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-iolists_equal(L1, L2) ->
-    iolist_to_binary(L1) =:= iolist_to_binary(L2).
-
 redact_test_() ->
     TestData = #{
         headers => [
@@ -1018,61 +955,6 @@ redact_test_() ->
     },
     [
         ?_assertNotEqual(TestData, redact(TestData))
-    ].
-
-join_paths_test_() ->
-    [
-        ?_assert(iolists_equal("abc/cde", join_paths("abc", "cde"))),
-        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc">>, <<"cde">>))),
-        ?_assert(
-            iolists_equal(
-                "abc/cde",
-                join_paths([["a"], <<"b">>, <<"c">>], [
-                    [[[], <<>>], <<>>, <<"c">>], <<"d">>, <<"e">>
-                ])
-            )
-        ),
-
-        ?_assert(iolists_equal("abc/cde", join_paths("abc", "/cde"))),
-        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc">>, <<"/cde">>))),
-        ?_assert(
-            iolists_equal(
-                "abc/cde",
-                join_paths([["a"], <<"b">>, <<"c">>], [
-                    [<<>>, [[], <<>>], <<"/c">>], <<"d">>, <<"e">>
-                ])
-            )
-        ),
-
-        ?_assert(iolists_equal("abc/cde", join_paths("abc/", "cde"))),
-        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc/">>, <<"cde">>))),
-        ?_assert(
-            iolists_equal(
-                "abc/cde",
-                join_paths([["a"], <<"b">>, <<"c">>, [<<"/">>]], [
-                    [[[], [], <<>>], <<>>, [], <<"c">>], <<"d">>, <<"e">>
-                ])
-            )
-        ),
-
-        ?_assert(iolists_equal("abc/cde", join_paths("abc/", "/cde"))),
-        ?_assert(iolists_equal("abc/cde", join_paths(<<"abc/">>, <<"/cde">>))),
-        ?_assert(
-            iolists_equal(
-                "abc/cde",
-                join_paths([["a"], <<"b">>, <<"c">>, [<<"/">>]], [
-                    [[[], <<>>], <<>>, [[$/]], <<"c">>], <<"d">>, <<"e">>
-                ])
-            )
-        ),
-
-        ?_assert(iolists_equal("/", join_paths("", ""))),
-        ?_assert(iolists_equal("/cde", join_paths("", "cde"))),
-        ?_assert(iolists_equal("/cde", join_paths("", "/cde"))),
-        ?_assert(iolists_equal("/cde", join_paths("/", "cde"))),
-        ?_assert(iolists_equal("/cde", join_paths("/", "/cde"))),
-        ?_assert(iolists_equal("//cde/", join_paths("/", "//cde/"))),
-        ?_assert(iolists_equal("abc///cde/", join_paths("abc//", "//cde/")))
     ].
 
 -endif.

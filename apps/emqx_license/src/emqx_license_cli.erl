@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_cli).
@@ -24,6 +24,8 @@ license(["update", EncodedLicense]) ->
         {ok, Warnings} ->
             ok = print_warnings(Warnings),
             ok = ?PRINT_MSG("ok~n");
+        {error, Reason} when is_atom(Reason) ->
+            ?PRINT("Error: ~s~n", [Reason]);
         {error, Reason} ->
             ?PRINT("Error: ~p~n", [Reason])
     end;
@@ -41,7 +43,8 @@ license(_) ->
     emqx_ctl:usage(
         [
             {"license info", "Show license info"},
-            {"license update <License>", "Update license given as a string"}
+            {"license update '<License>'|'file:///tmp/emqx.lic'",
+                "Update license given as a string\nor referenced by a file path via 'file://' prefix"}
         ]
     ).
 

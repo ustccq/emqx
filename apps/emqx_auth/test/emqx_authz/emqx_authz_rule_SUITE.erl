@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_rule_SUITE).
@@ -27,43 +16,41 @@
     username => <<"test">>,
     peerhost => {127, 0, 0, 1},
     zone => default,
-    listener => {tcp, default}
+    listener => 'tcp:default'
 }).
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:start_apps(
-        [emqx_conf, emqx_auth],
-        fun set_special_configs/1
+    Apps = emqx_cth_suite:start(
+        [
+            {emqx_conf, #{
+                config => #{
+                    authorization =>
+                        #{
+                            cache => #{enable => false},
+                            no_match => deny,
+                            sources => []
+                        }
+                }
+            }},
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    Config.
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    {ok, _} = emqx:update_config(
-        [authorization],
-        #{
-            <<"no_match">> => <<"allow">>,
-            <<"cache">> => #{<<"enable">> => <<"true">>},
-            <<"sources">> => []
-        }
-    ),
-    emqx_common_test_helpers:stop_apps([emqx_auth, emqx_conf]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_testcase(_TestCase, Config) ->
     Config.
 end_per_testcase(_TestCase, _Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, true),
-    ok.
-
-set_special_configs(emqx_auth) ->
-    {ok, _} = emqx:update_config([authorization, cache, enable], false),
-    {ok, _} = emqx:update_config([authorization, no_match], deny),
-    {ok, _} = emqx:update_config([authorization, sources], []),
-    ok;
-set_special_configs(_App) ->
     ok.
 
 t_compile(_) ->
@@ -170,24 +157,21 @@ t_compile(_) ->
         )
     ),
 
-    ok.
-
-t_compile_ce(_Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, false),
-
-    ?assertThrow(
-        #{reason := invalid_authorization_action},
+    ?assertEqual(
+        {allow, {client_attr, <<"a1">>, {eq, <<"v1">>}}, all, [[<<"topic">>, <<"test">>]]},
         emqx_authz_rule:compile(
-            {allow, {username, "test"}, {all, [{qos, 2}, {retain, true}]}, ["topic/test"]}
+            {allow, {client_attr, "a1", "v1"}, all, ["topic/test"]}
         )
     ),
 
-    ?assertEqual(
-        {allow, {username, {eq, <<"test">>}}, all, [[<<"topic">>, <<"test">>]]},
+    ?assertMatch(
+        {allow, {client_attr, <<"a2">>, {re_pattern, _, _, _, _}}, all, [[<<"topic">>, <<"test">>]]},
         emqx_authz_rule:compile(
-            {allow, {username, "test"}, all, ["topic/test"]}
+            {allow, {client_attr, "a2", {re, "v2.*"}}, all, ["topic/test"]}
         )
-    ).
+    ),
+
+    ok.
 
 t_match(_) ->
     ?assertEqual(
@@ -705,7 +689,60 @@ t_invalid_rule(_) ->
     ?assertThrow(
         #{reason := invalid_client_match_condition},
         emqx_authz_rule:compile({allow, who, all, ["topic/test"]})
-    ).
+    ),
+
+    ?assertThrow(
+        #{reason := invalid_re_pattern, type := clientid},
+        emqx_authz_rule:compile({allow, {clientid, {re, "["}}, all, ["topic/test"]})
+    ),
+
+    ?assertThrow(
+        #{reason := invalid_re_pattern, type := username},
+        emqx_authz_rule:compile({allow, {username, {re, "["}}, all, ["topic/test"]})
+    ),
+
+    ?assertThrow(
+        #{reason := invalid_re_pattern, type := zone},
+        emqx_authz_rule:compile({allow, {zone, {re, "["}}, all, ["topic/test"]})
+    ),
+
+    ?assertThrow(
+        #{reason := invalid_re_pattern, type := listener},
+        emqx_authz_rule:compile({allow, {listener, {re, "["}}, all, ["topic/test"]})
+    ),
+
+    ?assertThrow(
+        #{reason := invalid_re_pattern, type := {client_attr, "a"}},
+        emqx_authz_rule:compile({allow, {client_attr, "a", {re, "["}}, all, ["topic/test"]})
+    ),
+
+    ok.
+
+t_match_client_attr(_) ->
+    Topic = <<"test/topic">>,
+    RuleFn = fun(AttrName, AttrValue) ->
+        emqx_authz_rule:compile(
+            {allow, {'and', [{client, "c1"}, {client_attr, AttrName, AttrValue}]}, publish, [Topic]}
+        )
+    end,
+    ClientInfoFn = fun(AttrName, AttrValue) ->
+        client_info(#{clientid => <<"c1">>, client_attrs => #{bin(AttrName) => bin(AttrValue)}})
+    end,
+    Action = #{action_type => publish, qos => 0, retain => false},
+    MatchFn = fun(RuleAttrName, RuleAttrValue, AttrName, AttrValue) ->
+        ClientInfo = ClientInfoFn(AttrName, AttrValue),
+        Rule = RuleFn(RuleAttrName, RuleAttrValue),
+        emqx_authz_rule:match(ClientInfo, Action, Topic, Rule)
+    end,
+
+    ?assertEqual({matched, allow}, MatchFn("a1", "v1", "a1", "v1")),
+    ?assertEqual(nomatch, MatchFn("a1", "v1", "a1", "v2")),
+    ?assertEqual(nomatch, MatchFn("a1", "v1", "a2", "v1")),
+    ?assertEqual({matched, allow}, MatchFn("a1", {re, "v1"}, "a1", "v1")),
+    ?assertEqual({matched, allow}, MatchFn("a1", {re, "^abc.+"}, "a1", "abcd")),
+    ?assertEqual(nomatch, MatchFn("a1", {re, "^abc.+"}, "a1", "abc")),
+    ?assertEqual(nomatch, MatchFn("a1", {re, "^abc.+"}, "a2", "abcd")),
+    ok.
 
 t_matches(_) ->
     ?assertEqual(
@@ -748,3 +785,5 @@ client_info() ->
 
 client_info(Overrides) ->
     maps:merge(?CLIENT_INFO_BASE, Overrides).
+
+bin(X) -> iolist_to_binary(X).

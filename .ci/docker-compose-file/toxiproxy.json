@@ -79,6 +79,30 @@
     "enabled": true
   },
   {
+    "name": "kafka_2_plain",
+    "listen": "0.0.0.0:19292",
+    "upstream": "kafka-2.emqx.net:9292",
+    "enabled": true
+  },
+  {
+    "name": "kafka_2_sasl_plain",
+    "listen": "0.0.0.0:19293",
+    "upstream": "kafka-2.emqx.net:9293",
+    "enabled": true
+  },
+  {
+    "name": "kafka_2_ssl",
+    "listen": "0.0.0.0:19294",
+    "upstream": "kafka-2.emqx.net:9294",
+    "enabled": true
+  },
+  {
+    "name": "kafka_2_sasl_ssl",
+    "listen": "0.0.0.0:19295",
+    "upstream": "kafka-2.emqx.net:9295",
+    "enabled": true
+  },
+  {
     "name": "rocketmq",
     "listen": "0.0.0.0:9876",
     "upstream": "rocketmq_namesrv:9876",
@@ -157,6 +181,18 @@
     "enabled": true
   },
   {
+    "name": "iotdb_thrift",
+    "listen": "0.0.0.0:46667",
+    "upstream": "iotdb-thrift:6667",
+    "enabled": true
+  },
+  {
+    "name": "iotdb_thrift_rest",
+    "listen": "0.0.0.0:48080",
+    "upstream": "iotdb-thrift:18080",
+    "enabled": true
+  },
+  {
     "name": "minio_tcp",
     "listen": "0.0.0.0:19000",
     "upstream": "minio:9000",
@@ -172,12 +208,6 @@
     "name": "gcp_emulator",
     "listen": "0.0.0.0:8085",
     "upstream": "gcp_emulator:8085",
-    "enabled": true
-  },
-  {
-    "name": "hstreamdb",
-    "listen": "0.0.0.0:6570",
-    "upstream": "hstreamdb:6570",
     "enabled": true
   },
   {
@@ -214,6 +244,90 @@
     "name": "elasticsearch",
     "listen": "0.0.0.0:9200",
     "upstream": "elasticsearch:9200",
+    "enabled": true
+  },
+  {
+    "name": "azurite_plain",
+    "listen": "0.0.0.0:10000",
+    "upstream": "azurite:10000",
+    "enabled": true
+  },
+  {
+    "name": "couchbase",
+    "listen": "0.0.0.0:8093",
+    "upstream": "couchbase:8093",
+    "enabled": true
+  },
+  {
+    "name": "iceberg_rest",
+    "listen": "0.0.0.0:8181",
+    "upstream": "iceberg-rest-proxy:80",
+    "enabled": true
+  },
+  {
+    "name": "datalayers_gprc",
+    "listen": "0.0.0.0:8360",
+    "upstream": "datalayers_tcp:8360",
+    "enabled": true
+  },
+  {
+    "name": "datalayers_http",
+    "listen": "0.0.0.0:8361",
+    "upstream": "datalayers_tcp:8361",
+    "enabled": true
+  },
+  {
+    "name": "datalayers_grpcs",
+    "listen": "0.0.0.0:8362",
+    "upstream": "datalayers_tls:8362",
+    "enabled": true
+  },
+  {
+    "name": "datalayers_https",
+    "listen": "0.0.0.0:8363",
+    "upstream": "datalayers_tls:8363",
+    "enabled": true
+  },
+  {
+    "name": "mongo_single_tcp",
+    "listen": "0.0.0.0:27017",
+    "upstream": "mongo:27017",
+    "enabled": true
+  },
+  {
+    "name": "doris-fe",
+    "listen": "0.0.0.0:9030",
+    "upstream": "doris-fe:9030",
+    "enabled": true
+  },
+  {
+    "name": "doris-fe-tls",
+    "listen": "0.0.0.0:9130",
+    "upstream": "doris-fe-tls:9030",
+    "enabled": true
+  },
+  {
+    "name": "bigquery",
+    "listen": "0.0.0.0:9050",
+    "upstream": "bigquery:9050",
+    "enabled": true
+  },
+  {
+    "name": "cockroachdb",
+    "listen": "0.0.0.0:26257",
+    "upstream": "cockroachdb:26257",
+    "enabled": true
+  },
+  {
+    "name": "alloydb",
+    "listen": "0.0.0.0:6432",
+    "upstream": "alloydb:5432",
+    "enabled": true
+  },
+  {
+    "name": "clickhouse",
+    "listen": "0.0.0.0:8123",
+    "upstream": "clickhouse:8123",
     "enabled": true
   }
 ]

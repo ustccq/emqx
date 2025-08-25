@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_postgresql_SUITE).
@@ -18,7 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include_lib("emqx_postgresql/include/emqx_postgresql.hrl").
+-include_lib("../../emqx_postgresql/include/emqx_postgresql.hrl").
 -include_lib("emqx_auth/include/emqx_authz.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -65,13 +54,9 @@ init_per_testcase(_TestCase, Config) ->
     ok = emqx_authz_test_lib:reset_authorizers(),
     Config.
 end_per_testcase(_TestCase, _Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, true),
+    _ = emqx_auth_cache:reset(?AUTHZ_CACHE),
+    ok = emqx_authz_test_lib:enable_node_cache(false),
     ok = drop_table(),
-    ok.
-
-set_special_configs(emqx_auth) ->
-    ok = emqx_authz_test_lib:reset_authorizers();
-set_special_configs(_) ->
     ok.
 
 %%------------------------------------------------------------------------------
@@ -91,7 +76,49 @@ t_create_invalid(_Config) ->
     ),
     {ok, _} = emqx_authz:update(?CMD_REPLACE, [BadConfig]),
 
-    [_] = emqx_authz:lookup().
+    [_] = emqx_authz:lookup_states().
+
+t_node_cache(_Config) ->
+    Case = #{
+        name => cache_publish,
+        setup => [
+            "CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255), "
+            "permission VARCHAR(255), action VARCHAR(255))",
+            "INSERT INTO acl(username, topic, permission, action) VALUES('username', 'a', 'allow', 'publish')"
+        ],
+        query => "SELECT permission, action, topic FROM acl WHERE username = ${username}",
+        client_info => #{username => <<"username">>},
+        checks => []
+    },
+    ok = setup_source_data(Case),
+    ok = setup_authz_source(Case),
+    ok = emqx_authz_test_lib:enable_node_cache(true),
+
+    %% Subscribe to twice, should hit cache the second time
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>},
+                {allow, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ),
+
+    %% Change variable, should miss cache
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [{deny, ?AUTHZ_PUBLISH, <<"a">>}],
+            client_info => #{username => <<"username2">>}
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 2}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ).
 
 %%------------------------------------------------------------------------------
 %% Cases
@@ -178,7 +205,6 @@ cases() ->
         },
         #{
             name => qos_retain_in_query_result,
-            features => [rich_actions],
             setup => [
                 "CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255), "
                 "permission VARCHAR(255), action VARCHAR(255),"
@@ -229,7 +255,6 @@ cases() ->
         },
         #{
             name => qos_retain_in_query_result_as_integer,
-            features => [rich_actions],
             setup => [
                 "CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255), "
                 "permission VARCHAR(255), action VARCHAR(255),"
@@ -252,7 +277,6 @@ cases() ->
         },
         #{
             name => retain_in_query_result_as_boolean,
-            features => [rich_actions],
             setup => [
                 "CREATE TABLE acl(username VARCHAR(255), topic VARCHAR(255), permission VARCHAR(255),"
                 " action VARCHAR(255), retain_b BOOLEAN)",
@@ -305,7 +329,6 @@ cases() ->
         },
         #{
             name => array_null_qos,
-            features => [rich_actions],
             setup => [
                 "CREATE TABLE acl(qos INTEGER[], "
                 " topic VARCHAR(255), permission VARCHAR(255), action VARCHAR(255))",
@@ -426,6 +449,7 @@ setup_config(SpecialParams) ->
 pgsql_config() ->
     #{
         auto_reconnect => true,
+        disable_prepared_statements => false,
         database => <<"mqtt">>,
         username => <<"root">>,
         password => <<"public">>,
@@ -442,9 +466,3 @@ create_pgsql_resource() ->
         pgsql_config(),
         #{}
     ).
-
-start_apps(Apps) ->
-    lists:foreach(fun application:ensure_all_started/1, Apps).
-
-stop_apps(Apps) ->
-    lists:foreach(fun application:stop/1, Apps).

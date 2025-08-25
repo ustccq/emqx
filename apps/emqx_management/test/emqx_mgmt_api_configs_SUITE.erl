@@ -1,17 +1,5 @@
-%%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%%-------------------------------------------------------------------
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_configs_SUITE).
 
@@ -25,22 +13,27 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_management,
+            emqx_connector,
+            emqx_bridge,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf]).
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
 
 init_per_testcase(TestCase = t_configs_node, Config) ->
-    ?MODULE:TestCase({'init', Config});
-init_per_testcase(TestCase = t_create_webhook_v1_bridges_api, Config) ->
     ?MODULE:TestCase({'init', Config});
 init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(TestCase = t_configs_node, Config) ->
-    ?MODULE:TestCase({'end', Config});
-end_per_testcase(TestCase = t_create_webhook_v1_bridges_api, Config) ->
     ?MODULE:TestCase({'end', Config});
 end_per_testcase(_TestCase, Config) ->
     Config.
@@ -218,71 +211,6 @@ update_global_zone(Change) ->
 %    ?assertEqual(undefined, emqx_config:get_raw([zones, new_zone], undefined)),
 %    ok.
 
-t_dashboard(_Config) ->
-    {ok, Dashboard = #{<<"listeners">> := Listeners}} = get_config("dashboard"),
-    Https1 = #{enable => true, bind => 18084},
-    ?assertMatch(
-        {ok, _},
-        update_config("dashboard", Dashboard#{<<"listeners">> => Listeners#{<<"https">> => Https1}})
-    ),
-
-    Https2 = #{
-        <<"bind">> => 18084,
-        <<"ssl_options">> =>
-            #{
-                <<"keyfile">> => "etc/certs/badkey.pem",
-                <<"cacertfile">> => "etc/certs/badcacert.pem",
-                <<"certfile">> => "etc/certs/badcert.pem"
-            }
-    },
-    Dashboard2 = Dashboard#{<<"listeners">> => Listeners#{<<"https">> => Https2}},
-    ?assertMatch(
-        {error, {"HTTP/1.1", 400, _}},
-        update_config("dashboard", Dashboard2)
-    ),
-
-    FilePath = fun(Name) ->
-        iolist_to_binary(
-            emqx_common_test_helpers:app_path(emqx, filename:join(["etc", "certs", Name]))
-        )
-    end,
-    KeyFile = FilePath("key.pem"),
-    CertFile = FilePath("cert.pem"),
-    CacertFile = FilePath("cacert.pem"),
-    Https3 = #{
-        <<"bind">> => 18084,
-        <<"ssl_options">> => #{
-            <<"keyfile">> => KeyFile,
-            <<"cacertfile">> => CacertFile,
-            <<"certfile">> => CertFile
-        }
-    },
-    Dashboard3 = Dashboard#{<<"listeners">> => Listeners#{<<"https">> => Https3}},
-    ?assertMatch({ok, _}, update_config("dashboard", Dashboard3)),
-
-    Dashboard4 = Dashboard#{<<"listeners">> => Listeners#{<<"https">> => #{<<"bind">> => 0}}},
-    ?assertMatch({ok, _}, update_config("dashboard", Dashboard4)),
-    {ok, Dashboard41} = get_config("dashboard"),
-    ?assertMatch(
-        #{
-            <<"bind">> := 0,
-            <<"ssl_options">> :=
-                #{
-                    <<"keyfile">> := KeyFile,
-                    <<"cacertfile">> := CacertFile,
-                    <<"certfile">> := CertFile
-                }
-        },
-        read_conf([<<"dashboard">>, <<"listeners">>, <<"https">>]),
-        Dashboard41
-    ),
-
-    ?assertMatch({ok, _}, update_config("dashboard", Dashboard)),
-    {ok, Dashboard1} = get_config("dashboard"),
-    ?assertEqual(Dashboard, Dashboard1),
-    timer:sleep(1500),
-    ok.
-
 %% v1 version json
 t_configs_node({'init', Config}) ->
     Node = node(),
@@ -293,16 +221,16 @@ t_configs_node({'init', Config}) ->
         (bad_node) -> {badrpc, bad}
     end,
     F2 = fun
-        (Node0, _) when Node0 =:= Node -> <<"log=1">>;
-        (other_node, _) -> <<"log=2">>;
-        (bad_node, _) -> {badrpc, bad}
+        (Node0, _, _) when Node0 =:= Node -> <<"log=1">>;
+        (other_node, _, _) -> <<"log=2">>;
+        (bad_node, _, _) -> {badrpc, bad}
     end,
     meck:expect(emqx_management_proto_v5, get_full_config, F),
-    meck:expect(emqx_conf_proto_v3, get_hocon_config, F2),
+    meck:expect(emqx_conf_proto_v5, get_hocon_config, F2),
     meck:expect(hocon_pp, do, fun(Conf, _) -> Conf end),
     Config;
 t_configs_node({'end', _}) ->
-    meck:unload([emqx, emqx_management_proto_v5, emqx_conf_proto_v3, hocon_pp]);
+    meck:unload([emqx, emqx_management_proto_v5, emqx_conf_proto_v5, hocon_pp]);
 t_configs_node(_) ->
     Node = atom_to_list(node()),
 
@@ -313,7 +241,7 @@ t_configs_node(_) ->
     ?assertEqual(error, ExpType),
     ?assertMatch({{_, 404, _}, _, _}, ExpRes),
     {_, _, Body} = ExpRes,
-    ?assertMatch(#{<<"code">> := <<"NOT_FOUND">>}, emqx_utils_json:decode(Body, [return_maps])),
+    ?assertMatch(#{<<"code">> := <<"NOT_FOUND">>}, emqx_utils_json:decode(Body)),
 
     ?assertMatch({error, {_, 500, _}}, get_configs_with_json("bad_node")),
 
@@ -356,7 +284,7 @@ t_configs_key(_Config) ->
                 }
         }
     },
-    ?assertEqual(ExpectError, emqx_utils_json:decode(Error, [return_maps])),
+    ?assertEqual(ExpectError, emqx_utils_json:decode(Error)),
     ReadOnlyConf = #{
         <<"cluster">> =>
             #{
@@ -367,8 +295,8 @@ t_configs_key(_Config) ->
     },
     ReadOnlyBin = iolist_to_binary(hocon_pp:do(ReadOnlyConf, #{})),
     {error, ReadOnlyError} = update_configs_with_binary(ReadOnlyBin),
-    ?assertEqual(<<"{\"errors\":\"Cannot update read-only key 'cluster'.\"}">>, ReadOnlyError),
-    ?assertMatch({ok, <<>>}, update_configs_with_binary(ReadOnlyBin, _InogreReadonly = true)),
+    ?assertMatch(<<"{\"errors\":\"Cannot update read-only key 'cluster", _/binary>>, ReadOnlyError),
+    ?assertMatch({ok, <<>>}, update_configs_with_binary(ReadOnlyBin, _IgnoreReadonly = true)),
     ok.
 
 t_get_configs_in_different_accept(_Config) ->
@@ -401,54 +329,45 @@ t_get_configs_in_different_accept(_Config) ->
     %% returns error if it set to other type
     ?assertMatch({400, "application/json", _}, Request(<<"application/xml">>)).
 
-t_create_webhook_v1_bridges_api({'init', Config}) ->
-    lists:foreach(
-        fun(App) ->
-            _ = application:stop(App),
-            {ok, _} = application:ensure_all_started(App)
-        end,
-        [emqx_connector, emqx_bridge]
-    ),
-    Config;
-t_create_webhook_v1_bridges_api({'end', _}) ->
-    application:stop(emqx_bridge),
-    application:stop(emqx_connector),
-    ok;
 t_create_webhook_v1_bridges_api(Config) ->
     WebHookFile = filename:join(?config(data_dir, Config), "webhook_v1.conf"),
     ?assertMatch({ok, _}, hocon:files([WebHookFile])),
     {ok, WebHookBin} = file:read_file(WebHookFile),
     ?assertEqual({ok, <<>>}, update_configs_with_binary(WebHookBin)),
-    Actions =
+    ?assertMatch(
         #{
-            <<"http">> =>
+            <<"http">> :=
                 #{
-                    <<"webhook_name">> =>
+                    <<"webhook_name">> :=
                         #{
-                            <<"connector">> => <<"webhook_name">>,
-                            <<"description">> => <<>>,
-                            <<"enable">> => true,
-                            <<"parameters">> =>
+                            <<"connector">> := <<"webhook_name">>,
+                            <<"description">> := <<>>,
+                            <<"enable">> := true,
+                            <<"created_at">> := _,
+                            <<"last_modified_at">> := _,
+                            <<"fallback_actions">> := [],
+                            <<"parameters">> :=
                                 #{
-                                    <<"body">> => <<"{\"value\": \"${value}\"}">>,
-                                    <<"headers">> => #{},
-                                    <<"max_retries">> => 3,
-                                    <<"method">> => <<"post">>,
-                                    <<"path">> => <<>>
+                                    <<"body">> := <<"{\"value\": \"${value}\"}">>,
+                                    <<"headers">> := #{},
+                                    <<"max_retries">> := 3,
+                                    <<"method">> := <<"post">>,
+                                    <<"path">> := <<>>
                                 },
-                            <<"resource_opts">> =>
+                            <<"resource_opts">> :=
                                 #{
-                                    <<"health_check_interval">> => <<"15s">>,
-                                    <<"inflight_window">> => 100,
-                                    <<"max_buffer_bytes">> => <<"256MB">>,
-                                    <<"query_mode">> => <<"async">>,
-                                    <<"request_ttl">> => <<"45s">>,
-                                    <<"worker_pool_size">> => 4
+                                    <<"health_check_interval">> := <<"15s">>,
+                                    <<"inflight_window">> := 100,
+                                    <<"max_buffer_bytes">> := <<"256MB">>,
+                                    <<"query_mode">> := <<"async">>,
+                                    <<"request_ttl">> := <<"45s">>,
+                                    <<"worker_pool_size">> := 4
                                 }
                         }
                 }
         },
-    ?assertEqual(Actions, emqx_conf:get_raw([<<"actions">>])),
+        emqx_conf:get_raw([<<"actions">>])
+    ),
     Connectors =
         #{
             <<"http">> =>
@@ -464,11 +383,13 @@ t_create_webhook_v1_bridges_api(Config) ->
                                     <<"Authorization">> => <<"Bearer redacted">>,
                                     <<"content-type">> => <<"application/json">>
                                 },
+                            <<"max_inactive">> => <<"10s">>,
                             <<"pool_size">> => 4,
                             <<"pool_type">> => <<"random">>,
                             <<"resource_opts">> =>
                                 #{
                                     <<"health_check_interval">> => <<"15s">>,
+                                    <<"health_check_timeout">> => <<"60s">>,
                                     <<"start_after_created">> => true,
                                     <<"start_timeout">> => <<"5s">>
                                 },
@@ -479,11 +400,9 @@ t_create_webhook_v1_bridges_api(Config) ->
                                     <<"enable">> => true,
                                     <<"hibernate_after">> => <<"5s">>,
                                     <<"log_level">> => <<"notice">>,
-                                    <<"partial_chain">> => false,
+                                    <<"middlebox_comp_mode">> => true,
                                     <<"reuse_sessions">> => true,
                                     <<"secure_renegotiate">> => true,
-                                    <<"user_lookup_fun">> =>
-                                        <<"emqx_tls_psk:lookup">>,
                                     <<"verify">> => <<"verify_none">>,
                                     <<"versions">> =>
                                         [
@@ -502,13 +421,38 @@ t_create_webhook_v1_bridges_api(Config) ->
     ok.
 
 t_config_update_parse_error(_Config) ->
-    ?assertMatch(
-        {error, <<"{\"errors\":\"{parse_error,", _/binary>>},
-        update_configs_with_binary(<<"not an object">>)
+    BadHoconList = [
+        <<"not an object">>,
+        <<"a = \"tlsv1\"\"\"3e-01">>
+    ],
+    lists:map(
+        fun(BadHocon) ->
+            {error, ParseError} = update_configs_with_binary(BadHocon),
+            ?assertMatch(
+                #{
+                    <<"errors">> :=
+                        #{
+                            <<"line">> := 1,
+                            <<"reason">> := _,
+                            <<"type">> := <<"parse_error">>
+                        }
+                },
+                emqx_utils_json:decode(ParseError)
+            )
+        end,
+        BadHoconList
     ),
+
+    {error, ScanError} = update_configs_with_binary(<<"a=测试"/utf8>>),
     ?assertMatch(
-        {error, <<"{\"errors\":\"{parse_error,", _/binary>>},
-        update_configs_with_binary(<<"a = \"tlsv1\"\"\"3e-01">>)
+        #{
+            <<"errors">> := #{
+                <<"line">> := 1,
+                <<"reason">> := _,
+                <<"type">> := <<"scan_error">>
+            }
+        },
+        emqx_utils_json:decode(ScanError)
     ).
 
 t_config_update_unknown_root(_Config) ->
@@ -523,7 +467,7 @@ get_config(Name) ->
     Path = emqx_mgmt_api_test_util:api_path(["configs", Name]),
     case emqx_mgmt_api_test_util:request_api(get, Path) of
         {ok, Res} ->
-            {ok, emqx_utils_json:decode(Res, [return_maps])};
+            {ok, emqx_utils_json:decode(Res)};
         Error ->
             Error
     end.
@@ -544,8 +488,8 @@ get_configs_with_json(Node, Opts) ->
     Auth = emqx_mgmt_api_test_util:auth_header_(),
     Headers = [{"accept", "application/json"}, Auth],
     case emqx_mgmt_api_test_util:request_api(get, URI, [], Headers, [], Opts) of
-        {ok, {_, _, Res}} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, {_, _, Res}} -> {ok, emqx_utils_json:decode(Res)};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
@@ -598,7 +542,7 @@ update_config(Name, Change) ->
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     UpdatePath = emqx_mgmt_api_test_util:api_path(["configs", Name]),
     case emqx_mgmt_api_test_util:request_api(put, UpdatePath, "", AuthHeader, Change) of
-        {ok, Update} -> {ok, emqx_utils_json:decode(Update, [return_maps])};
+        {ok, Update} -> {ok, emqx_utils_json:decode(Update)};
         Error -> Error
     end.
 

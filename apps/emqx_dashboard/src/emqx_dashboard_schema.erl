@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_dashboard_schema).
 
@@ -21,9 +9,15 @@
     roots/0,
     fields/1,
     namespace/0,
-    desc/1,
+    desc/1
+]).
+
+-export([
+    mfa_fields/0,
     https_converter/2
 ]).
+
+-define(DAYS_7, 7 * 24 * 60 * 60 * 1000).
 
 namespace() -> dashboard.
 roots() -> ["dashboard"].
@@ -47,12 +41,30 @@ fields("dashboard") ->
                     validator => fun validate_sample_interval/1
                 }
             )},
+        {hwmark_expire_time,
+            ?HOCON(
+                emqx_schema:duration(),
+                #{
+                    default => <<"7d">>,
+                    desc => ?DESC(hwmark_expire_time),
+                    importance => ?IMPORTANCE_LOW,
+                    validator => fun validate_hwmark_expire_time/1
+                }
+            )},
         {token_expired_time,
             ?HOCON(
                 emqx_schema:duration(),
                 #{
                     default => <<"60m">>,
                     desc => ?DESC(token_expired_time)
+                }
+            )},
+        {password_expired_time,
+            ?HOCON(
+                emqx_schema:duration_s(),
+                #{
+                    default => 0,
+                    desc => ?DESC(password_expired_time)
                 }
             )},
         {cors, fun cors/1},
@@ -68,15 +80,45 @@ fields("dashboard") ->
                     deprecated => {since, "5.1.0"},
                     importance => ?IMPORTANCE_HIDDEN
                 }
+            )},
+        {unsuccessful_login_max_attempts,
+            ?HOCON(
+                pos_integer(),
+                #{
+                    desc => ?DESC(unsuccessful_login_max_attempts),
+                    required => false,
+                    default => 5,
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
+        {unsuccessful_login_lock_duration,
+            ?HOCON(
+                emqx_schema:duration_s(),
+                #{
+                    desc => ?DESC(unsuccessful_login_lock_duration),
+                    required => false,
+                    default => <<"10m">>,
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
+        {unsuccessful_login_interval,
+            ?HOCON(
+                emqx_schema:duration_s(),
+                #{
+                    desc => ?DESC(unsuccessful_login_interval),
+                    required => false,
+                    default => <<"5m">>,
+                    importance => ?IMPORTANCE_HIDDEN
+                }
             )}
-    ] ++ sso_fields();
+    ] ++ ee_fields();
 fields("listeners") ->
     [
         {"http",
             ?HOCON(
                 ?R_REF("http"),
                 #{
-                    desc => "TCP listeners",
+                    desc => ?DESC("http_listener_settings"),
                     required => {false, recursively}
                 }
             )},
@@ -84,7 +126,7 @@ fields("listeners") ->
             ?HOCON(
                 ?R_REF("https"),
                 #{
-                    desc => "SSL listeners",
+                    desc => ?DESC("ssl_listener_settings"),
                     required => {false, recursively},
                     converter => fun ?MODULE:https_converter/2
                 }
@@ -104,7 +146,22 @@ fields("https") ->
         | common_listener_fields()
     ];
 fields("ssl_options") ->
-    server_ssl_options().
+    server_ssl_options();
+fields("mfa_settings") ->
+    mfa_fields().
+
+mfa_fields() ->
+    [
+        {mechanism,
+            ?HOCON(
+                hoconsc:enum([totp]),
+                #{
+                    desc => ?DESC("mfa_mechanism"),
+                    importance => ?IMPORTANCE_HIGH,
+                    required => true
+                }
+            )}
+    ].
 
 ssl_options() ->
     {"ssl_options",
@@ -224,6 +281,8 @@ desc("https") ->
     ?DESC(desc_https);
 desc("ssl_options") ->
     ?DESC(ssl_options);
+desc("mfa_settings") ->
+    ?DESC(mfa_settings);
 desc(_) ->
     undefined.
 
@@ -239,12 +298,12 @@ default_username('readOnly') -> true;
 default_username(importance) -> ?IMPORTANCE_HIDDEN;
 default_username(_) -> undefined.
 
-default_password(type) -> binary();
+default_password(type) -> emqx_schema_secret:secret();
 default_password(default) -> <<"public">>;
 default_password(required) -> true;
 default_password('readOnly') -> true;
 default_password(sensitive) -> true;
-default_password(converter) -> fun emqx_schema:password_converter/2;
+default_password(converter) -> fun password_converter/2;
 default_password(desc) -> ?DESC(default_password);
 default_password(importance) -> ?IMPORTANCE_LOW;
 default_password(_) -> undefined.
@@ -278,6 +337,16 @@ validate_sample_interval(Second) ->
             {error, Msg}
     end.
 
+%% Cannot allow >7d because dashboard monitor data is only kept for 7 days
+validate_hwmark_expire_time(ExpireTime) ->
+    case ExpireTime >= 1 andalso ExpireTime =< ?DAYS_7 of
+        true ->
+            ok;
+        false ->
+            Msg = "must be between 1s and 7d.",
+            {error, Msg}
+    end.
+
 https_converter(undefined, _Opts) ->
     %% no https listener configured
     undefined;
@@ -292,17 +361,30 @@ convert_ssl_layout(Conf = #{}, _Opts) ->
     Conf1 = maps:without(Keys, Conf),
     Conf1#{<<"ssl_options">> => SslOpts}.
 
--if(?EMQX_RELEASE_EDITION == ee).
-sso_fields() ->
+password_converter(undefined, _HoconOpts) ->
+    undefined;
+password_converter(I, HoconOpts) when is_integer(I) ->
+    password_converter(integer_to_binary(I), HoconOpts);
+password_converter(X, HoconOpts) ->
+    emqx_schema_secret:convert_secret(X, HoconOpts).
+
+mfa_schema() ->
+    ?HOCON(
+        hoconsc:union([none, ?REF("mfa_settings")]),
+        #{
+            desc => ?DESC("default_mfa"),
+            default => none,
+            required => false,
+            importance => ?IMPORTANCE_LOW
+        }
+    ).
+
+ee_fields() ->
     [
+        {default_mfa, mfa_schema()},
         {sso,
             ?HOCON(
                 ?R_REF(emqx_dashboard_sso_schema, sso),
                 #{required => {false, recursively}}
             )}
     ].
-
--else.
-sso_fields() ->
-    [].
--endif.

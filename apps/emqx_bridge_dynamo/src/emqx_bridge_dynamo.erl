@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_dynamo).
 
@@ -200,7 +200,8 @@ fields("config_connector") ->
         end,
         Config,
         [
-            table
+            table,
+            undefined_vars_as_null
         ]
     );
 fields(connector_resource_opts) ->

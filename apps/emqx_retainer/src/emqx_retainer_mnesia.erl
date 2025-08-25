@@ -1,22 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer_mnesia).
 
--behaviour(emqx_retainer).
 -behaviour(emqx_db_backup).
 
 -include("emqx_retainer.hrl").
@@ -24,7 +11,7 @@
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("stdlib/include/ms_transform.hrl").
 
-%% emqx_retainer callbacks
+-behaviour(emqx_retainer).
 -export([
     create/1,
     update/2,
@@ -32,12 +19,16 @@
     delete_message/2,
     store_retained/2,
     read_message/2,
-    page_read/4,
+    page_read/5,
     match_messages/3,
     delete_cursor/2,
-    clear_expired/1,
     clean/1,
     size/1
+]).
+
+-behaviour(emqx_retainer_gc).
+-export([
+    clear_expired/3
 ]).
 
 %% Internal exports (RPC)
@@ -55,7 +46,10 @@
 -export([populate_index_meta/0]).
 -export([reindex/3]).
 
--export([backup_tables/0]).
+-export([
+    backup_tables/0,
+    on_backup_table_imported/2
+]).
 
 -record(retained_message, {topic, msg, expiry_time}).
 -record(retained_index, {key, expiry_time}).
@@ -80,8 +74,55 @@ topics() ->
 %%--------------------------------------------------------------------
 %% Data backup
 %%--------------------------------------------------------------------
+
 backup_tables() ->
-    [?TAB_MESSAGE].
+    {<<"builtin_retainer">>, tables_to_backup()}.
+
+tables_to_backup() ->
+    %% `backup_tables' is inspected to construct API docs (available table sets), and such
+    %% docs are built in `emqx_conf:dump_schema', while there's no started node.
+    try
+        [?TAB_MESSAGE || need_handle_backup()]
+    catch
+        exit:{noproc, _} ->
+            []
+    end.
+
+on_backup_table_imported(?TAB_MESSAGE, Opts) ->
+    case need_handle_backup() of
+        true ->
+            maybe_print("Starting reindexing retained messages ~n", [], Opts),
+            Res = reindex(false, mk_status_fun(Opts)),
+            maybe_print("Reindexing retained messages finished~n", [], Opts),
+            Res;
+        false ->
+            ok
+    end;
+on_backup_table_imported(_Tab, _Opts) ->
+    ok.
+
+mk_status_fun(Opts) ->
+    fun(Done) ->
+        log_status(Done),
+        maybe_print("Reindexed ~p messages~n", [Done], Opts)
+    end.
+
+maybe_print(Fmt, Args, #{print_fun := Fun}) when is_function(Fun, 2) ->
+    Fun(Fmt, Args);
+maybe_print(_Fmt, _Args, _Opts) ->
+    ok.
+
+log_status(Done) ->
+    ?SLOG(
+        info,
+        #{
+            msg => "retainer_message_record_reindexing_progress",
+            done => Done
+        }
+    ).
+
+need_handle_backup() ->
+    emqx_retainer:is_started() andalso emqx_retainer:backend_module() =:= ?MODULE.
 
 %%--------------------------------------------------------------------
 %% emqx_retainer callbacks
@@ -156,41 +197,65 @@ store_retained(State, Msg = #message{topic = Topic}) ->
     Tokens = topic_to_tokens(Topic),
     case is_table_full(State) andalso is_new_topic(Tokens) of
         true ->
-            ?SLOG(error, #{
-                msg => "failed_to_retain_message",
-                topic => Topic,
-                reason => table_is_full
-            });
+            ?SLOG_THROTTLE(
+                error,
+                #{
+                    msg => failed_to_retain_message,
+                    reason => table_is_full
+                },
+                #{topic => Topic}
+            ),
+            ok;
         false ->
             do_store_retained(Msg, Tokens, ExpiryTime),
             ?tp(message_retained, #{topic => Topic}),
             ok
     end.
 
-clear_expired(_) ->
-    case mria_rlog:role() of
-        core ->
-            clear_expired();
-        _ ->
-            ok
-    end.
-
-clear_expired() ->
-    NowMs = erlang:system_time(millisecond),
+clear_expired(_State, Deadline, Limit) ->
     S0 = ets_stream(?TAB_MESSAGE),
-    S1 = emqx_utils_stream:filter(
-        fun(#retained_message{expiry_time = ExpiryTime}) ->
-            ExpiryTime =/= 0 andalso ExpiryTime < NowMs
+    AllowNeverExpire = emqx_conf:get([retainer, allow_never_expire]),
+    FilterFn =
+        case emqx_conf:get([retainer, msg_expiry_interval_override]) of
+            disabled ->
+                fun(#retained_message{expiry_time = ExpiryTime}) ->
+                    ExpiryTime =/= 0 andalso ExpiryTime < Deadline
+                end;
+            OverrideMS ->
+                fun(
+                    #retained_message{
+                        expiry_time = StoredExpiryTime,
+                        msg = #message{timestamp = Ts}
+                    }
+                ) ->
+                    case StoredExpiryTime of
+                        0 when not AllowNeverExpire ->
+                            Ts + OverrideMS < Deadline;
+                        0 ->
+                            false;
+                        _ ->
+                            min(Ts + OverrideMS, StoredExpiryTime) < Deadline
+                    end
+                end
         end,
-        S0
-    ),
+    S1 = emqx_utils_stream:filter(FilterFn, S0),
     DirtyWriteIndices = dirty_indices(write),
-    emqx_utils_stream:foreach(
+    S2 = emqx_utils_stream:map(
         fun(RetainedMsg) ->
             delete_message_with_indices(RetainedMsg, DirtyWriteIndices)
         end,
         S1
-    ).
+    ),
+    CountF = fun(_, N) -> N + 1 end,
+    case Limit of
+        all ->
+            NCleared = emqx_utils_stream:fold(CountF, 0, S2),
+            {_Complete = true, NCleared};
+        Num ->
+            {NCleared, SRest} = emqx_utils_stream:fold(CountF, 0, Num, S2),
+            Complete = SRest == [],
+            {Complete, NCleared}
+    end.
 
 delete_message(_State, Topic) ->
     Tokens = topic_to_tokens(Topic),
@@ -230,15 +295,14 @@ match_messages(_State, _Topic, {S0, BatchNum}) ->
 delete_cursor(_State, _Cursor) ->
     ok.
 
-page_read(_State, Topic, Page, Limit) ->
-    Now = erlang:system_time(millisecond),
+page_read(_State, Topic, Deadline, Page, Limit) ->
     S0 =
         case Topic of
             undefined ->
-                msg_stream(search_stream(undefined, ['#'], Now));
+                msg_stream(all_stream(Deadline));
             _ ->
                 Tokens = topic_to_tokens(Topic),
-                msg_stream(search_stream(Tokens, Now))
+                msg_stream(search_stream(Tokens, Deadline))
         end,
     %% This is very inefficient, but we are limited with inherited API
     S1 = emqx_utils_stream:list(
@@ -336,14 +400,35 @@ search_stream(Tokens, Now) ->
     Index = emqx_retainer_index:select_index(Tokens, Indices),
     search_stream(Index, Tokens, Now).
 
-search_stream(undefined, Tokens, Now) ->
-    Ms = make_message_match_spec(Tokens, Now),
+all_stream(Now) ->
+    Ms = make_message_match_spec(Now),
     emqx_utils_stream:ets(
         fun
             (undefined) -> ets:select(?TAB_MESSAGE, Ms, 1);
             (Cont) -> ets:select(Cont)
         end
-    );
+    ).
+
+search_stream(undefined, Tokens, Now) ->
+    Ms = make_message_match_spec(Tokens, Now),
+    MsgStream = emqx_utils_stream:ets(
+        fun
+            (undefined) -> ets:select(?TAB_MESSAGE, Ms, 1);
+            (Cont) -> ets:select(Cont)
+        end
+    ),
+    case Tokens of
+        %% NOTE: Can not match only with $SPECIAL topics [MQTT-4.7.2-1].
+        [T | _] when T == '+' orelse T == '#' ->
+            emqx_utils_stream:filter(
+                fun(#retained_message{topic = [TopicToken | _]}) ->
+                    emqx_topic:match([TopicToken], [T])
+                end,
+                MsgStream
+            );
+        _ ->
+            MsgStream
+    end;
 search_stream(Index, FilterTokens, Now) ->
     {Ms, IsExactMs} = make_index_match_spec(Index, FilterTokens, Now),
     IndexRecordStream = emqx_utils_stream:ets(
@@ -372,8 +457,11 @@ search_stream(Index, FilterTokens, Now) ->
     ),
     ValidRetainMsgStream.
 
-match(_IsExactMs = true, _TopicTokens, _FilterTokens) -> true;
-match(_IsExactMs = false, TopicTokens, FilterTokens) -> emqx_topic:match(TopicTokens, FilterTokens).
+match(_IsExactMs = true, [TopicToken | _], [FilterToken | _]) ->
+    %% NOTE: Can not match only with $SPECIAL topics [MQTT-4.7.2-1].
+    emqx_topic:match([TopicToken], [FilterToken]);
+match(_IsExactMs = false, TopicTokens, FilterTokens) ->
+    emqx_topic:match(TopicTokens, FilterTokens).
 
 delete_message_by_topic(TopicTokens, Indices) ->
     case mnesia:dirty_read(?TAB_MESSAGE, TopicTokens) of
@@ -413,6 +501,10 @@ read_messages(Topic) ->
                 false -> []
             end
     end.
+
+make_message_match_spec(NowMs) ->
+    MsHd = #retained_message{topic = '_', msg = '_', expiry_time = '$3'},
+    [{MsHd, [{'orelse', {'=:=', '$3', 0}, {'>', '$3', NowMs}}], ['$_']}].
 
 make_message_match_spec(Tokens, NowMs) ->
     Cond = emqx_retainer_index:condition(Tokens),

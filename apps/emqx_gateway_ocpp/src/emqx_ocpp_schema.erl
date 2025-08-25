@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ocpp_schema).
@@ -77,9 +77,11 @@ fields(wss_listener) ->
     emqx_gateway_schema:wss_listener() ++
         [{websocket, sc(ref(websocket), #{})}];
 fields(websocket) ->
-    DefaultPath = <<"/ocpp">>,
-    SubProtocols = <<"ocpp1.6, ocpp2.0">>,
-    emqx_gateway_schema:ws_opts(DefaultPath, SubProtocols);
+    Override = #{
+        path => <<"/ocpp">>,
+        supported_subprotocols => <<"ocpp1.6, ocpp2.0">>
+    },
+    emqx_gateway_schema:ws_opts(Override);
 fields(upstream) ->
     [
         {topic,

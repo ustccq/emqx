@@ -68,6 +68,17 @@ cluster_proto_dist.desc:
 cluster_proto_dist.label:
 """Cluster Protocol Distribution"""
 
+cluster_quic_lb_mode.desc:
+"""QUIC stack LB Mode
+- 0: disabled (Default)
+- 1: server_ip
+- 2: server_id_fixed
+- N: when N>2 server_id_fixed and server_id is N
+- IfName: when IfName is string, server_id will be set to the first ip on interface IfName, ipv4 only."""
+
+cluster_quic_lb_mode.label:
+""" QUIC stack LB Mode """
+
 log_burst_limit_enable.desc:
 """Enable log burst control feature."""
 
@@ -89,7 +100,7 @@ common_handler_max_depth.label:
 desc_log.desc:
 """EMQX supports multiple log handlers, one console handler and multiple file handlers.
 EMQX by default logs to console when running in docker or in console/foreground mode,
-otherwise it logs to file $EMQX_LOG_DIR/emqx.log.
+otherwise it logs to file `${EMQX_LOG_DIR}/emqx.log.N`.
 For advanced configuration, you can find more parameters in this section."""
 
 desc_log.label:
@@ -123,10 +134,11 @@ node_name.label:
 """Node Name"""
 
 rpc_port_discovery.desc:
-"""<code>manual</code>: discover ports by <code>tcp_server_port</code>.<br/>
+"""<code>manual</code>: discover ports by <code>server_port</code>.<br/>
 <code>stateless</code>: discover ports in a stateless manner, using the following algorithm.
 If node name is <code>emqxN@127.0.0.1</code>, where the N is an integer,
-then the listening port will be 5370 + N."""
+then the listening port will be 5370 + N.
+NOTE: when `port_discovery` is `manual`, `server_port` configuration has no effect."""
 
 rpc_port_discovery.label:
 """RRC Port Discovery"""
@@ -156,8 +168,7 @@ desc_audit_log_handler.label:
 """Audit Log Handler"""
 
 rpc_socket_keepalive_count.desc:
-"""How many times the keepalive probe message can fail to receive a reply
-until the RPC connection is considered lost."""
+"""Corresponds to the `TCP_KEEPCNT` socket option. The maximum number of TCP keep-alive probes to send before giving up and killing the connection if no response is obtained from the other end."""
 
 rpc_socket_keepalive_count.label:
 """RPC Socket Keepalive Count"""
@@ -349,12 +360,12 @@ to <code>rlog</code>."""
 db_role.label:
 """DB Role"""
 
-rpc_tcp_server_port.desc:
+rpc_server_port.desc:
 """Listening port used by RPC local service.<br/>
 Note that this config only takes effect when rpc.port_discovery is set to manual."""
 
-rpc_tcp_server_port.label:
-"""RPC TCP Server Port"""
+rpc_server_port.label:
+"""RPC Server Port"""
 
 desc_console_handler.desc:
 """Log handler that prints log events to the EMQX console."""
@@ -374,10 +385,10 @@ log_burst_limit_max_count.desc:
 log_burst_limit_max_count.label:
 """Events Number"""
 
-rpc_tcp_client_num.desc:
+rpc_client_num.desc:
 """Set the maximum number of RPC communication channels initiated by this node to each remote node."""
 
-rpc_tcp_client_num.label:
+rpc_client_num.label:
 """RPC TCP Client Num"""
 
 cluster_k8s_address_type.desc:
@@ -562,7 +573,7 @@ authorization.label:
 """Authorization"""
 
 rpc_socket_keepalive_idle.desc:
-"""How long the connections between the brokers should remain open after the last message is sent."""
+"""Corresponds to the `TCP_KEEPIDLE` socket option. The time (in seconds) the connection needs to remain idle before TCP starts sending keepalive probes."""
 
 rpc_socket_keepalive_idle.label:
 """RPC Socket Keepalive Idle"""
@@ -648,7 +659,8 @@ log_audit_handler.label:
 """Audit log Handler"""
 
 node_global_gc_interval.desc:
-"""Periodic garbage collection interval. Set to <code>disabled</code> to have it disabled."""
+"""Periodic garbage collection interval. Set to <code>disabled</code> to have it disabled.<br/>
+Only use this feature as a workaround if EMQX memory usage keeps growing and significantly exceeds normal levels, and manual garbage collection can indeed release a large amount of memory."""
 
 node_global_gc_interval.label:
 """Global GC Interval"""
@@ -672,13 +684,14 @@ rpc_mode.label:
 """RPC Mode"""
 
 node_crash_dump_file.desc:
-"""Location of the crash dump file."""
+"""Location of the crash dump file. Defaults to <code>log/erl_crash.YYYY.MM.DD.HH.MM.SS.dump</code>.
+The timestamp is generated when emqx starts."""
 
 node_crash_dump_file.label:
 """Crash Dump File"""
 
 rpc_socket_keepalive_interval.desc:
-"""The interval between keepalive messages."""
+"""Corresponds to the `TCP_KEEPINTVL` socket option. The time (in seconds) between individual keepalive probes."""
 
 rpc_socket_keepalive_interval.label:
 """RPC Socket Keepalive Interval"""
@@ -724,14 +737,6 @@ this is where to look."""
 
 desc_rpc.label:
 """RPC"""
-
-rpc_ssl_server_port.desc:
-"""Listening port used by RPC local service.<br/>
-Note that this config only takes effect when rpc.port_discovery is set to manual
-and <code>driver</code> is set to <code>ssl</code>."""
-
-rpc_ssl_server_port.label:
-"""RPC SSL Server Port"""
 
 desc_cluster.desc:
 """EMQX nodes can form a cluster to scale up the total capacity.<br/>
@@ -855,5 +860,32 @@ Defaults to 100000."""
 
 node_channel_cleanup_batch_size.label:
 """Node Channel Cleanup Batch Size"""
+
+desc_durable_timers.label: "Durable timers"
+desc_durable_timers.desc:
+"""~
+Configuration for the durable timers.
+Durable timers are used to schedule actions that should occur even if the node that created them is down.~"""
+
+durable_timer_heartbeat_interval.label: "Heartbeat interval"
+durable_timer_heartbeat_interval.desc:
+"""~
+Node heartbeat interval specifies how often the node records its presence in the `timers` durable storage.
+This setting should be the same on all nodes in the cluster."""
+
+durable_timer_missed_heartbeats.label: "Missed heartbeats"
+durable_timer_missed_heartbeats.desc:
+"""~
+If node fails this many heartbeats, its peers consider will it down."""
+
+durable_timer_retry_interval.label: "Durable timer retry interval"
+durable_timer_retry_interval.desc:
+"""~
+If the node fails to fetch timers from the durable storage, it will retry the attempt after this interval."""
+
+durable_timer_batch_size.label: "Durable timer batch size"
+durable_timer_batch_size.desc:
+"""~
+Specifies the batch size used for reading `timers` durable storage."""
 
 }

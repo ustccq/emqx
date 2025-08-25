@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_exproto_unary_echo_svr).
@@ -72,7 +60,7 @@ on_socket_closed(_Req, _Md) ->
     {ok, emqx_exproto_pb:empty_success(), grpc:metadata()}
     | {error, grpc_stream:error_response()}.
 on_received_bytes(#{conn := Conn, bytes := Bytes}, _Md) ->
-    #{<<"type">> := Type} = Params = emqx_utils_json:decode(Bytes, [return_maps]),
+    #{<<"type">> := Type} = Params = emqx_utils_json:decode(Bytes),
     _ = handle_in(Conn, Type, Params),
     {ok, #{}, _Md}.
 

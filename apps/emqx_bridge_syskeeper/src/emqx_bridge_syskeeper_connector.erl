@@ -1,5 +1,5 @@
 %--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_syskeeper_connector).
@@ -18,6 +18,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     query_mode/1,
     on_start/2,
@@ -147,6 +148,7 @@ server() ->
 
 %% -------------------------------------------------------------------------------------------------
 %% `emqx_resource' API
+resource_type() -> syskeeper.
 
 callback_mode() -> always_sync.
 

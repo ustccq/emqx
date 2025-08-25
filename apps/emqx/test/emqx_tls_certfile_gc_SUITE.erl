@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_tls_certfile_gc_SUITE).
@@ -38,15 +26,14 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(TC, Config) ->
-    TCAbsDir = filename:join(?config(priv_dir, Config), TC),
-    ok = application:set_env(emqx, data_dir, TCAbsDir),
+    WorkDir = emqx_cth_suite:work_dir(TC, Config),
+    Apps = emqx_cth_suite:start([emqx], #{work_dir => WorkDir}),
     ok = snabbkaffe:start_trace(),
-    [{tc_name, atom_to_list(TC)}, {tc_absdir, TCAbsDir} | Config].
+    [{apps, Apps}, {tc_name, atom_to_list(TC)}, {tc_absdir, WorkDir} | Config].
 
-end_per_testcase(_TC, _Config) ->
+end_per_testcase(_TC, Config) ->
     ok = snabbkaffe:stop(),
-    _ = emqx_schema_hooks:erase_injections(),
-    _ = emqx_config:erase_all(),
+    ok = emqx_cth_suite:stop(?config(apps, Config)),
     ok.
 
 t_no_orphans(Config) ->
@@ -55,8 +42,8 @@ t_no_orphans(Config) ->
         <<"certfile">> => cert(),
         <<"cacertfile">> => cert()
     },
-    {ok, SSL} = emqx_tls_lib:ensure_ssl_files("ssl", SSL0),
-    {ok, SSLUnused} = emqx_tls_lib:ensure_ssl_files("unused", SSL0),
+    {ok, SSL} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("ssl", SSL0),
+    {ok, SSLUnused} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("unused", SSL0),
     SSLKeyfile = maps:get(<<"keyfile">>, SSL),
     ok = load_config(#{
         <<"clients">> => [
@@ -97,8 +84,8 @@ t_collect_orphans(_Config) ->
     SSL1 = SSL0#{
         <<"ocsp">> => #{<<"issuer_pem">> => cert()}
     },
-    {ok, SSL2} = emqx_tls_lib:ensure_ssl_files("client", SSL0),
-    {ok, SSL3} = emqx_tls_lib:ensure_ssl_files("server", SSL1),
+    {ok, SSL2} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("client", SSL0),
+    {ok, SSL3} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("server", SSL1),
     ok = load_config(#{
         <<"clients">> => [
             #{<<"transport">> => #{<<"ssl">> => SSL2}}
@@ -167,6 +154,7 @@ t_collect_orphans(_Config) ->
     ).
 
 t_gc_runs_periodically(_Config) ->
+    ok = supervisor:terminate_child(emqx_tls_lib_sup, emqx_tls_certfile_gc),
     {ok, Pid} = emqx_tls_certfile_gc:start_link(500),
 
     % Set up two servers in the config, each with its own set of certfiles
@@ -174,10 +162,10 @@ t_gc_runs_periodically(_Config) ->
         <<"keyfile">> => key(),
         <<"certfile">> => cert()
     },
-    {ok, SSL1} = emqx_tls_lib:ensure_ssl_files("s1", SSL),
+    {ok, SSL1} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("s1", SSL),
     SSL1Keyfile = emqx_utils_fs:canonicalize(maps:get(<<"keyfile">>, SSL1)),
     SSL1Certfile = emqx_utils_fs:canonicalize(maps:get(<<"certfile">>, SSL1)),
-    {ok, SSL2} = emqx_tls_lib:ensure_ssl_files("s2", SSL#{
+    {ok, SSL2} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("s2", SSL#{
         <<"ocsp">> => #{<<"issuer_pem">> => cert()}
     }),
     SSL2Keyfile = emqx_utils_fs:canonicalize(maps:get(<<"keyfile">>, SSL2)),
@@ -268,6 +256,7 @@ t_gc_runs_periodically(_Config) ->
     ok = proc_lib:stop(Pid).
 
 t_gc_spares_recreated_certfiles(_Config) ->
+    ok = supervisor:terminate_child(emqx_tls_lib_sup, emqx_tls_certfile_gc),
     {ok, Pid} = emqx_tls_certfile_gc:start_link(),
 
     % Create two sets of certfiles, with no references to them
@@ -275,10 +264,10 @@ t_gc_spares_recreated_certfiles(_Config) ->
         <<"keyfile">> => key(),
         <<"certfile">> => cert()
     },
-    {ok, SSL1} = emqx_tls_lib:ensure_ssl_files("s1", SSL),
+    {ok, SSL1} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("s1", SSL),
     SSL1Keyfile = emqx_utils_fs:canonicalize(maps:get(<<"keyfile">>, SSL1)),
     SSL1Certfile = emqx_utils_fs:canonicalize(maps:get(<<"certfile">>, SSL1)),
-    {ok, SSL2} = emqx_tls_lib:ensure_ssl_files("s2", SSL),
+    {ok, SSL2} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("s2", SSL),
     SSL2Keyfile = emqx_utils_fs:canonicalize(maps:get(<<"keyfile">>, SSL2)),
     SSL2Certfile = emqx_utils_fs:canonicalize(maps:get(<<"certfile">>, SSL2)),
     ok = load_config(#{}),
@@ -306,7 +295,7 @@ t_gc_spares_recreated_certfiles(_Config) ->
     % Recreate the SSL2 certfiles
     ok = file:delete(SSL2Keyfile),
     ok = file:delete(SSL2Certfile),
-    {ok, _} = emqx_tls_lib:ensure_ssl_files("s2", SSL),
+    {ok, _} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("s2", SSL),
     % Nothing should have been collected
     ?assertMatch(
         {ok, []},
@@ -316,6 +305,7 @@ t_gc_spares_recreated_certfiles(_Config) ->
     ok = proc_lib:stop(Pid).
 
 t_gc_spares_symlinked_datadir(Config) ->
+    ok = supervisor:terminate_child(emqx_tls_lib_sup, emqx_tls_certfile_gc),
     {ok, Pid} = emqx_tls_certfile_gc:start_link(),
 
     % Create a certfiles set and a server that references it
@@ -324,7 +314,7 @@ t_gc_spares_symlinked_datadir(Config) ->
         <<"certfile">> => cert(),
         <<"ocsp">> => #{<<"issuer_pem">> => cert()}
     },
-    {ok, SSL1} = emqx_tls_lib:ensure_ssl_files("srv", SSL),
+    {ok, SSL1} = emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir("srv", SSL),
     SSL1Keyfile = emqx_utils_fs:canonicalize(maps:get(<<"keyfile">>, SSL1)),
 
     ok = load_config(#{
@@ -369,19 +359,11 @@ t_gc_spares_symlinked_datadir(Config) ->
 
     ok = proc_lib:stop(Pid).
 
-t_gc_active(Config) ->
-    Apps = emqx_cth_suite:start(
-        [emqx],
-        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
-    ),
-    try
-        ?assertEqual(
-            {ok, []},
-            emqx_tls_certfile_gc:run()
-        )
-    after
-        emqx_cth_suite:stop(Apps)
-    end.
+t_gc_active(_Config) ->
+    ?assertEqual(
+        {ok, []},
+        emqx_tls_certfile_gc:run()
+    ).
 
 orphans() ->
     emqx_tls_certfile_gc:orphans(emqx:mutable_certs_dir()).

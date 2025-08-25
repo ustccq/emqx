@@ -1,11 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_s3_schema).
 
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
+-include("emqx_s3.hrl").
 
 -import(hoconsc, [mk/2, ref/2]).
 
@@ -16,7 +17,7 @@
 -export([translate/2]).
 
 roots() ->
-    [s3].
+    [].
 
 namespace() -> "s3".
 
@@ -60,6 +61,14 @@ fields(s3_client) ->
                 #{
                     desc => ?DESC("port"),
                     required => true
+                }
+            )},
+        {access_method,
+            mk(
+                hoconsc:enum([path, vhost]),
+                #{
+                    default => path,
+                    desc => ?DESC("bucket_access_method")
                 }
             )},
         {transport_options,
@@ -121,7 +130,7 @@ fields(s3_uploader) ->
                 #{
                     default => <<"5mb">>,
                     desc => ?DESC("min_part_size"),
-                    required => true,
+                    required => false,
                     validator => fun part_size_validator/1
                 }
             )},
@@ -131,7 +140,7 @@ fields(s3_uploader) ->
                 #{
                     default => <<"5gb">>,
                     desc => ?DESC("max_part_size"),
-                    required => true,
+                    required => false,
                     validator => fun part_size_validator/1
                 }
             )}
@@ -159,15 +168,58 @@ fields(transport_options) ->
                     desc => ?DESC("ipv6_probe"),
                     required => false
                 }
+            )},
+        {connect_timeout,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    default => <<"15s">>,
+                    desc => ?DESC(emqx_bridge_http_connector, "connect_timeout")
+                }
+            )},
+        {pool_type,
+            mk(
+                hoconsc:enum([random, hash]),
+                #{
+                    default => random,
+                    desc => ?DESC(emqx_bridge_http_connector, "pool_type"),
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
+        {pool_size,
+            mk(
+                pos_integer(),
+                #{
+                    default => 8,
+                    desc => ?DESC(emqx_bridge_http_connector, "pool_size")
+                }
+            )},
+        {enable_pipelining,
+            mk(
+                pos_integer(),
+                #{
+                    default => 0,
+                    desc => ?DESC(emqx_bridge_http_connector, "enable_pipelining"),
+                    deprecated => {since, "5.8.2"}
+                }
             )}
     ] ++
-        props_without(
-            [base_url, max_retries, retry_interval, request],
-            emqx_bridge_http_connector:fields(config)
-        ) ++
-        props_with(
-            [headers, max_retries, request_timeout], emqx_bridge_http_connector:fields("request")
-        ).
+        emqx_connector_schema_lib:ssl_fields(_EnableByDefault = true) ++
+        fields(http_request);
+fields(http_request) ->
+    Fields = props_with(
+        [headers, max_retries, request_timeout], emqx_bridge_http_connector:fields("request")
+    ),
+    lists:map(
+        fun
+            ({max_retries = Key, Sc}) ->
+                Override = #{default => ?DEFAULT_MAX_RETRIES},
+                {Key, hocon_schema:override(Sc, Override)};
+            (Field) ->
+                Field
+        end,
+        Fields
+    ).
 
 desc(s3) ->
     "S3 connection options";
@@ -202,9 +254,6 @@ translate(Conf, OptionsIn) ->
 
 props_with(Keys, Proplist) ->
     lists:filter(fun({K, _}) -> lists:member(K, Keys) end, Proplist).
-
-props_without(Keys, Proplist) ->
-    lists:filter(fun({K, _}) -> not lists:member(K, Keys) end, Proplist).
 
 part_size_validator(PartSizeLimit) ->
     case

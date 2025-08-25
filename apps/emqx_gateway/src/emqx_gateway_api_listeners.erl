@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_api_listeners).
@@ -315,14 +303,15 @@ do_listeners_cluster_status(Listeners) ->
     ).
 
 current_listener_status(Type, Id, _ListenOn) when Type =:= ws; Type =:= wss ->
-    Info = ranch:info(Id),
-    Conns = proplists:get_value(all_connections, Info, 0),
-    Running =
-        case proplists:get_value(status, Info) of
-            running -> true;
-            _ -> false
-        end,
-    {Running, Conns};
+    try
+        Info = ranch:info(Id),
+        Conns = maps:get(all_connections, Info, 0),
+        Running = maps:get(status, Info) =:= running,
+        {Running, Conns}
+    catch
+        error:badarg ->
+            {false, 0}
+    end;
 current_listener_status(_Type, Id, ListenOn) ->
     try esockd:get_current_connections({Id, ListenOn}) of
         Int -> {true, Int}

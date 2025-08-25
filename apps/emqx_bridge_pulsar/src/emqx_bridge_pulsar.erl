@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_pulsar).
 
@@ -127,7 +127,7 @@ fields(producer_buffer) ->
         {per_partition_limit,
             mk(
                 emqx_schema:bytesize(),
-                #{default => <<"2GB">>, desc => ?DESC("buffer_per_partition_limit")}
+                #{default => <<"256MB">>, desc => ?DESC("buffer_per_partition_limit")}
             )},
         {segment_bytes,
             mk(

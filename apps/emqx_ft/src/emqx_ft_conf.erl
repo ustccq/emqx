@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc File Transfer configuration management module
@@ -48,7 +36,7 @@
 
 %% callbacks for emqx_config_backup
 -export([
-    import_config/1
+    import_config/2
 ]).
 
 -type update_request() :: emqx_config:config().
@@ -119,7 +107,7 @@ update(Config) ->
 %% Data backup
 %%----------------------------------------------------------------------------------------
 
-import_config(#{<<"file_transfer">> := FTConf}) ->
+import_config(_Namespace, #{<<"file_transfer">> := FTConf}) ->
     OldFTConf = emqx:get_raw_config([file_transfer], #{}),
     NewFTConf = maps:merge(OldFTConf, FTConf),
     case emqx_conf:update([file_transfer], NewFTConf, #{override_to => cluster}) of
@@ -130,7 +118,7 @@ import_config(#{<<"file_transfer">> := FTConf}) ->
         Error ->
             {error, #{root_key => file_transfer, reason => Error}}
     end;
-import_config(_) ->
+import_config(_, _) ->
     {ok, #{root_key => file_transfer, changed => []}}.
 
 %%--------------------------------------------------------------------

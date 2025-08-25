@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_azure_event_hub_v2_SUITE).
 
@@ -9,6 +9,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -define(BRIDGE_TYPE, azure_event_hub_producer).
 -define(BRIDGE_TYPE_BIN, <<"azure_event_hub_producer">>).
@@ -40,6 +41,8 @@ init_per_suite(Config) ->
                     emqx,
                     emqx_management,
                     emqx_resource,
+                    %% Just for test helpers
+                    brod,
                     emqx_bridge_azure_event_hub,
                     emqx_bridge,
                     emqx_rule_engine,
@@ -93,6 +96,9 @@ common_init_per_testcase(TestCase, Config) ->
             {connector_type, ?CONNECTOR_TYPE},
             {connector_name, Name},
             {connector_config, ConnectorConfig},
+            {action_type, ?BRIDGE_TYPE},
+            {action_name, Name},
+            {action_config, BridgeConfig},
             {bridge_type, ?BRIDGE_TYPE},
             {bridge_name, Name},
             {bridge_config, BridgeConfig}
@@ -100,18 +106,13 @@ common_init_per_testcase(TestCase, Config) ->
         ].
 
 end_per_testcase(_Testcase, Config) ->
-    case proplists:get_bool(skip_does_not_apply, Config) of
-        true ->
-            ok;
-        false ->
-            ProxyHost = ?config(proxy_host, Config),
-            ProxyPort = ?config(proxy_port, Config),
-            emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
-            emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
-            emqx_common_test_helpers:call_janitor(60_000),
-            ok = snabbkaffe:stop(),
-            ok
-    end.
+    ProxyHost = ?config(proxy_host, Config),
+    ProxyPort = ?config(proxy_port, Config),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
+    emqx_common_test_helpers:call_janitor(60_000),
+    ok = snabbkaffe:stop(),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Helper fns
@@ -172,7 +173,7 @@ bridge_config(Name, ConnectorId, KafkaTopic) ->
         #{
             <<"enable">> => true,
             <<"connector">> => ConnectorId,
-            <<"kafka">> =>
+            <<"parameters">> =>
                 #{
                     <<"buffer">> =>
                         #{
@@ -269,14 +270,6 @@ make_message() ->
         timestamp => Time
     }.
 
-bridge_api_spec_props_for_get() ->
-    #{
-        <<"bridge_azure_event_hub.get_producer">> :=
-            #{<<"properties">> := Props}
-    } =
-        emqx_bridge_v2_testlib:bridges_api_spec_schemas(),
-    Props.
-
 action_api_spec_props_for_get() ->
     #{
         <<"bridge_azure_event_hub.get_bridge_v2">> :=
@@ -322,24 +315,20 @@ t_same_name_azure_kafka_bridges(Config) ->
     ),
 
     %% then create a Kafka bridge with same name and delete it after creation
-    ConfigKafka0 = lists:keyreplace(bridge_type, 1, Config, {bridge_type, ?KAFKA_BRIDGE_TYPE}),
+    ConfigKafka0 = lists:keyreplace(action_type, 1, Config, {action_type, ?KAFKA_BRIDGE_TYPE}),
     ConfigKafka = lists:keyreplace(
         connector_type, 1, ConfigKafka0, {connector_type, ?KAFKA_BRIDGE_TYPE}
     ),
     ok = emqx_bridge_v2_testlib:t_create_via_http(ConfigKafka),
 
-    AehResourceId = emqx_bridge_v2_testlib:resource_id(Config),
-    KafkaResourceId = emqx_bridge_v2_testlib:resource_id(ConfigKafka),
+    AehResourceId = emqx_bridge_v2_testlib:connector_resource_id(Config),
+    KafkaResourceId = emqx_bridge_v2_testlib:connector_resource_id(ConfigKafka),
     %% check that both bridges are healthy
     ?assertEqual({ok, connected}, emqx_resource_manager:health_check(AehResourceId)),
     ?assertEqual({ok, connected}, emqx_resource_manager:health_check(KafkaResourceId)),
     ?assertMatch(
-        {{ok, _}, {ok, _}},
-        ?wait_async_action(
-            emqx_connector:disable_enable(disable, ?KAFKA_BRIDGE_TYPE, BridgeName),
-            #{?snk_kind := kafka_producer_stopped},
-            5_000
-        )
+        {ok, _},
+        emqx_connector:disable_enable(?global_ns, disable, ?KAFKA_BRIDGE_TYPE, BridgeName)
     ),
     % check that AEH bridge is still working
     ?check_trace(
@@ -356,10 +345,6 @@ t_same_name_azure_kafka_bridges(Config) ->
     ok.
 
 t_parameters_key_api_spec(_Config) ->
-    BridgeProps = bridge_api_spec_props_for_get(),
-    ?assert(is_map_key(<<"kafka">>, BridgeProps), #{bridge_props => BridgeProps}),
-    ?assertNot(is_map_key(<<"parameters">>, BridgeProps), #{bridge_props => BridgeProps}),
-
     ActionProps = action_api_spec_props_for_get(),
     ?assertNot(is_map_key(<<"kafka">>, ActionProps), #{action_props => ActionProps}),
     ?assert(is_map_key(<<"parameters">>, ActionProps), #{action_props => ActionProps}),
@@ -373,4 +358,53 @@ t_http_api_get(Config) ->
         {ok, {{_, 200, _}, _, [#{<<"kafka">> := _}]}},
         emqx_bridge_testlib:list_bridges_api()
     ),
+    ok.
+
+t_multiple_actions_sharing_topic(Config) ->
+    ActionConfig0 = ?config(action_config, Config),
+    ActionConfig =
+        emqx_utils_maps:deep_merge(
+            ActionConfig0,
+            #{<<"parameters">> => #{<<"query_mode">> => <<"sync">>}}
+        ),
+    ok =
+        emqx_bridge_v2_kafka_producer_SUITE:?FUNCTION_NAME(
+            [
+                {type, ?BRIDGE_TYPE_BIN},
+                {connector_name, ?config(connector_name, Config)},
+                {connector_config, ?config(connector_config, Config)},
+                {action_config, ActionConfig}
+            ]
+        ),
+    ok.
+
+t_dynamic_topics(Config) ->
+    ActionConfig0 = ?config(action_config, Config),
+    ActionConfig =
+        emqx_utils_maps:deep_merge(
+            ActionConfig0,
+            #{<<"parameters">> => #{<<"query_mode">> => <<"sync">>}}
+        ),
+    ok =
+        emqx_bridge_v2_kafka_producer_SUITE:?FUNCTION_NAME(
+            [
+                {type, ?BRIDGE_TYPE_BIN},
+                {connector_name, ?config(connector_name, Config)},
+                {connector_config, ?config(connector_config, Config)},
+                {action_config, ActionConfig}
+            ]
+        ),
+    ok.
+
+t_disallow_disk_mode_for_dynamic_topic(Config) ->
+    ActionConfig = ?config(action_config, Config),
+    ok =
+        emqx_bridge_v2_kafka_producer_SUITE:?FUNCTION_NAME(
+            [
+                {type, ?BRIDGE_TYPE_BIN},
+                {connector_name, ?config(connector_name, Config)},
+                {connector_config, ?config(connector_config, Config)},
+                {action_config, ActionConfig}
+            ]
+        ),
     ok.

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_conf_schema).
@@ -41,7 +29,13 @@
 -export([tr_prometheus_collectors/1]).
 
 %% internal exports for `emqx_enterprise_schema' only.
--export([ensure_unicode_path/2, convert_rotation/2, log_handler_common_confs/2]).
+-export([
+    log_file_path_converter/2,
+    fix_bad_log_path/1,
+    ensure_unicode_path/2,
+    convert_rotation/2,
+    log_handler_common_confs/2
+]).
 
 -define(DEFAULT_NODE_NAME, <<"emqx@127.0.0.1">>).
 
@@ -56,7 +50,7 @@
     emqx_authn_schema,
     emqx_authz_schema,
     emqx_auto_subscribe_schema,
-    {emqx_telemetry_schema, ce},
+    emqx_telemetry_schema,
     emqx_modules_schema,
     emqx_plugins_schema,
     emqx_dashboard_schema,
@@ -65,14 +59,9 @@
     emqx_rule_engine_schema,
     emqx_exhook_schema,
     emqx_psk_schema,
-    emqx_limiter_schema,
     emqx_slow_subs_schema,
     emqx_otel_schema,
     emqx_mgmt_api_key_schema
-]).
--define(INJECTING_CONFIGS, [
-    {emqx_authn_schema, ?AUTHN_PROVIDER_SCHEMA_MODS},
-    {emqx_authz_schema, ?AUTHZ_SOURCE_SCHEMA_MODS}
 ]).
 
 %% 1 million default ports counter
@@ -84,9 +73,46 @@
     cannot_publish_to_topic_due_to_not_authorized,
     cannot_publish_to_topic_due_to_quota_exceeded,
     connection_rejected_due_to_license_limit_reached,
+    connection_rejected_due_to_trial_license_uptime_limit,
+    connection_rejected_due_to_license_expired,
+    listener_accept_throttled_due_to_quota_exceeded,
+    listener_accept_refused_reached_max_connections,
+    failed_to_consume_from_limiter,
+    failed_to_put_back_to_limiter,
+    data_bridge_buffer_overflow,
+    dropped_qos0_msg,
     dropped_msg_due_to_mqueue_is_full,
-    socket_receive_paused_by_rate_limit
+    external_broker_crashed,
+    failed_to_fetch_crl,
+    failed_to_retain_message,
+    failed_to_trigger_fallback_action,
+    handle_resource_metrics_failed,
+    retain_failed_for_payload_size_exceeded_limit,
+    retain_failed_for_rate_exceeded_limit,
+    retained_dispatch_failed_for_rate_exceeded_limit,
+    retained_delete_failed_for_rate_exceeded_limit,
+    socket_receive_paused_by_rate_limit,
+    %% ==== message transformation/validation ====
+    transformation_failed,
+    transformation_eval_operation_failure,
+    transformation_eval_operation_exception,
+    payload_encode_failed,
+    payload_decode_failed,
+    payload_decode_schema_not_found,
+    payload_encode_schema_not_found,
+    payload_decode_schema_failure,
+    payload_encode_schema_failure,
+    payload_decode_error,
+    validation_failed,
+    validation_sql_check_throw,
+    validation_sql_check_failure,
+    validation_schema_check_schema_not_found,
+    validation_schema_check_failure,
+    %% ==== message transformation/validation end ====
+    unrecoverable_resource_error
 ]).
+
+-define(DEFAULT_RPC_PORT, 5369).
 
 %% Callback to upgrade config after loaded from config file but before validation.
 upgrade_raw_conf(Raw0) ->
@@ -99,7 +125,8 @@ tags() ->
     [<<"EMQX">>].
 
 roots() ->
-    ok = emqx_schema_hooks:inject_from_modules(?INJECTING_CONFIGS),
+    Injections = emqx_conf_schema_inject:schemas(),
+    ok = emqx_schema_hooks:inject_from_modules(Injections),
     emqx_schema_high_prio_roots() ++
         [
             {node,
@@ -137,23 +164,41 @@ roots() ->
         lists:flatmap(fun roots/1, common_apps()).
 
 validations() ->
-    [{check_node_name_and_discovery_strategy, fun validate_cluster_strategy/1}] ++
+    [
+        {check_node_name_and_discovery_strategy, fun validate_cluster_strategy/1},
+        {validate_durable_sessions_strategy, fun validate_durable_sessions_strategy/1}
+    ] ++
         hocon_schema:validations(emqx_schema) ++
         lists:flatmap(fun hocon_schema:validations/1, common_apps()).
 
-common_apps() ->
-    Edition = emqx_release:edition(),
-    lists:filtermap(
-        fun
-            ({N, E}) ->
-                case E =:= Edition of
-                    true -> {true, N};
-                    false -> false
-                end;
-            (N) when is_atom(N) -> {true, N}
+validate_durable_sessions_strategy(Conf) ->
+    DSEnabled = hocon_maps:get("durable_sessions.enable", Conf),
+    DiscoveryStrategy = hocon_maps:get("cluster.discovery_strategy", Conf),
+    LocalBackends = lists:filter(
+        fun(Key) ->
+            hocon_maps:get(Key, Conf) =:= builtin_local
         end,
-        ?MERGED_CONFIGS
-    ).
+        [
+            "durable_storage.messages.backend",
+            "durable_storage.sessions.backend",
+            "durable_storage.timers.backend"
+        ]
+    ),
+    case LocalBackends of
+        [_ | _] when DSEnabled, DiscoveryStrategy =/= singleton ->
+            throw(#{
+                explain =>
+                    "Cluster discovery strategy must be 'singleton' when"
+                    " 'builtin_local' durable storage backend is used.",
+                keys =>
+                    LocalBackends
+            });
+        _ ->
+            ok
+    end.
+
+common_apps() ->
+    ?MERGED_CONFIGS.
 
 fields("cluster") ->
     [
@@ -167,25 +212,14 @@ fields("cluster") ->
                     'readOnly' => true
                 }
             )},
+        {"description", emqx_schema:description_schema()},
         {"discovery_strategy",
             sc(
-                hoconsc:enum([manual, static, dns, etcd, k8s]),
+                hoconsc:enum([manual, static, singleton, dns, etcd, k8s]),
                 #{
                     default => manual,
                     desc => ?DESC(cluster_discovery_strategy),
                     'readOnly' => true
-                }
-            )},
-        {"core_nodes",
-            sc(
-                node_array(),
-                #{
-                    %% This config is nerver needed (since 5.0.0)
-                    importance => ?IMPORTANCE_HIDDEN,
-                    mapping => "mria.core_nodes",
-                    default => [],
-                    'readOnly' => true,
-                    desc => ?DESC(db_core_nodes)
                 }
             )},
         {"autoclean",
@@ -218,6 +252,17 @@ fields("cluster") ->
                     desc => ?DESC(cluster_proto_dist)
                 }
             )},
+        {"quic_lb_mode",
+            sc(
+                hoconsc:union([integer(), string()]),
+                #{
+                    mapping => "quicer.lb_mode",
+                    default => 0,
+                    'readOnly' => true,
+                    desc => ?DESC(cluster_quic_lb_mode),
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
         {"static",
             sc(
                 ?R_REF(cluster_static),
@@ -247,8 +292,33 @@ fields("cluster") ->
                     default => false,
                     importance => ?IMPORTANCE_HIDDEN
                 }
+            )},
+        {"heartbeat_interval",
+            sc(
+                emqx_schema:duration_ms(),
+                #{
+                    default => <<"5s">>,
+                    desc => ?DESC(durable_timer_heartbeat_interval),
+                    importance => ?IMPORTANCE_HIDDEN,
+                    mapping => "emqx_durable_timer.heartbeat_interval"
+                }
+            )},
+        {"missed_heartbeats",
+            sc(
+                pos_integer(),
+                #{
+                    default => 5,
+                    desc => ?DESC(durable_timer_missed_heartbeats),
+                    importance => ?IMPORTANCE_HIDDEN,
+                    mapping => "emqx_durable_timer.missed_heartbeats"
+                }
+            )},
+        {"durable_timers",
+            sc(
+                ?R_REF(durable_timers),
+                #{}
             )}
-    ];
+    ] ++ emqx_schema_hooks:list_injection_point(cluster);
 fields(cluster_static) ->
     [
         {"seeds",
@@ -400,7 +470,7 @@ fields("node") ->
                     %% deprecated make sure it's disappeared in raw_conf user(HTTP API)
                     %% but still in vm.args via translation/1
                     %% ProcessLimit is always equal to MaxPort * 2 when translation/1.
-                    deprecated => true,
+                    deprecated => {since, "5.1"},
                     desc => ?DESC(process_limit),
                     importance => ?IMPORTANCE_HIDDEN,
                     'readOnly' => true
@@ -468,7 +538,7 @@ fields("node") ->
                 hoconsc:union([disabled, emqx_schema:duration()]),
                 #{
                     mapping => "emqx_machine.global_gc_interval",
-                    default => <<"15m">>,
+                    default => disabled,
                     desc => ?DESC(node_global_gc_interval),
                     importance => ?IMPORTANCE_LOW,
                     'readOnly' => true
@@ -572,14 +642,15 @@ fields("node") ->
             )},
         {"role",
             sc(
-                hoconsc:enum([core, replicant]),
+                hoconsc:enum(node_role_symbols()),
                 #{
                     mapping => "mria.node_role",
                     default => core,
                     'readOnly' => true,
                     importance => ?IMPORTANCE_HIGH,
                     aliases => [db_role],
-                    desc => ?DESC(db_role)
+                    desc => ?DESC(db_role),
+                    validator => fun validate_node_role/1
                 }
             )},
         {"rpc_module",
@@ -730,30 +801,22 @@ fields("rpc") ->
                     desc => ?DESC(rpc_port_discovery)
                 }
             )},
-        {"tcp_server_port",
+        {"server_port",
             sc(
-                integer(),
+                pos_integer(),
                 #{
-                    mapping => "gen_rpc.tcp_server_port",
-                    default => 5369,
-                    desc => ?DESC(rpc_tcp_server_port)
+                    aliases => [tcp_server_port, ssl_server_port],
+                    default => ?DEFAULT_RPC_PORT,
+                    desc => ?DESC(rpc_server_port)
                 }
             )},
-        {"ssl_server_port",
-            sc(
-                integer(),
-                #{
-                    mapping => "gen_rpc.ssl_server_port",
-                    default => 5369,
-                    desc => ?DESC(rpc_ssl_server_port)
-                }
-            )},
-        {"tcp_client_num",
+        {"client_num",
             sc(
                 range(1, 256),
                 #{
+                    aliases => [tcp_client_num],
                     default => 10,
-                    desc => ?DESC(rpc_tcp_client_num)
+                    desc => ?DESC(rpc_client_num)
                 }
             )},
         {"connect_timeout",
@@ -943,9 +1006,7 @@ fields("log_file_handler") ->
                     default => <<"${EMQX_LOG_DIR}/emqx.log">>,
                     aliases => [file, to],
                     importance => ?IMPORTANCE_HIGH,
-                    converter => fun(Path, Opts) ->
-                        emqx_schema:naive_env_interpolation(ensure_unicode_path(Path, Opts))
-                    end
+                    converter => fun log_file_path_converter/2
                 }
             )},
         {"rotation_count",
@@ -977,6 +1038,7 @@ fields("log_overload_kill") ->
                 boolean(),
                 #{
                     default => true,
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC("log_overload_kill_enable")
                 }
             )},
@@ -1012,6 +1074,7 @@ fields("log_burst_limit") ->
                 boolean(),
                 #{
                     default => true,
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC("log_burst_limit_enable")
                 }
             )},
@@ -1056,7 +1119,29 @@ fields("log_throttling") ->
     ];
 fields("authorization") ->
     emqx_schema:authz_fields() ++
-        emqx_authz_schema:authz_fields().
+        emqx_authz_schema:authz_fields();
+fields(durable_timers) ->
+    [
+        {"replay_retry_interval",
+            sc(
+                emqx_schema:duration_ms(),
+                #{
+                    default => <<"100ms">>,
+                    desc => ?DESC(durable_timer_retry_interval),
+                    importance => ?IMPORTANCE_HIDDEN,
+                    mapping => "emqx_durable_timer.replay_retry_interval"
+                }
+            )},
+        {"batch_size",
+            sc(
+                pos_integer(),
+                #{
+                    default => 100,
+                    desc => ?DESC(durable_timer_batch_size),
+                    mapping => "emqx_durable_timer.batch_size"
+                }
+            )}
+    ].
 
 desc("cluster") ->
     ?DESC("desc_cluster");
@@ -1090,6 +1175,8 @@ desc("authorization") ->
     ?DESC("desc_authorization");
 desc("log_throttling") ->
     ?DESC("desc_log_throttling");
+desc(durable_timers) ->
+    ?DESC("desc_durable_timers");
 desc(_) ->
     undefined.
 
@@ -1113,8 +1200,10 @@ translation("emqx") ->
 translation("gen_rpc") ->
     [
         {"default_client_driver", fun tr_gen_rpc_default_client_driver/1},
-        {"tcp_client_port", fun tr_gen_rpc_tcp_client_port/1},
-        {"ssl_client_port", fun tr_gen_rpc_ssl_client_port/1},
+        {"tcp_server_port", fun tr_gen_rpc_port/1},
+        {"ssl_server_port", fun tr_gen_rpc_port/1},
+        {"tcp_client_port", fun tr_gen_rpc_port/1},
+        {"ssl_client_port", fun tr_gen_rpc_port/1},
         {"ssl_client_options", fun tr_gen_rpc_ssl_options/1},
         {"ssl_server_options", fun tr_gen_rpc_ssl_options/1},
         {"socket_ip", fun(Conf) ->
@@ -1198,11 +1287,8 @@ collector_enabled(disabled, _) -> [].
 tr_gen_rpc_default_client_driver(Conf) ->
     conf_get("rpc.protocol", Conf).
 
-tr_gen_rpc_tcp_client_port(Conf) ->
-    conf_get("rpc.tcp_server_port", Conf).
-
-tr_gen_rpc_ssl_client_port(Conf) ->
-    conf_get("rpc.ssl_server_port", Conf).
+tr_gen_rpc_port(Conf) ->
+    conf_get("rpc.server_port", Conf).
 
 tr_gen_rpc_ssl_options(Conf) ->
     Ciphers = conf_get("rpc.ciphers", Conf),
@@ -1240,7 +1326,7 @@ tr_cluster_discovery(Conf) ->
 log_handler_common_confs(Handler, Default) ->
     %% We rarely support dynamic defaults like this.
     %% For this one, we have build-time default the same as runtime default so it's less tricky
-    %% Buildtime default: "" (which is the same as "file")
+    %% Build time default: "" (which is the same as "file")
     %% Runtime default: "file" (because .service file sets EMQX_DEFAULT_LOG_HANDLER to "file")
     EnableValues =
         case Handler of
@@ -1250,6 +1336,11 @@ log_handler_common_confs(Handler, Default) ->
     EnvValue = os:getenv("EMQX_DEFAULT_LOG_HANDLER"),
     Enable = lists:member(EnvValue, EnableValues),
     LevelDesc = maps:get(level_desc, Default, "common_handler_level"),
+    EnableImportance =
+        case Enable of
+            true -> ?IMPORTANCE_NO_DOC;
+            false -> ?IMPORTANCE_MEDIUM
+        end,
     [
         {"level",
             sc(
@@ -1266,7 +1357,7 @@ log_handler_common_confs(Handler, Default) ->
                 #{
                     default => Enable,
                     desc => ?DESC("common_handler_enable"),
-                    importance => ?IMPORTANCE_MEDIUM
+                    importance => EnableImportance
                 }
             )},
         {"formatter",
@@ -1362,17 +1453,34 @@ log_handler_common_confs(Handler, Default) ->
                     desc => ?DESC("common_handler_max_depth"),
                     importance => ?IMPORTANCE_HIDDEN
                 }
-            )}
+            )},
+        {"with_mfa",
+            sc(
+                boolean(),
+                #{
+                    default => false,
+                    desc => <<"Recording MFA and line in the log(usefully).">>,
+                    importance => ?IMPORTANCE_HIDDEN
+                }
+            )},
+        {"payload_encode",
+            sc(hoconsc:enum([hex, text, hidden]), #{
+                default => text,
+                desc => ?DESC(emqx_schema, fields_trace_payload_encode)
+            })}
     ].
 
 crash_dump_file_default() ->
-    case os:getenv("EMQX_LOG_DIR") of
-        false ->
-            %% testing, or running emqx app as deps
-            <<"log/erl_crash.dump">>;
-        Dir ->
-            unicode:characters_to_binary(filename:join([Dir, "erl_crash.dump"]), utf8)
-    end.
+    File = "erl_crash." ++ emqx_utils_calendar:now_time(second) ++ ".dump",
+    LogDir =
+        case os:getenv("EMQX_LOG_DIR") of
+            false ->
+                %% testing, or running emqx app as deps
+                "log";
+            Dir ->
+                Dir
+        end,
+    unicode:characters_to_binary(filename:join([LogDir, File]), utf8).
 
 %% utils
 -spec conf_get(string() | [string()], hocon:config()) -> term().
@@ -1422,6 +1530,8 @@ cluster_options(k8s, Conf) ->
         {suffix, conf_get("cluster.k8s.suffix", Conf, "")}
     ];
 cluster_options(manual, _Conf) ->
+    [];
+cluster_options(singleton, _Conf) ->
     [].
 
 to_atom(Atom) when is_atom(Atom) ->
@@ -1485,6 +1595,62 @@ convert_rotation(#{} = Rotation, _Opts) -> maps:get(<<"count">>, Rotation, 10);
 convert_rotation(Count, _Opts) when is_integer(Count) -> Count;
 convert_rotation(Count, _Opts) -> throw({"bad_rotation", Count}).
 
+log_file_path_converter(Path, Opts) ->
+    Fixed = fix_bad_log_path(Path),
+    ensure_unicode_path(Fixed, Opts).
+
+%% Prior to 5.8.3, the log file paths are resolved by scehma module
+%% and the interpolated paths (absolute paths) are exported.
+%% When exported from docker but import to a non-docker environment,
+%% the absolute paths are not valid anymore.
+%% Here we try to fix non-existing log dir with default log dir.
+fix_bad_log_path(Bin) when is_binary(Bin) ->
+    try
+        List = [_ | _] = unicode:characters_to_list(Bin, utf8),
+        Fixed = fix_bad_log_path(List),
+        unicode:characters_to_binary(Fixed, utf8)
+    catch
+        _:_ ->
+            %% defer validation to ensure_unicode_path
+            Bin
+    end;
+fix_bad_log_path(Path) when is_list(Path) ->
+    Dir = filename:dirname(Path),
+    Name = filename:basename(Path),
+    maybe_subst_log_dir(Dir, Name);
+fix_bad_log_path(Path) ->
+    %% defer validation to ensure_unicode_path
+    Path.
+
+%% Substitute the log dir with environment variable EMQX_LOG_DIR
+%% when possible
+maybe_subst_log_dir("${" ++ _ = Dir, Name) ->
+    %% the original path is already using environment variable
+    filename:join([Dir, Name]);
+maybe_subst_log_dir(Dir, Name) ->
+    Env = os:getenv("EMQX_LOG_DIR"),
+    IsEnvSet = (Env =/= false andalso Env =/= ""),
+    case Env =:= Dir of
+        true ->
+            %% the path is the same as the environment variable
+            %% substitute it with the environment variable
+            filename:join(["${EMQX_LOG_DIR}", Name]);
+        false ->
+            case filelib:is_dir(Dir) of
+                true ->
+                    %% the path exists, keep it
+                    filename:join(Dir, Name);
+                false when IsEnvSet ->
+                    %% the path does not exist, but the environment variable is set
+                    %% substitute it with the environment variable
+                    filename:join(["${EMQX_LOG_DIR}", Name]);
+                false ->
+                    %% the path does not exist, and the environment variable is not set
+                    %% keep it
+                    filename:join(Dir, Name)
+            end
+    end.
+
 ensure_unicode_path(Path, Opts) ->
     emqx_schema:ensure_unicode_path(Path, Opts).
 
@@ -1520,8 +1686,8 @@ validate_dns_cluster_strategy(_Other, _Type, _Name) ->
 
 is_ip_addr(Host, Type) ->
     case inet:parse_address(Host) of
-        {ok, Ip} ->
-            AddrType = address_type(Ip),
+        {ok, IP} ->
+            AddrType = address_type(IP),
             case
                 (AddrType =:= ipv4 andalso Type =:= a) orelse
                     (AddrType =:= ipv6 andalso Type =:= aaaa)
@@ -1533,7 +1699,7 @@ is_ip_addr(Host, Type) ->
                         explain => "Node name address " ++ atom_to_list(AddrType) ++
                             " is incompatible with DNS record type " ++ atom_to_list(Type),
                         record_type => Type,
-                        address_type => address_type(Ip)
+                        address_type => address_type(IP)
                     })
             end;
         _ ->
@@ -1542,3 +1708,17 @@ is_ip_addr(Host, Type) ->
 
 address_type(IP) when tuple_size(IP) =:= 4 -> ipv4;
 address_type(IP) when tuple_size(IP) =:= 8 -> ipv6.
+
+node_role_symbols() ->
+    [core] ++ emqx_schema_hooks:list_injection_point('node.role').
+
+validate_node_role(Role) ->
+    Allowed = node_role_symbols(),
+    case lists:member(Role, Allowed) of
+        true ->
+            ok;
+        false when Role =:= replicant ->
+            throw("Node role 'replicant' is only allowed in Enterprise edition since 5.8.0");
+        false ->
+            throw("Invalid node role: " ++ atom_to_list(Role))
+    end.

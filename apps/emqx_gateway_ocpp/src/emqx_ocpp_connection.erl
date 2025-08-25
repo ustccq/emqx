@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% OCPP/WS|WSS Connection
@@ -73,7 +61,7 @@
     %% Piggyback
     piggyback :: single | multiple,
     %% Limiter
-    limiter :: option(emqx_htb_limiter:limiter()),
+    limiter :: option(emqx_limiter_client_container:t()),
     %% Limit Timer
     limit_timer :: option(reference()),
     %% Parse State
@@ -107,8 +95,6 @@
 -type state() :: #state{}.
 
 -type ws_cmd() :: {active, boolean()} | close.
-
--define(ACTIVE_N, 100).
 
 -define(INFO_KEYS, [
     socktype,
@@ -240,7 +226,7 @@ do_init(Req, Opts, WsOpts) ->
         {error, Reason, _State} ->
             {ok, cowboy_req:reply(400, #{}, to_bin(Reason), Req), WsOpts};
         {ok, [Resp, Opts, WsOpts], NState} ->
-            {cowboy_websocket, Resp, [Req, Opts, NState], WsOpts}
+            {cowboy_websocket_linger, Resp, [Req, Opts, NState], WsOpts}
     end.
 
 init_state_and_channel([Req, Opts, _WsOpts], _State = undefined) ->
@@ -469,20 +455,18 @@ websocket_handle({Frame, _}, State) ->
 websocket_info({call, From, Req}, State) ->
     handle_call(From, Req, State);
 websocket_info({cast, rate_limit}, State) ->
-    Stats = #{
-        cnt => emqx_pd:reset_counter(incoming_pubs),
-        oct => emqx_pd:reset_counter(incoming_bytes)
-    },
-    NState = postpone({check_gc, Stats}, State),
-    return(ensure_rate_limit(Stats, NState));
+    Cnt = emqx_pd:reset_counter(incoming_pubs),
+    Oct = emqx_pd:reset_counter(incoming_bytes),
+    NState = postpone({check_gc, Cnt, Oct}, State),
+    return(ensure_rate_limit(NState));
 websocket_info({cast, Msg}, State) ->
     handle_info(Msg, State);
 websocket_info({incoming, Packet}, State) ->
     handle_incoming(Packet, State);
 websocket_info({outgoing, Packets}, State) ->
     return(enqueue(Packets, State));
-websocket_info({check_gc, Stats}, State) ->
-    return(check_oom(run_gc(Stats, State)));
+websocket_info({check_gc, Cnt, Oct}, State) ->
+    return(check_oom(run_gc(Cnt, Oct, State)));
 websocket_info(
     Deliver = {deliver, _Topic, _Msg},
     State = #state{active_n = ActiveN}
@@ -601,15 +585,15 @@ handle_timeout(TRef, TMsg, State) ->
 %% Ensure rate limit
 %%--------------------------------------------------------------------
 
-ensure_rate_limit(_Stats, State) ->
+ensure_rate_limit(State) ->
     State.
 
 %%--------------------------------------------------------------------
 %% Run GC, Check OOM
 %%--------------------------------------------------------------------
 
-run_gc(Stats, State = #state{gc_state = GcSt}) ->
-    case ?ENABLED(GcSt) andalso emqx_gc:run(Stats, GcSt) of
+run_gc(Cnt, Oct, State = #state{gc_state = GcSt}) ->
+    case ?ENABLED(GcSt) andalso emqx_gc:run(Cnt, Oct, GcSt) of
         false -> State;
         {_IsGC, GcSt1} -> State#state{gc_state = GcSt1}
     end.
@@ -694,11 +678,9 @@ handle_outgoing(Packets, State = #state{active_n = ActiveN, piggyback = Piggybac
     NState =
         case emqx_pd:get_counter(outgoing_pubs) > ActiveN of
             true ->
-                Stats = #{
-                    cnt => emqx_pd:reset_counter(outgoing_pubs),
-                    oct => emqx_pd:reset_counter(outgoing_bytes)
-                },
-                postpone({check_gc, Stats}, State);
+                Cnt = emqx_pd:reset_counter(outgoing_pubs),
+                Oct = emqx_pd:reset_counter(outgoing_bytes),
+                postpone({check_gc, Cnt, Oct}, State);
             false ->
                 State
         end,

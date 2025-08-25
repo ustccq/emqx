@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_azure_event_hub).
 
@@ -129,16 +129,7 @@ fields(actions) ->
         override(
             emqx_bridge_kafka:producer_opts(action),
             bridge_v2_overrides()
-        ) ++
-            [
-                {enable, mk(boolean(), #{desc => ?DESC("config_enable"), default => true})},
-                {connector,
-                    mk(binary(), #{
-                        desc => ?DESC(emqx_connector_schema, "connector_field"), required => true
-                    })},
-                {tags, emqx_schema:tags_schema()},
-                {description, emqx_schema:description_schema()}
-            ],
+        ) ++ emqx_bridge_v2_schema:common_action_fields(),
     override_documentations(Fields);
 fields(Method) ->
     Fields = emqx_bridge_kafka:fields(Method),
@@ -298,6 +289,8 @@ values(producer) ->
                 key => <<"${.clientid}">>,
                 value => <<"${.}">>
             },
+            max_linger_time => <<"5ms">>,
+            max_linger_bytes => <<"10MB">>,
             max_batch_bytes => <<"896KB">>,
             partition_strategy => <<"random">>,
             required_acks => <<"all_isr">>,
@@ -405,8 +398,7 @@ producer_overrides() ->
             ),
         %% NOTE: field 'kafka' is renamed to 'parameters' since e5.3.1
         %% We will keep 'kafka' for backward compatibility.
-        %% TODO: delete this override when we upgrade bridge schema json to 0.2.0
-        %% See emqx_conf:bridge_schema_json/0
+        %% TODO: delete this override when we stop supporting v1 bridge schema
         kafka =>
             mk(ref(producer_kafka_opts), #{
                 required => true,
@@ -426,7 +418,7 @@ bridge_v2_overrides() ->
         parameters =>
             mk(ref(producer_kafka_opts), #{
                 required => true,
-                validator => fun emqx_bridge_kafka:producer_strategy_key_validator/1
+                validator => fun emqx_bridge_kafka:producer_parameters_validator/1
             }),
         ssl => mk(ref(ssl_client_opts), #{default => #{<<"enable">> => true}}),
         type => mk(
@@ -476,8 +468,7 @@ override_documentations(Fields) ->
         fun({Name, Sc}) ->
             case hocon_schema:field_schema(Sc, desc) of
                 ?DESC(emqx_bridge_kafka, Key) ->
-                    %% to please dialyzer...
-                    Override = #{type => hocon_schema:field_schema(Sc, type), desc => ?DESC(Key)},
+                    Override = #{desc => ?DESC(Key)},
                     {Name, hocon_schema:override(Sc, Override)};
                 _ ->
                     {Name, Sc}

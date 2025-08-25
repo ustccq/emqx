@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_gcp_pubsub_consumer_worker).
@@ -37,6 +37,7 @@
     client := emqx_bridge_gcp_pubsub_client:state(),
     ecpool_worker_id => non_neg_integer(),
     forget_interval := duration(),
+    namespace := emqx_bridge_v2:maybe_namespace(),
     hookpoints := [binary()],
     connector_resource_id := binary(),
     source_resource_id := binary(),
@@ -56,6 +57,7 @@
     client := emqx_bridge_gcp_pubsub_client:state(),
     ecpool_worker_id := non_neg_integer(),
     forget_interval := duration(),
+    namespace := emqx_bridge_v2:maybe_namespace(),
     hookpoints := [binary()],
     connector_resource_id := binary(),
     source_resource_id := binary(),
@@ -159,6 +161,7 @@ connect(Opts0) ->
         ecpool_worker_id := WorkerId,
         forget_interval := ForgetInterval,
         hookpoints := Hookpoints,
+        namespace := Namespace,
         connector_resource_id := ConnectorResId,
         source_resource_id := SourceResId,
         project_id := ProjectId,
@@ -179,6 +182,7 @@ connect(Opts0) ->
         client => Client,
         forget_interval => ForgetInterval,
         hookpoints => Hookpoints,
+        namespace => Namespace,
         connector_resource_id => ConnectorResId,
         source_resource_id => SourceResId,
         mqtt_config => MQTTConfig,
@@ -627,7 +631,7 @@ do_get_subscription(State) ->
             }),
             {error, Reason};
         {ok, #{status_code := 200, body := RespBody}} ->
-            DecodedBody = emqx_utils_json:decode(RespBody, [return_maps]),
+            DecodedBody = emqx_utils_json:decode(RespBody),
             {ok, DecodedBody};
         {ok, Details} ->
             ?SLOG(warning, #{
@@ -716,7 +720,7 @@ subscription_resource(ProjectId, SubscriptionId) ->
 
 -spec decode_response(binary()) -> [decoded_message()].
 decode_response(RespBody) ->
-    case emqx_utils_json:decode(RespBody, [return_maps]) of
+    case emqx_utils_json:decode(RespBody) of
         #{<<"receivedMessages">> := Msgs0} ->
             lists:map(
                 fun(Msg0 = #{<<"message">> := InnerMsg0}) ->
@@ -742,6 +746,7 @@ handle_message(State, #{<<"ackId">> := AckId, <<"message">> := InnerMsg} = _Mess
                 source_resource_id := SourceResId,
                 hookpoints := Hookpoints,
                 mqtt_config := MQTTConfig,
+                namespace := Namespace,
                 topic := Topic
             } = State,
             #{
@@ -767,7 +772,7 @@ handle_message(State, #{<<"ackId">> := AckId, <<"message">> := InnerMsg} = _Mess
                 ),
             legacy_maybe_publish_mqtt_message(MQTTConfig, SourceResId, FullMessage),
             lists:foreach(
-                fun(Hookpoint) -> emqx_hooks:run(Hookpoint, [FullMessage]) end,
+                fun(Hookpoint) -> emqx_hooks:run(Hookpoint, [FullMessage, Namespace]) end,
                 Hookpoints
             ),
             emqx_resource_metrics:received_inc(SourceResId),

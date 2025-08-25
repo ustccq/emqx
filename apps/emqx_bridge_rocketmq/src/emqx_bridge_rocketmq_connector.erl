@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_rocketmq_connector).
@@ -16,6 +16,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -80,7 +81,7 @@ fields(config) ->
 
         {pool_size, fun emqx_connector_schema_lib:pool_size/1},
         {auto_reconnect, fun emqx_connector_schema_lib:auto_reconnect/1}
-    ].
+    ] ++ emqx_connector_schema_lib:ssl_fields().
 
 servers() ->
     Meta = #{desc => ?DESC("servers")},
@@ -90,6 +91,8 @@ servers() ->
 %% `emqx_resource' API
 %%========================================================================================
 
+resource_type() -> rocketmq.
+
 callback_mode() -> always_sync.
 
 on_start(
@@ -98,7 +101,8 @@ on_start(
         servers := BinServers,
         access_key := AccessKey,
         secret_key := SecretKey,
-        security_token := SecurityToken
+        security_token := SecurityToken,
+        ssl := SSLOptsMap
     } = Config
 ) ->
     ?SLOG(info, #{
@@ -112,15 +116,19 @@ on_start(
     ),
     ClientId = client_id(InstanceId),
     ACLInfo = acl_info(AccessKey, SecretKey, SecurityToken),
-    ClientCfg = namespace(#{acl_info => ACLInfo}, Config),
-
+    Namespace = maps:get(namespace, Config, <<>>),
+    ClientCfg0 = #{acl_info => ACLInfo, namespace => Namespace},
+    SSLOpts = emqx_tls_lib:to_client_opts(SSLOptsMap),
+    ClientCfg = emqx_utils_maps:put_if(ClientCfg0, ssl_opts, SSLOpts, SSLOpts =/= []),
     State = #{
         client_id => ClientId,
         acl_info => ACLInfo,
-        installed_channels => #{}
+        namespace => Namespace,
+        installed_channels => #{},
+        ssl_opts => SSLOpts
     },
 
-    ok = emqx_resource:allocate_resource(InstanceId, client_id, ClientId),
+    ok = emqx_resource:allocate_resource(InstanceId, ?MODULE, client_id, ClientId),
     create_producers_map(ClientId),
 
     case rocketmq:ensure_supervised_client(ClientId, Servers, ClientCfg) of
@@ -139,34 +147,47 @@ on_add_channel(
     _InstId,
     #{
         installed_channels := InstalledChannels,
-        acl_info := ACLInfo
+        namespace := Namespace,
+        acl_info := ACLInfo,
+        ssl_opts := SSLOpts
     } = OldState,
     ChannelId,
     ChannelConfig
 ) ->
-    {ok, ChannelState} = create_channel_state(ChannelConfig, ACLInfo),
+    {ok, ChannelState} = create_channel_state(
+        ChannelId, ChannelConfig, ACLInfo, Namespace, SSLOpts
+    ),
     NewInstalledChannels = maps:put(ChannelId, ChannelState, InstalledChannels),
     %% Update state
     NewState = OldState#{installed_channels => NewInstalledChannels},
     {ok, NewState}.
 
 create_channel_state(
+    ActionResId,
     #{parameters := Conf} = _ChannelConfig,
-    ACLInfo
+    ACLInfo,
+    Namespace,
+    SSLOpts
 ) ->
     #{
         topic := Topic,
-        sync_timeout := SyncTimeout
+        sync_timeout := SyncTimeout,
+        strategy := Strategy
     } = Conf,
     TopicTks = emqx_placeholder:preproc_tmpl(Topic),
-    ProducerOpts = make_producer_opts(Conf, ACLInfo),
+    KeyTemplate = maybe_parse_template(maps:get(key, Conf, undefined)),
+    TagTemplate = maybe_parse_template(maps:get(tag, Conf, undefined)),
+    ProducerOpts = make_producer_opts(Conf, ACLInfo, Namespace, Strategy, SSLOpts),
     Templates = parse_template(Conf),
-    DispatchStrategy = parse_dispatch_strategy(Conf),
+    maybe_warn_deprecated_dispatch(ActionResId, Strategy),
+    ContextFn = mk_context_fn(Strategy, KeyTemplate, TagTemplate),
     State = #{
+        key => KeyTemplate,
+        tag => TagTemplate,
         topic => Topic,
         topic_tokens => TopicTks,
         templates => Templates,
-        dispatch_strategy => DispatchStrategy,
+        context_fn => ContextFn,
         sync_timeout => SyncTimeout,
         acl_info => ACLInfo,
         producers_opts => ProducerOpts
@@ -257,13 +278,13 @@ do_query(
     #{
         topic_tokens := TopicTks,
         templates := Templates,
-        dispatch_strategy := DispatchStrategy,
+        context_fn := ContextFn,
         sync_timeout := RequestTimeout,
         producers_opts := ProducerOpts
     } = maps:get(ChannelId, Channels),
-
     TopicKey = get_topic_key(Query, TopicTks),
-    Data = apply_template(Query, Templates, DispatchStrategy),
+    Data = apply_template(Query, Templates, ContextFn),
+    ?tp("rocketmq_rendered_data", #{data => Data}),
     emqx_trace:rendered_action_template(ChannelId, #{
         topic_key => TopicKey,
         data => Data,
@@ -329,29 +350,26 @@ parse_template([{Key, H} | T], Templates) ->
 parse_template([], Templates) ->
     Templates.
 
-%% returns a procedure to generate the produce context
-parse_dispatch_strategy(#{strategy := roundrobin}) ->
-    fun(_) ->
-        #{}
-    end;
-parse_dispatch_strategy(#{strategy := Template}) ->
-    Tokens = emqx_placeholder:preproc_tmpl(Template),
+maybe_warn_deprecated_dispatch(ActionResId, Strategy) when is_binary(Strategy) ->
+    ?tp(warning, "rocketmq_deprecated_placeholder_strategy", #{
+        deprecated_since => <<"6.0.0">>,
+        hint => <<
+            "Using placeholder templates for key in the `strategy`"
+            " is deprecated.  Please use the `parameter.key` config and"
+            " set `parameters.strategy` to `key_dispatch`."
+        >>,
+        action => ActionResId
+    });
+maybe_warn_deprecated_dispatch(_ActionResId, _Strategy) ->
+    ok.
+
+mk_context_fn(key_dispatch, undefined = _KeyTemplate, _TagTemplate) ->
+    throw(<<"must provide a key template if strategy is key dispatch">>);
+mk_context_fn(_Strategy, KeyTemplate, TagTemplate) ->
     fun(Msg) ->
-        #{
-            key =>
-                case emqx_placeholder:proc_tmpl(Tokens, Msg) of
-                    <<"undefined">> ->
-                        %% Since the key may be absent on some kinds of events (ex:
-                        %% `topic' is absent in `client.disconnected'), and this key is
-                        %% used for routing, we generate a random key when it's absent to
-                        %% better distribute the load, effectively making it `random'
-                        %% dispatch if the key is absent and we are using `key_dispatch'.
-                        %% Otherwise, it'll be deterministic.
-                        emqx_guid:to_base62(emqx_guid:gen());
-                    Key ->
-                        Key
-                end
-        }
+        Ctx0 = #{},
+        Ctx1 = maybe_add_rendered_key(KeyTemplate, key, Msg, Ctx0, key_render_opts()),
+        maybe_add_rendered_key(TagTemplate, tag, Msg, Ctx1)
     end.
 
 get_topic_key({_, Msg}, TopicTks) ->
@@ -361,7 +379,7 @@ get_topic_key([Query | _], TopicTks) ->
 
 %% return a message data and its context,
 %% {binary(), rocketmq_producers:produce_context()})
-apply_template({Key, Msg} = _Req, Templates, DispatchStrategy) ->
+apply_template({Key, Msg} = _Req, Templates, ContextFn) ->
     {
         case maps:get(Key, Templates, undefined) of
             undefined ->
@@ -369,15 +387,15 @@ apply_template({Key, Msg} = _Req, Templates, DispatchStrategy) ->
             Template ->
                 emqx_placeholder:proc_tmpl(Template, Msg)
         end,
-        DispatchStrategy(Msg)
+        ContextFn(Msg)
     };
-apply_template([{Key, _} | _] = Reqs, Templates, DispatchStrategy) ->
+apply_template([{Key, _} | _] = Reqs, Templates, ContextFn) ->
     case maps:get(Key, Templates, undefined) of
         undefined ->
-            [{emqx_utils_json:encode(Msg), DispatchStrategy(Msg)} || {_, Msg} <- Reqs];
+            [{emqx_utils_json:encode(Msg), ContextFn(Msg)} || {_, Msg} <- Reqs];
         Template ->
             [
-                {emqx_placeholder:proc_tmpl(Template, Msg), DispatchStrategy(Msg)}
+                {emqx_placeholder:proc_tmpl(Template, Msg), ContextFn(Msg)}
              || {_, Msg} <- Reqs
             ]
     end.
@@ -400,13 +418,23 @@ make_producer_opts(
         send_buffer := SendBuff,
         refresh_interval := RefreshInterval
     },
-    ACLInfo
+    ACLInfo,
+    Namespace,
+    Strategy,
+    SSLOpts
 ) ->
-    #{
+    ProducerOpts = #{
         tcp_opts => [{sndbuf, SendBuff}],
         ref_topic_route_interval => RefreshInterval,
-        acl_info => emqx_secret:wrap(ACLInfo)
-    }.
+        acl_info => emqx_secret:wrap(ACLInfo),
+        namespace => Namespace,
+        partitioner =>
+            case Strategy of
+                roundrobin -> roundrobin;
+                _ -> key_dispatch
+            end
+    },
+    emqx_utils_maps:put_if(ProducerOpts, ssl_opts, SSLOpts, SSLOpts =/= []).
 
 acl_info(<<>>, _, _) ->
     #{};
@@ -423,10 +451,6 @@ acl_info(AccessKey, SecretKey, SecurityToken) when is_binary(AccessKey) ->
     end;
 acl_info(_, _, _) ->
     #{}.
-
-namespace(ClientCfg, Config) ->
-    Namespace = maps:get(namespace, Config, <<>>),
-    ClientCfg#{namespace => Namespace}.
 
 create_producers_map(ClientId) ->
     _ = ets:new(ClientId, [public, named_table, {read_concurrency, true}]),
@@ -456,7 +480,37 @@ get_producers(ChannelId, InstanceId, ClientId, Topic, ProducerOpts) ->
             {ok, Producers} = rocketmq:ensure_supervised_producers(
                 ClientId, ProducerGroup, Topic, ProducerOpts2
             ),
-            ok = emqx_resource:allocate_resource(InstanceId, ProducerGroup, Producers),
+            ok = emqx_resource:allocate_resource(InstanceId, ?MODULE, ProducerGroup, Producers),
             ets:insert(ClientId, {ProducerGroup, Producers}),
             Producers
     end.
+
+maybe_parse_template(undefined) ->
+    undefined;
+maybe_parse_template(Template) ->
+    emqx_template:parse(Template).
+
+maybe_add_rendered_key(Template, Key, Data, RocketMQCtx) ->
+    maybe_add_rendered_key(Template, Key, Data, RocketMQCtx, _RenderOpts = #{}).
+
+maybe_add_rendered_key(undefined, _Key, _Data, RocketMQCtx, _RenderOpts) ->
+    RocketMQCtx;
+maybe_add_rendered_key(Template, Key, Data, RocketMQCtx, RenderOpts) ->
+    {Rendered, _Errors} = emqx_template:render(Template, Data, RenderOpts),
+    RocketMQCtx#{Key => iolist_to_binary(Rendered)}.
+
+key_render_opts() ->
+    #{
+        var_trans => fun
+            (undefined) ->
+                %% Since the key may be absent on some kinds of events (ex:
+                %% `topic' is absent in `client.disconnected'), and this key is
+                %% used for routing, we generate a random key when it's absent to
+                %% better distribute the load, effectively making it `random'
+                %% dispatch if the key is absent and we are using `key_dispatch'.
+                %% Otherwise, it'll be deterministic.
+                emqx_utils:rand_id(8);
+            (X) ->
+                X
+        end
+    }.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_s3_SUITE).
@@ -10,6 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/test_macros.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 %% See `emqx_bridge_s3.hrl`.
 -define(BRIDGE_TYPE, <<"s3">>).
@@ -86,14 +87,14 @@ connector_config(Name, _Config) ->
             <<"access_key_id">> => maps:get(<<"access_key_id">>, BaseConf),
             <<"secret_access_key">> => maps:get(<<"secret_access_key">>, BaseConf),
             <<"transport_options">> => #{
+                <<"ssl">> => #{<<"enable">> => false},
                 <<"headers">> => #{
                     <<"content-type">> => <<?CONTENT_TYPE>>
                 },
                 <<"connect_timeout">> => <<"500ms">>,
                 <<"request_timeout">> => <<"1s">>,
                 <<"pool_size">> => 4,
-                <<"max_retries">> => 0,
-                <<"enable_pipelining">> => 1
+                <<"max_retries">> => 0
             },
             <<"resource_opts">> => #{
                 <<"health_check_interval">> => <<"5s">>,
@@ -134,6 +135,22 @@ action_config(Name, ConnectorId) ->
 t_start_stop(Config) ->
     emqx_bridge_v2_testlib:t_start_stop(Config, s3_bridge_stopped).
 
+t_create_unavailable_credentials(Config) ->
+    ConnectorName = ?config(connector_name, Config),
+    ConnectorType = ?config(connector_type, Config),
+    ConnectorConfig = maps:without(
+        [<<"access_key_id">>, <<"secret_access_key">>],
+        ?config(connector_config, Config)
+    ),
+    ?assertMatch(
+        {ok,
+            {{_HTTP, 201, _}, _, #{
+                <<"status_reason">> :=
+                    <<"Unable to obtain AWS credentials:", _/bytes>>
+            }}},
+        emqx_bridge_v2_testlib:create_connector_api(ConnectorName, ConnectorType, ConnectorConfig)
+    ).
+
 t_ignore_batch_opts(Config) ->
     {ok, {_Status, _, Bridge}} = emqx_bridge_v2_testlib:create_bridge_api(Config),
     ?assertMatch(
@@ -153,11 +170,18 @@ t_start_broken_update_restart(Config) ->
         {ok, {{_HTTP, 201, _}, _, _}},
         emqx_bridge_v2_testlib:create_connector_api(Name, Type, ConnectorConfBroken)
     ),
-    ConnectorId = emqx_connector_resource:resource_id(Type, Name),
+    ConnectorId = emqx_bridge_v2_testlib:connector_resource_id(Config),
     ?retry(
         _Sleep = 1_000,
         _Attempts = 20,
         ?assertEqual({ok, disconnected}, emqx_resource_manager:health_check(ConnectorId))
+    ),
+    ?assertMatch(
+        {ok,
+            {{_HTTP, 200, _}, _, #{
+                <<"status_reason">> := <<"AWS error: SignatureDoesNotMatch:", _/bytes>>
+            }}},
+        emqx_bridge_v2_testlib:get_connector_api(Type, Name)
     ),
     ?assertMatch(
         {ok, {{_HTTP, 200, _}, _, _}},
@@ -223,7 +247,8 @@ t_query_retry_recoverable(Config) ->
     ),
     Message = emqx_bridge_s3_test_helpers:mk_message_event(Bucket, Topic, Payload),
     %% Verify that the message is sent eventually.
-    ok = emqx_bridge_v2:send_message(?BRIDGE_TYPE, BridgeName, Message, #{}),
+    %% todo: messages should be sent via rules in tests...
+    ok = emqx_bridge_v2:send_message(?global_ns, ?BRIDGE_TYPE, BridgeName, Message, #{}),
     ?assertMatch(
         #{content := Payload},
         maps:from_list(erlcloud_s3:get_object(Bucket, Topic, AwsConfig))

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_api_authn_user_import).
@@ -67,28 +55,12 @@ import_users(post, #{
     bindings := #{name := Name0},
     body := Body
 }) ->
-    with_authn(Name0, fun(
-        _GwName,
-        #{
-            id := AuthId,
-            chain_name := ChainName
-        }
-    ) ->
-        case maps:get(<<"filename">>, Body, undefined) of
-            undefined ->
-                emqx_authn_api:serialize_error({missing_parameter, filename});
-            File ->
-                [{FileName, FileData}] = maps:to_list(maps:without([type], File)),
-                case
-                    emqx_authn_chains:import_users(
-                        ChainName, AuthId, {hash, FileName, FileData}
-                    )
-                of
-                    ok -> {204};
-                    {error, Reason} -> emqx_authn_api:serialize_error(Reason)
-                end
+    with_authn(
+        Name0,
+        fun(_GwName, #{id := AuthId, chain_name := ChainName}) ->
+            do_import_users(ChainName, AuthId, Body)
         end
-    end).
+    ).
 
 import_listener_users(post, #{
     bindings := #{name := Name0, id := Id},
@@ -98,22 +70,21 @@ import_listener_users(post, #{
         Name0,
         Id,
         fun(_GwName, #{id := AuthId, chain_name := ChainName}) ->
-            case maps:get(<<"filename">>, Body, undefined) of
-                undefined ->
-                    emqx_authn_api:serialize_error({missing_parameter, filename});
-                File ->
-                    [{FileName, FileData}] = maps:to_list(maps:without([type], File)),
-                    case
-                        emqx_authn_chains:import_users(
-                            ChainName, AuthId, {hash, FileName, FileData}
-                        )
-                    of
-                        ok -> {204};
-                        {error, Reason} -> emqx_authn_api:serialize_error(Reason)
-                    end
-            end
+            do_import_users(ChainName, AuthId, Body)
         end
     ).
+
+do_import_users(ChainName, AuthId, HttpBody) ->
+    case maps:get(<<"filename">>, HttpBody, undefined) of
+        undefined ->
+            emqx_authn_api:serialize_error({missing_parameter, filename});
+        File ->
+            [{FileName, FileData}] = maps:to_list(maps:without([type], File)),
+            case emqx_authn_chains:import_users(ChainName, AuthId, {hash, FileName, FileData}) of
+                {ok, Result} -> {200, Result};
+                {error, Reason} -> emqx_authn_api:serialize_error(Reason)
+            end
+    end.
 
 %%--------------------------------------------------------------------
 %% Swagger defines
@@ -130,7 +101,7 @@ schema("/gateways/:name/authentication/import_users") ->
                 parameters => params_gateway_name_in_path(),
                 'requestBody' => emqx_dashboard_swagger:file_schema(filename),
                 responses =>
-                    ?STANDARD_RESP(#{204 => <<"Imported">>})
+                    ?STANDARD_RESP(#{200 => emqx_authn_user_import_api:import_result_schema()})
             }
     };
 schema("/gateways/:name/listeners/:id/authentication/import_users") ->
@@ -145,7 +116,7 @@ schema("/gateways/:name/listeners/:id/authentication/import_users") ->
                     params_listener_id_in_path(),
                 'requestBody' => emqx_dashboard_swagger:file_schema(filename),
                 responses =>
-                    ?STANDARD_RESP(#{204 => <<"Imported">>})
+                    ?STANDARD_RESP(#{200 => emqx_authn_user_import_api:import_result_schema()})
             }
     }.
 

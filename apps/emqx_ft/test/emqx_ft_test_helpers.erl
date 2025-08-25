@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ft_test_helpers).
@@ -157,15 +145,15 @@ to_bin(Val) ->
 aws_config() ->
     emqx_s3_test_helpers:aws_config(tcp, binary_to_list(?S3_HOST), ?S3_PORT).
 
-pem_privkey() ->
-    <<
-        "\n"
-        "-----BEGIN EC PRIVATE KEY-----\n"
-        "MHQCAQEEICKTbbathzvD8zvgjL7qRHhW4alS0+j0Loo7WeYX9AxaoAcGBSuBBAAK\n"
-        "oUQDQgAEJBdF7MIdam5T4YF3JkEyaPKdG64TVWCHwr/plC0QzNVJ67efXwxlVGTo\n"
-        "ju0VBj6tOX1y6C0U+85VOM0UU5xqvw==\n"
-        "-----END EC PRIVATE KEY-----\n"
-    >>.
+generate_pki_files(Config) ->
+    PrivDir = ?config(priv_dir, Config),
+    KeyType = ec,
+    Opts = #{
+        base_tmp_dir => PrivDir,
+        key_type => KeyType,
+        password => undefined
+    },
+    emqx_tls_lib_tests:do_setup_ssl_files(Opts).
 
 unique_binary_string() ->
     emqx_guid:to_hexstr(emqx_guid:gen()).

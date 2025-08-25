@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_cth_tls).
@@ -49,6 +37,7 @@
     {_From :: calendar:date(), _To :: calendar:date()}.
 
 -type cert_extensions() :: #{
+    subject_alt_name => string(),
     basic_constraints => false | ca | _PathLenContraint :: pos_integer(),
     key_usage => false | certsign
 }.
@@ -211,6 +200,13 @@ extensions(Opts) ->
         maps:merge(Default, Exts)
     ).
 
+extension(subject_alt_name, Ns) ->
+    [
+        #'Extension'{
+            extnID = ?'id-ce-subjectAltName',
+            extnValue = lists:map(fun subject_alt_name/1, Ns)
+        }
+    ];
 extension(basic_constraints, false) ->
     [];
 extension(basic_constraints, ca) ->
@@ -239,6 +235,9 @@ extension(key_usage, certsign) ->
             critical = true
         }
     ].
+
+subject_alt_name({ip, IPAddr}) when tuple_size(IPAddr) == 4 ->
+    {iPAddress, tuple_to_list(IPAddr)}.
 
 default_validity() ->
     {shift_date(date(), -1), shift_date(date(), +7)}.
@@ -276,7 +275,7 @@ verify_signature(CertDer, KeyPem) ->
 %% -------------------------------------------------------------------
 
 gen_privkey(ec) ->
-    public_key:generate_key({namedCurve, secp256k1});
+    public_key:generate_key({namedCurve, secp521r1});
 gen_privkey(rsa) ->
     public_key:generate_key({rsa, 2048, 17}).
 

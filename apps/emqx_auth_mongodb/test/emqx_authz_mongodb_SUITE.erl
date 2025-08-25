@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_mongodb_SUITE).
@@ -19,7 +8,7 @@
 -compile(export_all).
 
 -include_lib("emqx_auth/include/emqx_authz.hrl").
--include_lib("emqx_connector/include/emqx_connector.hrl").
+-include("../../emqx_connector/include/emqx_connector.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("emqx/include/emqx_placeholder.hrl").
@@ -28,10 +17,20 @@
 -define(MONGO_CLIENT, 'emqx_authz_mongo_SUITE_client').
 
 all() ->
-    emqx_authz_test_lib:all_with_table_case(?MODULE, t_run_case, cases()).
+    [
+        {group, legacy_protocol_true},
+        {group, legacy_protocol_false},
+        {group, legacy_protocol_auto}
+    ].
 
 groups() ->
-    emqx_authz_test_lib:table_groups(t_run_case, cases()).
+    All = emqx_authz_test_lib:all_with_table_case(?MODULE, t_run_case, cases()),
+    [
+        {legacy_protocol_true, [], All},
+        {legacy_protocol_false, [], All},
+        {legacy_protocol_auto, [], All}
+    ] ++
+        emqx_authz_test_lib:table_groups(t_run_case, cases()).
 
 init_per_suite(Config) ->
     case emqx_common_test_helpers:is_tcp_server_available(?MONGO_HOST, ?MONGO_DEFAULT_PORT) of
@@ -55,6 +54,12 @@ end_per_suite(Config) ->
     ok = emqx_authz_test_lib:restore_authorizers(),
     emqx_cth_suite:stop(?config(suite_apps, Config)).
 
+init_per_group(legacy_protocol_true, Config) ->
+    [{use_legacy_protocol, true} | Config];
+init_per_group(legacy_protocol_false, Config) ->
+    [{use_legacy_protocol, false} | Config];
+init_per_group(legacy_protocol_auto, Config) ->
+    [{use_legacy_protocol, auto} | Config];
 init_per_group(Group, Config) ->
     [{test_case, emqx_authz_test_lib:get_case(Group, cases())} | Config].
 end_per_group(_Group, _Config) ->
@@ -66,7 +71,7 @@ init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, true),
+    ok = emqx_authz_test_lib:enable_node_cache(false),
     ok = reset_samples(),
     ok = mc_worker_api:disconnect(?MONGO_CLIENT).
 
@@ -75,15 +80,61 @@ end_per_testcase(_TestCase, _Config) ->
 %%------------------------------------------------------------------------------
 
 t_run_case(Config) ->
-    run_case(Config, true),
-    run_case(Config, false),
-    run_case(Config, auto).
+    run_test(?config(test_case, Config), ?config(use_legacy_protocol, Config)).
 
-run_case(Config, UseLegacyProtocol) ->
-    Case = ?config(test_case, Config),
+run_test(#{name := extended_query_with_order_skip_limit}, true) ->
+    ok;
+run_test(Case, UseLegacyProtocol) ->
     ok = setup_source_data(Case),
     ok = setup_authz_source(Case#{use_legacy_protocol => UseLegacyProtocol}),
     ok = emqx_authz_test_lib:run_checks(Case).
+
+t_node_cache(_Config) ->
+    ok = emqx_authz_test_lib:reset_node_cache(),
+    Case = #{
+        name => cache_publish,
+        records => [
+            #{
+                <<"username">> => <<"username">>,
+                <<"action">> => <<"publish">>,
+                <<"topic">> => <<"a">>,
+                <<"permission">> => <<"allow">>
+            }
+        ],
+        filter => #{<<"username">> => <<"${username}">>},
+        client_info => #{username => <<"username">>},
+        use_legacy_protocol => <<"auto">>,
+        checks => []
+    },
+    ok = setup_source_data(Case),
+    ok = setup_authz_source(Case),
+    ok = emqx_authz_test_lib:enable_node_cache(true),
+
+    %% Subscribe to twice, should hit cache the second time
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>},
+                {allow, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ),
+
+    %% Change variable, should miss cache
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [{deny, ?AUTHZ_PUBLISH, <<"a">>}],
+            client_info => #{username => <<"username2">>}
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 2}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ).
 
 %%------------------------------------------------------------------------------
 %% Cases
@@ -142,8 +193,51 @@ cases() ->
             ]
         },
         #{
+            name => extended_query_with_order_skip_limit,
+            records => [
+                #{
+                    <<"username">> => <<"usernameWrong">>,
+                    <<"action">> => <<"publish">>,
+                    <<"topic">> => <<"a">>,
+                    <<"permission">> => <<"allow">>,
+                    <<"order">> => <<"0">>
+                },
+                #{
+                    <<"username">> => <<"username">>,
+                    <<"action">> => <<"publish">>,
+                    <<"topic">> => <<"a">>,
+                    <<"permission">> => <<"deny">>,
+                    <<"order">> => <<"1">>
+                },
+                #{
+                    <<"username">> => <<"username">>,
+                    <<"action">> => <<"publish">>,
+                    <<"topic">> => <<"a">>,
+                    <<"permission">> => <<"allow">>,
+                    <<"order">> => <<"2">>
+                },
+                #{
+                    <<"username">> => <<"username">>,
+                    <<"action">> => <<"publish">>,
+                    <<"topic">> => <<"a">>,
+                    <<"permission">> => <<"deny">>,
+                    <<"order">> => <<"3">>
+                }
+            ],
+            filter => #{
+                <<"username">> => <<"${username}">>,
+                <<"$orderby">> => #{<<"order">> => 1}
+            },
+            settings => #{skip => 1, limit => 1},
+            %% We have 3 matching rules from 4.
+            %% From the matching rules ordered by `order' field only the second one is allowing.
+            %% We should reach it utilizing `$orderby' and `skip' options.
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"a">>}
+            ]
+        },
+        #{
             name => invalid_rich_rules,
-            features => [rich_actions],
             records => [
                 #{
                     <<"action">> => <<"publish">>,
@@ -232,7 +326,6 @@ cases() ->
         },
         #{
             name => qos_retain_in_query_result,
-            features => [rich_actions],
             records => [
                 #{
                     <<"username">> => <<"username">>,
@@ -379,9 +472,10 @@ setup_source_data(#{records := Records}) ->
     {{true, _}, _} = mc_worker_api:insert(?MONGO_CLIENT, <<"acl">>, Records),
     ok.
 
-setup_authz_source(#{filter := Filter, use_legacy_protocol := UseLegacyProtocol}) ->
+setup_authz_source(#{filter := Filter, use_legacy_protocol := UseLegacyProtocol} = Case) ->
+    AdditionalSettings = maps:get(settings, Case, #{}),
     setup_config(
-        #{
+        AdditionalSettings#{
             <<"filter">> => Filter,
             <<"use_legacy_protocol">> => UseLegacyProtocol
         }
@@ -433,9 +527,3 @@ mongo_username() ->
 
 mongo_password() ->
     iolist_to_binary(os:getenv("MONGO_PASSWORD", "")).
-
-start_apps(Apps) ->
-    lists:foreach(fun application:ensure_all_started/1, Apps).
-
-stop_apps(Apps) ->
-    lists:foreach(fun application:stop/1, Apps).

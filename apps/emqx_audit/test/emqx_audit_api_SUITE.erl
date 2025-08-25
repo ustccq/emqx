@@ -1,23 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_audit_api_SUITE).
 -compile(export_all).
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 
 all() ->
     [
@@ -54,18 +43,27 @@ common_tests() ->
 }).
 
 init_per_suite(Config) ->
-    _ = application:load(emqx_conf),
-    emqx_config:erase_all(),
-    emqx_mgmt_api_test_util:init_suite([emqx_ctl, emqx_conf, emqx_audit]),
-    ok = emqx_common_test_helpers:load_config(emqx_enterprise_schema, ?CONF_DEFAULT),
-    emqx_config:save_schema_mod_and_names(emqx_enterprise_schema),
-    ok = emqx_config_logger:refresh_config(),
-    application:set_env(emqx, boot_modules, []),
-    emqx_conf_cli:load(),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_ctl,
+            emqx,
+            {emqx_conf, #{
+                config => ?CONF_DEFAULT,
+                schema_mod => emqx_enterprise_schema
+            }},
+            emqx_modules,
+            emqx_audit,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_audit, emqx_conf, emqx_ctl]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    ok = emqx_cth_suite:stop(Apps),
+    ok.
 
 t_http_api(_) ->
     process_flag(trap_exit, true),
@@ -86,7 +84,7 @@ t_http_api(_) ->
                     <<"source">> := _,
                     <<"http_request">> := #{
                         <<"method">> := <<"put">>,
-                        <<"body">> := #{<<"mqtt">> := #{<<"max_qos_allowed">> := 1}},
+                        <<"body">> := _,
                         <<"bindings">> := _,
                         <<"headers">> := #{<<"authorization">> := <<"******">>}
                     },
@@ -96,7 +94,7 @@ t_http_api(_) ->
                 }
             ]
         },
-        emqx_utils_json:decode(Res1, [return_maps])
+        emqx_utils_json:decode(Res1)
     ),
     ok.
 
@@ -148,7 +146,7 @@ t_cli(_Config) ->
     AuditPath = emqx_mgmt_api_test_util:api_path(["audit"]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     {ok, Res} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "limit=1", AuthHeader),
-    #{<<"data">> := Data} = emqx_utils_json:decode(Res, [return_maps]),
+    #{<<"data">> := Data} = emqx_utils_json:decode(Res),
     ?assertMatch(
         [
             #{
@@ -164,6 +162,7 @@ t_cli(_Config) ->
         ],
         Data
     ),
+    [ShowLogEntry] = Data,
     %% check create at is valid
     [#{<<"created_at">> := CreateAtRaw}] = Data,
     CreateAt = calendar:rfc3339_to_system_time(binary_to_list(CreateAtRaw), [{unit, microsecond}]),
@@ -171,18 +170,21 @@ t_cli(_Config) ->
     ?assert(CreateAt < TimeInt + 5000000, CreateAtRaw),
     %% check cli filter
     {ok, Res1} = emqx_mgmt_api_test_util:request_api(get, AuditPath, "from=cli", AuthHeader),
-    #{<<"data">> := Data1} = emqx_utils_json:decode(Res1, [return_maps]),
-    ?assertEqual(Data, Data1),
+    #{<<"data">> := Data1} = emqx_utils_json:decode(Res1),
+    ?assertMatch(
+        [ShowLogEntry, #{<<"operation_type">> := <<"emqx">>, <<"args">> := [<<"start">>]}],
+        Data1
+    ),
     {ok, Res2} = emqx_mgmt_api_test_util:request_api(
         get, AuditPath, "from=erlang_console", AuthHeader
     ),
-    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Res2, [return_maps])),
+    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Res2)),
 
     %% check created_at filter microsecond
     {ok, Res3} = emqx_mgmt_api_test_util:request_api(
         get, AuditPath, "gte_created_at=" ++ Time, AuthHeader
     ),
-    #{<<"data">> := Data3} = emqx_utils_json:decode(Res3, [return_maps]),
+    #{<<"data">> := Data3} = emqx_utils_json:decode(Res3),
     ?assertEqual(1, erlang:length(Data3)),
     %% check created_at filter rfc3339
     {ok, Res31} = emqx_mgmt_api_test_util:request_api(
@@ -200,7 +202,7 @@ t_cli(_Config) ->
     {ok, Res4} = emqx_mgmt_api_test_util:request_api(
         get, AuditPath, "lte_created_at=" ++ Time, AuthHeader
     ),
-    #{<<"data">> := Data4} = emqx_utils_json:decode(Res4, [return_maps]),
+    #{<<"data">> := Data4} = emqx_utils_json:decode(Res4),
     ?assertEqual(Size, erlang:length(Data4)),
 
     %% check created_at filter rfc3339
@@ -218,12 +220,12 @@ t_cli(_Config) ->
     {ok, Res5} = emqx_mgmt_api_test_util:request_api(
         get, AuditPath, "gte_duration_ms=0", AuthHeader
     ),
-    #{<<"data">> := Data5} = emqx_utils_json:decode(Res5, [return_maps]),
+    #{<<"data">> := Data5} = emqx_utils_json:decode(Res5),
     ?assertEqual(Size + 1, erlang:length(Data5)),
     {ok, Res6} = emqx_mgmt_api_test_util:request_api(
         get, AuditPath, "lte_duration_ms=-1", AuthHeader
     ),
-    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Res6, [return_maps])),
+    ?assertMatch(#{<<"data">> := []}, emqx_utils_json:decode(Res6)),
     ok.
 
 t_max_size(_Config) ->
@@ -236,7 +238,7 @@ t_max_size(_Config) ->
             AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
             Limit = "limit=1000",
             {ok, Res} = emqx_mgmt_api_test_util:request_api(get, AuditPath, Limit, AuthHeader),
-            #{<<"data">> := Data} = emqx_utils_json:decode(Res, [return_maps]),
+            #{<<"data">> := Data} = emqx_utils_json:decode(Res),
             erlang:length(Data)
         end,
     InitSize = SizeFun(),
@@ -293,7 +295,7 @@ kickout_clients() ->
     %% get /clients
     ClientsPath = emqx_mgmt_api_test_util:api_path(["clients"]),
     {ok, Clients} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
-    ClientsResponse = emqx_utils_json:decode(Clients, [return_maps]),
+    ClientsResponse = emqx_utils_json:decode(Clients),
     ClientsMeta = maps:get(<<"meta">>, ClientsResponse),
     ClientsPage = maps:get(<<"page">>, ClientsMeta),
     ClientsLimit = maps:get(<<"limit">>, ClientsMeta),
@@ -308,7 +310,7 @@ kickout_clients() ->
     {ok, 204, _} = emqx_mgmt_api_test_util:request_api_with_body(post, KickoutPath, KickoutBody),
 
     {ok, Clients2} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
-    ClientsResponse2 = emqx_utils_json:decode(Clients2, [return_maps]),
+    ClientsResponse2 = emqx_utils_json:decode(Clients2),
     ?assertMatch(#{<<"data">> := []}, ClientsResponse2).
 
 wait_for_dirty_write_log_done(MaxMs) ->

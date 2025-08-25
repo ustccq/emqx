@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_mongodb_SUITE).
@@ -143,14 +143,15 @@ end_per_suite(_Config) ->
 
 init_per_testcase(_Testcase, Config) ->
     clear_db(Config),
-    delete_bridge(Config),
+    emqx_bridge_v2_testlib:delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     snabbkaffe:start_trace(),
     Config.
 
 end_per_testcase(_Testcase, Config) ->
     clear_db(Config),
-    delete_bridge(Config),
-    [] = emqx_connector:list(),
+    emqx_bridge_v2_testlib:delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     snabbkaffe:stop(),
     ok.
 
@@ -177,8 +178,7 @@ start_apps(Config) ->
 
 ensure_loaded() ->
     _ = application:load(emqtt),
-    _ = emqx_bridge_enterprise:module_info(),
-    ok.
+    ok = emqx_utils:interactive_load(emqx_bridge_enterprise).
 
 mongo_type(Config) ->
     case ?config(mongo_type, Config) of
@@ -329,7 +329,7 @@ create_bridge(Config, Overrides) ->
     MongoConfig0 = ?config(mongo_config, Config),
     MongoConfig = emqx_utils_maps:deep_merge(MongoConfig0, Overrides),
     ct:pal("creating ~p bridge with config:\n ~p", [Type, MongoConfig]),
-    emqx_bridge:create(Type, Name, MongoConfig).
+    emqx_bridge_testlib:create_bridge_api(Type, Name, MongoConfig).
 
 delete_bridge(Config) ->
     Type = mongo_type_bin(?config(mongo_type, Config)),
@@ -344,8 +344,13 @@ create_bridge_http(Params) ->
             return_all => true
         })
     of
-        {ok, {{_, 201, _}, _, Body}} -> {ok, emqx_utils_json:decode(Body, [return_maps])};
-        Error -> Error
+        {ok, {{_, 201, _}, _, Body}} ->
+            #{<<"type">> := Type0, <<"name">> := Name} = Params,
+            Type = emqx_action_info:bridge_v1_type_to_action_type(Type0),
+            _ = emqx_bridge_v2_testlib:kickoff_action_health_check(Type, Name),
+            {ok, emqx_utils_json:decode(Body)};
+        Error ->
+            Error
     end.
 
 clear_db(Config) ->
@@ -548,19 +553,16 @@ t_mongo_date_rule_engine_functions(Config) ->
     SQL =
         "SELECT mongo_date() as date_0, mongo_date(1000) as date_1, mongo_date(1, 'second') as date_2 FROM "
         "\"t_mongo_date_rule_engine_functions/topic\"",
-    %% Remove rule if it already exists
-    RuleId = <<"rule:t_mongo_date_rule_engine_functions">>,
-    emqx_rule_engine:delete_rule(RuleId),
     BridgeId = emqx_bridge_resource:bridge_id(Type, Name),
-    {ok, _Rule} = emqx_rule_engine:create_rule(
+    {201, _} = emqx_bridge_v2_testlib:create_rule_api2(
         #{
-            id => <<"rule:t_mongo_date_rule_engine_functions">>,
-            sql => SQL,
-            actions => [
+            <<"id">> => <<"t_mongo_date_rule_engine_functions">>,
+            <<"sql">> => SQL,
+            <<"actions">> => [
                 BridgeId,
-                #{function => console}
+                #{<<"function">> => <<"console">>}
             ],
-            description => <<"to mongo bridge">>
+            <<"description">> => <<"to mongo bridge">>
         }
     ),
     %% Send a message to topic

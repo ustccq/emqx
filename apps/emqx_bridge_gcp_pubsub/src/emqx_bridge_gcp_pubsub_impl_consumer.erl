@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_gcp_pubsub_impl_consumer).
@@ -8,6 +8,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     query_mode/1,
     on_start/2,
@@ -84,6 +85,8 @@
 %%-------------------------------------------------------------------------------------------------
 %% `emqx_resource' API
 %%-------------------------------------------------------------------------------------------------
+-spec resource_type() -> resource_type().
+resource_type() -> gcp_pubsub_consumer.
 
 -spec callback_mode() -> callback_mode().
 callback_mode() -> async_if_possible.
@@ -94,9 +97,20 @@ query_mode(_Config) -> no_queries.
 -spec on_start(connector_resource_id(), connector_config()) ->
     {ok, connector_state()} | {error, term()}.
 on_start(ConnectorResId, Config0) ->
-    Config = maps:update_with(
-        service_account_json, fun(X) -> emqx_utils_json:decode(X, [return_maps]) end, Config0
+    Config1 = maps:update_with(
+        service_account_json, fun(X) -> emqx_utils_json:decode(X) end, Config0
     ),
+    {Transport, HostPort} = emqx_bridge_gcp_pubsub_client:get_transport(pubsub),
+    #{hostname := Host, port := Port} = emqx_schema:parse_server(HostPort, #{default_port => 443}),
+    Config = Config1#{
+        jwt_opts => #{
+            %% fixed for pubsub; trailing slash is important.
+            aud => <<"https://pubsub.googleapis.com/">>
+        },
+        transport => Transport,
+        host => Host,
+        port => Port
+    },
     #{service_account_json := #{<<"project_id">> := ProjectId}} = Config,
     case emqx_bridge_gcp_pubsub_client:start(ConnectorResId, Config) of
         {ok, Client} ->
@@ -243,6 +257,7 @@ start_consumers(ConnectorResId, SourceResId, Client, ProjectId, SourceConfig) ->
         hookpoints := Hookpoints,
         resource_opts := #{request_ttl := RequestTTL}
     } = SourceConfig,
+    #{namespace := Namespace} = emqx_resource:parse_channel_id(SourceResId),
     ConsumerConfig1 = ensure_topic_mapping(ConsumerConfig0),
     TopicMapping = maps:get(topic_mapping, ConsumerConfig1),
     ConsumerWorkersPerTopic = maps:get(consumer_workers_per_topic, ConsumerConfig1),
@@ -253,6 +268,7 @@ start_consumers(ConnectorResId, SourceResId, Client, ProjectId, SourceConfig) ->
         client => Client,
         forget_interval => forget_interval(RequestTTL),
         hookpoints => Hookpoints,
+        namespace => Namespace,
         connector_resource_id => ConnectorResId,
         source_resource_id => SourceResId,
         pool_size => PoolSize,
@@ -328,14 +344,14 @@ convert_topic_mapping(TopicMappingList) ->
     lists:foldl(
         fun(Fields, Acc) ->
             #{
-                pubsub_topic := PubSubTopic,
+                pubsub_topic := PubsubTopic,
                 mqtt_topic := MQTTTopic,
                 qos := QoS,
                 payload_template := PayloadTemplate0
             } = Fields,
             PayloadTemplate = emqx_placeholder:preproc_tmpl(PayloadTemplate0),
             Acc#{
-                PubSubTopic => #{
+                PubsubTopic => #{
                     payload_template => PayloadTemplate,
                     mqtt_topic => MQTTTopic,
                     qos => QoS
@@ -347,8 +363,8 @@ convert_topic_mapping(TopicMappingList) ->
     ).
 
 validate_pubsub_topics(TopicMapping, Client, ReqOpts) ->
-    PubSubTopics = maps:keys(TopicMapping),
-    do_validate_pubsub_topics(Client, PubSubTopics, ReqOpts).
+    PubsubTopics = maps:keys(TopicMapping),
+    do_validate_pubsub_topics(Client, PubsubTopics, ReqOpts).
 
 do_validate_pubsub_topics(Client, [Topic | Rest], ReqOpts) ->
     case check_for_topic_existence(Topic, Client, ReqOpts) of
@@ -362,7 +378,7 @@ do_validate_pubsub_topics(_Client, [], _ReqOpts) ->
     ok.
 
 check_for_topic_existence(Topic, Client, ReqOpts) ->
-    Res = emqx_bridge_gcp_pubsub_client:get_topic(Topic, Client, ReqOpts),
+    Res = emqx_bridge_gcp_pubsub_client:pubsub_get_topic(Topic, Client, ReqOpts),
     case Res of
         {ok, _} ->
             ok;
@@ -378,10 +394,10 @@ check_for_topic_existence(Topic, Client, ReqOpts) ->
     end.
 
 -spec get_client_status(emqx_bridge_gcp_pubsub_client:state()) ->
-    ?status_connected | ?status_connecting.
+    ?status_connected | {?status_connecting, term()}.
 get_client_status(Client) ->
     case emqx_bridge_gcp_pubsub_client:get_status(Client) of
-        ?status_disconnected -> ?status_connecting;
+        {?status_disconnected, Reason} -> {?status_connecting, Reason};
         ?status_connected -> ?status_connected
     end.
 

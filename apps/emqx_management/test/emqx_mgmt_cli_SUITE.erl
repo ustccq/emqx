@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_cli_SUITE).
 
@@ -20,58 +8,40 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/test_macros.hrl").
+
+-define(ON(NODES, BODY),
+    emqx_ds_test_helpers:on(NODES, fun() -> BODY end)
+).
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_management]),
-    ok = emqx_mgmt_cli:load(),
-    Config.
-
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_management, emqx_conf]).
-
-init_per_testcase(t_autocluster_leave = TC, Config) ->
-    [Core1, Core2, Repl1, Repl2] =
-        Nodes = [
-            t_autocluster_leave_core1,
-            t_autocluster_leave_core2,
-            t_autocluster_leave_replicant1,
-            t_autocluster_leave_replicant2
-        ],
-
-    NodeNames = [emqx_cth_cluster:node_name(N) || N <- Nodes],
-    AppSpec = [
-        emqx,
-        {emqx_conf, #{
-            config => #{
-                cluster => #{
-                    discovery_strategy => static,
-                    static => #{seeds => NodeNames}
-                }
-            }
-        }},
-        emqx_management
-    ],
-    Cluster = emqx_cth_cluster:start(
+    Apps = emqx_cth_suite:start(
         [
-            {Core1, #{role => core, apps => AppSpec}},
-            {Core2, #{role => core, apps => AppSpec}},
-            {Repl1, #{role => replicant, apps => AppSpec}},
-            {Repl2, #{role => replicant, apps => AppSpec}}
+            emqx_conf,
+            emqx_modules,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
         ],
-        #{work_dir => emqx_cth_suite:work_dir(TC, Config)}
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    [{cluster, Cluster} | Config];
-init_per_testcase(_TC, Config) ->
-    Config.
+    ok = emqx_mgmt_cli:load(),
+    [{apps, Apps} | Config].
 
-end_per_testcase(_TC, Config) ->
-    case ?config(cluster, Config) of
-        undefined -> ok;
-        Cluster -> emqx_cth_cluster:stop(Cluster)
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
+
+init_per_testcase(TC, Config) ->
+    try
+        emqx_common_test_helpers:init_per_testcase(?MODULE, TC, Config)
+    catch
+        throw:{skip, Reason} -> {skip, Reason}
     end.
+
+end_per_testcase(TC, Config) ->
+    emqx_common_test_helpers:end_per_testcase(?MODULE, TC, Config).
 
 t_status(_Config) ->
     emqx_ctl:run_command([]),
@@ -90,7 +60,7 @@ t_broker(_Config) ->
 t_cluster(_Config) ->
     SelfNode = node(),
     FakeNode = 'fake@127.0.0.1',
-    MFA = {io, format, [""]},
+    MFA = {?MODULE, format, [""]},
     meck:new(mria_mnesia, [non_strict, passthrough, no_link]),
     meck:expect(mria_mnesia, running_nodes, 0, [SelfNode, FakeNode]),
     {atomic, {ok, TnxId, _}} =
@@ -124,6 +94,11 @@ t_cluster(_Config) ->
     %% cluster force-leave <Node> # Force the node leave from cluster
     %% cluster status             # Cluster status
     emqx_ctl:run_command(["cluster", "status"]),
+
+    ?assertEqual(
+        {error, {node_down, 'nosuchnode@127.0.0.1'}},
+        emqx_ctl:run_command(["cluster", "join", "nosuchnode@127.0.0.1"])
+    ),
 
     emqx_ctl:run_command(["cluster", "force-leave", atom_to_list(FakeNode)]),
     ?assertMatch(
@@ -218,9 +193,12 @@ t_log(_Config) ->
 
 t_trace(_Config) ->
     %% trace list                                        # List all traces started on local node
-    emqx_ctl:run_command(["trace", "list"]),
+    ok = emqx_ctl:run_command(["trace", "list"]),
     %% trace start client <ClientId> <File> [<Level>]    # Traces for a client on local node
     %% trace stop  client <ClientId>                     # Stop tracing for a client on local node
+    ok = emqx_ctl:run_command(["trace", "start", "client", ?MODULE_STRING, "trace/t1.log"]),
+    ok = emqx_ctl:run_command(["trace", "list"]),
+    ok = emqx_ctl:run_command(["trace", "stop", "client", ?MODULE_STRING]),
     %% trace start topic  <Topic>    <File> [<Level>]    # Traces for a topic on local node
     %% trace stop  topic  <Topic>                        # Stop tracing for a topic on local node
     %% trace start ip_address  <IP>    <File> [<Level>]  # Traces for a client ip on local node
@@ -273,6 +251,9 @@ t_listeners(_Config) ->
 t_authz(_Config) ->
     %% authz cache-clean all         # Clears authorization cache on all nodes
     ?assertMatch(ok, emqx_ctl:run_command(["authz", "cache-clean", "all"])),
+    %% "cache-clean all" relies on an inserted timestamp in persistent term; we need to
+    %% sleep to avoid considering a freshly inserted cache entry as stale.
+    ct:sleep(1),
     ClientId = "authz_clean_test",
     ClientIdBin = list_to_binary(ClientId),
     %% authz cache-clean <ClientId>  # Clears authorization cache for given client
@@ -306,10 +287,42 @@ t_admin(_Config) ->
     %% admins del <Username>                          # Delete dashboard user
     ok.
 
+t_autocluster_leave('init', Config) ->
+    [Core1, Core2, Repl1, Repl2] =
+        Nodes = [
+            t_autocluster_leave_core1,
+            t_autocluster_leave_core2,
+            t_autocluster_leave_replicant1,
+            t_autocluster_leave_replicant2
+        ],
+    NodeNames = [emqx_cth_cluster:node_name(N) || N <- Nodes],
+    AppSpec = [
+        emqx,
+        {emqx_conf, #{
+            config => #{
+                cluster => #{
+                    discovery_strategy => static,
+                    static => #{seeds => NodeNames}
+                }
+            }
+        }},
+        emqx_management
+    ],
+    Cluster = emqx_cth_cluster:start(
+        [
+            {Core1, #{role => core, apps => AppSpec}},
+            {Core2, #{role => core, apps => AppSpec}},
+            {Repl1, #{role => replicant, apps => AppSpec}},
+            {Repl2, #{role => replicant, apps => AppSpec}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    [{cluster, Cluster} | Config];
+t_autocluster_leave('end', Config) ->
+    emqx_cth_cluster:stop(?config(cluster, Config)).
+
 t_autocluster_leave(Config) ->
     [Core1, Core2, Repl1, Repl2] = Cluster = ?config(cluster, Config),
-    %% Mria membership updates are async, makes sense to wait a little
-    timer:sleep(300),
     ClusterView = [lists:sort(rpc:call(N, emqx, running_nodes, [])) || N <- Cluster],
     [View1, View2, View3, View4] = ClusterView,
     ?assertEqual(lists:sort(Cluster), View1),
@@ -332,9 +345,12 @@ t_autocluster_leave(Config) ->
     timer:sleep(1000),
     ?assertEqual(lists:sort([Core1, Repl2]), rpc:call(Core1, emqx, running_nodes, [])),
 
+    ct:pal("enabling discovery for core2"),
     rpc:call(Core2, emqx_mgmt_cli, cluster, [["discovery", "enable"]]),
+    ct:pal("enabling discovery for repl1"),
     rpc:call(Repl1, emqx_mgmt_cli, cluster, [["discovery", "enable"]]),
     %% nodes will join and restart asyncly, may need more time to re-cluster
+    ct:pal("waiting recovery"),
     ?assertEqual(
         ok,
         emqx_common_test_helpers:wait_for(
@@ -346,3 +362,86 @@ t_autocluster_leave(Config) ->
             10_000
         )
     ).
+
+t_leave_rejected_ds_nonempty('init', Config) ->
+    ok = snabbkaffe:start_trace(),
+    AppSpec = [
+        emqx_conf,
+        {emqx, """
+        durable_sessions.enable = true
+        durable_storage.messages.backend = builtin_raft
+        durable_storage.sessions.backend = builtin_raft
+        durable_storage.timers.backend = builtin_raft
+        durable_storage.n_sites = 2
+        """},
+        emqx_management
+    ],
+    NodeSpecs = emqx_cth_cluster:mk_nodespecs(
+        [
+            {t_leave_rejected_ds_nonempty1, #{role => core, apps => AppSpec}},
+            {t_leave_rejected_ds_nonempty2, #{role => core, apps => AppSpec}}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    Cluster = emqx_cth_cluster:start(NodeSpecs),
+    [{cluster, Cluster}, {nodespecs, NodeSpecs} | Config];
+t_leave_rejected_ds_nonempty('end', Config) ->
+    ok = snabbkaffe:stop(),
+    emqx_cth_cluster:stop(?config(cluster, Config)).
+
+%% This testcase verifies that `emqx_ctl leave` command checks if the
+%% leaving node holds replicas of DS DBs. Node hosting the replicas of
+%% DS shards should not be able to leave the cluster.
+t_leave_rejected_ds_nonempty(Config) ->
+    _Specs = [_, NS2] = ?config(nodespecs, Config),
+    Nodes = [N1, N2] = ?config(cluster, Config),
+    S2 = ?ON(N2, emqx_ds_builtin_raft_meta:this_site()),
+    S2Arg = binary_to_list(S2),
+
+    %% Ensure DSs have been bootstrapped.
+    ok = emqx_ds_raft_test_helpers:wait_db_bootstrapped(Nodes, messages),
+    ok = emqx_ds_raft_test_helpers:wait_db_bootstrapped(Nodes, sessions),
+    ?ON(N1, emqx_mgmt_cli:ds(["info"])),
+
+    %% Should not be possible to leave, because there are shard replicas.
+    ?assertEqual(
+        {error, [nonempty_ds_site]},
+        ?ON(N2, emqx_mgmt_cli:cluster(["leave"]))
+    ),
+
+    %% Ask to leave DS DB replication, wait until transitions are finished.
+    ?assertEqual(ok, ?ON(N1, emqx_mgmt_cli:ds(["leave", "all", S2Arg]))),
+    ?assertEqual(ok, ?ON(N1, emqx_ds_raft_test_helpers:wait_db_transitions_done(messages))),
+    ?assertEqual(ok, ?ON(N1, emqx_ds_raft_test_helpers:wait_db_transitions_done(sessions))),
+    ?assertEqual(ok, ?ON(N1, emqx_ds_raft_test_helpers:wait_db_transitions_done(timers))),
+
+    %% Now leave the cluster again.
+    ?assertEqual(ok, ?ON(N2, emqx_mgmt_cli:cluster(["leave"]))),
+    %% Make N1 forget about S2
+    LostSite = binary_to_list(?ON(N2, emqx_ds_builtin_raft_meta:this_site())),
+    ?assertEqual(ok, ?ON(N1, emqx_mgmt_cli:ds(["forget", LostSite]))),
+    ?retry(500, 10, undefined = ?ON(N1, emqx_ds_builtin_raft_meta:node(S2))),
+    ?ON(N1, emqx_mgmt_cli:ds(["info"])),
+
+    %% Join the cluster again.
+    ?assertEqual(ok, ?ON(N2, emqx_mgmt_cli:cluster(["join", atom_to_list(N1)]))),
+    [N2] = emqx_cth_cluster:restart(NS2),
+    ?ON(N1, emqx_mgmt_cli:ds(["info"])),
+
+    %% Ask to be DS DB replication site again.
+    ?assertEqual(ok, ?ON(N1, emqx_mgmt_cli:ds(["join", "all", S2Arg]))),
+    %% Should not be possible to leave, even if transitions are still in-progress.
+    ?assertEqual(
+        {error, [nonempty_ds_site]},
+        ?ON(N1, emqx_mgmt_cli:cluster(["leave"]))
+    ).
+
+t_exclusive(_Config) ->
+    emqx_ctl:run_command(["exclusive", "list"]),
+    emqx_ctl:run_command(["exclusive", "delete", "t/1"]),
+    ok.
+
+%%
+
+format(Str, Opts) ->
+    io:format("str:~s: Opts:~p", [Str, Opts]).

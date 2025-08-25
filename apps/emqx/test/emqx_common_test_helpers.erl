@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_common_test_helpers).
@@ -22,8 +10,13 @@
 
 -export([
     all/1,
+    all_with_matrix/1,
+    groups_with_matrix/1,
     matrix_to_groups/2,
     group_path/1,
+    group_path/2,
+    get_matrix_prop/3,
+    get_tc_prop/4,
     init_per_testcase/3,
     end_per_testcase/3,
     boot_modules/1,
@@ -72,17 +65,16 @@
 ]).
 
 -export([
-    emqx_cluster/1,
-    emqx_cluster/2,
     start_ekka/0,
     start_epmd/0,
     start_peer/2,
     stop_peer/1,
+    ebin_path/0,
     listener_port/2
 ]).
 
 -export([clear_screen/0]).
--export([with_mock/4]).
+-export([with_mock/4, with_mock/5, with_mocks/2, with_mocks/3]).
 -export([
     on_exit/1,
     call_janitor/0,
@@ -94,7 +86,9 @@
     with_failure/5,
     enable_failure/4,
     heal_failure/4,
-    reset_proxy/2
+    reset_proxy/2,
+    create_proxy/3,
+    delete_proxy/3
 ]).
 
 %% TLS certs API
@@ -103,6 +97,22 @@
     gen_host_cert/3,
     gen_host_cert/4
 ]).
+
+-export([ensure_loaded/1]).
+-export([is_standalone_test/0]).
+
+%% DS test helpers
+-export([
+    start_apps_ds/3,
+    stop_apps_ds/1,
+    start_cluster_ds/3,
+    stop_cluster_ds/1,
+    restart_node_ds/2
+]).
+
+-export([capture_io_format/1]).
+
+-export([seed_defaults_for_all_roots_namespaced_cluster/2]).
 
 -define(CERTS_PATH(CertName), filename:join(["etc", "certs", CertName])).
 
@@ -168,16 +178,78 @@
 
 -define(DEFAULT_TCP_SERVER_CHECK_AVAIL_TIMEOUT, 1000).
 
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
 %%------------------------------------------------------------------------------
 %% APIs
 %%------------------------------------------------------------------------------
 
 all(Suite) ->
+    TestCases = all0(Suite),
+    FlakyTests = flaky_tests(Suite),
+    lists:map(
+        fun(TestCase) ->
+            case maps:find(TestCase, FlakyTests) of
+                {ok, Repetitions} -> {testcase, TestCase, [{flaky, Repetitions}]};
+                error -> TestCase
+            end
+        end,
+        TestCases
+    ).
+
+all_with_matrix(Module) ->
+    All0 = emqx_common_test_helpers:all(Module),
+    All = All0 -- matrix_cases(Module),
+    Groups = lists:map(fun({G, _, _}) -> {group, G} end, groups_with_matrix(Module)),
+    Groups ++ All.
+
+groups_with_matrix(Module) ->
+    matrix_to_groups(Module, matrix_cases(Module)).
+
+all0(Module) ->
     lists:usort([
         F
-     || {F, 1} <- Suite:module_info(exports),
+     || {F, 1} <- Module:module_info(exports),
         string:substr(atom_to_list(F), 1, 2) == "t_"
     ]).
+
+-spec flaky_tests(module()) -> #{atom() => pos_integer()}.
+flaky_tests(Suite) ->
+    case erlang:function_exported(Suite, flaky_tests, 0) of
+        true ->
+            Suite:flaky_tests();
+        false ->
+            #{}
+    end.
+
+matrix_cases(Module) ->
+    lists:filter(
+        fun
+            ({testcase, TestCase, _Opts}) ->
+                get_tc_prop(Module, TestCase, matrix, false);
+            (TestCase) ->
+                get_tc_prop(Module, TestCase, matrix, false)
+        end,
+        all0(Module)
+    ).
+
+get_tc_prop(Module, TestCase, Key, Default) ->
+    maybe
+        true ?= erlang:function_exported(Module, TestCase, 0),
+        {Key, Val} ?= proplists:lookup(Key, Module:TestCase()),
+        Val
+    else
+        _ -> Default
+    end.
+
+get_matrix_prop(TCConfig, Alternatives, Default) ->
+    GroupPath = group_path(TCConfig, [Default]),
+    case lists:filter(fun(G) -> lists:member(G, Alternatives) end, GroupPath) of
+        [] ->
+            Default;
+        [Opt] ->
+            Opt
+    end.
 
 init_per_testcase(Module, TestCase, Config) ->
     case erlang:function_exported(Module, TestCase, 2) of
@@ -221,7 +293,6 @@ start_apps(Apps, SpecAppConfig, Opts) when is_function(SpecAppConfig) ->
     %% Because, minirest, ekka etc.. application will scan these modules
     lists:foreach(fun load/1, [emqx | Apps]),
     ok = start_ekka(),
-    ok = emqx_ratelimiter_SUITE:load_conf(),
     lists:foreach(fun(App) -> start_app(App, SpecAppConfig, Opts) end, [emqx | Apps]).
 
 load(App) ->
@@ -248,6 +319,7 @@ render_and_load_app_config(App, Opts) ->
             %% turn throw into error
             error({Conf, E, St})
     end.
+
 do_render_app_config(App, Schema, ConfigFile, Opts) ->
     %% copy acl_conf must run before read_schema_configs
     copy_acl_conf(),
@@ -266,7 +338,6 @@ start_app(App, SpecAppConfig, Opts) ->
     SpecAppConfig(App),
     case application:ensure_all_started(App) of
         {ok, _} ->
-            ok = ensure_dashboard_listeners_started(App),
             ok = wait_for_app_processes(App),
             ok = perform_sanity_checks(App),
             ok;
@@ -403,14 +474,9 @@ do_safe_relative_path(Path) ->
         OK -> OK
     end.
 
--if(?OTP_RELEASE < 23).
-safe_relative_path_2(Path) ->
-    filename:safe_relative_path(Path).
--else.
 safe_relative_path_2(Path) ->
     {ok, Cwd} = file:get_cwd(),
     filelib:safe_relative_path(Path, Cwd).
--endif.
 
 -spec reload(App :: atom(), SpecAppConfig :: special_config_handler()) -> ok.
 reload(App, SpecAppConfigHandler) ->
@@ -531,7 +597,7 @@ force_set_config_file_paths(emqx, Paths) ->
     %% we need init cluster conf, so we can save the cluster conf to the file
     application:set_env(emqx, local_override_conf_file, "local_override.conf"),
     application:set_env(emqx, cluster_override_conf_file, "cluster_override.conf"),
-    application:set_env(emqx, cluster_conf_file, "cluster.hocon"),
+    application:set_env(emqx, cluster_hocon_file, "cluster.hocon"),
     application:set_env(emqx, config_files, Paths);
 force_set_config_file_paths(_, _) ->
     ok.
@@ -611,7 +677,7 @@ is_tcp_server_available(Host, Port, Timeout) ->
     end.
 
 start_ekka() ->
-    try mnesia_hook:module_info() of
+    try mnesia_hook:module_info(module) of
         _ -> ekka:start()
     catch
         _:_ ->
@@ -619,12 +685,6 @@ start_ekka() ->
             application:set_env(mria, db_backend, mnesia),
             ekka:start()
     end.
-
-ensure_dashboard_listeners_started(emqx_dashboard) ->
-    true = emqx_dashboard_listener:is_ready(infinity),
-    ok;
-ensure_dashboard_listeners_started(_App) ->
-    ok.
 
 -spec ensure_quic_listener(Name :: atom(), UdpPort :: inet:port_number()) -> ok.
 ensure_quic_listener(Name, UdpPort) ->
@@ -646,9 +706,9 @@ ensure_quic_listener(Name, UdpPort, ExtraSettings) ->
         idle_timeout => 15000,
         ssl_options => #{
             certfile => filename:join(code:lib_dir(emqx), "etc/certs/cert.pem"),
-            keyfile => filename:join(code:lib_dir(emqx), "etc/certs/key.pem")
+            keyfile => filename:join(code:lib_dir(emqx), "etc/certs/key.pem"),
+            hibernate_after => 30000
         },
-        limiter => #{},
         max_connections => 1024000,
         mountpoint => <<>>,
         zone => default
@@ -666,9 +726,6 @@ ensure_quic_listener(Name, UdpPort, ExtraSettings) ->
 %% Clusterisation and multi-node testing
 %%
 
--type cluster_spec() :: [node_spec()].
--type node_spec() :: role() | {role(), shortname()} | {role(), shortname(), node_opts()}.
--type role() :: core | replicant.
 -type shortname() :: atom().
 -type nodename() :: atom().
 -type node_opts() :: #{
@@ -703,58 +760,6 @@ ensure_quic_listener(Name, UdpPort, ExtraSettings) ->
     listener_ports => [{Type :: tcp | ssl | ws | wss, inet:port_number()}]
 }.
 
--spec emqx_cluster(cluster_spec()) -> [{shortname(), node_opts()}].
-emqx_cluster(Specs) ->
-    emqx_cluster(Specs, #{}).
-
--spec emqx_cluster(cluster_spec(), node_opts()) -> [{shortname(), node_opts()}].
-emqx_cluster(Specs, CommonOpts) when is_list(CommonOpts) ->
-    emqx_cluster(Specs, maps:from_list(CommonOpts));
-emqx_cluster(Specs0, CommonOpts) ->
-    Specs1 = lists:zip(Specs0, lists:seq(1, length(Specs0))),
-    Specs = expand_node_specs(Specs1, CommonOpts),
-    %% Assign grpc ports
-    GenRpcPorts = maps:from_list([
-        {node_name(Name), {tcp, gen_rpc_port(base_port(Num))}}
-     || {{_, Name, _}, Num} <- Specs
-    ]),
-    %% Set the default node of the cluster:
-    CoreNodes = [node_name(Name) || {{core, Name, _}, _} <- Specs],
-    JoinTo =
-        case CoreNodes of
-            [First | _] -> First;
-            _ -> undefined
-        end,
-    NodeOpts = fun(Number) ->
-        #{
-            base_port => base_port(Number),
-            env => [
-                {mria, core_nodes, CoreNodes},
-                {gen_rpc, client_config_per_node, {internal, GenRpcPorts}}
-            ]
-        }
-    end,
-    RoleOpts = fun
-        (core) ->
-            #{
-                join_to => JoinTo,
-                env => [
-                    {mria, node_role, core}
-                ]
-            };
-        (replicant) ->
-            #{
-                env => [
-                    {mria, node_role, replicant},
-                    {ekka, cluster_discovery, {static, [{seeds, CoreNodes}]}}
-                ]
-            }
-    end,
-    [
-        {Name, merge_opts(merge_opts(NodeOpts(Number), RoleOpts(Role)), Opts)}
-     || {{Role, Name, Opts}, Number} <- Specs
-    ].
-
 %% Lower level starting API
 
 -spec start_peer(shortname(), node_opts()) -> nodename().
@@ -775,7 +780,8 @@ start_peer(Name, Opts) when is_map(Opts) ->
             Envs = [
                 {"HOCON_ENV_OVERRIDE_PREFIX", "EMQX_"},
                 {"EMQX_NODE__COOKIE", Cookie},
-                {"EMQX_NODE__DATA_DIR", NodeDataDir}
+                {"EMQX_NODE__DATA_DIR", NodeDataDir},
+                {"EMQX_LICENSE__KEY", "evaluation"}
             ],
             emqx_cth_peer:start(Node, erl_flags(), Envs)
         end,
@@ -980,25 +986,9 @@ node_name(Name) ->
             list_to_atom(atom_to_list(Name) ++ "@" ++ host())
     end.
 
-gen_node_name(Num) ->
-    list_to_atom("autocluster_node" ++ integer_to_list(Num)).
-
 host() ->
     [_, Host] = string:tokens(atom_to_list(node()), "@"),
     Host.
-
-merge_opts(Opts1, Opts2) ->
-    maps:merge_with(
-        fun
-            (env, Env1, Env2) -> lists:usort(Env2 ++ Env1);
-            (conf, Conf1, Conf2) -> lists:usort(Conf2 ++ Conf1);
-            (apps, Apps1, Apps2) -> lists:usort(Apps2 ++ Apps1);
-            (load_apps, Apps1, Apps2) -> lists:usort(Apps2 ++ Apps1);
-            (_Option, _Old, Value) -> Value
-        end,
-        Opts1,
-        Opts2
-    ).
 
 set_envs(Node, Env) ->
     lists:foreach(
@@ -1021,9 +1011,6 @@ is_lib(Path) ->
 
 %% Ports
 
-base_port(Number) ->
-    10000 + Number * 100.
-
 gen_rpc_port(BasePort) ->
     BasePort - 1.
 
@@ -1040,36 +1027,6 @@ listener_port(BasePort, ws) ->
     BasePort + 3;
 listener_port(BasePort, wss) ->
     BasePort + 4.
-
-%% Autocluster helpers
-
-expand_node_specs(Specs, CommonOpts) ->
-    lists:map(
-        fun({Spec, Num}) ->
-            {
-                case Spec of
-                    core ->
-                        {core, gen_node_name(Num), CommonOpts};
-                    replicant ->
-                        {replicant, gen_node_name(Num), CommonOpts};
-                    {Role, Name} when is_atom(Name) ->
-                        {Role, Name, CommonOpts};
-                    {Role, Opts} when is_list(Opts) ->
-                        Opts1 = maps:from_list(Opts),
-                        {Role, gen_node_name(Num), merge_opts(CommonOpts, Opts1)};
-                    {Role, Name, Opts} when is_list(Opts) ->
-                        Opts1 = maps:from_list(Opts),
-                        {Role, Name, merge_opts(CommonOpts, Opts1)};
-                    {Role, Opts} ->
-                        {Role, gen_node_name(Num), merge_opts(CommonOpts, Opts)};
-                    {Role, Name, Opts} ->
-                        {Role, Name, merge_opts(CommonOpts, Opts)}
-                end,
-                Num
-            }
-        end,
-        Specs
-    ).
 
 %% Useful when iterating on the tests in a loop, to get rid of all the garbaged printed
 %% before the test itself beings.
@@ -1091,10 +1048,37 @@ clear_screen() ->
     end.
 
 with_mock(Mod, FnName, MockedFn, Fun) ->
-    ok = meck:new(Mod, [non_strict, no_link, no_history, passthrough]),
+    with_mock(Mod, FnName, MockedFn, _Opts = #{}, Fun).
+
+with_mock(Mod, FnName, MockedFn, Opts, Fun) ->
+    MeckOpts = maps:get(meck_opts, Opts, [no_link, no_history, passthrough]),
+    ok = meck:new(Mod, MeckOpts),
     ok = meck:expect(Mod, FnName, MockedFn),
     try
         Fun()
+    after
+        ok = meck:unload(Mod)
+    end.
+
+with_mocks(ModToMocked, TestFn) ->
+    with_mocks(ModToMocked, _Opts = #{}, TestFn).
+
+with_mocks(#{} = ModsToMocked, Opts, TestFn) ->
+    do_with_mocks(maps:to_list(ModsToMocked), Opts, TestFn).
+
+do_with_mocks([], _Opts, TestFn) ->
+    TestFn();
+do_with_mocks([{Mod, #{} = MockedFns} | Rest], Opts, TestFn) ->
+    MeckOpts = maps:get(meck_opts, Opts, [no_history, passthrough]),
+    ok = meck:new(Mod, MeckOpts),
+    maps:foreach(
+        fun(FnName, MockedFn) ->
+            ok = meck:expect(Mod, FnName, MockedFn)
+        end,
+        MockedFns
+    ),
+    try
+        do_with_mocks(Rest, Opts, TestFn)
     after
         ok = meck:unload(Mod)
     end.
@@ -1104,7 +1088,7 @@ with_mock(Mod, FnName, MockedFn, Fun) ->
 %%-------------------------------------------------------------------------------
 
 reset_proxy(ProxyHost, ProxyPort) ->
-    Url = "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort) ++ "/reset",
+    Url = toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/reset",
     Body = <<>>,
     {ok, {{_, 204, _}, _, _}} = httpc:request(
         post,
@@ -1136,7 +1120,7 @@ heal_failure(FailureType, Name, ProxyHost, ProxyPort) ->
     end.
 
 switch_proxy(Switch, Name, ProxyHost, ProxyPort) ->
-    Url = "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort) ++ "/proxies/" ++ Name,
+    Url = toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies/" ++ Name,
     Body =
         case Switch of
             off -> #{<<"enabled">> => false};
@@ -1152,7 +1136,7 @@ switch_proxy(Switch, Name, ProxyHost, ProxyPort) ->
 
 timeout_proxy(on, Name, ProxyHost, ProxyPort) ->
     Url =
-        "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort) ++ "/proxies/" ++ Name ++
+        toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies/" ++ Name ++
             "/toxics",
     NameBin = list_to_binary(Name),
     Body = #{
@@ -1172,7 +1156,7 @@ timeout_proxy(on, Name, ProxyHost, ProxyPort) ->
 timeout_proxy(off, Name, ProxyHost, ProxyPort) ->
     ToxicName = Name ++ "_timeout",
     Url =
-        "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort) ++ "/proxies/" ++ Name ++
+        toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies/" ++ Name ++
             "/toxics/" ++ ToxicName,
     Body = <<>>,
     {ok, {{_, 204, _}, _, _}} = httpc:request(
@@ -1184,7 +1168,7 @@ timeout_proxy(off, Name, ProxyHost, ProxyPort) ->
 
 latency_up_proxy(on, Name, ProxyHost, ProxyPort) ->
     Url =
-        "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort) ++ "/proxies/" ++ Name ++
+        toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies/" ++ Name ++
             "/toxics",
     NameBin = list_to_binary(Name),
     Body = #{
@@ -1207,7 +1191,7 @@ latency_up_proxy(on, Name, ProxyHost, ProxyPort) ->
 latency_up_proxy(off, Name, ProxyHost, ProxyPort) ->
     ToxicName = Name ++ "_latency_up",
     Url =
-        "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort) ++ "/proxies/" ++ Name ++
+        toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies/" ++ Name ++
             "/toxics/" ++ ToxicName,
     Body = <<>>,
     {ok, {{_, 204, _}, _, _}} = httpc:request(
@@ -1216,6 +1200,27 @@ latency_up_proxy(off, Name, ProxyHost, ProxyPort) ->
         [],
         [{body_format, binary}]
     ).
+
+create_proxy(ProxyHost, ProxyPort, Body) ->
+    Url = toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies",
+    {ok, {{_, 201, _}, _, _}} = httpc:request(
+        post,
+        {Url, [], "application/json", emqx_utils_json:encode(Body)},
+        [],
+        [{body_format, binary}]
+    ).
+
+delete_proxy(ProxyHost, ProxyPort, ProxyName) ->
+    Url = toxiproxy_base_uri(ProxyHost, ProxyPort) ++ "/proxies/" ++ ProxyName,
+    {ok, {{_, 204, _}, _, _}} = httpc:request(
+        delete,
+        {Url, []},
+        [],
+        [{body_format, binary}]
+    ).
+
+toxiproxy_base_uri(ProxyHost, ProxyPort) ->
+    "http://" ++ ProxyHost ++ ":" ++ integer_to_list(ProxyPort).
 
 %%-------------------------------------------------------------------------------
 %% TLS certs
@@ -1415,7 +1420,14 @@ matrix_to_groups(Module, Cases) ->
         Cases
     ).
 
-add_case_matrix(Module, TestCase, Acc0) ->
+add_case_matrix(Module, TestCase0, Acc0) ->
+    TestCase =
+        case TestCase0 of
+            {testcase, TestCase1, _Opts} ->
+                TestCase1;
+            _ ->
+                TestCase0
+        end,
     {MaybeRootGroup, Matrix} =
         case Module:TestCase(matrix) of
             {RootGroup0, Matrix0} ->
@@ -1427,9 +1439,9 @@ add_case_matrix(Module, TestCase, Acc0) ->
         fun(Row, Acc) ->
             case MaybeRootGroup of
                 undefined ->
-                    add_group(Row, Acc, TestCase);
+                    add_group(Row, Acc, TestCase0);
                 RootGroup ->
-                    add_group([RootGroup | Row], Acc, TestCase)
+                    add_group([RootGroup | Row], Acc, TestCase0)
             end
         end,
         Acc0,
@@ -1466,6 +1478,12 @@ group_path(Config) ->
             []
     end.
 
+group_path(TCConfig, Default) ->
+    case group_path(TCConfig) of
+        [] -> Default;
+        Path -> Path
+    end.
+
 %% almost verify_none equivalent, but only ignores 'hostname_check_failed'
 ssl_verify_fun_allow_any_host_impl(_Cert, Event, State) ->
     case Event of
@@ -1486,3 +1504,169 @@ ssl_verify_fun_allow_any_host() ->
         {verify, verify_peer},
         {verify_fun, {fun ?MODULE:ssl_verify_fun_allow_any_host_impl/3, _State = #{}}}
     ].
+
+ensure_loaded(Mod) ->
+    case code:ensure_loaded(Mod) of
+        {module, Mod} -> true;
+        _ -> false
+    end.
+
+%%------------------------------------------------------------------------------
+%% DS Test Helpers
+%%------------------------------------------------------------------------------
+
+start_apps_ds(Config, ExtraApps, Opts) ->
+    DurableStorageOpts = maps:get(durable_storage_opts, Opts, #{}),
+    DurableSessionsOpts = maps:get(durable_sessions_opts, Opts, #{}),
+    EMQXOpts = maps:get(emqx_opts, Opts, #{}),
+    WorkDir = maps:get(work_dir, Opts, emqx_cth_suite:work_dir(Config)),
+    StartEMQXConf = maps:get(start_emqx_conf, Opts, true),
+    Apps = emqx_cth_suite:start(
+        lists:flatten(
+            [
+                [emqx_conf || StartEMQXConf],
+                {emqx, #{
+                    config => emqx_utils_maps:deep_merge(EMQXOpts, #{
+                        <<"durable_sessions">> => durable_sessions_config(
+                            DurableSessionsOpts
+                        ),
+                        <<"durable_storage">> => DurableStorageOpts
+                    })
+                }}
+                | ExtraApps
+            ]
+        ),
+        #{work_dir => WorkDir}
+    ),
+    emqx_persistent_message:wait_readiness(5_000),
+    [{apps, Apps} | Config].
+
+stop_apps_ds(Config) ->
+    emqx_cth_suite:stop(proplists:get_value(apps, Config)).
+
+durable_sessions_config(Opts) ->
+    emqx_utils_maps:deep_merge(
+        #{
+            <<"enable">> => true
+        },
+        Opts
+    ).
+
+start_cluster_ds(Config, ClusterSpec0, Opts) when is_list(ClusterSpec0) ->
+    WorkDir = maps:get(work_dir, Opts, emqx_cth_suite:work_dir(Config)),
+    DurableSessionsOpts = maps:get(durable_sessions_opts, Opts, #{}),
+    EMQXOpts = maps:get(emqx_opts, Opts, #{}),
+    BaseApps = [
+        emqx_conf,
+        {emqx_durable_timer, #{
+            override_env =>
+                [
+                    {heartbeat_interval, 500},
+                    {missed_heartbeats, 3}
+                ]
+        }},
+        {emqx, #{
+            config => maps:merge(EMQXOpts, #{
+                <<"durable_storage">> => #{<<"n_sites">> => length(ClusterSpec0)},
+                <<"durable_sessions">> => durable_sessions_config(
+                    DurableSessionsOpts
+                )
+            })
+        }}
+    ],
+    ClusterSpec =
+        lists:map(
+            fun({NodeName, #{apps := ExtraApps} = NodeOpts}) ->
+                {NodeName, NodeOpts#{apps := BaseApps ++ ExtraApps}}
+            end,
+            ClusterSpec0
+        ),
+    ClusterOpts = #{work_dir => WorkDir},
+    NodeSpecs = emqx_cth_cluster:mk_nodespecs(ClusterSpec, ClusterOpts),
+    Nodes = emqx_cth_cluster:start(ClusterSpec, ClusterOpts),
+    erpc:multicall(Nodes, emqx_persistent_message, wait_readiness, [5_000], infinity),
+    [{cluster_nodes, Nodes}, {node_specs, NodeSpecs}, {work_dir, WorkDir} | Config].
+
+stop_cluster_ds(Config) ->
+    emqx_cth_cluster:stop(proplists:get_value(cluster_nodes, Config)),
+    case proplists:get_value(work_dir, Config) of
+        undefined ->
+            ok;
+        WorkDir ->
+            emqx_cth_suite:clean_work_dir(WorkDir)
+    end.
+
+restart_node_ds(Node, NodeSpec) ->
+    emqx_cth_cluster:restart(NodeSpec),
+    wait_nodeup(Node),
+    erpc:call(Node, emqx_persistent_message, wait_readiness, [5_000], infinity),
+    ok.
+
+wait_nodeup(Node) ->
+    ?retry(
+        _Sleep0 = 500,
+        _Attempts0 = 50,
+        pong = net_adm:ping(Node)
+    ).
+
+capture_io_format(Fn) ->
+    Owner = self(),
+    {GL, _} = spawn_monitor(fun() -> gl_sink(Owner, []) end),
+    {Runner, _} = spawn_monitor(fun() ->
+        group_leader(GL, self()),
+        exit({self(), result, Fn()})
+    end),
+    Result =
+        receive
+            {'DOWN', _, process, Runner, {_, result, Res}} ->
+                Res
+        after 1000 ->
+            exit(Runner, kill),
+            error(timeout)
+        end,
+    GL ! stop,
+    Prints =
+        receive
+            {'DOWN', _, process, GL, {_, prints, IoRequests}} ->
+                IoRequests
+        after 1000 ->
+            exit(GL, kill),
+            error(timeout)
+        end,
+    {Result, format_io_requests(Prints)}.
+
+gl_sink(Owner, Acc) ->
+    receive
+        {io_request, From, ReplyAs, Request} ->
+            From ! {io_reply, ReplyAs, ok},
+            gl_sink(Owner, [Request | Acc]);
+        stop ->
+            exit({self(), prints, lists:reverse(Acc)});
+        _ ->
+            gl_sink(Owner, Acc)
+    end.
+
+format_io_requests(IoRequests) ->
+    lists:map(
+        fun(Request) ->
+            case Request of
+                {put_chars, unicode, M, F, A} ->
+                    IoDat = apply(M, F, A),
+                    unicode:characters_to_binary(IoDat);
+                _ ->
+                    error({unknown_io_request, Request})
+            end
+        end,
+        IoRequests
+    ).
+
+%% In standalone tests, other applications such as `emqx_conf` are not available.
+is_standalone_test() ->
+    not emqx_common_test_helpers:ensure_loaded(emqx_conf).
+
+seed_defaults_for_all_roots_namespaced_cluster(SchemaMod, Namespace) ->
+    emqx_cluster_rpc:multicall(
+        emqx_config,
+        seed_defaults_for_all_roots_namespaced,
+        [SchemaMod, Namespace]
+    ).

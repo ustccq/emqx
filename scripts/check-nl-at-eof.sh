@@ -19,6 +19,9 @@ nl_at_eof() {
         *.jks)
             return
             ;;
+        *.avro)
+            return
+            ;;
     esac
     local lastbyte
     lastbyte="$(tail -c 1 "$file" 2>&1)"
@@ -32,6 +35,8 @@ n=0
 while read -r file; do
     if ! nl_at_eof "$file"; then
         echo "nl_at_eof: $file"
+        # shellcheck disable=SC1003
+        sed -i -e '$a\' "$file"
         n=$(( n + 1 ))
     fi
 done < <(git ls-files)

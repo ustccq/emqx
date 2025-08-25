@@ -37,9 +37,10 @@
 ## Prevent user from accidentally calling a function from the prompt that could harm a running system.
 -stdlib restricted_shell emqx_restricted_shell
 
-## Sets the distribution buffer busy limit (dist_buf_busy_limit).
-## Preferably set in `emqx.conf`,
-#+zdbbl 8192
+## Sets the distribution buffer busy limit (dist_buf_busy_limit) in kilobytes.
+## The default 1024 may not be sufficient when mnesia operations are intensive,
+##  and could result in busy_dist_port alarms.
++zdbbl 32768
 
 ## Sets default scheduler hint for port parallelism.
 +spp true
@@ -87,12 +88,26 @@
 ## Suggested stack size, in kilowords, for dirty IO scheduler threads.
 #+sssdio 40
 
-## Sets scheduler bind type.
-## Can be one of: u, ns, ts, ps, s, nnts, nnps, tnnps, db
-#+sbt db
-
 ## Sets a user-defined CPU topology.
 #+sct L0-3c0-3p0N0:L4-7c0-3p1N1
+
+## Sets scheduler bind type. Setting to 'db' may achieve lower message latency
+##  than the default 'u' in most scenarios.
+## If binding of schedulers is not supported by the OS, or no available CPU
+##  topology detected, the runtime system silently ignores the error, and start
+##  up using unbound schedulers 'u'.
++stbt db
+
+## Sets scheduler busy wait threshold. Setting to 'none' disables busy waiting.
+## This can significantly reduce the CPU usage observed by the OS, but may
+##  increase message latency in some scenarios.
++sbwt none
+
+## As +sbwt but affects dirty CPU schedulers.
++sbwtdcpu none
+
+## As +sbwt but affects dirty IO schedulers.
++sbwtdio none
 
 ## Sets the mapping of warning messages for error_logger
 #+W w
@@ -100,12 +115,27 @@
 ## Sets time warp mode: no_time_warp | single_time_warp | multi_time_warp
 +C multi_time_warp
 
+## Enable/disable Erlang monotonic time correction aginast OS.
+## In some operating systems which cannot provide a stable monotonic time source,
+## Erlang VM may exit with error log "monotonic time stepped backwards"
+## In such cases, setting this option to 'false' can prevent the VM from restarting.
+##
+## NOTE!
+## You typically never want to disable time correction.
+## If time correction is disabled, Erlang monotonic time can warp forwards or stop,
+## or even freeze for extended periods of time.
+## There are then no guarantees that the frequency of the Erlang monotonic clock is accurate or stable.
++c true
+
 ## Prevents loading information about source filenames and line numbers.
 #+L
 
 ## Specifies how long time (in milliseconds) to spend shutting down the system.
 ## See: http://erlang.org/doc/man/erl.html
 -shutdown_time 30000
+
+## Disable the code path caching feature to allow adding dynamic patch path using `-pa`.
+-cache_boot_paths false
 
 ## patches dir
 -pa "{{ platform_data_dir }}/patches"
@@ -116,3 +146,6 @@
 
 ## Disable os_mon's disksup by default
 -os_mon start_disksup false
+
+## Sets unicode as the printable character range when formatting binaries
++pc unicode

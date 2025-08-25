@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_cli_SUITE).
@@ -20,21 +8,7 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
-
--define(GP(S), begin
-    S,
-    receive
-        {fmt, P} -> P;
-        O -> O
-    end
-end).
-
-%% this parses to #{}, will not cause config cleanup
-%% so we will need call emqx_config:erase
--define(CONF_DEFAULT, <<
-    "\n"
-    "gateway {}\n"
->>).
+-include_lib("common_test/include/ct.hrl").
 
 %% The config with json format for mqtt-sn gateway
 -define(CONF_MQTTSN,
@@ -62,16 +36,17 @@ end).
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
-init_per_suite(Conf) ->
-    emqx_config:erase(gateway),
-    emqx_gateway_test_utils:load_all_gateway_apps(),
-    emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_auth, emqx_gateway]),
-    Conf.
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx, emqx_conf, emqx_gateway],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(Conf) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_gateway, emqx_auth, emqx_conf]),
-    Conf.
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_, Conf) ->
     Self = self(),

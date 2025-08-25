@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt).
@@ -120,8 +108,14 @@
 
 -define(maybe_log_node_errors(LogData, Errors),
     case Errors of
-        [] -> ok;
-        _ -> ?SLOG(error, (LogData)#{node_errors => Errors})
+        [] ->
+            ok;
+        _ ->
+            ?SLOG(error, (begin
+                LogData
+            end)#{
+                node_errors => Errors
+            })
     end
 ).
 
@@ -151,10 +145,7 @@ node_info() ->
         memory_used => erlang:round(Total * UsedRatio),
         process_available => erlang:system_info(process_limit),
         process_used => erlang:system_info(process_count),
-
-        max_fds => proplists:get_value(
-            max_fds, lists:usort(lists:flatten(erlang:system_info(check_io)))
-        ),
+        max_fds => esockd:ulimit(),
         connections => ets:info(?CHAN_TAB, size),
         live_connections => ets:info(?CHAN_LIVE_TAB, size),
         cluster_sessions => ets:info(?CHAN_REG_TAB, size),
@@ -204,6 +195,8 @@ vm_stats() ->
     cpu_stats() ++
         [
             {run_queue, vm_stats('run.queue')},
+            {mnesia_tm_mailbox_size, vm_stats('mnesia.tm.mailbox.size')},
+            {broker_pool_max_mailbox_size, vm_stats('broker.pool.max.mailbox.size')},
             {total_memory, MemTotal},
             {used_memory, erlang:round(MemTotal * MemUsedRatio)}
         ].
@@ -227,14 +220,18 @@ vm_stats('cpu') ->
         _ ->
             [{cpu_use, 0}, {cpu_idle, 0}]
     end;
+vm_stats('run.queue') ->
+    erlang:statistics(run_queue);
+vm_stats('mnesia.tm.mailbox.size') ->
+    emqx_broker_mon:get_mnesia_tm_mailbox_size();
+vm_stats('broker.pool.max.mailbox.size') ->
+    emqx_broker_mon:get_broker_pool_max_mailbox_size();
 vm_stats('total.memory') ->
     {_, MemTotal} = get_sys_memory(),
     MemTotal;
 vm_stats('used.memory') ->
     {MemUsedRatio, MemTotal} = get_sys_memory(),
-    erlang:round(MemTotal * MemUsedRatio);
-vm_stats('run.queue') ->
-    erlang:statistics(run_queue).
+    erlang:round(MemTotal * MemUsedRatio).
 
 %%--------------------------------------------------------------------
 %% Brokers
@@ -336,10 +333,10 @@ lookup_client({clientid, ClientId}, FormatFun) ->
     IsPersistenceEnabled = emqx_persistent_message:is_persistence_enabled(),
     case lookup_running_client(ClientId, FormatFun) of
         [] when IsPersistenceEnabled ->
-            case emqx_persistent_session_ds_state:print_session(ClientId) of
-                undefined -> [];
-                Session -> [maybe_format(FormatFun, {ClientId, Session})]
-            end;
+            [
+                maybe_format(FormatFun, I)
+             || I <- emqx_persistent_session_ds_state:print_channel(ClientId)
+            ];
         Res ->
             Res
     end;
@@ -567,7 +564,18 @@ list_subscriptions_via_topic(Node, Topic, _FormatFun = {M, F}) ->
 %%--------------------------------------------------------------------
 
 subscribe(ClientId, TopicTables) ->
-    subscribe(emqx:running_nodes(), ClientId, TopicTables).
+    case emqx_cm_registry:is_enabled() of
+        false ->
+            subscribe(emqx:running_nodes(), ClientId, TopicTables);
+        true ->
+            with_client_node(
+                ClientId,
+                {error, channel_not_found},
+                fun(Node) ->
+                    subscribe([Node], ClientId, TopicTables)
+                end
+            )
+    end.
 
 subscribe([Node | Nodes], ClientId, TopicTables) ->
     case unwrap_rpc(emqx_management_proto_v5:subscribe(Node, ClientId, TopicTables)) of
@@ -615,7 +623,18 @@ do_unsubscribe(ClientId, Topic) ->
 -spec unsubscribe_batch(emqx_types:clientid(), [emqx_types:topic()]) ->
     {unsubscribe, _} | {error, channel_not_found}.
 unsubscribe_batch(ClientId, Topics) ->
-    unsubscribe_batch(emqx:running_nodes(), ClientId, Topics).
+    case emqx_cm_registry:is_enabled() of
+        false ->
+            unsubscribe_batch(emqx:running_nodes(), ClientId, Topics);
+        true ->
+            with_client_node(
+                ClientId,
+                {error, channel_not_found},
+                fun(Node) ->
+                    unsubscribe_batch([Node], ClientId, Topics)
+                end
+            )
+    end.
 
 -spec unsubscribe_batch([node()], emqx_types:clientid(), [emqx_types:topic()]) ->
     {unsubscribe_batch, _} | {error, channel_not_found}.
@@ -691,14 +710,32 @@ delete_banned(Who) ->
 %%--------------------------------------------------------------------
 
 lookup_running_client(ClientId, FormatFun) ->
-    lists:append([
-        lookup_client(Node, {clientid, ClientId}, FormatFun)
-     || Node <- emqx:running_nodes()
-    ]).
+    case emqx_cm_registry:is_enabled() of
+        false ->
+            lists:append([
+                lookup_client(Node, {clientid, ClientId}, FormatFun)
+             || Node <- emqx:running_nodes()
+            ]);
+        true ->
+            with_client_node(
+                ClientId,
+                _WhenNotFound = [],
+                fun(Node) -> lookup_client(Node, {clientid, ClientId}, FormatFun) end
+            )
+    end.
 
 %%--------------------------------------------------------------------
 %% Internal Functions.
 %%--------------------------------------------------------------------
+
+with_client_node(ClientId, WhenNotFound, Fn) ->
+    case emqx_cm_registry:lookup_channels(ClientId) of
+        [ChanPid | _] ->
+            Node = node(ChanPid),
+            Fn(Node);
+        [] ->
+            WhenNotFound
+    end.
 
 unwrap_rpc({badrpc, Reason}) ->
     {error, Reason};

@@ -31,15 +31,6 @@ case "${MAKE_TARGET}" in
         ;;
 esac
 
-case "${MAKE_TARGET}" in
-    *elixir*)
-        IS_ELIXIR='yes'
-        ;;
-    *)
-        IS_ELIXIR='no'
-        ;;
-esac
-
 export DEBUG=1
 export CODE_PATH=${CODE_PATH:-"/emqx"}
 export SCRIPTS="${CODE_PATH}/scripts"
@@ -63,7 +54,7 @@ else
     esac
 fi
 PACKAGE_VERSION="$("$CODE_PATH"/pkg-vsn.sh "${EMQX_NAME}")"
-PACKAGE_VERSION_LONG="$("$CODE_PATH"/pkg-vsn.sh "${EMQX_NAME}" --long --elixir "${IS_ELIXIR}")"
+PACKAGE_VERSION_LONG="$("$CODE_PATH"/pkg-vsn.sh "${EMQX_NAME}" --long)"
 PACKAGE_NAME="${EMQX_NAME}-${PACKAGE_VERSION_LONG}"
 PACKAGE_FILE_NAME="${PACKAGE_FILE_NAME:-${PACKAGE_NAME}.${PKG_SUFFIX}}"
 
@@ -131,6 +122,21 @@ emqx_test(){
                 exit 1
             fi
 
+            echo "try to install again and purge while the service is running"
+            dpkg -i "${PACKAGE_PATH}/${packagename}"
+            if [ "$(dpkg -l | grep ${EMQX_NAME} | awk '{print $1}')" != "ii" ]
+            then
+                echo "package install error"
+                exit 1
+            fi
+            if ! /usr/bin/emqx start
+            then
+                echo "ERROR: failed_to_start_emqx"
+                cat /var/log/emqx/erlang.log.1 || true
+                cat /var/log/emqx/emqx.log.1 || true
+                exit 1
+            fi
+            /usr/bin/emqx ping
             dpkg -P "${EMQX_NAME}"
             if dpkg -l |grep -q emqx
             then
@@ -197,6 +203,14 @@ EOF
         echo "Error: cannot locate emqx_vars"
         exit 1
     fi
+    if ! "${bin_dir}/emqx" 'start' 'help'; then
+        echo "ERROR: failed_to_call_help_command"
+        exit 1
+    fi
+    if ! "${bin_dir}/emqx" 'help'; then
+        echo "ERROR: failed_to_call_help_command"
+        exit 1
+    fi
     echo "running ${packagename} start"
     if ! "${bin_dir}/emqx" 'start'; then
         echo "ERROR: failed_to_start_emqx"
@@ -246,8 +260,3 @@ relup_test(){
 
 emqx_prepare
 emqx_test
-if [ "$IS_ELIXIR" = 'yes' ]; then
-    echo "WARNING: skipped relup test for elixir"
-else
-    relup_test
-fi

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_SUITE).
 
@@ -56,27 +44,21 @@ init_per_group(persistence_disabled, Config) ->
         | Config
     ];
 init_per_group(persistence_enabled, Config) ->
-    Apps = emqx_cth_suite:start(
-        [
-            {emqx,
-                "durable_sessions {\n"
-                "  enable = true\n"
-                "  heartbeat_interval = 100ms\n"
-                "  renew_streams_interval = 100ms\n"
-                "}"},
-            emqx_management
-        ],
-        #{work_dir => emqx_cth_suite:work_dir(Config)}
-    ),
-    [
-        {apps, Apps}
-        | Config
-    ];
+    DurableSessionsOpts = #{
+        <<"enable">> => true,
+        <<"checkpoint_interval">> => <<"0ms">>
+    },
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    ExtraApps = [emqx_management],
+    emqx_common_test_helpers:start_apps_ds(Config, ExtraApps, Opts);
 init_per_group(cm_registry_enabled, Config) ->
     [{emqx_config, "broker.enable_session_registry = true"} | Config];
 init_per_group(cm_registry_disabled, Config) ->
     [{emqx_config, "broker.enable_session_registry = false"} | Config].
 
+end_per_group(persistence_enabled, Config) ->
+    emqx_common_test_helpers:stop_apps_ds(Config),
+    ok;
 end_per_group(_Grp, Config) ->
     case ?config(apps, Config) of
         undefined -> ok;
@@ -180,9 +162,14 @@ t_lookup_client(_Config) ->
     ),
     ?assertEqual([], emqx_mgmt:lookup_client({clientid, <<"notfound">>}, ?FORMATFUN)),
     meck:expect(emqx, running_nodes, 0, [node(), 'fake@nonode']),
-    ?assertMatch(
-        [_ | {error, nodedown}], emqx_mgmt:lookup_client({clientid, <<"client1">>}, ?FORMATFUN)
-    ).
+    try
+        emqx:update_config([broker, enable_session_registry], false),
+        ?assertMatch(
+            [_ | {error, nodedown}], emqx_mgmt:lookup_client({clientid, <<"client1">>}, ?FORMATFUN)
+        )
+    after
+        emqx:update_config([broker, enable_session_registry], true)
+    end.
 
 t_kickout_client(init, Config) ->
     process_flag(trap_exit, true),

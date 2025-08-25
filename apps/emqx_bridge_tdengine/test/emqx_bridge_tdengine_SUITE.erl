@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_tdengine_SUITE).
@@ -10,6 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 % SQL definitions
 -define(SQL_BRIDGE,
@@ -27,7 +28,6 @@
 -define(SQL_DROP_TABLE, "DROP TABLE t_mqtt_msg").
 -define(SQL_DROP_STABLE, "DROP STABLE s_tab").
 -define(SQL_DELETE, "DELETE FROM t_mqtt_msg").
--define(SQL_SELECT, "SELECT payload FROM t_mqtt_msg").
 
 -define(AUTO_CREATE_BRIDGE,
     "insert into ${clientid} USING s_tab TAGS ('${clientid}') values (${timestamp}, '${payload}')"
@@ -45,6 +45,8 @@
 -define(TD_DATABASE, "mqtt").
 -define(TD_USERNAME, "root").
 -define(TD_PASSWORD, "taosdata").
+%% only for emqx_tdengine_cloud_svr
+-define(TD_TOKEN, <<"token_1234567890">>).
 -define(BATCH_SIZE, 10).
 -define(PAYLOAD, <<"HELLO">>).
 
@@ -55,9 +57,8 @@
 ).
 
 -define(BRIDGE_TYPE_BIN, <<"tdengine">>).
--define(APPS, [
-    hackney, tdengine, emqx_bridge, emqx_resource, emqx_rule_engine, emqx_bridge_tdengine
-]).
+
+-define(MOCK_SVR_PORT, 8080).
 
 %%------------------------------------------------------------------------------
 %% CT boilerplate
@@ -66,7 +67,8 @@
 all() ->
     [
         {group, async},
-        {group, sync}
+        {group, sync},
+        {group, cloud}
     ].
 
 groups() ->
@@ -77,19 +79,42 @@ groups() ->
         {async, BatchingGroups},
         {sync, BatchingGroups},
         {with_batch, TCs},
-        {without_batch, TCs -- MustBatchCases}
+        {without_batch, TCs -- MustBatchCases},
+        %% new connector params is not supported for bridge v1 http api,
+        %% so we can skip this test case
+        {cloud, TCs -- [t_create_via_http]}
     ].
 
+-define(APPS, [
+    emqx,
+    emqx_conf,
+    emqx_bridge_tdengine,
+    emqx_connector,
+    emqx_bridge,
+    emqx_rule_engine,
+    emqx_management
+]).
+
 init_per_suite(Config) ->
-    emqx_bridge_v2_testlib:init_per_suite(Config, ?APPS).
+    emqx_bridge_v2_testlib:init_per_suite(
+        Config, ?APPS ++ [emqx_mgmt_api_test_util:emqx_dashboard()]
+    ).
 
 end_per_suite(Config) ->
-    emqx_bridge_v2_testlib:end_per_suite(Config).
+    emqx_bridge_v2_testlib:end_per_suite([{apps, ?APPS} | Config]).
 
 init_per_group(async, Config) ->
     [{query_mode, async} | Config];
 init_per_group(sync, Config) ->
     [{query_mode, sync} | Config];
+init_per_group(cloud, Config0) ->
+    Config = [
+        {query_mode, async},
+        {enable_batch, true},
+        {cloud, true}
+        | Config0
+    ],
+    common_init(Config);
 init_per_group(with_batch, Config0) ->
     Config = [{enable_batch, true} | Config0],
     common_init(Config);
@@ -99,7 +124,14 @@ init_per_group(without_batch, Config0) ->
 init_per_group(_Group, Config) ->
     Config.
 
-end_per_group(default, Config) ->
+end_per_group(Group, Config) when
+    Group =:= with_batch;
+    Group =:= without_batch
+->
+    emqx_bridge_v2_testlib:end_per_group(Config),
+    ok;
+end_per_group(cloud, Config) ->
+    emqx_tdengine_cloud_svr:stop(),
     emqx_bridge_v2_testlib:end_per_group(Config),
     ok;
 end_per_group(_Group, _Config) ->
@@ -143,9 +175,20 @@ common_init(ConfigT) ->
     Config0 = [
         {td_host, Host},
         {td_port, Port},
+        {mock_svr_host, "localhost"},
+        {mock_svr_port, ?MOCK_SVR_PORT},
         {proxy_name, "tdengine_restful"}
         | ConfigT
     ],
+
+    case ?config(cloud, Config0) of
+        true ->
+            emqx_tdengine_cloud_svr:start(
+                ?MOCK_SVR_PORT, ?TD_TOKEN, config_to_tdengine_opts(Config0)
+            );
+        _ ->
+            ok
+    end,
 
     case emqx_common_test_helpers:is_tcp_server_available(Host, Port) of
         true ->
@@ -205,28 +248,43 @@ action_config(TestCase, Name, Config) ->
     {ConfigString, parse_action_and_check(ConfigString, Type, Name)}.
 
 connector_config(Name, Config) ->
-    Host = ?config(td_host, Config),
-    Port = ?config(td_port, Config),
     Type = ?config(bridge_type, Config),
-    Server = Host ++ ":" ++ integer_to_list(Port),
+    Fmt = connector_config_str(?config(cloud, Config)),
+    Params = connector_config_params(?config(cloud, Config), Name, Config),
     ConfigString =
         io_lib:format(
-            "connectors.~s.~s {\n"
-            "  enable = true\n"
-            "  server = \"~s\"\n"
-            "  username = ~p\n"
-            "  password = ~p\n"
-            "}\n",
-            [
-                Type,
-                Name,
-                Server,
-                ?TD_USERNAME,
-                ?TD_PASSWORD
-            ]
+            Fmt,
+            Params
         ),
     ct:pal("ConnectorConfig:~ts~n", [ConfigString]),
     {ConfigString, parse_connector_and_check(ConfigString, Type, Name)}.
+
+connector_config_str(_IsCloud = true) ->
+    "connectors.~s.~s {\n"
+    "  enable = true\n"
+    "  server = \"~s\"\n"
+    "  token = ~s\n"
+    "}\n";
+connector_config_str(_NotCloud) ->
+    "connectors.~s.~s {\n"
+    "  enable = true\n"
+    "  server = \"~s\"\n"
+    "  username = ~p\n"
+    "  password = ~p\n"
+    "}\n".
+
+connector_config_params(_IsCloud = true, Name, Config) ->
+    Type = ?config(bridge_type, Config),
+    Host = ?config(mock_svr_host, Config),
+    Port = ?config(mock_svr_port, Config),
+    Server = Host ++ ":" ++ integer_to_list(Port),
+    [Type, Name, Server, ?TD_TOKEN];
+connector_config_params(_NotCloud, Name, Config) ->
+    Type = ?config(bridge_type, Config),
+    Host = ?config(td_host, Config),
+    Port = ?config(td_port, Config),
+    Server = Host ++ ":" ++ integer_to_list(Port),
+    [Type, Name, Server, ?TD_USERNAME, ?TD_PASSWORD].
 
 parse_action_and_check(ConfigString, BridgeType, Name) ->
     parse_and_check(ConfigString, emqx_bridge_schema, <<"actions">>, BridgeType, Name).
@@ -250,11 +308,12 @@ to_bin(Atom) when is_atom(Atom) ->
 to_bin(Bin) when is_binary(Bin) ->
     Bin.
 
+%% todo: messages should be sent via rules in tests...
 send_message(Config, Payload) ->
     BridgeType = ?config(bridge_type, Config),
     Name = ?config(bridge_name, Config),
     ct:print(">>> Name:~p~n BridgeType:~p~n", [Name, BridgeType]),
-    emqx_bridge_v2:send_message(BridgeType, Name, Payload, #{}).
+    emqx_bridge_v2:send_message(?global_ns, BridgeType, Name, Payload, #{}).
 
 receive_result(Ref, Timeout) ->
     receive
@@ -266,16 +325,17 @@ receive_result(Ref, Timeout) ->
         timeout
     end.
 
-connect_direct_tdengine(Config) ->
-    Opts = [
+config_to_tdengine_opts(Config) ->
+    [
         {host, to_bin(?config(td_host, Config))},
         {port, ?config(td_port, Config)},
         {username, to_bin(?TD_USERNAME)},
         {password, to_bin(?TD_PASSWORD)},
         {pool_size, 8}
-    ],
+    ].
 
-    {ok, Con} = tdengine:start_link(Opts),
+connect_direct_tdengine(Config) ->
+    {ok, Con} = tdengine:start_link(config_to_tdengine_opts(Config)),
     Con.
 
 % These funs connect and then stop the tdengine connection
@@ -292,8 +352,11 @@ connect_and_clear_table(Config) ->
     ?WITH_CON({ok, _} = directly_query(Con, ?SQL_DELETE)).
 
 connect_and_get_payload(Config) ->
+    connect_and_get_column(Config, "SELECT payload FROM t_mqtt_msg").
+
+connect_and_get_column(Config, Select) ->
     ?WITH_CON(
-        {ok, #{<<"code">> := 0, <<"data">> := Result}} = directly_query(Con, ?SQL_SELECT)
+        {ok, #{<<"code">> := 0, <<"data">> := Result}} = directly_query(Con, Select)
     ),
     Result.
 
@@ -364,9 +427,46 @@ t_simple_insert(Config) ->
         connect_and_get_payload(Config)
     ).
 
-t_batch_insert(Config) ->
+t_simple_insert_undefined(Config) ->
     connect_and_clear_table(Config),
-    ?assertMatch({ok, _}, emqx_bridge_v2_testlib:create_bridge(Config)),
+
+    MakeMessageFun = fun() ->
+        #{payload => undefined, timestamp => 1668602148000, second_ts => 1668602148010}
+    end,
+
+    ok = emqx_bridge_v2_testlib:t_sync_query(
+        Config, MakeMessageFun, fun is_success_check/1, tdengine_connector_query_return
+    ),
+
+    ?assertMatch(
+        %% the old behavior without undefined_vars_as_null
+        [[<<"undefined">>], [<<"undefined">>]],
+        connect_and_get_payload(Config)
+    ).
+
+t_undefined_vars_as_null(Config0) ->
+    Config = patch_bridge_config(Config0, #{
+        <<"parameters">> => #{<<"undefined_vars_as_null">> => true}
+    }),
+    connect_and_clear_table(Config),
+
+    MakeMessageFun = fun() ->
+        #{payload => undefined, timestamp => 1668602148000, second_ts => 1668602148010}
+    end,
+    ok = emqx_bridge_v2_testlib:t_sync_query(
+        Config, MakeMessageFun, fun is_success_check/1, tdengine_connector_query_return
+    ),
+
+    ?assertMatch(
+        [[<<"null">>], [<<"null">>]],
+        connect_and_get_payload(Config)
+    ).
+
+t_batch_insert(Config) ->
+    Name = ?config(bridge_name, Config),
+    connect_and_clear_table(Config),
+    ?assertMatch({ok, _}, emqx_bridge_v2_testlib:create_bridge_api(Config)),
+    _ = emqx_bridge_v2_testlib:kickoff_action_health_check(?BRIDGE_TYPE_BIN, Name),
 
     Size = 5,
     Ts = erlang:system_time(millisecond),
@@ -433,9 +533,11 @@ t_auto_create_simple_insert(Config) ->
     ).
 
 t_auto_create_batch_insert(Config) ->
+    Name = ?config(bridge_name, Config),
     ClientId1 = "client1",
     ClientId2 = "client2",
-    ?assertMatch({ok, _}, emqx_bridge_v2_testlib:create_bridge(Config)),
+    ?assertMatch({ok, _}, emqx_bridge_v2_testlib:create_bridge_api(Config)),
+    _ = emqx_bridge_v2_testlib:kickoff_action_health_check(?BRIDGE_TYPE_BIN, Name),
 
     Size1 = 2,
     Size2 = 3,
@@ -491,3 +593,8 @@ t_auto_create_batch_insert(Config) ->
         end,
         [ClientId1, ClientId2, "test_" ++ ClientId1, "test_" ++ ClientId2]
     ).
+
+patch_bridge_config(Config, Overrides) ->
+    BridgeConfig0 = ?config(bridge_config, Config),
+    BridgeConfig1 = emqx_utils_maps:deep_merge(BridgeConfig0, Overrides),
+    [{bridge_config, BridgeConfig1} | proplists:delete(bridge_config, Config)].

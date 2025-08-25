@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_http_schema).
 
@@ -72,35 +60,29 @@ fields(action) ->
             }
         )};
 fields("http_action") ->
-    [
-        {enable, mk(boolean(), #{desc => ?DESC("config_enable_bridge"), default => true})},
-        {connector,
-            mk(binary(), #{
-                desc => ?DESC(emqx_connector_schema, "connector_field"), required => true
-            })},
-        {tags, emqx_schema:tags_schema()},
-        {description, emqx_schema:description_schema()},
-        %% Note: there's an implicit convention in `emqx_bridge' that,
-        %% for egress bridges with this config, the published messages
-        %% will be forwarded to such bridges.
-        {local_topic,
-            mk(
-                binary(),
-                #{
-                    required => false,
-                    desc => ?DESC("config_local_topic"),
-                    importance => ?IMPORTANCE_HIDDEN
-                }
-            )},
-        %% Since e5.3.2, we split the http bridge to two parts: a) connector. b) actions.
-        %% some fields are moved to connector, some fields are moved to actions and composed into the
-        %% `parameters` field.
-        {parameters,
-            mk(ref("parameters_opts"), #{
-                required => true,
-                desc => ?DESC("config_parameters_opts")
-            })}
-    ] ++
+    emqx_bridge_v2_schema:common_action_fields() ++
+        [
+            %% Note: there's an implicit convention in `emqx_bridge' that,
+            %% for egress bridges with this config, the published messages
+            %% will be forwarded to such bridges.
+            {local_topic,
+                mk(
+                    binary(),
+                    #{
+                        required => false,
+                        desc => ?DESC("config_local_topic"),
+                        importance => ?IMPORTANCE_HIDDEN
+                    }
+                )},
+            %% Since e5.3.2, we split the http bridge to two parts: a) connector. b) actions.
+            %% some fields are moved to connector, some fields are moved to actions and composed into the
+            %% `parameters` field.
+            {parameters,
+                mk(ref("parameters_opts"), #{
+                    required => true,
+                    desc => ?DESC("config_parameters_opts")
+                })}
+        ] ++
         emqx_connector_schema:resource_opts_ref(
             ?MODULE, action_resource_opts, fun legacy_action_resource_opts_converter/2
         );

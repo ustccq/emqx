@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Stomp heartbeat.
@@ -27,7 +15,7 @@
     interval/2
 ]).
 
--export_type([heartbeat/0]).
+-export_type([heartbeat/0, name/0]).
 
 -record(heartbeater, {interval, statval, repeat}).
 
@@ -86,19 +74,26 @@ check(
         NewVal =/= OldVal ->
             {ok, HrtBter#heartbeater{statval = NewVal, repeat = 0}};
         Repeat < 1 ->
+            %% Allow the first check to pass
+            %% This is to compensate network latency etc for the heartbeat.
+            %% On average (normal distribution of the timing of when check
+            %% happen during the heartbeat interval), it allows the connection
+            %% to idle for 1.5x heartbeat interval.
             {ok, HrtBter#heartbeater{repeat = Repeat + 1}};
         true ->
             {error, timeout}
     end.
 
+%% @doc Call this when heartbeat is receved or sent.
 -spec reset(name(), pos_integer(), heartbeat()) ->
     heartbeat().
 reset(Name, NewVal, HrtBt) ->
     HrtBter = maps:get(Name, HrtBt),
     HrtBt#{Name => reset(NewVal, HrtBter)}.
 
+%% Set counter back to zero (the initial state)
 reset(NewVal, HrtBter) ->
-    HrtBter#heartbeater{statval = NewVal, repeat = 1}.
+    HrtBter#heartbeater{statval = NewVal, repeat = 0}.
 
 -spec info(heartbeat()) -> map().
 info(HrtBt) ->

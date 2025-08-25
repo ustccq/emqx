@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% a coap to mqtt adapter with a retained topic message database
@@ -28,8 +16,16 @@
 -import(emqx_coap_channel, [run_hooks/3]).
 
 -define(UNSUB(Topic, Msg), #{subscribe => {Topic, Msg}}).
--define(SUB(Topic, Token, Msg), #{subscribe => {{Topic, Token}, Msg}}).
--define(SUBOPTS, #{qos => 0, rh => 1, rap => 0, nl => 0, is_new => false}).
+-define(SUB(Topic, Token, Opts, Msg), #{
+    subscribe => {
+        #{
+            topic => Topic,
+            token => Token,
+            subopts => Opts
+        },
+        Msg
+    }
+}).
 
 %% TODO maybe can merge this code into emqx_coap_session, simplify the call chain
 
@@ -80,11 +76,17 @@ get_sub_opts(Msg) ->
     ),
     case SubOpts of
         #{qos := _} ->
-            maps:merge(?SUBOPTS, SubOpts);
+            maps:merge(mk_subopts(), SubOpts);
         _ ->
             CfgType = emqx_conf:get([gateway, coap, subscribe_qos], ?QOS_0),
-            maps:merge(?SUBOPTS#{qos => type_to_qos(CfgType, Msg)}, SubOpts)
+            maps:merge(mk_subopts(type_to_qos(CfgType, Msg)), SubOpts)
     end.
+
+mk_subopts() ->
+    mk_subopts(?QOS_0).
+
+mk_subopts(QoS) ->
+    #{qos => QoS, rh => 1, rap => 0, nl => 0, is_new => false}.
 
 parse_sub_opts(<<"qos">>, V, Opts) ->
     Opts#{qos => erlang:binary_to_integer(V)};
@@ -172,7 +174,7 @@ subscribe(#coap_message{token = Token} = Msg, Topic, Ctx, CInfo) ->
             MountTopic = mount(CInfo, Topic),
             emqx_broker:subscribe(MountTopic, ClientId, SubOpts),
             run_hooks(Ctx, 'session.subscribed', [CInfo, MountTopic, SubOpts]),
-            ?SUB(MountTopic, Token, Msg);
+            ?SUB(MountTopic, Token, SubOpts, Msg);
         _ ->
             reply({error, unauthorized}, Msg)
     end.
@@ -180,7 +182,7 @@ subscribe(#coap_message{token = Token} = Msg, Topic, Ctx, CInfo) ->
 unsubscribe(Msg, Topic, Ctx, CInfo) ->
     MountTopic = mount(CInfo, Topic),
     emqx_broker:unsubscribe(MountTopic),
-    run_hooks(Ctx, 'session.unsubscribed', [CInfo, Topic, ?SUBOPTS]),
+    run_hooks(Ctx, 'session.unsubscribed', [CInfo, Topic, mk_subopts()]),
     ?UNSUB(MountTopic, Msg).
 
 mount(#{mountpoint := Mountpoint}, Topic) ->

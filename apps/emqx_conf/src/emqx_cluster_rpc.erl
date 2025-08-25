@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_cluster_rpc).
 -behaviour(gen_server).
@@ -27,19 +15,24 @@
     query/1,
     reset/0,
     status/0,
+    is_initiator/1,
+    find_leader/0,
     skip_failed_commit/1,
     fast_forward_to_commit/2,
     on_mria_stop/1,
     force_leave_clean/1,
     wait_for_cluster_rpc/0,
-    maybe_init_tnx_id/2
+    maybe_init_tnx_id/2,
+    update_mfa/3
 ]).
 -export([
     commit/2,
     commit_status_trans/2,
     get_cluster_tnx_id/0,
+    get_current_tnx_id/0,
     get_node_tnx_id/1,
     init_mfa/2,
+    force_sync_tnx_id/3,
     latest_tnx_id/0,
     make_initiate_call_req/3,
     read_next_mfa/1,
@@ -66,6 +59,7 @@
 -export_type([tnx_id/0, succeed_num/0]).
 
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include("emqx_conf.hrl").
 
@@ -78,8 +72,6 @@
 -define(INITIATE(MFA), {initiate, MFA}).
 -define(CATCH_UP, catch_up).
 -define(TIMEOUT, timer:minutes(1)).
--define(APPLY_KIND_REPLICATE, replicate).
--define(APPLY_KIND_INITIATE, initiate).
 -define(IS_STATUS(_A_), (_A_ =:= peers_lagging orelse _A_ =:= stopped_nodes)).
 
 -type tnx_id() :: pos_integer().
@@ -223,6 +215,20 @@ reset() -> gen_server:call(?MODULE, reset).
 -spec status() -> {'atomic', [map()]} | {'aborted', Reason :: term()}.
 status() ->
     transaction(fun ?MODULE:trans_status/0, []).
+
+is_initiator(Opts) ->
+    ?KIND_INITIATE =:= maps:get(kind, Opts, ?KIND_INITIATE).
+
+find_leader() ->
+    {atomic, Status} = status(),
+    case Status of
+        [#{node := N} | _] ->
+            N;
+        [] ->
+            %% running nodes already sort.
+            [N | _] = emqx:running_nodes(),
+            N
+    end.
 
 %% DO NOT delete this on_leave_clean/0, It's use when rpc before v560.
 on_leave_clean() ->
@@ -398,7 +404,7 @@ catch_up(#{node := Node, retry_interval := RetryMs, is_leaving := false} = State
             ?tp(cluster_rpc_caught_up, #{}),
             ?TIMEOUT;
         {atomic, {still_lagging, NextId, MFA}} ->
-            {Succeed, _} = apply_mfa(NextId, MFA, ?APPLY_KIND_REPLICATE),
+            {Succeed, _} = apply_mfa(NextId, MFA, ?KIND_REPLICATE),
             case Succeed orelse SkipResult of
                 true ->
                     case transaction(fun ?MODULE:commit/2, [Node, NextId]) of
@@ -469,6 +475,12 @@ get_cluster_tnx_id() ->
         Id -> Id
     end.
 
+get_current_tnx_id() ->
+    case mnesia:dirty_read(?CLUSTER_COMMIT, node()) of
+        [] -> ?DEFAULT_INIT_TXN_ID;
+        [#cluster_rpc_commit{tnx_id = TnxId}] -> TnxId
+    end.
+
 get_oldest_mfa_id() ->
     case mnesia:first(?CLUSTER_MFA) of
         '$end_of_table' -> 0;
@@ -497,12 +509,14 @@ do_initiate(MFA, State = #{node := Node}, Count, Failure0) ->
     end.
 
 stale_view_of_cluster_msg(Meta, Count) ->
+    Node = find_leader(),
     Reason = Meta#{
-        msg => stale_view_of_cluster_state,
-        retry_times => Count
+        msg => stale_view_of_cluster,
+        retry_times => Count,
+        suggestion => ?SUGGESTION(Node)
     },
     ?SLOG(warning, Reason),
-    Reason.
+    {error, Reason}.
 
 %% The entry point of a config change transaction.
 init_mfa(Node, MFA) ->
@@ -520,7 +534,7 @@ init_mfa(Node, MFA) ->
             },
             ok = mnesia:write(?CLUSTER_MFA, MFARec, write),
             ok = commit(Node, TnxId),
-            case apply_mfa(TnxId, MFA, ?APPLY_KIND_INITIATE) of
+            case apply_mfa(TnxId, MFA, ?KIND_INITIATE) of
                 {true, Result} -> {ok, TnxId, Result};
                 {false, Error} -> mnesia:abort(Error)
             end;
@@ -529,11 +543,41 @@ init_mfa(Node, MFA) ->
             {retry, Meta}
     end.
 
+force_sync_tnx_id(Node, MFA, NodeTnxId) ->
+    mnesia:write_lock_table(?CLUSTER_MFA),
+    case get_node_tnx_id(Node) of
+        NodeTnxId ->
+            TnxId = NodeTnxId + 1,
+            MFARec = #cluster_rpc_mfa{
+                tnx_id = TnxId,
+                mfa = MFA,
+                initiator = Node,
+                created_at = erlang:localtime()
+            },
+            ok = mnesia:write(?CLUSTER_MFA, MFARec, write),
+            lists:foreach(
+                fun(N) ->
+                    ok = emqx_cluster_rpc:commit(N, NodeTnxId)
+                end,
+                mria:running_nodes()
+            );
+        NewTnxId ->
+            Fmt = "aborted_force_sync, tnx_id(~w) is not the latest(~w)",
+            Reason = emqx_utils:format(Fmt, [NodeTnxId, NewTnxId]),
+            mnesia:abort({error, Reason})
+    end.
+
+update_mfa(Node, MFA, LatestId) ->
+    case transaction(fun ?MODULE:force_sync_tnx_id/3, [Node, MFA, LatestId]) of
+        {atomic, ok} -> ok;
+        {aborted, Error} -> Error
+    end.
+
 transaction(Func, Args) ->
     mria:transaction(?CLUSTER_RPC_SHARD, Func, Args).
 
 trans_status() ->
-    mnesia:foldl(
+    List = mnesia:foldl(
         fun(Rec, Acc) ->
             #cluster_rpc_commit{node = Node, tnx_id = TnxId} = Rec,
             case mnesia:read(?CLUSTER_MFA, TnxId) of
@@ -556,7 +600,35 @@ trans_status() ->
         end,
         [],
         ?CLUSTER_COMMIT
+    ),
+    Cores = lists:sort(mria:cluster_nodes(cores)),
+    RunningNodes = mria:running_nodes(),
+    %% Make sure cores is ahead of replicants
+    Replicants = lists:subtract(RunningNodes, Cores),
+    Nodes = lists:append(Cores, Replicants),
+    {NodeIndices, _} = lists:foldl(
+        fun(N, {Acc, Seq}) ->
+            {maps:put(N, Seq, Acc), Seq + 1}
+        end,
+        {#{}, 1},
+        Nodes
+    ),
+    lists:sort(
+        fun(A, B) ->
+            compare_tnx_id_and_node(A, B, NodeIndices)
+        end,
+        List
     ).
+
+compare_tnx_id_and_node(
+    #{tnx_id := Id, node := NA},
+    #{tnx_id := Id, node := NB},
+    NodeIndices
+    %% The smaller the seq, the higher the priority level.
+) ->
+    maps:get(NA, NodeIndices, undefined) < maps:get(NB, NodeIndices, undefined);
+compare_tnx_id_and_node(#{tnx_id := IdA}, #{tnx_id := IdB}, _NodeIndices) ->
+    IdA > IdB.
 
 trans_query(TnxId) ->
     case mnesia:read(?CLUSTER_MFA, TnxId) of
@@ -571,23 +643,7 @@ trans_query(TnxId) ->
 apply_mfa(TnxId, {M, F, A}, Kind) ->
     Res =
         try
-            case erlang:apply(M, F, A) of
-                {error, {post_config_update, HandlerName, {Reason0, PostFailureFun}}} when
-                    Kind =/= ?APPLY_KIND_INITIATE
-                ->
-                    ?SLOG(error, #{
-                        msg => "post_config_update_failed",
-                        handler => HandlerName,
-                        reason => Reason0
-                    }),
-                    PostFailureFun();
-                {error, {post_config_update, HandlerName, {Reason0, _Fun}}} when
-                    Kind =:= ?APPLY_KIND_INITIATE
-                ->
-                    {error, {post_config_update, HandlerName, Reason0}};
-                Result ->
-                    Result
-            end
+            erlang:apply(M, F, A ++ [#{kind => Kind}])
         catch
             throw:Reason ->
                 {error, #{reason => Reason}};
@@ -607,7 +663,7 @@ is_success(ok) -> true;
 is_success({ok, _}) -> true;
 is_success(_) -> false.
 
-log_and_alarm(IsSuccess, Res, #{kind := ?APPLY_KIND_INITIATE} = Meta) ->
+log_and_alarm(IsSuccess, Res, #{kind := ?KIND_INITIATE} = Meta) ->
     %% no alarm or error log in case of failure at originating a new cluster-call
     %% because nothing is committed
     case IsSuccess of

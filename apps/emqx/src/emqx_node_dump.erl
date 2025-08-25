@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% Collection of functions for creating node dumps
@@ -19,7 +7,8 @@
 
 -export([
     sys_info/0,
-    app_env_dump/0
+    app_env_dump/0,
+    print_conf_dump/0
 ]).
 
 sys_info() ->
@@ -31,8 +20,15 @@ sys_info() ->
 app_env_dump() ->
     censor(ets:tab2list(ac_tab)).
 
+print_conf_dump() ->
+    RawConf0 = emqx_config:get_raw([]),
+    RawConf = emqx_utils:redact(RawConf0),
+    io:put_chars(hocon_pp:do(RawConf, #{})).
+
 censor([]) ->
     [];
+censor([{{env, cowboy_swagger, global_spec}, _} | Rest]) ->
+    censor(Rest);
 censor([{{env, App, Key}, Val} | Rest]) ->
     [{{env, App, Key}, censor([Key, App], Val)} | censor(Rest)];
 censor([_ | Rest]) ->

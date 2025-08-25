@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_v2_test_connector).
@@ -19,6 +8,7 @@
 
 -export([
     query_mode/1,
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -33,6 +23,8 @@
 
 query_mode(_Config) ->
     sync.
+
+resource_type() -> test_connector.
 
 callback_mode() ->
     always_sync.
@@ -94,9 +86,15 @@ on_query(
     Channels = maps:get(channels, ConnectorState, #{}),
     %% Lookup the channel
     ChannelState = maps:get(ChannelId, Channels, not_found),
-    SendTo = maps:get(send_to, ChannelState),
-    SendTo ! Message,
-    ok.
+    Ctx = #{message => Message, action_res_id => ChannelId},
+    case ChannelState of
+        #{parameters := #{on_query_fn := OnQueryFn0}} ->
+            OnQueryFn = emqx_bridge_v2_SUITE:unwrap_fun(OnQueryFn0),
+            OnQueryFn(Ctx);
+        #{parameters := #{send_to := SendTo}} ->
+            SendTo ! {query_called, Ctx},
+            ok
+    end.
 
 on_get_channels(ResId) ->
     emqx_bridge_v2:get_channels_for_connector(ResId).
@@ -129,7 +127,7 @@ on_get_channel_status(
     Channels = maps:get(channels, State, #{}),
     ChannelState = maps:get(ChannelId, Channels, #{}),
     case ChannelState of
-        #{on_get_channel_status_fun := FunRef} ->
+        #{parameters := #{on_get_channel_status_fun := FunRef}} ->
             Fun = emqx_bridge_v2_SUITE:unwrap_fun(FunRef),
             Fun();
         _ ->

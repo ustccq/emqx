@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_metrics).
@@ -22,6 +10,7 @@
 -include("logger.hrl").
 -include("types.hrl").
 -include("emqx_mqtt.hrl").
+-include_lib("hocon/include/hoconsc.hrl").
 
 -export([
     start_link/0,
@@ -67,7 +56,11 @@
     terminate/2,
     code_change/3
 ]).
--export([olp_metrics/0]).
+
+%% {Type, Name, Description} for API schema definition.
+-export([all_metrics/0]).
+
+-export([is_olp_metric/1]).
 
 %% BACKW: v4.3.0
 -export([upgrade_retained_delayed_counter_type/0]).
@@ -86,206 +79,8 @@
 -define(TAB, ?MODULE).
 -define(SERVER, ?MODULE).
 
-%% Bytes sent and received
--define(BYTES_METRICS,
-    % Total bytes received
-    [
-        {counter, 'bytes.received'},
-        % Total bytes sent
-        {counter, 'bytes.sent'}
-    ]
-).
-
-%% Packets sent and received
--define(PACKET_METRICS,
-    % All Packets received
-    [
-        {counter, 'packets.received'},
-        % All Packets sent
-        {counter, 'packets.sent'},
-        % CONNECT Packets received
-        {counter, 'packets.connect.received'},
-        % CONNACK Packets sent
-        {counter, 'packets.connack.sent'},
-        % CONNACK error sent
-        {counter, 'packets.connack.error'},
-        % CONNACK auth_error sent
-        {counter, 'packets.connack.auth_error'},
-        % PUBLISH packets received
-        {counter, 'packets.publish.received'},
-        % PUBLISH packets sent
-        {counter, 'packets.publish.sent'},
-        % PUBLISH packet_id inuse
-        {counter, 'packets.publish.inuse'},
-        % PUBLISH failed for error
-        {counter, 'packets.publish.error'},
-        % PUBLISH failed for auth error
-        {counter, 'packets.publish.auth_error'},
-        % PUBLISH(QoS2) packets dropped
-        {counter, 'packets.publish.dropped'},
-        % PUBACK packets received
-        {counter, 'packets.puback.received'},
-        % PUBACK packets sent
-        {counter, 'packets.puback.sent'},
-        % PUBACK packet_id inuse
-        {counter, 'packets.puback.inuse'},
-        % PUBACK packets missed
-        {counter, 'packets.puback.missed'},
-        % PUBREC packets received
-        {counter, 'packets.pubrec.received'},
-        % PUBREC packets sent
-        {counter, 'packets.pubrec.sent'},
-        % PUBREC packet_id inuse
-        {counter, 'packets.pubrec.inuse'},
-        % PUBREC packets missed
-        {counter, 'packets.pubrec.missed'},
-        % PUBREL packets received
-        {counter, 'packets.pubrel.received'},
-        % PUBREL packets sent
-        {counter, 'packets.pubrel.sent'},
-        % PUBREL packets missed
-        {counter, 'packets.pubrel.missed'},
-        % PUBCOMP packets received
-        {counter, 'packets.pubcomp.received'},
-        % PUBCOMP packets sent
-        {counter, 'packets.pubcomp.sent'},
-        % PUBCOMP packet_id inuse
-        {counter, 'packets.pubcomp.inuse'},
-        % PUBCOMP packets missed
-        {counter, 'packets.pubcomp.missed'},
-        % SUBSCRIBE Packets received
-        {counter, 'packets.subscribe.received'},
-        % SUBSCRIBE error
-        {counter, 'packets.subscribe.error'},
-        % SUBSCRIBE failed for not auth
-        {counter, 'packets.subscribe.auth_error'},
-        % SUBACK packets sent
-        {counter, 'packets.suback.sent'},
-        % UNSUBSCRIBE Packets received
-        {counter, 'packets.unsubscribe.received'},
-        % UNSUBSCRIBE error
-        {counter, 'packets.unsubscribe.error'},
-        % UNSUBACK Packets sent
-        {counter, 'packets.unsuback.sent'},
-        % PINGREQ packets received
-        {counter, 'packets.pingreq.received'},
-        % PINGRESP Packets sent
-        {counter, 'packets.pingresp.sent'},
-        % DISCONNECT Packets received
-        {counter, 'packets.disconnect.received'},
-        % DISCONNECT Packets sent
-        {counter, 'packets.disconnect.sent'},
-        % Auth Packets received
-        {counter, 'packets.auth.received'},
-        % Auth Packets sent
-        {counter, 'packets.auth.sent'}
-    ]
-).
-
-%% Messages sent/received and pubsub
--define(MESSAGE_METRICS,
-    % All Messages received
-    [
-        {counter, 'messages.received'},
-        % All Messages sent
-        {counter, 'messages.sent'},
-        % QoS0 Messages received
-        {counter, 'messages.qos0.received'},
-        % QoS0 Messages sent
-        {counter, 'messages.qos0.sent'},
-        % QoS1 Messages received
-        {counter, 'messages.qos1.received'},
-        % QoS1 Messages sent
-        {counter, 'messages.qos1.sent'},
-        % QoS2 Messages received
-        {counter, 'messages.qos2.received'},
-        % QoS2 Messages sent
-        {counter, 'messages.qos2.sent'},
-        %% PubSub Metrics
-
-        % Messages Publish
-        {counter, 'messages.publish'},
-        % Messages dropped due to no subscribers
-        {counter, 'messages.dropped'},
-        %% % Messages that failed validations
-        {counter, 'messages.validation_failed'},
-        %% % Messages that passed validations
-        {counter, 'messages.validation_succeeded'},
-        % QoS2 Messages expired
-        {counter, 'messages.dropped.await_pubrel_timeout'},
-        % Messages dropped
-        {counter, 'messages.dropped.no_subscribers'},
-        % Messages forward
-        {counter, 'messages.forward'},
-        % Messages delayed
-        {counter, 'messages.delayed'},
-        % Messages delivered
-        {counter, 'messages.delivered'},
-        % Messages acked
-        {counter, 'messages.acked'},
-        % Messages persistently stored
-        {counter, 'messages.persisted'}
-    ]
-).
-
-%% Delivery metrics
--define(DELIVERY_METRICS, [
-    {counter, 'delivery.dropped'},
-    {counter, 'delivery.dropped.no_local'},
-    {counter, 'delivery.dropped.too_large'},
-    {counter, 'delivery.dropped.qos0_msg'},
-    {counter, 'delivery.dropped.queue_full'},
-    {counter, 'delivery.dropped.expired'}
-]).
-
-%% Client Lifecircle metrics
--define(CLIENT_METRICS, [
-    {counter, 'client.connect'},
-    {counter, 'client.connack'},
-    {counter, 'client.connected'},
-    {counter, 'client.authenticate'},
-    {counter, 'client.auth.anonymous'},
-    {counter, 'client.authorize'},
-    {counter, 'client.subscribe'},
-    {counter, 'client.unsubscribe'},
-    {counter, 'client.disconnected'}
-]).
-
-%% Session Lifecircle metrics
--define(SESSION_METRICS, [
-    {counter, 'session.created'},
-    {counter, 'session.resumed'},
-    {counter, 'session.takenover'},
-    {counter, 'session.discarded'},
-    {counter, 'session.terminated'}
-]).
-
-%% Statistic metrics for ACL checking
--define(STASTS_ACL_METRICS, [
-    {counter, 'authorization.allow'},
-    {counter, 'authorization.deny'},
-    {counter, 'authorization.cache_hit'},
-    {counter, 'authorization.cache_miss'}
-]).
-
-%% Statistic metrics for auth checking
--define(STASTS_AUTHN_METRICS, [
-    {counter, 'authentication.success'},
-    {counter, 'authentication.success.anonymous'},
-    {counter, 'authentication.failure'}
-]).
-
-%% Overload protection counters
--define(OLP_METRICS, [
-    {counter, 'overload_protection.delay.ok'},
-    {counter, 'overload_protection.delay.timeout'},
-    {counter, 'overload_protection.hibernation'},
-    {counter, 'overload_protection.gc'},
-    {counter, 'overload_protection.new_conn'}
-]).
-
-olp_metrics() ->
-    lists:map(fun({_, Metric}) -> Metric end, ?OLP_METRICS).
+is_olp_metric(Name) ->
+    lists:keymember(Name, 2, olp_metrics()).
 
 -record(state, {next_idx = 1}).
 
@@ -553,20 +348,10 @@ init([]) ->
     ok = persistent_term:put(?MODULE, CRef),
     % Create index mapping table
     ok = emqx_utils_ets:new(?TAB, [{keypos, 2}, {read_concurrency, true}]),
-    Metrics = lists:append([
-        ?BYTES_METRICS,
-        ?PACKET_METRICS,
-        ?MESSAGE_METRICS,
-        ?DELIVERY_METRICS,
-        ?CLIENT_METRICS,
-        ?SESSION_METRICS,
-        ?STASTS_ACL_METRICS,
-        ?STASTS_AUTHN_METRICS,
-        ?OLP_METRICS
-    ]),
+    Metrics = all_metrics(),
     % Store reserved indices
     ok = lists:foreach(
-        fun({Type, Name}) ->
+        fun({Type, Name, _Desc}) ->
             Idx = reserved_idx(Name),
             Metric = #metric{name = Name, type = Type, idx = Idx},
             true = ets:insert(?TAB, Metric),
@@ -665,7 +450,8 @@ reserved_idx('packets.disconnect.received') -> 45;
 reserved_idx('packets.disconnect.sent') -> 46;
 reserved_idx('packets.auth.received') -> 47;
 reserved_idx('packets.auth.sent') -> 48;
-reserved_idx('packets.publish.dropped') -> 49;
+%% reserved_idx('packets.publish.dropped') -> 49; %% deprecated; new metrics may use this index.
+reserved_idx('packets.publish.quota_exceeded') -> 50;
 %% Reserved indices of message's metrics
 reserved_idx('messages.received') -> 100;
 reserved_idx('messages.sent') -> 101;
@@ -680,11 +466,11 @@ reserved_idx('messages.dropped') -> 109;
 reserved_idx('messages.dropped.await_pubrel_timeout') -> 110;
 reserved_idx('messages.dropped.no_subscribers') -> 111;
 reserved_idx('messages.forward') -> 112;
-%%reserved_idx('messages.retained')            -> 113; %% keep the index, new metrics can use this
+reserved_idx('messages.dropped.quota_exceeded') -> 113;
 reserved_idx('messages.delayed') -> 114;
 reserved_idx('messages.delivered') -> 115;
 reserved_idx('messages.acked') -> 116;
-reserved_idx('delivery.expired') -> 117;
+reserved_idx('messages.dropped.receive_maximum') -> 117;
 reserved_idx('delivery.dropped') -> 118;
 reserved_idx('delivery.dropped.no_local') -> 119;
 reserved_idx('delivery.dropped.too_large') -> 120;
@@ -695,7 +481,7 @@ reserved_idx('client.connect') -> 200;
 reserved_idx('client.connack') -> 201;
 reserved_idx('client.connected') -> 202;
 reserved_idx('client.authenticate') -> 203;
-reserved_idx('client.enhanced_authenticate') -> 204;
+%% reserved_idx('client.enhanced_authenticate') -> 204; %% have never used
 reserved_idx('client.auth.anonymous') -> 205;
 reserved_idx('client.authorize') -> 206;
 reserved_idx('client.subscribe') -> 207;
@@ -721,4 +507,161 @@ reserved_idx('overload_protection.new_conn') -> 404;
 reserved_idx('messages.validation_succeeded') -> 405;
 reserved_idx('messages.validation_failed') -> 406;
 reserved_idx('messages.persisted') -> 407;
+reserved_idx('messages.transformation_succeeded') -> 408;
+reserved_idx('messages.transformation_failed') -> 409;
 reserved_idx(_) -> undefined.
+
+all_metrics() ->
+    lists:append([
+        bytes_metrics(),
+        packet_metrics(),
+        message_metrics(),
+        delivery_metrics(),
+        client_metrics(),
+        session_metrics(),
+        stats_acl_metrics(),
+        stats_authn_metrics(),
+        olp_metrics()
+    ]).
+
+%% Bytes sent and received
+bytes_metrics() ->
+    [
+        {counter, 'bytes.received', ?DESC("bytes_received")},
+        {counter, 'bytes.sent', ?DESC("bytes_sent")}
+    ].
+
+%% Packets sent and received
+packet_metrics() ->
+    [
+        {counter, 'packets.received', ?DESC("packets_received")},
+        {counter, 'packets.sent', ?DESC("packets_sent")},
+        {counter, 'packets.connect.received', ?DESC("packets_connect_received")},
+        {counter, 'packets.connack.sent', ?DESC("packets_connack_sent")},
+        {counter, 'packets.connack.error', ?DESC("packets_connack_error")},
+        {counter, 'packets.connack.auth_error', ?DESC("packets_connack_auth_error")},
+        {counter, 'packets.publish.received', ?DESC("packets_publish_received")},
+        {counter, 'packets.publish.sent', ?DESC("packets_publish_sent")},
+        {counter, 'packets.publish.inuse', ?DESC("packets_publish_inuse")},
+        {counter, 'packets.publish.error', ?DESC("packets_publish_error")},
+        {counter, 'packets.publish.auth_error', ?DESC("packets_publish_auth_error")},
+        {counter, 'packets.publish.quota_exceeded', ?DESC("packets_publish_quota_exceeded")},
+        {counter, 'packets.puback.received', ?DESC("packets_puback_received")},
+        {counter, 'packets.puback.sent', ?DESC("packets_puback_sent")},
+        {counter, 'packets.puback.inuse', ?DESC("packets_puback_inuse")},
+        {counter, 'packets.puback.missed', ?DESC("packets_puback_missed")},
+        {counter, 'packets.pubrec.received', ?DESC("packets_pubrec_received")},
+        {counter, 'packets.pubrec.sent', ?DESC("packets_pubrec_sent")},
+        {counter, 'packets.pubrec.inuse', ?DESC("packets_pubrec_inuse")},
+        {counter, 'packets.pubrec.missed', ?DESC("packets_pubrec_missed")},
+        {counter, 'packets.pubrel.received', ?DESC("packets_pubrel_received")},
+        {counter, 'packets.pubrel.sent', ?DESC("packets_pubrel_sent")},
+        {counter, 'packets.pubrel.missed', ?DESC("packets_pubrel_missed")},
+        {counter, 'packets.pubcomp.received', ?DESC("packets_pubcomp_received")},
+        {counter, 'packets.pubcomp.sent', ?DESC("packets_pubcomp_sent")},
+        {counter, 'packets.pubcomp.inuse', ?DESC("packets_pubcomp_inuse")},
+        {counter, 'packets.pubcomp.missed', ?DESC("packets_pubcomp_missed")},
+        {counter, 'packets.subscribe.received', ?DESC("packets_subscribe_received")},
+        {counter, 'packets.subscribe.error', ?DESC("packets_subscribe_error")},
+        {counter, 'packets.subscribe.auth_error', ?DESC("packets_subscribe_auth_error")},
+        {counter, 'packets.suback.sent', ?DESC("packets_suback_sent")},
+        {counter, 'packets.unsubscribe.received', ?DESC("packets_unsubscribe_received")},
+        {counter, 'packets.unsubscribe.error', ?DESC("packets_unsubscribe_error")},
+        {counter, 'packets.unsuback.sent', ?DESC("packets_unsuback_sent")},
+        {counter, 'packets.pingreq.received', ?DESC("packets_pingreq_received")},
+        {counter, 'packets.pingresp.sent', ?DESC("packets_pingresp_sent")},
+        {counter, 'packets.disconnect.received', ?DESC("packets_disconnect_received")},
+        {counter, 'packets.disconnect.sent', ?DESC("packets_disconnect_sent")},
+        {counter, 'packets.auth.received', ?DESC("packets_auth_received")},
+        {counter, 'packets.auth.sent', ?DESC("packets_auth_sent")}
+    ].
+
+%% Messages sent/received and pubsub
+message_metrics() ->
+    [
+        {counter, 'messages.received', ?DESC("messages_received")},
+        {counter, 'messages.sent', ?DESC("messages_sent")},
+        {counter, 'messages.qos0.received', ?DESC("messages_qos0_received")},
+        {counter, 'messages.qos0.sent', ?DESC("messages_qos0_sent")},
+        {counter, 'messages.qos1.received', ?DESC("messages_qos1_received")},
+        {counter, 'messages.qos1.sent', ?DESC("messages_qos1_sent")},
+        {counter, 'messages.qos2.received', ?DESC("messages_qos2_received")},
+        {counter, 'messages.qos2.sent', ?DESC("messages_qos2_sent")},
+        {counter, 'messages.publish', ?DESC("messages_publish")},
+        {counter, 'messages.dropped', ?DESC("messages_dropped")},
+        {counter, 'messages.dropped.await_pubrel_timeout',
+            ?DESC("messages_dropped_await_pubrel_timeout")},
+        {counter, 'messages.dropped.no_subscribers', ?DESC("messages_dropped_no_subscribers")},
+        {counter, 'messages.dropped.quota_exceeded', ?DESC("messages_dropped_quota_exceeded")},
+        {counter, 'messages.dropped.receive_maximum', ?DESC("messages_dropped_receive_maximum")},
+        {counter, 'messages.forward', ?DESC("messages_forward")},
+        {counter, 'messages.delayed', ?DESC("messages_delayed")},
+        {counter, 'messages.delivered', ?DESC("messages_delivered")},
+        {counter, 'messages.acked', ?DESC("messages_acked")},
+        {counter, 'messages.validation_failed', ?DESC("messages_validation_failed")},
+        {counter, 'messages.validation_succeeded', ?DESC("messages_validation_succeeded")},
+        {counter, 'messages.transformation_failed', ?DESC("messages_transformation_failed")},
+        {counter, 'messages.transformation_succeeded', ?DESC("messages_transformation_succeeded")},
+        {counter, 'messages.persisted', ?DESC("messages_persisted")}
+    ].
+
+%% Delivery metrics
+delivery_metrics() ->
+    [
+        {counter, 'delivery.dropped', ?DESC("delivery_dropped")},
+        {counter, 'delivery.dropped.no_local', ?DESC("delivery_dropped_no_local")},
+        {counter, 'delivery.dropped.too_large', ?DESC("delivery_dropped_too_large")},
+        {counter, 'delivery.dropped.qos0_msg', ?DESC("delivery_dropped_qos0_msg")},
+        {counter, 'delivery.dropped.queue_full', ?DESC("delivery_dropped_queue_full")},
+        {counter, 'delivery.dropped.expired', ?DESC("delivery_dropped_expired")}
+    ].
+
+%% Client Lifecycle metrics
+client_metrics() ->
+    [
+        {counter, 'client.connect', ?DESC("client_connect")},
+        {counter, 'client.connack', ?DESC("client_connack")},
+        {counter, 'client.connected', ?DESC("client_connected")},
+        {counter, 'client.authenticate', ?DESC("client_authenticate")},
+        {counter, 'client.auth.anonymous', ?DESC("client_auth_anonymous")},
+        {counter, 'client.authorize', ?DESC("client_authorize")},
+        {counter, 'client.subscribe', ?DESC("client_subscribe")},
+        {counter, 'client.unsubscribe', ?DESC("client_unsubscribe")},
+        {counter, 'client.disconnected', ?DESC("client_disconnected")}
+    ].
+
+%% Session Lifecycle metrics
+session_metrics() ->
+    [
+        {counter, 'session.created', ?DESC("session_created")},
+        {counter, 'session.resumed', ?DESC("session_resumed")},
+        {counter, 'session.takenover', ?DESC("session_takenover")},
+        {counter, 'session.discarded', ?DESC("session_discarded")},
+        {counter, 'session.terminated', ?DESC("session_terminated")}
+    ].
+
+%% Statistic metrics for ACL checking
+stats_acl_metrics() ->
+    [
+        {counter, 'authorization.allow', ?DESC("authorization_allow")},
+        {counter, 'authorization.deny', ?DESC("authorization_deny")},
+        {counter, 'authorization.cache_hit', ?DESC("authorization_cache_hit")},
+        {counter, 'authorization.cache_miss', ?DESC("authorization_cache_miss")}
+    ].
+
+stats_authn_metrics() ->
+    %% Statistic metrics for auth checking
+    [
+        {counter, 'authentication.success', ?DESC("authentication_success")},
+        {counter, 'authentication.success.anonymous', ?DESC("authentication_success_anonymous")},
+        {counter, 'authentication.failure', ?DESC("authentication_failure")}
+    ].
+
+olp_metrics() ->
+    [
+        {counter, 'overload_protection.delay.ok', ?DESC("overload_protection_delay_ok")},
+        {counter, 'overload_protection.delay.timeout', ?DESC("overload_protection_delay_timeout")},
+        {counter, 'overload_protection.hibernation', ?DESC("overload_protection_hibernation")},
+        {counter, 'overload_protection.gc', ?DESC("overload_protection_gc")},
+        {counter, 'overload_protection.new_conn', ?DESC("overload_protection_new_conn")}
+    ].

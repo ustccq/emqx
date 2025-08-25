@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_redis).
 
@@ -19,6 +7,8 @@
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 
 -export([namespace/0, roots/0, fields/1, redis_fields/0, desc/1]).
 
@@ -26,6 +16,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -117,6 +108,8 @@ redis_type(Type) ->
         desc => ?DESC(Type)
     }}.
 
+resource_type() -> redis.
+
 callback_mode() -> always_sync.
 
 on_start(InstId, Config0) ->
@@ -139,8 +132,8 @@ on_start(InstId, Config0) ->
         ] ++ database(Config),
 
     State = #{pool_name => InstId, type => Type},
-    ok = emqx_resource:allocate_resource(InstId, type, Type),
-    ok = emqx_resource:allocate_resource(InstId, pool_name, InstId),
+    ok = emqx_resource:allocate_resource(InstId, ?MODULE, type, Type),
+    ok = emqx_resource:allocate_resource(InstId, ?MODULE, pool_name, InstId),
     case Type of
         cluster ->
             case eredis_cluster:start_pool(InstId, Opts) of
@@ -240,26 +233,51 @@ on_get_status(_InstId, #{type := cluster, pool_name := PoolName}) ->
             %% In this case, we can directly consider it as a disconnect and then proceed to reconnect.
             case eredis_cluster_monitor:get_all_pools(PoolName) of
                 [] ->
-                    disconnected;
+                    ?status_disconnected;
                 [_ | _] ->
-                    Health = eredis_cluster:ping_all(PoolName),
-                    status_result(Health)
+                    do_cluster_status_check(PoolName)
             end;
         false ->
-            disconnected
+            ?status_disconnected
     end;
 on_get_status(_InstId, #{pool_name := PoolName}) ->
-    Health = emqx_resource_pool:health_check_workers(PoolName, fun ?MODULE:do_get_status/1),
-    status_result(Health).
-
-do_get_status(Conn) ->
-    case eredis:q(Conn, ["PING"]) of
-        {ok, _} -> true;
-        _ -> false
+    HealthCheckResoults = emqx_resource_pool:health_check_workers(
+        PoolName,
+        fun ?MODULE:do_get_status/1,
+        emqx_resource_pool:health_check_timeout(),
+        #{return_values => true}
+    ),
+    case HealthCheckResoults of
+        {ok, Results} ->
+            sum_worker_results(Results);
+        Error ->
+            {?status_disconnected, Error}
     end.
 
-status_result(_Status = true) -> connected;
-status_result(_Status = false) -> connecting.
+do_cluster_status_check(Pool) ->
+    Pongs = eredis_cluster:qa(Pool, [<<"PING">>]),
+    sum_worker_results(Pongs).
+
+do_get_status(Conn) ->
+    eredis:q(Conn, ["PING"]).
+
+sum_worker_results([]) ->
+    ?status_connected;
+sum_worker_results([{error, <<"NOAUTH Authentication required.">>} = Error | _Rest]) ->
+    ?tp(emqx_redis_auth_required_error, #{}),
+    %% This requires user action to fix so we set the status to disconnected
+    {?status_disconnected, {unhealthy_target, Error}};
+sum_worker_results([{ok, _} | Rest]) ->
+    sum_worker_results(Rest);
+sum_worker_results([Error | _Rest]) ->
+    ?SLOG(
+        warning,
+        #{
+            msg => "emqx_redis_check_status_error",
+            error => Error
+        }
+    ),
+    {?status_connecting, Error}.
 
 do_cmd(PoolName, cluster, {cmd, Command}) ->
     eredis_cluster:q(PoolName, Command);

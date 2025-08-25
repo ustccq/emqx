@@ -1,23 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_persistent_messages_SUITE).
 
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
@@ -32,56 +21,76 @@
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
+%% Needed for standalone mode:
+-ifndef(EMQX_RELEASE_EDITION).
+-define(EMQX_RELEASE_EDITION, ce).
+-endif.
+
+-if(?EMQX_RELEASE_EDITION == ee).
+
 init_per_suite(Config) ->
     Config.
+
+-else.
+
+init_per_suite(_Config) ->
+    {skip, no_replication}.
+
+-endif.
 
 end_per_suite(_Config) ->
     ok.
 
-init_per_testcase(t_session_subscription_iterators = TestCase, Config) ->
-    Cluster = cluster(),
-    Nodes = emqx_cth_cluster:start(Cluster, #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}),
-    _ = wait_shards_online(Nodes),
-    [{nodes, Nodes} | Config];
 init_per_testcase(t_message_gc = TestCase, Config) ->
-    Opts = #{
-        extra_emqx_conf =>
-            "\n  durable_sessions.message_retention_period = 3s"
-            "\n  durable_storage.messages.n_shards = 3"
-    },
+    DurableSessonsOpts = #{<<"message_retention_period">> => <<"3s">>},
+    EMQXOpts = #{<<"durable_storage">> => #{<<"messages">> => #{<<"n_shards">> => 3}}},
+    Opts = #{durable_sessions_opts => DurableSessonsOpts, emqx_opts => EMQXOpts},
     common_init_per_testcase(TestCase, [{n_shards, 3} | Config], Opts);
 init_per_testcase(t_replication_options = TestCase, Config) ->
-    Opts = #{
-        extra_emqx_conf =>
-            "\n durable_storage.messages.replication_options {"
-            "\n  wal_max_size_bytes = 16000000"
-            "\n  wal_max_batch_size = 1024"
-            "\n  wal_write_strategy = o_sync"
-            "\n  wal_sync_method = datasync"
-            "\n  wal_compute_checksums = false"
-            "\n  snapshot_interval = 64"
-            "\n  resend_window = 60"
-            "\n}"
+    EMQXOpts = #{
+        <<"durable_storage">> =>
+            #{
+                <<"messages">> =>
+                    #{
+                        <<"replication_options">> =>
+                            #{
+                                <<"resend_window">> => 60,
+                                <<"snapshot_interval">> => 64,
+                                <<"wal_compute_checksums">> => false,
+                                <<"wal_max_batch_size">> => 1024,
+                                <<"wal_max_size_bytes">> => 16000000,
+                                <<"wal_sync_method">> => <<"datasync">>,
+                                <<"wal_write_strategy">> => <<"o_sync">>
+                            }
+                    }
+            }
     },
+    Opts = #{emqx_opts => EMQXOpts},
     common_init_per_testcase(TestCase, Config, Opts);
+init_per_testcase(t_message_gc_too_young = TestCase, Config) ->
+    common_init_per_testcase(TestCase, Config, _Opts = #{});
 init_per_testcase(TestCase, Config) ->
-    common_init_per_testcase(TestCase, Config, _Opts = #{}).
+    DurableSessonsOpts = #{
+        <<"enable">> => true,
+        <<"checkpoint_interval">> => <<"100ms">>
+    },
+    Opts = #{
+        durable_sessions_opts => DurableSessonsOpts
+    },
+    common_init_per_testcase(TestCase, Config, Opts).
 
-common_init_per_testcase(TestCase, Config, Opts) ->
-    Apps = emqx_cth_suite:start(
-        app_specs(Opts),
-        #{work_dir => emqx_cth_suite:work_dir(TestCase, Config)}
-    ),
-    [{apps, Apps} | Config].
+common_init_per_testcase(TestCase, Config, Opts0) ->
+    Opts = Opts0#{
+        work_dir => emqx_cth_suite:work_dir(TestCase, Config),
+        start_emqx_conf => false
+    },
+    Result = emqx_common_test_helpers:start_apps_ds(Config, _ExtraApps = [], Opts),
+    ok = emqx_persistent_message:wait_readiness(5_000),
+    Result.
 
-end_per_testcase(t_session_subscription_iterators, Config) ->
-    Nodes = ?config(nodes, Config),
-    emqx_common_test_helpers:call_janitor(60_000),
-    ok = emqx_cth_cluster:stop(Nodes);
 end_per_testcase(_TestCase, Config) ->
-    Apps = proplists:get_value(apps, Config, []),
     emqx_common_test_helpers:call_janitor(60_000),
-    ok = emqx_cth_suite:stop(Apps).
+    ok = emqx_common_test_helpers:stop_apps_ds(Config).
 
 t_messages_persisted(_Config) ->
     C1 = connect(<<?MODULE_STRING "1">>, true, 30),
@@ -174,59 +183,6 @@ t_messages_persisted_2(_Config) ->
 
     ok.
 
-%% TODO: test quic and ws too
-t_session_subscription_iterators(Config) ->
-    [Node1, _Node2] = ?config(nodes, Config),
-    Port = get_mqtt_port(Node1, tcp),
-    Topic = <<"t/topic">>,
-    SubTopicFilter = <<"t/+">>,
-    AnotherTopic = <<"u/another-topic">>,
-    ClientId = <<"myclientid">>,
-    ?check_trace(
-        begin
-            [
-                Payload1,
-                Payload2,
-                Payload3,
-                Payload4
-            ] = lists:map(
-                fun(N) -> <<"hello", (integer_to_binary(N))/binary>> end,
-                lists:seq(1, 4)
-            ),
-            ct:pal("starting"),
-            Client = connect(#{
-                clientid => ClientId,
-                port => Port,
-                properties => #{'Session-Expiry-Interval' => 300}
-            }),
-            ct:pal("publishing 1"),
-            Message1 = emqx_message:make(Topic, Payload1),
-            publish(Node1, Message1),
-            ct:pal("subscribing 1"),
-            {ok, _, [2]} = emqtt:subscribe(Client, SubTopicFilter, qos2),
-            ct:pal("publishing 2"),
-            Message2 = emqx_message:make(Topic, Payload2),
-            publish(Node1, Message2),
-            % TODO: no incoming publishes at the moment
-            % [_] = receive_messages(1),
-            ct:pal("subscribing 2"),
-            {ok, _, [1]} = emqtt:subscribe(Client, SubTopicFilter, qos1),
-            ct:pal("publishing 3"),
-            Message3 = emqx_message:make(Topic, Payload3),
-            publish(Node1, Message3),
-            % [_] = receive_messages(1),
-            ct:pal("publishing 4"),
-            Message4 = emqx_message:make(AnotherTopic, Payload4),
-            publish(Node1, Message4),
-            emqtt:stop(Client),
-            #{
-                messages => [Message1, Message2, Message3, Message4]
-            }
-        end,
-        []
-    ),
-    ok.
-
 t_qos0(_Config) ->
     Sub = connect(<<?MODULE_STRING "1">>, true, 30),
     Pub = connect(<<?MODULE_STRING "2">>, true, 0),
@@ -256,12 +212,10 @@ t_qos0_only_many_streams(_Config) ->
     ClientId = <<?MODULE_STRING "_sub">>,
     Sub = connect(ClientId, true, 30),
     Pub = connect(<<?MODULE_STRING "_pub">>, true, 0),
-    [ConnPid] = emqx_cm:lookup_channels(ClientId),
     try
-        {ok, _, [1]} = emqtt:subscribe(Sub, <<"t/#">>, qos1),
-
+        {ok, _, [1]} = emqtt:subscribe(Sub, <<"t/#">>, [{qos, 1}]),
         [
-            emqtt:publish(Pub, Topic, Payload, ?QOS_0)
+            emqtt:publish(Pub, Topic, Payload, ?QOS_1)
          || {Topic, Payload} <- [
                 {<<"t/1">>, <<"foo">>},
                 {<<"t/2">>, <<"bar">>},
@@ -272,11 +226,8 @@ t_qos0_only_many_streams(_Config) ->
             [_, _, _],
             receive_messages(3)
         ),
-
-        Inflight0 = get_session_inflight(ConnPid),
-
         [
-            emqtt:publish(Pub, Topic, Payload, ?QOS_0)
+            emqtt:publish(Pub, Topic, Payload, ?QOS_1)
          || {Topic, Payload} <- [
                 {<<"t/2">>, <<"foo">>},
                 {<<"t/2">>, <<"bar">>},
@@ -284,12 +235,15 @@ t_qos0_only_many_streams(_Config) ->
             ]
         ],
         ?assertMatch(
-            [_, _, _],
-            receive_messages(3)
+            [
+                #{topic := <<"t/1">>, payload := <<"baz">>},
+                #{topic := <<"t/2">>, payload := <<"foo">>},
+                #{topic := <<"t/2">>, payload := <<"bar">>}
+            ],
+            group_maps_by(topic, receive_messages(3))
         ),
-
         [
-            emqtt:publish(Pub, Topic, Payload, ?QOS_0)
+            emqtt:publish(Pub, Topic, Payload, ?QOS_1)
          || {Topic, Payload} <- [
                 {<<"t/3">>, <<"foo">>},
                 {<<"t/3">>, <<"bar">>},
@@ -297,24 +251,18 @@ t_qos0_only_many_streams(_Config) ->
             ]
         ],
         ?assertMatch(
-            [_, _, _],
-            receive_messages(3)
+            [
+                #{topic := <<"t/2">>, payload := <<"baz">>},
+                #{topic := <<"t/3">>, payload := <<"foo">>},
+                #{topic := <<"t/3">>, payload := <<"bar">>}
+            ],
+            group_maps_by(topic, receive_messages(3))
         ),
-
-        Inflight1 = get_session_inflight(ConnPid),
-
-        %% TODO: Kinda stupid way to verify that the runtime state is not growing.
-        ?assert(
-            erlang:external_size(Inflight1) - erlang:external_size(Inflight0) < 16,
-            Inflight1
-        )
+        ?assertNotReceive(_)
     after
         emqtt:stop(Sub),
         emqtt:stop(Pub)
     end.
-
-get_session_inflight(ConnPid) ->
-    emqx_connection:info({channel, {session, inflight}}, sys:get_state(ConnPid)).
 
 t_publish_as_persistent(_Config) ->
     Sub = connect(<<?MODULE_STRING "1">>, true, 30),
@@ -465,7 +413,7 @@ t_metrics_not_dropped(_Config) ->
 t_replication_options(_Config) ->
     ?assertMatch(
         #{
-            backend := builtin,
+            backend := builtin_raft,
             replication_options := #{
                 wal_max_size_bytes := 16000000,
                 wal_max_batch_size := 1024,
@@ -476,7 +424,7 @@ t_replication_options(_Config) ->
                 resend_window := 60
             }
         },
-        emqx_ds_replication_layer_meta:db_config(?PERSISTENT_MESSAGE_DB)
+        emqx_ds_builtin_raft_meta:db_config(?PERSISTENT_MESSAGE_DB)
     ),
     ?assertMatch(
         #{
@@ -522,8 +470,8 @@ consume(It) ->
     case emqx_ds:next(?PERSISTENT_MESSAGE_DB, It, 100) of
         {ok, _NIt, _Msgs = []} ->
             [];
-        {ok, NIt, MsgsAndKeys} ->
-            [Msg || {_DSKey, Msg} <- MsgsAndKeys] ++ consume(NIt);
+        {ok, NIt, Batch} ->
+            Batch ++ consume(NIt);
         {ok, end_of_stream} ->
             []
     end.
@@ -544,6 +492,9 @@ receive_messages(Count, Msgs, Timeout) ->
         Msgs
     end.
 
+group_maps_by(K, Maps) ->
+    emqx_ds_test_helpers:group_maps_by(K, Maps).
+
 publish(Node, Message) ->
     erpc:call(Node, emqx, publish, [Message]).
 
@@ -559,18 +510,11 @@ app_specs(Opts) ->
 
 cluster() ->
     ExtraConf = "\n durable_storage.messages.n_sites = 2",
-    Spec = #{role => core, apps => app_specs(#{extra_emqx_conf => ExtraConf})},
+    Spec = #{apps => app_specs(#{extra_emqx_conf => ExtraConf})},
     [
         {persistent_messages_SUITE1, Spec},
         {persistent_messages_SUITE2, Spec}
     ].
-
-wait_shards_online(Nodes = [Node | _]) ->
-    NShards = erpc:call(Node, emqx_ds_replication_layer_meta, n_shards, [?PERSISTENT_MESSAGE_DB]),
-    ?retry(500, 10, [?assertEqual(NShards, shards_online(N)) || N <- Nodes]).
-
-shards_online(Node) ->
-    length(erpc:call(Node, emqx_ds_builtin_db_sup, which_shards, [?PERSISTENT_MESSAGE_DB])).
 
 get_mqtt_port(Node, Type) ->
     {_IP, Port} = erpc:call(Node, emqx_config, get, [[listeners, Type, default, bind]]),

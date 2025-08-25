@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_prometheus_api).
@@ -49,14 +37,13 @@
     stats/2,
     auth/2,
     data_integration/2,
-    schema_validation/2
+    schema_validation/2,
+    message_transformation/2
 ]).
 
 -export([lookup_from_local_nodes/3]).
 
 -define(TAGS, [<<"Monitor">>]).
--define(IS_TRUE(Val), ((Val =:= true) orelse (Val =:= <<"true">>))).
--define(IS_FALSE(Val), ((Val =:= false) orelse (Val =:= <<"false">>))).
 
 namespace() -> undefined.
 
@@ -73,7 +60,10 @@ paths() ->
 
 -if(?EMQX_RELEASE_EDITION == ee).
 paths_ee() ->
-    ["/prometheus/schema_validation"].
+    [
+        "/prometheus/schema_validation",
+        "/prometheus/message_transformation"
+    ].
 %% ELSE if(?EMQX_RELEASE_EDITION == ee).
 -else.
 paths_ee() ->
@@ -145,6 +135,19 @@ schema("/prometheus/schema_validation") ->
         get =>
             #{
                 description => ?DESC(get_prom_schema_validation),
+                tags => ?TAGS,
+                parameters => [ref(mode)],
+                security => security(),
+                responses =>
+                    #{200 => prometheus_data_schema()}
+            }
+    };
+schema("/prometheus/message_transformation") ->
+    #{
+        'operationId' => message_transformation,
+        get =>
+            #{
+                description => ?DESC(get_prom_message_transformation),
                 tags => ?TAGS,
                 parameters => [ref(mode)],
                 security => security(),
@@ -225,6 +228,9 @@ data_integration(get, #{headers := Headers, query_string := Qs}) ->
 
 schema_validation(get, #{headers := Headers, query_string := Qs}) ->
     collect(emqx_prometheus_schema_validation, collect_opts(Headers, Qs)).
+
+message_transformation(get, #{headers := Headers, query_string := Qs}) ->
+    collect(emqx_prometheus_message_transformation, collect_opts(Headers, Qs)).
 
 %%--------------------------------------------------------------------
 %% Internal funcs
@@ -316,6 +322,7 @@ recommend_setting_example() ->
             enable_basic_auth => false,
             push_gateway => #{
                 interval => <<"15s">>,
+                method => put,
                 url => <<"http://127.0.0.1:9091">>,
                 headers => #{<<"Authorization">> => <<"Basic YWRtaW46Y2JraG55eWd5QDE=">>},
                 job_name => <<"${name}/instance/${name}~${host}">>

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_sso_ldap_SUITE).
@@ -7,7 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
--include_lib("emqx_dashboard/include/emqx_dashboard.hrl").
+-include("../../emqx_dashboard/include/emqx_dashboard.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -24,7 +24,7 @@
 
 -define(MOD_TAB, emqx_dashboard_sso).
 -define(MOD_KEY_PATH, [dashboard, sso, ldap]).
--define(RESOURCE_GROUP, <<"emqx_dashboard_sso">>).
+-define(RESOURCE_GROUP, <<"dashboard_sso">>).
 
 -import(emqx_mgmt_api_test_util, [request/2, request/3, uri/1, request_api/3]).
 
@@ -306,7 +306,7 @@ ldap_server() ->
     iolist_to_binary(io_lib:format("~s:~B", [?LDAP_HOST, ?LDAP_DEFAULT_PORT])).
 
 decode_json(Data) ->
-    BinJson = emqx_utils_json:decode(Data, [return_maps]),
+    BinJson = emqx_utils_json:decode(Data),
     emqx_utils_maps:unsafe_atom_key_map(BinJson).
 
 request_without_authorization(Method, Url, Body) ->

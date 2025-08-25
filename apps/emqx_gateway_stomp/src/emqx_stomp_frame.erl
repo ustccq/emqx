@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc
@@ -96,8 +84,6 @@
 -define(LF, $\n).
 -define(BSL, $\\).
 -define(COLON, $:).
-
--define(IS_ESC(Ch), Ch == ?CR; Ch == ?LF; Ch == ?BSL; Ch == ?COLON).
 
 -record(parser_state, {
     cmd,
@@ -393,16 +379,16 @@ format({frame_error, _Reason} = Error) ->
 format(Frame) ->
     serialize_pkt(Frame, #{}).
 
-is_message(#stomp_frame{command = CMD}) when
-    CMD == ?CMD_SEND;
-    CMD == ?CMD_MESSAGE
+is_message(#stomp_frame{command = Cmd}) when
+    Cmd == ?CMD_SEND;
+    Cmd == ?CMD_MESSAGE
 ->
     true;
 is_message(_) ->
     false.
 
-type(#stomp_frame{command = CMD}) ->
-    type(CMD);
+type(#stomp_frame{command = Cmd}) ->
+    type(Cmd);
 type(?CMD_STOMP) ->
     connect;
 type(?CMD_CONNECT) ->

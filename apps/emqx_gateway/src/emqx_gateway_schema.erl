@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_schema).
@@ -53,7 +41,7 @@
 
 -export([mountpoint/0, mountpoint/1, gateway_common_options/0, gateway_schema/1, gateway_names/0]).
 
--export([ws_listener/0, wss_listener/0, ws_opts/2]).
+-export([ws_listener/0, wss_listener/0, ws_opts/1]).
 
 namespace() -> gateway.
 
@@ -133,12 +121,20 @@ fields(wss_listener) ->
     emqx_gateway_schema:wss_listener() ++
         [{websocket, sc(ref(websocket), #{})}];
 fields(websocket) ->
-    DefaultPath = <<>>,
-    SubProtocols = <<>>,
-    emqx_gateway_schema:ws_opts(DefaultPath, SubProtocols);
+    emqx_gateway_schema:ws_opts(#{});
 fields(udp_listener) ->
     [
         %% some special configs for udp listener
+        {health_check,
+            sc(
+                ref(udp_health_check),
+                #{
+                    desc => ?DESC(
+                        udp_health_check
+                    ),
+                    required => false
+                }
+            )}
     ] ++
         udp_opts() ++
         common_listener_opts();
@@ -175,7 +171,12 @@ fields(dtls_opts) ->
             versions => dtls_all_available
         },
         _IsRanchListener = false
-    ).
+    );
+fields(udp_health_check) ->
+    [
+        {request, sc(binary(), #{desc => ?DESC(udp_health_check_request), required => false})},
+        {reply, sc(binary(), #{desc => ?DESC(udp_health_check_reply), required => false})}
+    ].
 
 desc(gateway) ->
     "EMQX Gateway configuration root.";
@@ -201,6 +202,8 @@ desc(dtls_opts) ->
     "Settings for DTLS protocol.";
 desc(websocket) ->
     "Websocket options";
+desc(udp_health_check) ->
+    "UDP health check";
 desc(_) ->
     undefined.
 
@@ -223,6 +226,7 @@ gateway_common_options() ->
                 boolean(),
                 #{
                     default => true,
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(gateway_common_enable)
                 }
             )},
@@ -282,15 +286,13 @@ wss_listener() ->
                 )}
         ].
 
-ws_opts(DefaultPath, DefaultSubProtocols) when
-    is_binary(DefaultPath), is_binary(DefaultSubProtocols)
-->
+ws_opts(Override) when is_map(Override) ->
     [
         {"path",
             sc(
                 string(),
                 #{
-                    default => DefaultPath,
+                    default => maps:get(path, Override, <<>>),
                     desc => ?DESC(fields_ws_opts_path)
                 }
             )},
@@ -330,7 +332,7 @@ ws_opts(DefaultPath, DefaultSubProtocols) when
             sc(
                 boolean(),
                 #{
-                    default => true,
+                    default => maps:get(fail_if_no_subprotocol, Override, false),
                     desc => ?DESC(fields_ws_opts_fail_if_no_subprotocol)
                 }
             )},
@@ -338,7 +340,7 @@ ws_opts(DefaultPath, DefaultSubProtocols) when
             sc(
                 emqx_schema:comma_separated_list(),
                 #{
-                    default => DefaultSubProtocols,
+                    default => maps:get(supported_subprotocols, Override, <<>>),
                     desc => ?DESC(fields_ws_opts_supported_subprotocols)
                 }
             )},
@@ -396,6 +398,7 @@ common_listener_opts() ->
                 boolean(),
                 #{
                     default => true,
+                    importance => ?IMPORTANCE_NO_DOC,
                     desc => ?DESC(gateway_common_listener_enable)
                 }
             )},

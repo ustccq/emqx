@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_engine_test_action_info).
@@ -19,6 +19,8 @@
     fields/1,
     desc/1
 ]).
+
+-export([bridge_v2_examples/1, connector_examples/1]).
 
 -define(CONNECTOR_TYPE, rule_engine_test).
 -define(ACTION_TYPE, ?CONNECTOR_TYPE).
@@ -99,3 +101,9 @@ fields(connector_fields) ->
     ].
 desc(_) ->
     undefined.
+
+bridge_v2_examples(_Method) ->
+    [].
+
+connector_examples(_Method) ->
+    [].

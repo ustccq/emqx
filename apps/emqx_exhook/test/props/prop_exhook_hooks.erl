@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(prop_exhook_hooks).
@@ -73,7 +61,8 @@ prop_client_connect() ->
                 #{
                     props => properties(ConnProps),
                     conninfo => from_conninfo(ConnInfo),
-                    meta => Meta
+                    meta => Meta,
+                    user_props => []
                 },
             ?assertEqual(Expected, Resp),
             true
@@ -92,7 +81,8 @@ prop_client_connack() ->
                     props => properties(AckProps),
                     result_code => atom_to_binary(Rc, utf8),
                     conninfo => from_conninfo(ConnInfo),
-                    meta => Meta
+                    meta => Meta,
+                    user_props => []
                 },
             ?assertEqual(Expected, Resp),
             true
@@ -115,10 +105,10 @@ prop_client_authenticate() ->
                     <<"normaluser">> ->
                         ok;
                     _ ->
-                        case AuthResult of
-                            ok -> ok;
-                            _ -> {error, not_authorized}
-                        end
+                        %% the exhook server will return ignore if the
+                        %% username is not in the whitelist
+                        %% so we need to return the original auth result
+                        AuthResult
                 end,
             ?assertEqual(ExpectedAuthResult, OutAuthResult),
 
@@ -222,7 +212,8 @@ prop_client_subscribe() ->
                     props => properties(SubProps),
                     topic_filters => topicfilters(TopicTab),
                     clientinfo => from_clientinfo(ClientInfo),
-                    meta => Meta
+                    meta => Meta,
+                    user_props => []
                 },
             ?assertEqual(Expected, Resp),
             true
@@ -241,7 +232,8 @@ prop_client_unsubscribe() ->
                     props => properties(UnSubProps),
                     topic_filters => topicfilters(TopicTab),
                     clientinfo => from_clientinfo(ClientInfo),
-                    meta => Meta
+                    meta => Meta,
+                    user_props => []
                 },
             ?assertEqual(Expected, Resp),
             true
@@ -413,7 +405,9 @@ prop_message_publish() ->
                     Expected =
                         #{
                             message => from_message(Msg),
-                            meta => Meta
+                            meta => Meta,
+                            props => [],
+                            user_props => []
                         },
                     ?assertEqual(Expected, Resp)
             end,
@@ -578,13 +572,14 @@ from_conninfo(ConnInfo) ->
     }.
 
 from_clientinfo(ClientInfo) ->
+    {PeerHost, PeerPort} = maps:get(peername, ClientInfo),
     #{
         node => nodestr(),
         clientid => maps:get(clientid, ClientInfo),
         username => option(maps:get(username, ClientInfo, <<>>)),
         password => option(maps:get(password, ClientInfo, <<>>)),
-        peerhost => ntoa(maps:get(peerhost, ClientInfo)),
-        peerport => maps:get(peerport, ClientInfo),
+        peerhost => ntoa(PeerHost),
+        peerport => PeerPort,
         sockport => maps:get(sockport, ClientInfo),
         protocol => stringfy(maps:get(protocol, ClientInfo)),
         mountpoint => option(maps:get(mountpoint, ClientInfo, <<>>)),

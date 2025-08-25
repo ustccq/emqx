@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 -compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
--include_lib("emqx/include/asserts.hrl").
+-include("../../emqx/include/asserts.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -define(SOCKOPTS, [
@@ -128,7 +128,7 @@ t_drain_down(_) ->
     {Pid1, _Ref1} = erlang:spawn_monitor(fun() -> ok end),
     {Pid2, _Ref2} = erlang:spawn_monitor(fun() -> ok end),
     timer:sleep(100),
-    ?assertEqual([Pid1, Pid2], lists:sort(emqx_utils:drain_down(2))),
+    ?assertEqual(lists:sort([Pid1, Pid2]), lists:sort(emqx_utils:drain_down(2))),
     ?assertEqual([], emqx_utils:drain_down(1)).
 
 t_index_of(_) ->
@@ -153,6 +153,22 @@ t_check(_) ->
         {shutdown, #{reason => mailbox_overflow, value => 11, max => 10}},
         emqx_utils:check_oom(Policy)
     ).
+
+t_tune_heap_size(_Config) ->
+    Policy = #{
+        max_mailbox_size => 10,
+        max_heap_size => 1024 * 1024 * 8,
+        enable => true
+    },
+    ?assertEqual(ignore, emqx_utils:tune_heap_size(Policy#{enable := false})),
+    %% Setting it to 0 disables the check.
+    ?assertEqual(ignore, emqx_utils:tune_heap_size(Policy#{max_heap_size := 0})),
+    {max_heap_size, PreviousHeapSize} = process_info(self(), max_heap_size),
+    try
+        ?assertMatch(PreviousHeapSize, emqx_utils:tune_heap_size(Policy))
+    after
+        process_flag(max_heap_size, PreviousHeapSize)
+    end.
 
 t_rand_seed(_) ->
     ?assert(is_tuple(emqx_utils:rand_seed())).

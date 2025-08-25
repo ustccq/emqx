@@ -10,7 +10,6 @@ subscriber_source.desc:
 subscriber_source.label:
 """Source"""
 
-
 action_parameters.desc:
 """The action config defines how this bridge send messages to the remote RabbitMQ broker"""
 action_parameters.label:
@@ -30,5 +29,30 @@ source_no_ack.desc:
 """Whether to use no_ack mode when consuming messages from the RabbitMQ broker."""
 source_no_ack.label:
 """Source No Ack"""
+
+headers_template.label:
+"""Headers Template"""
+headers_template.desc:
+"""Template for message headers."""
+
+properties_template.label:
+"""Properties Template"""
+properties_template.desc:
+"""Template for message properties.  See also: https://www.rabbitmq.com/docs/publishers#message-properties"""
+
+key_value.label:
+"""Key-Value Pair"""
+key_value.desc:
+"""Key-Value template pair."""
+
+key_value_key.label:
+"""Key"""
+key_value_key.desc:
+"""Template for key."""
+
+key_value_value.label:
+"""Value"""
+key_value_value.desc:
+"""Template for value."""
 
 }

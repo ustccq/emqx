@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2019-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2019-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% The proper types extension for EMQX
@@ -50,12 +38,18 @@
     printable_utf8/0,
     printable_codepoint/0,
     raw_duration/0,
-    large_raw_duration/0
+    raw_duration/1,
+    large_raw_duration/0,
+    raw_byte_size/0,
+    clientid/0,
+    packet_id/0,
+    qos/0
 ]).
 
 %% Generic Types
 -export([
     scaled/2,
+    logscaled/2,
     fixedmap/1
 ]).
 
@@ -107,8 +101,8 @@ clientinfo() ->
     Keys = [
         {zone, zone()},
         {protocol, protocol()},
+        {peername, peername()},
         {peerhost, ip()},
-        {peerport, port()},
         {sockport, port()},
         {clientid, clientid()},
         {username, username()},
@@ -360,7 +354,6 @@ systopic_metrics() ->
         <<"packets/publish/sent">>,
         <<"packets/publish/error">>,
         <<"packets/publish/auth_error">>,
-        <<"packets/publish/dropped">>,
         <<"packets/puback/received">>,
         <<"packets/puback/sent">>,
         <<"packets/puback/inuse">>,
@@ -400,6 +393,8 @@ systopic_metrics() ->
         <<"messages/dropped">>,
         <<"messages/dropped/expired">>,
         <<"messages/dropped/no_subscribers">>,
+        <<"messages/dropped/quota_exceeded">>,
+        <<"messages/dropped/receive_maximum">>,
         <<"messages/forward">>,
         <<"messages/delayed">>,
         <<"messages/delivered">>,
@@ -643,9 +638,13 @@ printable_codepoint() ->
     ]).
 
 raw_duration() ->
+    Units = [<<"d">>, <<"h">>, <<"m">>, <<"s">>, <<"ms">>],
+    raw_duration(Units).
+
+raw_duration(Units) ->
     ?LET(
         {Value, Unit},
-        {pos_integer(), oneof([<<"d">>, <<"h">>, <<"m">>, <<"s">>, <<"ms">>])},
+        {pos_integer(), oneof(Units)},
         <<(integer_to_binary(Value))/binary, Unit/binary>>
     ).
 
@@ -653,6 +652,13 @@ large_raw_duration() ->
     ?LET(
         {Value, Unit},
         {range(1_000_000, inf), oneof([<<"d">>, <<"h">>, <<"m">>])},
+        <<(integer_to_binary(Value))/binary, Unit/binary>>
+    ).
+
+raw_byte_size() ->
+    ?LET(
+        {Value, Unit},
+        {pos_integer(), oneof([<<"gb">>, <<"mb">>, <<"kb">>, <<"b">>, <<"">>])},
         <<(integer_to_binary(Value))/binary, Unit/binary>>
     ).
 
@@ -689,6 +695,10 @@ limited_list(N, T) ->
 -spec scaled(number(), proptype()) -> proptype().
 scaled(F, T) when F > 0 ->
     ?SIZED(S, resize(round(S * F), T)).
+
+-spec logscaled(number(), proptype()) -> proptype().
+logscaled(F, T) when F > 0 ->
+    ?SIZED(S, resize(round(math:log(S + 1) * F), T)).
 
 -spec fixedmap(#{_Key => proptype()}) -> proptype().
 fixedmap(M) ->

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@
 -export_type([compiled/0]).
 
 -type compiled() :: #{expr := string(), form := term()}.
+-type opts() :: #{eval_coalesce => boolean()}.
 -define(BIF_MOD, emqx_variform_bif).
 -define(IS_ALLOWED_MOD(M),
     (M =:= ?BIF_MOD orelse
@@ -42,7 +43,7 @@
         M =:= maps)
 ).
 
--define(IS_EMPTY(X), (X =:= <<>> orelse X =:= "" orelse X =:= undefined)).
+-define(IS_EMPTY(X), (X =:= <<>> orelse X =:= "" orelse X =:= undefined orelse X =:= null)).
 
 %% @doc Render a variform expression with bindings.
 %% A variform expression is a template string which supports variable substitution
@@ -64,12 +65,13 @@
 %% For unresolved variables, empty string (but not "undefined") is used.
 %% In case of runtime exeption, an error is returned.
 %% In case of unbound variable is referenced, error is returned.
--spec render(string(), map()) -> {ok, binary()} | {error, term()}.
+-spec render(string() | compiled(), map()) -> {ok, binary()} | {error, term()}.
 render(Expression, Bindings) ->
     render(Expression, Bindings, #{}).
 
+-spec render(string() | compiled(), map(), opts()) -> {ok, binary()} | {error, term()}.
 render(#{form := Form}, Bindings, Opts) ->
-    eval_as_string(Form, Bindings, Opts);
+    eval_render(Form, Bindings, Opts);
 render(Expression, Bindings, Opts) ->
     case compile(Expression) of
         {ok, Compiled} ->
@@ -78,9 +80,16 @@ render(Expression, Bindings, Opts) ->
             {error, Reason}
     end.
 
-eval_as_string(Expr, Bindings, _Opts) ->
+eval_render(Expr, Bindings, Opts) ->
+    EvalAsStr = maps:get(eval_as_string, Opts, true),
     try
-        {ok, return_str(eval(Expr, Bindings, #{}))}
+        Result = eval(Expr, Bindings, #{}),
+        case EvalAsStr of
+            true ->
+                {ok, return_str(Result)};
+            false ->
+                {ok, Result}
+        end
     catch
         throw:Reason ->
             {error, Reason};
@@ -88,7 +97,8 @@ eval_as_string(Expr, Bindings, _Opts) ->
             {error, #{exception => C, reason => E, stack_trace => S}}
     end.
 
-%% Force the expression to return binary string.
+%% Force the expression to return binary string (in most cases).
+return_str(X) when ?IS_EMPTY(X) -> <<"">>;
 return_str(Str) when is_binary(Str) -> Str;
 return_str(Num) when is_integer(Num) -> integer_to_binary(Num);
 return_str(Num) when is_float(Num) -> float_to_binary(Num, [{decimals, 10}, compact]);
@@ -106,7 +116,12 @@ compile(#{form := _} = Compiled) ->
     {ok, Compiled};
 compile(Expression) when is_binary(Expression) ->
     compile(unicode:characters_to_list(Expression));
-compile(Expression) ->
+compile(Expression) when is_list(Expression) ->
+    do_compile(Expression);
+compile(_Expression) ->
+    {error, invalid_expression}.
+
+do_compile(Expression) ->
     case emqx_variform_scan:string(Expression) of
         {ok, Tokens, _Line} ->
             case emqx_variform_parser:parse(Tokens) of
@@ -147,6 +162,8 @@ eval({call, FuncNameStr, Args}, Bindings, Opts) ->
             eval_iif(Args, Bindings, Opts);
         {?BIF_MOD, coalesce} ->
             eval_coalesce(Args, Bindings, Opts);
+        {?BIF_MOD, is_empty} ->
+            eval_is_empty(Args, Bindings, Opts);
         _ ->
             call(Mod, Fun, eval_loop(Args, Bindings, Opts))
     end;
@@ -202,6 +219,10 @@ try_eval(Arg, Bindings, Opts) ->
             <<>>
     end.
 
+eval_is_empty([Arg], Bindings, Opts) ->
+    Val = eval_coalesce_loop([Arg], Bindings, Opts),
+    ?IS_EMPTY(Val).
+
 eval_iif([Cond, If, Else], Bindings, Opts) ->
     CondVal = try_eval(Cond, Bindings, Opts),
     case is_iif_condition_met(CondVal) of
@@ -242,6 +263,7 @@ resolve_func_name(FuncNameStr) ->
                     error:badarg ->
                         throw(#{
                             reason => unknown_variform_function,
+                            module => Mod,
                             function => Fun0
                         })
                 end,
@@ -254,6 +276,7 @@ resolve_func_name(FuncNameStr) ->
                     error:badarg ->
                         throw(#{
                             reason => unknown_variform_function,
+                            module => ?BIF_MOD,
                             function => Fun
                         })
                 end,
@@ -265,11 +288,13 @@ resolve_func_name(FuncNameStr) ->
 %% _Opts can be extended in the future. For example, unbound var as 'undfeined'
 resolve_var_value(VarName, Bindings, _Opts) ->
     case emqx_template:lookup_var(split(VarName), Bindings) of
+        {ok, Value} when ?IS_EMPTY(Value) ->
+            <<"">>;
         {ok, Value} ->
             Value;
         {error, _Reason} ->
             throw(#{
-                var_name => VarName,
+                var_name => iolist_to_binary(VarName),
                 reason => var_unbound
             })
     end.
@@ -278,8 +303,12 @@ assert_func_exported(?BIF_MOD, coalesce, _Arity) ->
     ok;
 assert_func_exported(?BIF_MOD, iif, _Arity) ->
     ok;
+assert_func_exported(?BIF_MOD, is_empty, _Arity) ->
+    ok;
 assert_func_exported(Mod, Fun, Arity) ->
-    ok = try_load(Mod),
+    %% call emqx_utils:interactive_load to make sure it will work in tests.
+    %% in production, the module has to be pre-loaded by plugin management code
+    ok = emqx_utils:interactive_load(Mod),
     case erlang:function_exported(Mod, Fun, Arity) of
         true ->
             ok;
@@ -292,18 +321,6 @@ assert_func_exported(Mod, Fun, Arity) ->
             })
     end.
 
-%% best effort to load the module because it might not be loaded as a part of the release modules
-%% e.g. from a plugin.
-%% do not call code server, just try to call a function in the module.
-try_load(Mod) ->
-    try
-        _ = erlang:apply(Mod, module_info, [md5]),
-        ok
-    catch
-        _:_ ->
-            ok
-    end.
-
 assert_module_allowed(Mod) when ?IS_ALLOWED_MOD(Mod) ->
     ok;
 assert_module_allowed(Mod) ->
@@ -313,7 +330,7 @@ assert_module_allowed(Mod) ->
             ok;
         false ->
             throw(#{
-                reason => unallowed_veriform_module,
+                reason => unallowed_variform_module,
                 module => Mod
             })
     end.

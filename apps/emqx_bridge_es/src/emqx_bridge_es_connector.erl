@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_es_connector).
 
@@ -8,12 +8,14 @@
 -behaviour(emqx_resource).
 
 -include("emqx_bridge_es.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -111,8 +113,9 @@ roots() ->
     [{config, #{type => ?R_REF(config)}}].
 
 fields(config) ->
+    UnsupportedFields = [url, request, retry_interval, headers],
     lists:filter(
-        fun({K, _}) -> not lists:member(K, [url, request, retry_interval, headers]) end,
+        fun({K, _}) -> not lists:member(K, UnsupportedFields) end,
         emqx_bridge_http_schema:fields("config_connector")
     ) ++
         fields("connection_fields");
@@ -207,6 +210,8 @@ base_url(#{server := Server}) -> "http://" ++ Server.
 %%-------------------------------------------------------------------------------------
 %% `emqx_resource' API
 %%-------------------------------------------------------------------------------------
+resource_type() -> elastic_search.
+
 callback_mode() -> async_if_possible.
 
 -spec on_start(manager_id(), config()) -> {ok, state()} | no_return().
@@ -241,7 +246,7 @@ on_stop(InstanceId, State) ->
     Res.
 
 -spec on_get_status(manager_id(), state()) ->
-    {connected, state()} | {disconnected, state(), term()}.
+    ?status_connected | {?status_disconnected, term()}.
 on_get_status(InstanceId, State) ->
     emqx_bridge_http_connector:on_get_status(InstanceId, State).
 

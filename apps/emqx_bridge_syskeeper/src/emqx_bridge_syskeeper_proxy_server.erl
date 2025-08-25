@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_syskeeper_proxy_server).
@@ -7,11 +7,13 @@
 -behaviour(gen_statem).
 
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 
 -elvis([{elvis_style, invalid_dynamic_call, disable}]).
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     query_mode/1,
     on_start/2,
     on_stop/2,
@@ -40,6 +42,8 @@
 
 %% -------------------------------------------------------------------------------------------------
 %% emqx_resource
+resource_type() ->
+    syskeeper_proxy_server.
 
 query_mode(_) ->
     no_queries.
@@ -74,7 +78,7 @@ on_start(
     %% we need record only when the listen is successed
     case esockd:open(?MODULE, ListenOn, Options, MFArgs) of
         {ok, _} ->
-            ok = emqx_resource:allocate_resource(InstanceId, listen_on, ListenOn),
+            ok = emqx_resource:allocate_resource(InstanceId, ?MODULE, listen_on, ListenOn),
             {ok, #{listen_on => ListenOn}};
         {error, {already_started, _}} ->
             {error, eaddrinuse};
@@ -102,10 +106,10 @@ on_stop(InstanceId, _State) ->
 on_get_status(_InstanceId, #{listen_on := ListenOn}) ->
     try
         _ = esockd:listener({?MODULE, ListenOn}),
-        connected
+        ?status_connected
     catch
         _:_ ->
-            disconnected
+            ?status_disconnected
     end.
 
 %% -------------------------------------------------------------------------------------------------

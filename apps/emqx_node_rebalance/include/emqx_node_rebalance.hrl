@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -define(DEFAULT_CONN_EVICT_RATE, 500).
@@ -17,5 +17,8 @@
 -define(DEFAULT_REL_SESS_THRESHOLD, 1.1).
 
 -define(EVICT_INTERVAL, 1000).
+
+-define(DEFAULT_CONN_EVICT_RPC_TIMEOUT, 15000).
+-define(DEFAULT_SESS_EVICT_RPC_TIMEOUT, 15000).
 
 -define(EVACUATION_FILENAME, <<".evacuation">>).

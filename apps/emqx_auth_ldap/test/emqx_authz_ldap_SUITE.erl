@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_authz_ldap_SUITE).
 
@@ -24,7 +12,6 @@
 
 -define(LDAP_HOST, "ldap").
 -define(LDAP_DEFAULT_PORT, 389).
--define(LDAP_RESOURCE, <<"emqx_authz_ldap_SUITE">>).
 
 all() ->
     emqx_authz_test_lib:all_with_table_case(?MODULE, t_run_case, cases()).
@@ -33,25 +20,27 @@ groups() ->
     emqx_authz_test_lib:table_groups(t_run_case, cases()).
 
 init_per_suite(Config) ->
-    ok = stop_apps([emqx_resource]),
     case emqx_common_test_helpers:is_tcp_server_available(?LDAP_HOST, ?LDAP_DEFAULT_PORT) of
         true ->
-            ok = emqx_common_test_helpers:start_apps(
-                [emqx_conf, emqx_auth, emqx_auth_ldap],
-                fun set_special_configs/1
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    {emqx_conf,
+                        "authorization.no_match = deny, authorization.cache.enable = false"},
+                    emqx_auth,
+                    emqx_auth_ldap
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
             ),
-            ok = start_apps([emqx_resource]),
-            ok = create_ldap_resource(),
-            Config;
+            [{apps, Apps} | Config];
         false ->
             {skip, no_ldap}
     end.
 
-end_per_suite(_Config) ->
-    ok = emqx_authz_test_lib:restore_authorizers(),
-    ok = emqx_resource:remove_local(?LDAP_RESOURCE),
-    ok = stop_apps([emqx_resource]),
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf, emqx_auth, emqx_auth_ldap]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_group(Group, Config) ->
     [{test_case, emqx_authz_test_lib:get_case(Group, cases())} | Config].
@@ -62,12 +51,7 @@ init_per_testcase(_TestCase, Config) ->
     ok = emqx_authz_test_lib:reset_authorizers(),
     Config.
 end_per_testcase(_TestCase, _Config) ->
-    _ = emqx_authz:set_feature_available(rich_actions, true),
-    ok.
-
-set_special_configs(emqx_authz) ->
-    ok = emqx_authz_test_lib:reset_authorizers();
-set_special_configs(_) ->
+    ok = emqx_authz_test_lib:enable_node_cache(false),
     ok.
 
 %%------------------------------------------------------------------------------
@@ -87,7 +71,54 @@ t_create_invalid(_Config) ->
     ),
     {ok, _} = emqx_authz:update(?CMD_REPLACE, [BadConfig]),
 
-    [_] = emqx_authz:lookup().
+    [_] = emqx_authz:lookup_states().
+
+t_node_cache(_Config) ->
+    ClientInfo = #{username => <<"mqttuser0001">>, cn => <<"mqttUser">>},
+    Case = #{
+        name => cache_publish,
+        client_info => ClientInfo,
+        checks => []
+    },
+    setup_config(#{
+        <<"base_dn">> => <<"uid=${username},ou=testdevice,dc=emqx,dc=io">>,
+        %% This interpolation probably makes no sense,
+        %% but we just test that the filter's vars are used for caching
+        <<"filter">> => <<"(objectClass=${cert_common_name})">>
+    }),
+    ok = emqx_authz_test_lib:enable_node_cache(true),
+
+    %% Subscribe to twice, should hit cache the second time
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"mqttuser0001/pub/1">>},
+                {allow, ?AUTHZ_PUBLISH, <<"mqttuser0001/pub/+">>}
+            ]
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ),
+
+    %% Change variables, should miss cache
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [{deny, ?AUTHZ_PUBLISH, <<"mqttuser0001/pub/1">>}],
+            client_info => ClientInfo#{username => <<"username2">>}
+        }
+    ),
+    emqx_authz_test_lib:run_checks(
+        Case#{
+            checks => [{deny, ?AUTHZ_PUBLISH, <<"mqttuser0001/pub/1">>}],
+            client_info => ClientInfo#{cn => <<"mqttUser1">>}
+        }
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 3}},
+        emqx_auth_cache:metrics(?AUTHZ_CACHE)
+    ).
 
 %%------------------------------------------------------------------------------
 %% Case
@@ -95,7 +126,7 @@ t_create_invalid(_Config) ->
 cases() ->
     [
         #{
-            name => simpe_publish,
+            name => simple_publish,
             client_info => #{username => <<"mqttuser0001">>},
             checks => [
                 {allow, ?AUTHZ_PUBLISH, <<"mqttuser0001/pub/1">>},
@@ -104,7 +135,7 @@ cases() ->
             ]
         },
         #{
-            name => simpe_subscribe,
+            name => simple_subscribe,
             client_info => #{username => <<"mqttuser0001">>},
             checks => [
                 {allow, ?AUTHZ_SUBSCRIBE, <<"mqttuser0001/sub/1">>},
@@ -114,7 +145,7 @@ cases() ->
         },
 
         #{
-            name => simpe_pubsub,
+            name => simple_pubsub,
             client_info => #{username => <<"mqttuser0001">>},
             checks => [
                 {allow, ?AUTHZ_PUBLISH, <<"mqttuser0001/pubsub/1">>},
@@ -128,12 +159,22 @@ cases() ->
         },
 
         #{
-            name => simpe_unmatched,
+            name => simple_unmatched,
             client_info => #{username => <<"mqttuser0001">>},
             checks => [
                 {deny, ?AUTHZ_PUBLISH, <<"mqttuser0001/req/mqttuser0001/+">>},
                 {deny, ?AUTHZ_PUBLISH, <<"mqttuser0001/req/mqttuser0002/+">>},
                 {deny, ?AUTHZ_SUBSCRIBE, <<"mqttuser0001/req/+/mqttuser0002">>}
+            ]
+        },
+
+        #{
+            name => raw_rule,
+            client_info => #{username => <<"mqttuser0002">>},
+            checks => [
+                {allow, ?AUTHZ_PUBLISH, <<"mqttuser0002/rawrule1/1">>},
+                {allow, ?AUTHZ_PUBLISH, <<"mqttuser0002/rawrule2/2">>},
+                {deny, ?AUTHZ_PUBLISH, <<"mqttuser0002/rawrule3/3">>}
             ]
         }
     ].
@@ -164,22 +205,3 @@ setup_config(SpecialParams) ->
 
 ldap_server() ->
     iolist_to_binary(io_lib:format("~s:~B", [?LDAP_HOST, ?LDAP_DEFAULT_PORT])).
-
-ldap_config() ->
-    emqx_ldap_SUITE:ldap_config([]).
-
-start_apps(Apps) ->
-    lists:foreach(fun application:ensure_all_started/1, Apps).
-
-stop_apps(Apps) ->
-    lists:foreach(fun application:stop/1, Apps).
-
-create_ldap_resource() ->
-    {ok, _} = emqx_resource:create_local(
-        ?LDAP_RESOURCE,
-        ?AUTHZ_RESOURCE_GROUP,
-        emqx_ldap,
-        ldap_config(),
-        #{}
-    ),
-    ok.

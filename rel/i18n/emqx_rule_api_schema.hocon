@@ -24,6 +24,12 @@ metrics_actions_failed_unknown.desc:
 metrics_actions_failed_unknown.label:
 """Unknown Failures"""
 
+metrics_actions_discarded.desc:
+"""The number of discarded actions due to action being disabled or race condition while action is being deleted."""
+
+metrics_actions_discarded.label:
+"""Discarded"""
+
 event_server.desc:
 """The IP address (or hostname) and port of the MQTT broker, in IP:Port format"""
 
@@ -214,7 +220,7 @@ metrics_sql_matched_rate.desc:
 """The rate of matched, times/second"""
 
 metrics_sql_matched_rate.label:
-"""命中速率"""
+"""Matched Rate"""
 
 event_proto_ver.desc:
 """Protocol Version"""
@@ -318,6 +324,32 @@ ri_created_at.desc:
 ri_created_at.label:
 """Rule Create Time"""
 
+ri_last_modified_at.desc:
+"""Time at which the rule was last modified."""
+
+ri_last_modified_at.label:
+"""Rule Last Modified Time"""
+
+ri_action_details.desc:
+"""Details about the referenced Actions."""
+ri_action_details.label:
+"""Action Details"""
+
+ri_action_details_type.desc:
+"""Type of the referenced Action."""
+ri_action_details_type.label:
+"""Type"""
+
+ri_action_details_name.desc:
+"""Name of the referenced Action."""
+ri_action_details_name.label:
+"""Name"""
+
+ri_action_details_status.desc:
+"""Status of the referenced Action."""
+ri_action_details_status.label:
+"""Status"""
+
 event_dup.desc:
 """The DUP flag of the MQTT message"""
 
@@ -365,6 +397,12 @@ event_validation.desc:
 
 event_validation.label:
 """Validation"""
+
+event_transformation.desc:
+"""Transformation"""
+
+event_transformation.label:
+"""Transformation"""
 
 root_rule_info.desc:
 """Schema for rule info"""

@@ -1,8 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_sqlserver_connector).
+
+-feature(maybe_expr, enable).
 
 -behaviour(emqx_resource).
 
@@ -17,6 +19,8 @@
 
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
+-elvis([{elvis_text_style, line_length, #{skip_comments => whole_line}}]).
+
 %%====================================================================
 %% Exports
 %%====================================================================
@@ -30,6 +34,7 @@
 
 %% callbacks for behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -43,11 +48,16 @@
     on_format_query_result/1
 ]).
 
-%% callbacks for ecpool
--export([connect/1]).
+%% `ecpool_worker' API
+-export([
+    connect/1,
+    disconnect/1
+]).
 
 %% Internal exports used to execute code with ecpool worker
--export([do_get_status/1, worker_do_insert/3]).
+-export([do_get_status/1, worker_do_insert/3, get_servername/1]).
+
+-export([parse_server/1]).
 
 -import(emqx_utils_conv, [str/1]).
 -import(hoconsc, [mk/2, enum/1, ref/2]).
@@ -56,8 +66,9 @@
 
 -define(SYNC_QUERY_MODE, handover).
 
+%% We use -1 to differentiate between default port and explicitly defined port.
 -define(SQLSERVER_HOST_OPTIONS, #{
-    default_port => ?SQLSERVER_DEFAULT_PORT
+    default_port => -1
 }).
 
 -define(REQUEST_TTL(RESOURCE_OPTS),
@@ -78,7 +89,7 @@
 %% https://www.erlang.org/doc/man/odbc.html
 
 %% as returned by connect/2
--type connection_reference() :: pid().
+-type connection_reference() :: term().
 -type time_out() :: milliseconds() | infinity.
 -type sql() :: string() | binary().
 -type milliseconds() :: pos_integer().
@@ -167,12 +178,47 @@ add_default_fn(OrigFn, Default) ->
     end.
 
 server() ->
-    Meta = #{desc => ?DESC("server")},
-    emqx_schema:servers_sc(Meta, ?SQLSERVER_HOST_OPTIONS).
+    hoconsc:mk(
+        string(),
+        #{
+            desc => ?DESC("server"),
+            required => true,
+            converter => fun emqx_schema:convert_servers/2,
+            validator => fun server_validator/1
+        }
+    ).
+
+server_validator(Str) ->
+    BaseValidator = emqx_schema:servers_validator(?SQLSERVER_HOST_OPTIONS, _Required = true),
+    ok = BaseValidator(Str),
+    _ = parse_server(Str),
+    ok.
+
+parse_server(undefined) ->
+    undefined;
+parse_server(Str) ->
+    Parsed = emqx_schema:parse_server(Str, ?SQLSERVER_HOST_OPTIONS),
+    split_named_instance(Parsed).
+
+split_named_instance(#{hostname := Hostname0} = Parsed) ->
+    HasExplicitPort = maps:get(port, Parsed) =/= -1,
+    case string:tokens(Hostname0, "\\") of
+        [_] when HasExplicitPort ->
+            Parsed;
+        [_] ->
+            Parsed#{port => ?SQLSERVER_DEFAULT_PORT};
+        [Server, InstanceName] when HasExplicitPort ->
+            Parsed#{hostname => Server, instance_name => InstanceName};
+        [_Server, _InstanceName] ->
+            throw("must_explicitly_define_port_when_using_named_instances");
+        [_, _, _ | _] ->
+            throw("bad_server_name_and_instance_name")
+    end.
 
 %%====================================================================
 %% Callbacks defined in emqx_resource
 %%====================================================================
+resource_type() -> sqlserver.
 
 callback_mode() -> always_sync.
 
@@ -205,17 +251,22 @@ on_start(
     end,
 
     %% odbc connection string required
+    ServerBin = to_bin(Server),
     ConnectOptions = [
-        {server, to_bin(Server)},
+        {server, ServerBin},
         {username, Username},
         {password, maps:get(password, Config, emqx_secret:wrap(""))},
         {driver, Driver},
         {database, Database},
-        {pool_size, PoolSize}
+        {pool_size, PoolSize},
+        {auto_reconnect, 2},
+        {on_disconnect, {?MODULE, disconnect, []}}
     ],
+    ParsedServer = parse_server(Server),
 
     State = #{
         %% also InstanceId
+        server => ParsedServer,
         pool_name => PoolName,
         installed_channels => #{},
         resource_opts => ResourceOpts
@@ -231,46 +282,34 @@ on_start(
             {error, Reason}
     end.
 
-on_add_channel(
-    _InstId,
-    #{
-        installed_channels := InstalledChannels
-    } = OldState,
-    ChannelId,
-    ChannelConfig
-) ->
-    {ok, ChannelState} = create_channel_state(ChannelConfig),
-    NewInstalledChannels = maps:put(ChannelId, ChannelState, InstalledChannels),
-    %% Update state
-    NewState = OldState#{installed_channels => NewInstalledChannels},
-    {ok, NewState}.
+on_add_channel(_InstId, OldState, ChannelId, #{parameters := Params}) ->
+    #{installed_channels := InstalledChannels} = OldState,
+    case parse_sql_template(Params) of
+        {ok, Templs} ->
+            ChannelState = #{
+                sql_templates => Templs,
+                channel_conf => Params
+            },
+            NewInstalledChannels = maps:put(ChannelId, ChannelState, InstalledChannels),
+            %% Update state
+            NewState = OldState#{installed_channels => NewInstalledChannels},
+            {ok, NewState};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
-create_channel_state(
-    #{parameters := Conf} = _ChannelConfig
-) ->
-    State = #{sql_templates => parse_sql_template(Conf)},
-    {ok, State}.
-
-on_remove_channel(
-    _InstId,
-    #{
-        installed_channels := InstalledChannels
-    } = OldState,
-    ChannelId
-) ->
+on_remove_channel(_InstId, #{installed_channels := InstalledChannels} = OldState, ChannelId) ->
     NewInstalledChannels = maps:remove(ChannelId, InstalledChannels),
     %% Update state
     NewState = OldState#{installed_channels => NewInstalledChannels},
     {ok, NewState}.
 
-on_get_channel_status(
-    InstanceId,
-    ChannelId,
-    #{installed_channels := Channels} = State
-) ->
+on_get_channel_status(InstanceId, ChannelId, #{installed_channels := Channels} = State) ->
     case maps:find(ChannelId, Channels) of
-        {ok, _} -> on_get_status(InstanceId, State);
-        error -> ?status_disconnected
+        {ok, _} ->
+            on_get_status(InstanceId, State);
+        error ->
+            ?status_disconnected
     end.
 
 on_get_channels(ResId) ->
@@ -326,17 +365,50 @@ on_format_query_result({ok, Rows}) ->
 on_format_query_result(Result) ->
     Result.
 
-on_get_status(_InstanceId, #{pool_name := PoolName} = _State) ->
-    Health = emqx_resource_pool:health_check_workers(
+on_get_status(_InstanceId, #{pool_name := PoolName} = ConnState) ->
+    Results = emqx_resource_pool:health_check_workers(
         PoolName,
-        {?MODULE, do_get_status, []}
+        {?MODULE, do_get_status, []},
+        _Timeout = 5000,
+        #{return_values => true}
     ),
-    status_result(Health).
+    status_result(Results, ConnState).
 
-status_result(_Status = true) -> ?status_connected;
-status_result(_Status = false) -> ?status_connecting.
-%% TODO:
-%% case for disconnected
+status_result({error, timeout}, _ConnState) ->
+    {?status_connecting, <<"timeout_checking_connections">>};
+status_result({ok, []}, _ConnState) ->
+    %% ecpool will auto-restart after delay
+    {?status_connecting, <<"connection_pool_not_initialized">>};
+status_result({ok, Results}, ConnState) ->
+    case lists:filter(fun(S) -> S =/= ok end, Results) of
+        [] ->
+            case validate_connected_instance_name(ConnState) of
+                ok ->
+                    ?status_connected;
+                {error, #{expected := ExpectedInstanceName, got := InstanceName}} ->
+                    Msg = iolist_to_binary(
+                        io_lib:format(
+                            "connected instance does not match desired instance name;"
+                            " expected ~s; connected to: ~s",
+                            [
+                                format_instance_name(ExpectedInstanceName),
+                                format_instance_name(InstanceName)
+                            ]
+                        )
+                    ),
+                    {?status_disconnected, {unhealthy_target, Msg}};
+                error ->
+                    %% Could not infer instance name; assume ok
+                    ?status_connected
+            end;
+        [{error, Reason} | _] ->
+            {?status_connecting, Reason}
+    end.
+
+format_instance_name(undefined) ->
+    <<"no instance name">>;
+format_instance_name(Name) ->
+    Name.
 
 %%====================================================================
 %% ecpool callback fns
@@ -345,14 +417,36 @@ status_result(_Status = false) -> ?status_connecting.
 -spec connect(Options :: list()) -> {ok, connection_reference()} | {error, term()}.
 connect(Options) ->
     ConnectStr = lists:concat(conn_str(Options, [])),
+    %% Note: we don't use `emqx_secret:wrap/1` here because its return type is opaque, and
+    %% dialyzer then complains that it's being fed to a function that doesn't expect
+    %% something opaque...
+    ConnectStrWrapped = fun() -> ConnectStr end,
     Opts = proplists:get_value(options, Options, []),
-    odbc:connect(ConnectStr, Opts).
+    odbc:connect(ConnectStrWrapped, Opts).
 
--spec do_get_status(connection_reference()) -> Result :: boolean().
+-spec disconnect(connection_reference()) -> ok | {error, term()}.
+disconnect(ConnectionPid) ->
+    odbc:disconnect(ConnectionPid).
+
+-spec do_get_status(connection_reference()) -> ok | {error, term()}.
 do_get_status(Conn) ->
     case execute(Conn, <<"SELECT 1">>) of
-        {selected, [[]], [{1}]} -> true;
-        _ -> false
+        {selected, [[]], [{1}]} ->
+            ok;
+        Other ->
+            _ = disconnect(Conn),
+            {error, #{
+                cause => "unexpected_SELECT_1_result",
+                result => Other
+            }}
+    end.
+
+get_servername(Conn) ->
+    case execute(Conn, <<"select @@servername">>) of
+        {selected, _, [{RawName}]} ->
+            {ok, RawName};
+        _ ->
+            error
     end.
 
 %%====================================================================
@@ -369,14 +463,19 @@ do_get_status(Conn) ->
 %% 'https://learn.microsoft.com/en-us/sql/connect/odbc/
 %%      dsn-connection-string-attribute?source=recommendations&view=sql-server-ver16#encrypt'
 conn_str([], Acc) ->
-    %% we should use this for msodbcsql 18+
-    %% lists:join(";", ["Encrypt=YES", "TrustServerCertificate=YES" | Acc]);
-    lists:join(";", Acc);
+    lists:join(";", ["Encrypt=YES", "TrustServerCertificate=YES" | Acc]);
 conn_str([{driver, Driver} | Opts], Acc) ->
     conn_str(Opts, ["Driver=" ++ str(Driver) | Acc]);
 conn_str([{server, Server} | Opts], Acc) ->
-    #{hostname := Host, port := Port} = emqx_schema:parse_server(Server, ?SQLSERVER_HOST_OPTIONS),
-    conn_str(Opts, ["Server=" ++ str(Host) ++ "," ++ str(Port) | Acc]);
+    #{hostname := Host, port := Port} = Parsed = parse_server(Server),
+    InstanceNameStr =
+        case maps:find(instance_name, Parsed) of
+            {ok, InstanceName} -> "\\" ++ InstanceName;
+            error -> ""
+        end,
+    conn_str(Opts, [
+        "Server=" ++ str(Host) ++ InstanceNameStr ++ "," ++ str(Port) | Acc
+    ]);
 conn_str([{database, Database} | Opts], Acc) ->
     conn_str(Opts, ["Database=" ++ str(Database) | Acc]);
 conn_str([{username, Username} | Opts], Acc) ->
@@ -397,71 +496,57 @@ conn_str([{_, _} | Opts], Acc) ->
     | {error, {recoverable_error, term()}}
     | {error, {unrecoverable_error, term()}}
     | {error, term()}.
-do_query(
-    ResourceId,
-    Query,
-    ApplyMode,
-    #{
-        pool_name := PoolName,
-        installed_channels := Channels
-    } = State
-) ->
+do_query(ResourceId, Query, ApplyMode, State) ->
+    #{pool_name := PoolName, installed_channels := Channels} = State,
     ?TRACE(
         "SINGLE_QUERY_SYNC",
         "sqlserver_connector_received",
         #{query => Query, connector => ResourceId, state => State}
     ),
-
     ChannelId = get_channel_id(Query),
     QueryTuple = get_query_tuple(Query),
-    #{sql_templates := Templates} = _ChannelState = maps:get(ChannelId, Channels),
-
+    #{sql_templates := Templates} = ChannelState = maps:get(ChannelId, Channels),
+    ChannelConf = maps:get(channel_conf, ChannelState, #{}),
     %% only insert sql statement for single query and batch query
-    case apply_template(QueryTuple, Templates) of
-        {?ACTION_SEND_MESSAGE, SQL} ->
-            emqx_trace:rendered_action_template(ChannelId, #{
-                sql => SQL
-            }),
-            Result = ecpool:pick_and_do(
-                PoolName,
-                {?MODULE, worker_do_insert, [SQL, State]},
-                ApplyMode
-            );
-        QueryTuple ->
-            Result = {error, {unrecoverable_error, invalid_query}};
-        _ ->
-            Result = {error, {unrecoverable_error, failed_to_apply_sql_template}}
-    end,
-    case Result of
-        {error, Reason} ->
-            ?tp(
-                sqlserver_connector_query_return,
-                #{error => Reason}
-            ),
-            ?SLOG(error, #{
-                msg => "sqlserver_connector_do_query_failed",
-                connector => ResourceId,
-                query => Query,
-                reason => Reason
-            }),
-            case Reason of
-                ecpool_empty ->
-                    {error, {recoverable_error, Reason}};
-                _ ->
-                    Result
-            end;
-        _ ->
-            ?tp(
-                sqlserver_connector_query_return,
-                #{result => Result}
-            ),
-            Result
-    end.
+    Result =
+        case apply_template(QueryTuple, Templates, ChannelConf) of
+            {?ACTION_SEND_MESSAGE, SQL} ->
+                emqx_trace:rendered_action_template(ChannelId, #{
+                    sql => SQL
+                }),
+                ecpool:pick_and_do(
+                    PoolName,
+                    {?MODULE, worker_do_insert, [SQL, State]},
+                    ApplyMode
+                );
+            QueryTuple ->
+                {error, {unrecoverable_error, invalid_query}};
+            _ ->
+                {error, {unrecoverable_error, failed_to_apply_sql_template}}
+        end,
+    handle_result(Result, ResourceId, Query).
 
-worker_do_insert(
-    Conn, SQL, #{resource_opts := ResourceOpts, pool_name := ResourceId} = State
-) ->
-    LogMeta = #{connector => ResourceId, state => State},
+handle_result({error, {recoverable_error, _} = Reason} = Result, _ResourceId, _Query) ->
+    ?tp(sqlserver_connector_query_return, #{error => Reason}),
+    Result;
+handle_result({error, Reason}, ResourceId, Query) ->
+    ?tp(sqlserver_connector_query_return, #{error => Reason}),
+    ?SLOG(error, #{
+        msg => "sqlserver_connector_do_query_failed",
+        connector => ResourceId,
+        query => Query,
+        reason => Reason
+    }),
+    case Reason of
+        ecpool_empty -> {error, {recoverable_error, ecpool_empty}};
+        _ -> {error, Reason}
+    end;
+handle_result(Result, _, _) ->
+    ?tp(sqlserver_connector_query_return, #{result => Result}),
+    Result.
+
+worker_do_insert(Conn, SQL, #{resource_opts := ResourceOpts, pool_name := ResourceId}) ->
+    LogMeta = #{connector => ResourceId},
     try
         case execute(Conn, SQL, ?REQUEST_TTL(ResourceOpts)) of
             {selected, Rows, _} ->
@@ -469,16 +554,68 @@ worker_do_insert(
             {updated, _} ->
                 ok;
             {error, ErrStr} ->
-                ?SLOG(error, LogMeta#{msg => "invalid_request", reason => ErrStr}),
-                {error, {unrecoverable_error, {invalid_request, ErrStr}}}
+                IsConnectionClosedError = is_connection_closed_error(ErrStr),
+                IsConnectionBrokenError = is_connection_broken_error(ErrStr),
+                ErrStr1 =
+                    case is_table_or_view_not_found_error(ErrStr) of
+                        true ->
+                            <<"table_or_view_not_found">>;
+                        false ->
+                            ErrStr
+                    end,
+                {LogLevel, Err} =
+                    case IsConnectionClosedError orelse IsConnectionBrokenError of
+                        true ->
+                            {info, {recoverable_error, <<"connection_closed">>}};
+                        false ->
+                            {error, {unrecoverable_error, {invalid_request, ErrStr1}}}
+                    end,
+                ?SLOG(LogLevel, LogMeta#{msg => "invalid_request", reason => ErrStr1}),
+                {error, Err}
         end
     catch
-        _Type:Reason ->
-            ?SLOG(error, LogMeta#{msg => "invalid_request", reason => Reason}),
+        _Type:Reason:St ->
+            ?SLOG(error, LogMeta#{msg => "invalid_request", reason => Reason, stacktrace => St}),
             {error, {unrecoverable_error, {invalid_request, Reason}}}
     end.
 
--spec execute(pid(), sql()) ->
+%% Potential race condition: if an insert request is made while the connection is being
+%% cut by the remote server, this error might be returned.
+%% References:
+%% https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-17194-database-engine-error?view=sql-server-ver16
+is_connection_closed_error(MsgStr) ->
+    case re:run(MsgStr, <<"0x2746[^0-9a-fA-F]?">>, [{capture, none}]) of
+        match ->
+            true;
+        nomatch ->
+            false
+    end.
+
+%% Potential race condition: if an insert request is made while the connection is being
+%% cut by the remote server, this error might be returned.
+%% References:
+%% https://learn.microsoft.com/en-us/sql/connect/odbc/connection-resiliency?view=sql-server-ver16
+is_connection_broken_error(MsgStr) ->
+    case re:run(MsgStr, <<"SQLSTATE IS: IMC0[1-6]">>, [{capture, none}]) of
+        match ->
+            true;
+        nomatch ->
+            false
+    end.
+
+%% https://learn.microsoft.com/en-us/sql/odbc/reference/appendixes/appendix-a-odbc-error-codes?view=sql-server-ver15
+%% In some occasions, non-printable bytes/chars may be returned in the error message,
+%% making it non-loggable.
+%% See also: https://emqx.atlassian.net/browse/EMQX-14171
+is_table_or_view_not_found_error(MsgStr) ->
+    case re:run(MsgStr, <<"SQLSTATE IS: 42S02">>, [{capture, none}]) of
+        match ->
+            true;
+        nomatch ->
+            false
+    end.
+
+-spec execute(connection_reference(), sql()) ->
     updated_tuple()
     | selected_tuple()
     | [updated_tuple()]
@@ -487,7 +624,7 @@ worker_do_insert(
 execute(Conn, SQL) ->
     odbc:sql_query(Conn, str(SQL)).
 
--spec execute(pid(), sql(), time_out()) ->
+-spec execute(connection_reference(), sql(), time_out()) ->
     updated_tuple()
     | selected_tuple()
     | [updated_tuple()]
@@ -510,8 +647,8 @@ get_query_tuple([{_ChannelId, {_QueryType, _Data}} | _]) ->
         {unrecoverable_error,
             {invalid_request, <<"The only query type that supports batching is insert.">>}}
     );
-get_query_tuple([InsertQuery | _]) ->
-    get_query_tuple(InsertQuery).
+get_query_tuple([_InsertQuery | _] = Reqs) ->
+    lists:map(fun get_query_tuple/1, Reqs).
 
 %% for bridge data to sql server
 parse_sql_template(Config) ->
@@ -521,27 +658,27 @@ parse_sql_template(Config) ->
             <<>> -> #{};
             SQLTemplate -> #{?ACTION_SEND_MESSAGE => SQLTemplate}
         end,
-
-    BatchInsertTks = #{},
-    parse_sql_template(maps:to_list(RawSQLTemplates), BatchInsertTks).
+    try
+        {ok, parse_sql_template(maps:to_list(RawSQLTemplates), #{})}
+    catch
+        throw:Reason ->
+            {error, Reason}
+    end.
 
 parse_sql_template([{Key, H} | T], BatchInsertTks) ->
     case emqx_utils_sql:get_statement_type(H) of
         select ->
             parse_sql_template(T, BatchInsertTks);
         insert ->
-            case emqx_utils_sql:parse_insert(H) of
-                {ok, {InsertSQL, Params}} ->
-                    parse_sql_template(
-                        T,
-                        BatchInsertTks#{
-                            Key =>
-                                #{
-                                    ?BATCH_INSERT_PART => InsertSQL,
-                                    ?BATCH_PARAMS_TOKENS => emqx_placeholder:preproc_tmpl(Params)
-                                }
-                        }
-                    );
+            case emqx_utils_sql:split_insert(H) of
+                {ok, {InsertPart, Values}} ->
+                    Tks = #{
+                        ?BATCH_INSERT_PART => InsertPart,
+                        ?BATCH_PARAMS_TOKENS => emqx_placeholder:preproc_tmpl(Values)
+                    },
+                    parse_sql_template(T, BatchInsertTks#{Key => Tks});
+                {ok, {_InsertPart, _Values, OnClause}} ->
+                    throw(<<"The 'ON' clause is not supported in SQLServer: ", OnClause/binary>>);
                 {error, Reason} ->
                     ?SLOG(error, #{msg => "split_sql_failed", sql => H, reason => Reason}),
                     parse_sql_template(T, BatchInsertTks)
@@ -560,36 +697,82 @@ parse_sql_template([], BatchInsertTks) ->
 
 %% single insert
 apply_template(
-    {?ACTION_SEND_MESSAGE = _Key, _Msg} = Query, Templates
+    {?ACTION_SEND_MESSAGE = _Key, _Msg} = Query, Templates, ChannelConf
 ) ->
     %% TODO: fix emqx_placeholder:proc_tmpl/2
     %% it won't add single quotes for string
-    apply_template([Query], Templates);
+    apply_template([Query], Templates, ChannelConf);
 %% batch inserts
 apply_template(
     [{?ACTION_SEND_MESSAGE = Key, _Msg} | _T] = BatchReqs,
-    #{?BATCH_INSERT_TEMP := BatchInsertsTks} = _Templates
+    #{?BATCH_INSERT_TEMP := BatchInsertsTks} = _Templates,
+    ChannelConf
 ) ->
     case maps:get(Key, BatchInsertsTks, undefined) of
         undefined ->
             BatchReqs;
         #{?BATCH_INSERT_PART := BatchInserts, ?BATCH_PARAMS_TOKENS := BatchParamsTks} ->
-            SQL = proc_batch_sql(BatchReqs, BatchInserts, BatchParamsTks),
+            BatchParams = [proc_msg(BatchParamsTks, Msg, ChannelConf) || {_, Msg} <- BatchReqs],
+            Values = erlang:iolist_to_binary(lists:join($,, BatchParams)),
+            SQL = <<BatchInserts/binary, " values ", Values/binary>>,
             {Key, SQL}
     end;
-apply_template(Query, Templates) ->
+apply_template(Query, Templates, _) ->
     %% TODO: more detail information
     ?SLOG(error, #{msg => "apply_sql_template_failed", query => Query, templates => Templates}),
     {error, failed_to_apply_sql_template}.
 
-proc_batch_sql(BatchReqs, BatchInserts, Tokens) ->
-    Values = erlang:iolist_to_binary(
-        lists:join($,, [
-            emqx_placeholder:proc_sql_param_str(Tokens, Msg)
-         || {_, Msg} <- BatchReqs
-        ])
-    ),
-    <<BatchInserts/binary, " values ", Values/binary>>.
+proc_msg(Tokens, Msg, #{undefined_vars_as_null := true}) ->
+    emqx_placeholder:proc_sqlserver_param_str2(Tokens, Msg);
+proc_msg(Tokens, Msg, _) ->
+    emqx_placeholder:proc_sqlserver_param_str(Tokens, Msg).
 
+to_bin(B) when is_binary(B) ->
+    B;
 to_bin(List) when is_list(List) ->
     unicode:characters_to_binary(List, utf8).
+
+validate_connected_instance_name(#{server := ParsedServer} = ConnState) ->
+    ExpectedInstanceName = maps:get(instance_name, ParsedServer, undefined),
+    maybe
+        {ok, InstanceName} ?= infer_instance_name(ConnState),
+        InstanceName1 = emqx_maybe:apply(fun to_bin/1, InstanceName),
+        ExpectedInstanceName1 = emqx_maybe:apply(fun to_bin/1, ExpectedInstanceName),
+        case InstanceName1 == ExpectedInstanceName1 of
+            true ->
+                ok;
+            false ->
+                {error, #{expected => ExpectedInstanceName, got => InstanceName}}
+        end
+    end.
+
+infer_instance_name(#{pool_name := PoolName} = _ConnState) ->
+    maybe
+        {ok, RawName} ?= ecpool:pick_and_do(PoolName, {?MODULE, get_servername, []}, handover),
+        {ok, Decoded} ?= try_decode_raw_str(RawName),
+        get_instance_name(Decoded)
+    end.
+
+try_decode_raw_str(Raw) when is_binary(Raw) ->
+    case io_lib:printable_unicode_list(binary_to_list(Raw)) of
+        true ->
+            {ok, Raw};
+        false ->
+            Decoded = unicode:characters_to_binary(Raw, {utf16, little}, utf8),
+            case io_lib:printable_unicode_list(binary_to_list(Decoded)) of
+                true ->
+                    {ok, Decoded};
+                false ->
+                    error
+            end
+    end.
+
+get_instance_name(ServerName) ->
+    case binary:split(ServerName, <<"\\">>) of
+        [_Server, InstanceName] ->
+            {ok, InstanceName};
+        [_] ->
+            {ok, undefined};
+        _ ->
+            error
+    end.

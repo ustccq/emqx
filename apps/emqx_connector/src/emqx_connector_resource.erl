@@ -1,28 +1,18 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_connector_resource).
 
--include_lib("emqx_bridge/include/emqx_bridge_resource.hrl").
+-include("../../emqx_bridge/include/emqx_bridge_resource.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx_resource/include/emqx_resource.hrl").
+-include_lib("emqx_resource/include/emqx_resource_id.hrl").
+-include("emqx_connector.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -export([
     connector_to_resource_type/1,
-    resource_id/1,
-    resource_id/2,
+    resource_id/3,
     connector_id/2,
     parse_connector_id/1,
     parse_connector_id/2,
@@ -31,25 +21,29 @@
 ]).
 
 -export([
-    create/3,
-    create/4,
+    create/5,
     create_dry_run/2,
     create_dry_run/3,
-    recreate/2,
-    recreate/3,
-    remove/1,
-    remove/2,
-    remove/4,
-    restart/2,
+    recreate/5,
+    remove/3,
+    restart/3,
     start/2,
-    stop/2,
-    update/2,
-    update/3,
-    update/4,
-    get_channels/2
+    start/3,
+    stop/3,
+    update/5,
+    get_channels/3
 ]).
 
 -export([parse_url/1]).
+
+%% Deprecated RPC target (`emqx_connector_proto_v1`).
+-deprecated({start, 2, "use start/3 instead"}).
+
+-define(PROBE_ID_SEP, $_).
+
+%% Some connectors (e.g., Kafka producer/wolff) have some timeouts of 5 s when tearing
+%% down unresponsive processes.
+-define(STOP_TIMEOUT, 10_000).
 
 -callback connector_config(ParsedConfig, Context) ->
     ParsedConfig
@@ -70,12 +64,19 @@ connector_impl_module(ConnectorType) when is_binary(ConnectorType) ->
 connector_impl_module(ConnectorType) ->
     emqx_connector_info:config_transform_module(ConnectorType).
 
-resource_id(ConnectorId) when is_binary(ConnectorId) ->
-    <<"connector:", ConnectorId/binary>>.
-
-resource_id(ConnectorType, ConnectorName) ->
-    ConnectorId = connector_id(ConnectorType, ConnectorName),
-    resource_id(ConnectorId).
+resource_id(Namespace, ConnectorType0, ConnectorName0) ->
+    ConnectorType = bin(ConnectorType0),
+    ConnectorName = bin(ConnectorName0),
+    case is_binary(Namespace) of
+        true ->
+            iolist_to_binary(
+                lists:join(?RES_SEP, ?NAMESPACED_CONNECTOR(Namespace, ConnectorType, ConnectorName))
+            );
+        false ->
+            iolist_to_binary(
+                lists:join(?RES_SEP, ?NON_NAMESPACED_CONNECTOR(ConnectorType, ConnectorName))
+            )
+    end.
 
 connector_id(ConnectorType, ConnectorName) ->
     Name = bin(ConnectorName),
@@ -86,13 +87,26 @@ parse_connector_id(ConnectorId) ->
     parse_connector_id(ConnectorId, #{atom_name => true}).
 
 -spec parse_connector_id(binary() | atom(), #{atom_name => boolean()}) ->
-    {atom(), atom() | binary()}.
-parse_connector_id(<<"connector:", ConnectorId/binary>>, Opts) ->
+    #{type := atom(), name := atom() | binary(), namespace := ?global_ns | binary()}.
+parse_connector_id(<<?NS_SEG_PREFIX_STR, NSConnectorId/binary>>, Opts) ->
+    case binary:split(NSConnectorId, ?RES_SEP) of
+        [Namespace, ConnectorId] when size(Namespace) > 0 ->
+            Parsed = parse_connector_id(ConnectorId, Opts),
+            Parsed#{namespace => Namespace};
+        _ ->
+            throw(#{
+                kind => validation_error,
+                reason => <<"Invalid connector id: bad namespace tag">>
+            })
+    end;
+parse_connector_id(<<?CONN_SEG_PREFIX_STR, ConnectorId/binary>>, Opts) ->
     parse_connector_id(ConnectorId, Opts);
-parse_connector_id(<<?TEST_ID_PREFIX, _:16/binary, ConnectorId/binary>>, Opts) ->
+parse_connector_id(?PROBE_ID_MATCH(Suffix), Opts) ->
+    <<?PROBE_ID_SEP, ConnectorId/binary>> = Suffix,
     parse_connector_id(ConnectorId, Opts);
 parse_connector_id(ConnectorId, Opts) ->
-    emqx_resource:parse_resource_id(ConnectorId, Opts).
+    {Type, Name} = emqx_resource:parse_resource_id(ConnectorId, Opts),
+    #{type => Type, name => Name, namespace => ?global_ns}.
 
 connector_hookpoint(ConnectorId) ->
     <<"$connectors/", (bin(ConnectorId))/binary>>.
@@ -102,46 +116,44 @@ connector_hookpoint_to_connector_id(?BRIDGE_HOOKPOINT(ConnectorId)) ->
 connector_hookpoint_to_connector_id(_) ->
     {error, bad_connector_hookpoint}.
 
-restart(Type, Name) ->
-    emqx_resource:restart(resource_id(Type, Name)).
+restart(Namespace, Type, Name) ->
+    ConnResId = resource_id(Namespace, Type, Name),
+    emqx_resource:restart(ConnResId).
 
-stop(Type, Name) ->
-    emqx_resource:stop(resource_id(Type, Name)).
+stop(Namespace, Type, Name) ->
+    ConnResId = resource_id(Namespace, Type, Name),
+    emqx_resource:stop(ConnResId, ?STOP_TIMEOUT).
 
+%% Deprecated RPC target (`emqx_connector_proto_v1`).
 start(Type, Name) ->
-    emqx_resource:start(resource_id(Type, Name)).
+    start(?global_ns, Type, Name).
 
-create(Type, Name, Conf) ->
-    create(Type, Name, Conf, #{}).
+start(Namespace, Type, Name) ->
+    ConnResId = resource_id(Namespace, Type, Name),
+    emqx_resource:start(ConnResId).
 
-create(Type, Name, Conf0, Opts) ->
+create(Namespace, Type, Name, Conf0, Opts) ->
     ?SLOG(info, #{
         msg => "create connector",
         type => Type,
         name => Name,
+        namespace => Namespace,
         config => redact(Conf0, Type)
     }),
     TypeBin = bin(Type),
-    ResourceId = resource_id(Type, Name),
+    ResourceId = resource_id(Namespace, Type, Name),
     Conf = Conf0#{connector_type => TypeBin, connector_name => Name},
+    _ = emqx_alarm:ensure_deactivated(ResourceId),
     {ok, _Data} = emqx_resource:create_local(
         ResourceId,
-        <<"emqx_connector">>,
+        ?CONNECTOR_RESOURCE_GROUP,
         ?MODULE:connector_to_resource_type(Type),
         parse_confs(TypeBin, Name, Conf),
         parse_opts(Conf, Opts)
     ),
-    _ = emqx_alarm:ensure_deactivated(ResourceId),
     ok.
 
-update(ConnectorId, {OldConf, Conf}) ->
-    {ConnectorType, ConnectorName} = parse_connector_id(ConnectorId),
-    update(ConnectorType, ConnectorName, {OldConf, Conf}).
-
-update(Type, Name, {OldConf, Conf}) ->
-    update(Type, Name, {OldConf, Conf}, #{}).
-
-update(Type, Name, {OldConf, Conf0}, Opts) ->
+update(Namespace, Type, Name, {OldConf, Conf0}, Opts) ->
     %% TODO: sometimes its not necessary to restart the connector connection.
     %%
     %% - if the connection related configs like `servers` is updated, we should restart/start
@@ -151,15 +163,16 @@ update(Type, Name, {OldConf, Conf0}, Opts) ->
     %% without restarting the connector.
     %%
     Conf = Conf0#{connector_type => bin(Type), connector_name => bin(Name)},
-    case emqx_utils_maps:if_only_to_toggle_enable(OldConf, Conf) of
+    case emqx_utils_maps:if_only_to_toggle_enable(OldConf, Conf0) of
         false ->
             ?SLOG(info, #{
                 msg => "update connector",
                 type => Type,
                 name => Name,
+                namespace => Namespace,
                 config => redact(Conf, Type)
             }),
-            case recreate(Type, Name, Conf, Opts) of
+            case recreate(Namespace, Type, Name, Conf, Opts) of
                 {ok, _} ->
                     ok;
                 {error, not_found} ->
@@ -167,38 +180,34 @@ update(Type, Name, {OldConf, Conf0}, Opts) ->
                         msg => "updating_a_non_existing_connector",
                         type => Type,
                         name => Name,
+                        namespace => Namespace,
                         config => redact(Conf, Type)
                     }),
-                    create(Type, Name, Conf, Opts);
+                    create(Namespace, Type, Name, Conf, Opts);
                 {error, Reason} ->
                     {error, {update_connector_failed, Reason}}
             end;
         true ->
             %% we don't need to recreate the connector if this config change is only to
-            %% toggole the config 'connector.{type}.{name}.enable'
+            %% toggle the config 'connector.{type}.{name}.enable'
             _ =
                 case maps:get(enable, Conf, true) of
                     true ->
-                        restart(Type, Name);
+                        restart(Namespace, Type, Name);
                     false ->
-                        stop(Type, Name)
+                        stop(Namespace, Type, Name)
                 end,
             ok
     end.
 
-get_channels(Type, Name) ->
-    emqx_resource:get_channels(resource_id(Type, Name)).
+get_channels(Namespace, Type, Name) ->
+    ConnResId = resource_id(Namespace, Type, Name),
+    emqx_resource:get_channels(ConnResId).
 
-recreate(Type, Name) ->
-    recreate(Type, Name, emqx:get_config([connectors, Type, Name])).
-
-recreate(Type, Name, Conf) ->
-    recreate(Type, Name, Conf, #{}).
-
-recreate(Type, Name, Conf, Opts) ->
+recreate(Namespace, Type, Name, Conf, Opts) ->
     TypeBin = bin(Type),
     emqx_resource:recreate_local(
-        resource_id(Type, Name),
+        resource_id(Namespace, Type, Name),
         ?MODULE:connector_to_resource_type(Type),
         parse_confs(TypeBin, Name, Conf),
         parse_opts(Conf, Opts)
@@ -208,14 +217,13 @@ create_dry_run(Type, Conf) ->
     create_dry_run(Type, Conf, fun(_) -> ok end).
 
 create_dry_run(Type, Conf0, Callback) ->
-    %% Already typechecked, no need to catch errors
+    %% Already type checked, no need to catch errors
     TypeBin = bin(Type),
     TypeAtom = safe_atom(Type),
     %% We use a fixed name here to avoid creating an atom
     %% to avoid potential race condition, the resource id should be unique
-    Prefix = emqx_resource_manager:make_test_id(),
-    TmpName =
-        iolist_to_binary([Prefix, TypeBin, ":", <<"probedryrun">>]),
+    Prefix = ?PROBE_ID_NEW(),
+    TmpName = iolist_to_binary([Prefix, ?PROBE_ID_SEP, TypeBin, $:, "dryrun"]),
     TmpPath = emqx_utils:safe_filename(TmpName),
     Conf1 = maps:without([<<"name">>], Conf0),
     RawConf = #{<<"connectors">> => #{TypeBin => #{<<"temp_name">> => Conf1}}},
@@ -253,17 +261,16 @@ get_temp_conf(TypeAtom, CheckedConf) ->
             Conf
     end.
 
-remove(ConnectorId) ->
-    {ConnectorType, ConnectorName} = parse_connector_id(ConnectorId),
-    remove(ConnectorType, ConnectorName, #{}, #{}).
-
-remove(Type, Name) ->
-    remove(Type, Name, #{}, #{}).
-
-%% just for perform_connector_changes/1
-remove(Type, Name, _Conf, _Opts) ->
-    ?SLOG(info, #{msg => "remove_connector", type => Type, name => Name}),
-    emqx_resource:remove_local(resource_id(Type, Name)).
+remove(Namespace, Type, Name) ->
+    %% just for perform_connector_changes/1
+    ?SLOG(info, #{
+        msg => "remove_connector",
+        type => Type,
+        name => Name,
+        namespace => Namespace
+    }),
+    ConnResId = resource_id(Namespace, Type, Name),
+    emqx_resource:remove_local(ConnResId).
 
 %% convert connector configs to what the connector modules want
 parse_confs(
@@ -351,13 +358,9 @@ safe_atom(Bin) when is_binary(Bin) -> binary_to_existing_atom(Bin, utf8);
 safe_atom(Atom) when is_atom(Atom) -> Atom.
 
 parse_opts(Conf, Opts0) ->
-    Opts1 = override_start_after_created(Conf, Opts0),
-    set_no_buffer_workers(Opts1).
-
-override_start_after_created(Config, Opts) ->
-    Enabled = maps:get(enable, Config, true),
-    StartAfterCreated = Enabled andalso maps:get(start_after_created, Opts, Enabled),
-    Opts#{start_after_created => StartAfterCreated}.
+    Opts1 = emqx_resource:fetch_creation_opts(Conf),
+    Opts = maps:merge(Opts1, Opts0),
+    set_no_buffer_workers(Opts).
 
 set_no_buffer_workers(Opts) ->
     Opts#{spawn_buffer_workers => false}.

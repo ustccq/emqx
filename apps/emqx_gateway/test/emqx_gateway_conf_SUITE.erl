@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_conf_SUITE).
@@ -28,6 +16,7 @@
 ).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 
 %%--------------------------------------------------------------------
 %% Setups
@@ -36,18 +25,20 @@
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
-init_per_suite(Conf) ->
-    emqx_gateway_test_utils:load_all_gateway_apps(),
-    emqx_common_test_helpers:load_config(emqx_gateway_schema, <<"gateway {}">>),
-    emqx_common_test_helpers:start_apps([emqx_conf, emqx_auth, emqx_auth_mnesia, emqx_gateway]),
-    Conf.
+init_per_suite(Config) ->
+    Apps = emqx_cth_suite:start(
+        [emqx, emqx_conf, emqx_auth, emqx_auth_mnesia, emqx_gateway],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Conf) ->
-    emqx_common_test_helpers:stop_apps([emqx_gateway, emqx_auth, emqx_auth_mnesia, emqx_conf]),
-    emqx_config:delete_override_conf_files().
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 init_per_testcase(_CaseName, Conf) ->
-    _ = emqx_gateway_conf:unload_gateway(stomp),
+    ok = emqx_gateway_conf:unload_gateway(stomp),
     ct:sleep(500),
     Conf.
 

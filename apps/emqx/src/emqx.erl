@@ -1,22 +1,11 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx).
 
 -include("emqx.hrl").
+-include("emqx_config.hrl").
 -include("logger.hrl").
 -include("types.hrl").
 
@@ -61,16 +50,31 @@
     get_raw_config/2,
     update_config/2,
     update_config/3,
+    update_config/4,
     remove_config/1,
     remove_config/2,
+    remove_config/3,
     reset_config/2,
+    reset_config/3,
     data_dir/0,
     etc_file/1,
     cert_file/1,
     mutable_certs_dir/0
 ]).
 
+%% Namespaced config facades.
+-export([
+    get_namespaced_config/2,
+    get_namespaced_config/3,
+    get_raw_namespaced_config/2,
+    get_raw_namespaced_config/3
+]).
+
 -define(APP, ?MODULE).
+
+-type config_key_path() :: emqx_utils_maps:config_key_path().
+-type namespace() :: emqx_config:namespace().
+-type maybe_namespace() :: emqx_config:maybe_namespace().
 
 %%--------------------------------------------------------------------
 %% Bootstrap, is_running...
@@ -169,12 +173,19 @@ subscribed(SubId, Topic) when is_atom(SubId); is_binary(SubId) ->
 %% Config API
 %%--------------------------------------------------------------------
 
--spec get_config(emqx_utils_maps:config_key_path()) -> term().
+-spec get_config(config_key_path()) -> term().
 get_config(KeyPath) ->
     KeyPath1 = emqx_config:ensure_atom_conf_path(KeyPath, {raise_error, config_not_found}),
     emqx_config:get(KeyPath1).
 
--spec get_config(emqx_utils_maps:config_key_path(), term()) -> term().
+-spec get_namespaced_config(maybe_namespace(), config_key_path()) -> term().
+get_namespaced_config(Namespace, KeyPath0) when is_binary(Namespace) ->
+    KeyPath = emqx_config:ensure_atom_conf_path(KeyPath0, {raise_error, config_not_found}),
+    emqx_config:get_namespaced(KeyPath, Namespace);
+get_namespaced_config(?global_ns, KeyPath) ->
+    get_config(KeyPath).
+
+-spec get_config(config_key_path(), term()) -> term().
 get_config(KeyPath, Default) ->
     try
         KeyPath1 = emqx_config:ensure_atom_conf_path(KeyPath, {raise_error, config_not_found}),
@@ -184,49 +195,100 @@ get_config(KeyPath, Default) ->
             Default
     end.
 
--spec get_raw_config(emqx_utils_maps:config_key_path()) -> term().
+-spec get_namespaced_config(maybe_namespace(), config_key_path(), _Default :: term()) -> term().
+get_namespaced_config(Namespace, KeyPath0, Default) when is_binary(Namespace) ->
+    try
+        KeyPath = emqx_config:ensure_atom_conf_path(KeyPath0, {raise_error, config_not_found}),
+        emqx_config:get_namespaced(KeyPath, Namespace, Default)
+    catch
+        error:config_not_found ->
+            Default
+    end;
+get_namespaced_config(?global_ns, KeyPath, Default) ->
+    get_config(KeyPath, Default).
+
+-spec get_raw_config(config_key_path()) -> term().
 get_raw_config(KeyPath) ->
     emqx_config:get_raw(KeyPath).
 
--spec get_raw_config(emqx_utils_maps:config_key_path(), term()) -> term().
+-spec get_raw_namespaced_config(maybe_namespace(), config_key_path()) -> term().
+get_raw_namespaced_config(Namespace, KeyPath) when is_binary(Namespace) ->
+    emqx_config:get_raw_namespaced(KeyPath, Namespace);
+get_raw_namespaced_config(?global_ns, KeyPath) ->
+    emqx_config:get_raw(KeyPath).
+
+-spec get_raw_config(config_key_path(), term()) -> term().
 get_raw_config(KeyPath, Default) ->
     emqx_config:get_raw(KeyPath, Default).
 
--spec update_config(emqx_utils_maps:config_key_path(), emqx_config:update_request()) ->
+-spec get_raw_namespaced_config(namespace(), config_key_path(), _Default :: term()) -> term().
+get_raw_namespaced_config(Namespace, KeyPath, Default) when is_binary(Namespace) ->
+    emqx_config:get_raw_namespaced(KeyPath, Namespace, Default);
+get_raw_namespaced_config(?global_ns, KeyPath, Default) ->
+    emqx_config:get_raw(KeyPath, Default).
+
+-spec update_config(config_key_path(), emqx_config:update_request()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 update_config(KeyPath, UpdateReq) ->
-    update_config(KeyPath, UpdateReq, #{}).
+    update_config(KeyPath, UpdateReq, #{}, #{}).
 
 -spec update_config(
-    emqx_utils_maps:config_key_path(),
+    config_key_path(),
     emqx_config:update_request(),
     emqx_config:update_opts()
 ) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
-update_config([RootName | _] = KeyPath, UpdateReq, Opts) ->
+update_config(KeyPath, UpdateReq, Opts) ->
+    update_config(KeyPath, UpdateReq, Opts, #{}).
+
+-spec update_config(
+    config_key_path(),
+    emqx_config:update_request(),
+    emqx_config:update_opts(),
+    emqx_config:cluster_rpc_opts()
+) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
+update_config([RootName | _] = KeyPath, UpdateReq, Opts, ClusterRpcOpts) ->
+    Mod = emqx_config:get_schema_mod(RootName),
     emqx_config_handler:update_config(
-        emqx_config:get_schema_mod(RootName),
+        Mod,
         KeyPath,
-        {{update, UpdateReq}, Opts}
+        {{update, UpdateReq}, Opts},
+        ClusterRpcOpts
     ).
 
--spec remove_config(emqx_utils_maps:config_key_path()) ->
+-spec remove_config(config_key_path()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 remove_config(KeyPath) ->
-    remove_config(KeyPath, #{}).
+    remove_config(KeyPath, #{}, #{}).
 
--spec remove_config(emqx_utils_maps:config_key_path(), emqx_config:update_opts()) ->
+-spec remove_config(config_key_path(), emqx_config:update_opts()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
-remove_config([RootName | _] = KeyPath, Opts) ->
+remove_config([_RootName | _] = KeyPath, Opts) ->
+    remove_config(KeyPath, Opts, #{}).
+
+-spec remove_config(
+    config_key_path(), emqx_config:update_opts(), emqx_config:cluster_rpc_opts()
+) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
+remove_config([RootName | _] = KeyPath, Opts, ClusterRpcOpts) ->
     emqx_config_handler:update_config(
         emqx_config:get_schema_mod(RootName),
         KeyPath,
-        {remove, Opts}
+        {remove, Opts},
+        ClusterRpcOpts
     ).
 
--spec reset_config(emqx_utils_maps:config_key_path(), emqx_config:update_opts()) ->
+-spec reset_config(config_key_path(), emqx_config:update_opts()) ->
     {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 reset_config([RootName | SubKeys] = KeyPath, Opts) ->
+    reset_config([RootName | SubKeys] = KeyPath, Opts, #{}).
+
+-spec reset_config(
+    config_key_path(), emqx_config:update_opts(), emqx_config:cluster_rpc_opts()
+) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
+reset_config([RootName | SubKeys] = KeyPath, Opts, ClusterRpcOpts) ->
     case emqx_config:get_default_value(KeyPath) of
         {ok, Default} ->
             Mod = emqx_config:get_schema_mod(RootName),
@@ -235,7 +297,8 @@ reset_config([RootName | SubKeys] = KeyPath, Opts) ->
                     emqx_config_handler:update_config(
                         Mod,
                         KeyPath,
-                        {{update, Default}, Opts}
+                        {{update, Default}, Opts},
+                        ClusterRpcOpts
                     );
                 false ->
                     NewConf =
@@ -247,7 +310,8 @@ reset_config([RootName | SubKeys] = KeyPath, Opts) ->
                     emqx_config_handler:update_config(
                         Mod,
                         [RootName],
-                        {{update, NewConf}, Opts}
+                        {{update, NewConf}, Opts},
+                        ClusterRpcOpts
                     )
             end;
         {error, _} = Error ->

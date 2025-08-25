@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_banned_SUITE).
@@ -254,6 +242,58 @@ t_session_taken(_) ->
     {ok, #{}, [0]} = emqtt:unsubscribe(C3, Topic),
     ok = emqtt:disconnect(C3).
 
+t_full_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"full.csv">>))),
+    FullDatas = lists:sort([
+        {banned, {username, <<"u1">>}, <<"boot">>, <<"reason 2">>, 1635170027, 1761400427},
+        {banned, {clientid, <<"c1">>}, <<"boot">>, <<"reason 1">>, 1635170027, 1761400427}
+    ]),
+    ?assertMatch(FullDatas, lists:sort(get_banned_list())),
+
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"full2.csv">>))),
+    ?assertMatch(FullDatas, lists:sort(get_banned_list())),
+    ok.
+
+t_optional_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"optional.csv">>))),
+    Keys = lists:sort([{username, <<"u1">>}, {clientid, <<"c1">>}]),
+    ?assertMatch(Keys, lists:sort([element(2, Data) || Data <- get_banned_list()])),
+    ok.
+
+t_omitted_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"omitted.csv">>))),
+    Keys = lists:sort([{username, <<"u1">>}, {clientid, <<"c1">>}]),
+    ?assertMatch(Keys, lists:sort([element(2, Data) || Data <- get_banned_list()])),
+    ok.
+
+t_error_bootstrap_file(_) ->
+    emqx_banned:clear(),
+    ?assertEqual(
+        {error, enoent}, emqx_banned:init_from_csv(mk_bootstrap_file(<<"not_exists.csv">>))
+    ),
+    ?assertEqual(
+        ok, emqx_banned:init_from_csv(mk_bootstrap_file(<<"error.csv">>))
+    ),
+    Keys = [{clientid, <<"c1">>}],
+    ?assertMatch(Keys, [element(2, Data) || Data <- get_banned_list()]),
+    ok.
+
+t_until_expiry(_) ->
+    Who = #{<<"as">> => clientid, <<"who">> => <<"t_until_expiry">>},
+
+    {ok, Banned} = emqx_banned:parse(Who),
+    {ok, _} = emqx_banned:create(Banned),
+
+    [Data] = emqx_banned:look_up(Who),
+    ?assertEqual(Banned, Data),
+    ?assertMatch(#{until := infinity}, emqx_banned:format(Data)),
+
+    emqx_banned:clear(),
+    ok.
+
 receive_messages(Count) ->
     receive_messages(Count, []).
 receive_messages(0, Msgs) ->
@@ -269,3 +309,17 @@ receive_messages(Count, Msgs) ->
     after 1200 ->
         Msgs
     end.
+
+mk_bootstrap_file(File) ->
+    Dir = code:lib_dir(emqx),
+    filename:join([Dir, "test", "data", "banned", File]).
+
+get_banned_list() ->
+    Tabs = emqx_banned:tables(),
+    lists:foldl(
+        fun(Tab, Acc) ->
+            Acc ++ ets:tab2list(Tab)
+        end,
+        [],
+        Tabs
+    ).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_kafka_consumer_action_info).
@@ -30,14 +30,20 @@ connector_type_name() -> kafka_consumer.
 schema_module() -> emqx_bridge_kafka_consumer_schema.
 
 connector_action_config_to_bridge_v1_config(ConnectorConfig, ActionConfig) ->
-    V1Config1 = maps:remove(<<"connector">>, ActionConfig),
+    V1Config1 = maps:without(
+        [
+            <<"connector">>,
+            <<"created_at">>,
+            <<"last_modified_at">>
+        ],
+        ActionConfig
+    ),
     V1Config2 = emqx_utils_maps:deep_merge(ConnectorConfig, V1Config1),
     V1Config3 = maybe_fabricate_topic_mapping(V1Config2),
     {Params1, V1Config4} = maps:take(<<"parameters">>, V1Config3),
     TopLevelCfgKeys = [to_bin(K) || {K, _} <- emqx_bridge_kafka:fields(consumer_opts), K =/= kafka],
     TopLevelCfg = maps:with(TopLevelCfgKeys, Params1),
-    %% `topic' is v2-only
-    Params = maps:without([<<"topic">> | TopLevelCfgKeys], Params1),
+    Params = maps:with(v1_source_parameters(), Params1),
     V1Config5 = emqx_utils_maps:deep_merge(V1Config4, TopLevelCfg),
     V1Config = emqx_utils_maps:update_if_present(
         <<"resource_opts">>,
@@ -63,6 +69,14 @@ bridge_v1_config_to_action_config(BridgeV1Conf, ConnectorName) ->
 %%------------------------------------------------------------------------------------------
 %% Internal helper functions
 %%------------------------------------------------------------------------------------------
+
+v1_source_parameters() ->
+    [
+        <<"max_batch_bytes">>,
+        <<"max_rejoin_attempts">>,
+        <<"offset_commit_interval_seconds">>,
+        <<"offset_reset_policy">>
+    ].
 
 %% The new schema has a single kafka topic, so we take it from topic mapping when
 %% converting from v1.

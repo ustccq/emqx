@@ -1,22 +1,13 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -define(APP, emqx_rule_engine).
 
 -define(KV_TAB, '@rule_engine_db').
+
+-define(RES_SEP, <<":">>).
+-define(NS_SEG, <<"ns">>).
 
 -type option(T) :: T | undefined.
 
@@ -42,27 +33,9 @@
         func := builtin_action_func() | atom(),
         args => action_fun_args()
     }
-    | bridge_channel_id().
-
--type rule() ::
-    #{
-        id := rule_id(),
-        name := binary(),
-        sql := binary(),
-        actions := [action()],
-        enable := boolean(),
-        description => binary(),
-        %% epoch in millisecond precision
-        created_at := integer(),
-        %% epoch in millisecond precision
-        updated_at := integer(),
-        from := list(topic()),
-        is_foreach := boolean(),
-        fields := list(),
-        doeach := term(),
-        incase := term(),
-        conditions := tuple()
-    }.
+    | bridge_channel_id()
+    | {bridge_v2, emqx_bridge_v2:bridge_v2_type(), emqx_bridge_v2:bridge_v2_name()}
+    | {bridge, emqx_utils_maps:config_key(), emqx_utils_maps:config_key(), bridge_channel_id()}.
 
 %% Arithmetic operators
 -define(is_arith(Op),
@@ -124,5 +97,8 @@
     end)
 ).
 
--define(KEY_PATH, [rule_engine, rules]).
--define(RULE_PATH(RULE), [rule_engine, rules, RULE]).
+-define(ROOT_KEY, rule_engine).
+-define(ROOT_KEY_BIN, <<"rule_engine">>).
+-define(KEY_PATH, [?ROOT_KEY, rules]).
+-define(RULE_PATH(RULE), [?ROOT_KEY, rules, RULE]).
+-define(TAG, "RULE").

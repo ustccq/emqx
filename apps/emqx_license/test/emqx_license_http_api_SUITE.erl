@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_http_api_SUITE).
@@ -9,10 +9,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
-
-%%------------------------------------------------------------------------------
-%% CT boilerplate
-%%------------------------------------------------------------------------------
+-include_lib("emqx_license.hrl").
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
@@ -20,7 +17,7 @@ all() ->
 init_per_suite(Config) ->
     emqx_license_test_lib:mock_parser(),
     Setting = emqx_license_schema:default_setting(),
-    Key = emqx_license_test_lib:make_license(#{max_connections => "100"}),
+    Key = emqx_license_test_lib:make_license(#{max_sessions => "100"}),
     LicenseConf = maps:merge(#{key => Key}, Setting),
     Apps = emqx_cth_suite:start(
         [
@@ -45,12 +42,12 @@ end_per_suite(Config) ->
     emqx_license_test_lib:unmock_parser(),
     ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
 
-init_per_testcase(_TestCase, Config) ->
-    Config.
+init_per_testcase(Case, Config) ->
+    ?MODULE:Case({init, Config}).
 
-end_per_testcase(_TestCase, _Config) ->
-    ok = reset_license(),
-    ok.
+end_per_testcase(Case, Config) ->
+    ?MODULE:Case({'end', Config}),
+    ok = reset_license().
 
 %%------------------------------------------------------------------------------
 %% Helper fns
@@ -71,7 +68,7 @@ get_license() ->
     maps:from_list(emqx_license_checker:dump()).
 
 default_license() ->
-    emqx_license_test_lib:make_license(#{max_connections => "100"}).
+    emqx_license_test_lib:make_license(#{max_sessions => "100"}).
 
 reset_license() ->
     {ok, _} = emqx_license:update_key(default_license()),
@@ -82,7 +79,7 @@ reset_license() ->
 
 assert_untouched_license() ->
     ?assertMatch(
-        #{max_connections := 100},
+        #{max_sessions := 100},
         get_license()
     ).
 
@@ -90,26 +87,34 @@ assert_untouched_license() ->
 %% Testcases
 %%------------------------------------------------------------------------------
 
+t_license_info({init, Config}) ->
+    Config;
+t_license_info({'end', _Config}) ->
+    ok;
 t_license_info(_Config) ->
     Res = request(get, uri(["license"]), []),
     ?assertMatch({ok, 200, _}, Res),
     {ok, 200, Payload} = Res,
-    ?assertEqual(
+    ?assertMatch(
         #{
-            <<"customer">> => <<"Foo">>,
-            <<"customer_type">> => 10,
-            <<"deployment">> => <<"bar-deployment">>,
-            <<"email">> => <<"contact@foo.com">>,
-            <<"expiry">> => false,
-            <<"expiry_at">> => <<"2295-10-27">>,
-            <<"max_connections">> => 100,
-            <<"start_at">> => <<"2022-01-11">>,
-            <<"type">> => <<"trial">>
+            <<"customer">> := <<"Foo">>,
+            <<"customer_type">> := 11,
+            <<"deployment">> := <<"bar-deployment">>,
+            <<"email">> := <<"contact@foo.com">>,
+            <<"expiry">> := false,
+            <<"expiry_at">> := <<"2295-10-27">>,
+            <<"max_sessions">> := 100,
+            <<"start_at">> := <<"2022-01-11">>,
+            <<"type">> := <<"community">>
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
     ok.
 
+t_set_default_license({init, Config}) ->
+    Config;
+t_set_default_license({'end', _Config}) ->
+    ok;
 t_set_default_license(_Config) ->
     NewKey = <<"default">>,
     Res = request(
@@ -120,11 +125,11 @@ t_set_default_license(_Config) ->
     ?assertMatch({ok, 200, _}, Res),
     {ok, 200, Payload} = Res,
     %% assert that it's not the string "default" returned
-    ?assertMatch(#{<<"customer">> := _}, emqx_utils_json:decode(Payload, [return_maps])),
+    ?assertMatch(#{<<"customer">> := _}, emqx_utils_json:decode(Payload)),
     ok.
 
-t_license_upload_key_success(_Config) ->
-    NewKey = emqx_license_test_lib:make_license(#{max_connections => "999"}),
+t_set_evaluation_license({init, Config}) ->
+    NewKey = <<"evaluation">>,
     Res = request(
         post,
         uri(["license"]),
@@ -132,26 +137,68 @@ t_license_upload_key_success(_Config) ->
     ),
     ?assertMatch({ok, 200, _}, Res),
     {ok, 200, Payload} = Res,
+    ?assertMatch(#{<<"customer">> := _}, emqx_utils_json:decode(Payload)),
+    %% mock emqx:cluster_nodes/1 to return 2 nodes to test cluster mode
+    meck:new(emqx, [passthrough, no_history]),
+    meck:expect(emqx, cluster_nodes, fun(running) -> [node(), node()] end),
+    Config;
+t_set_evaluation_license({'end', _Config}) ->
+    meck:unload(emqx),
+    ok;
+t_set_evaluation_license(_Config) ->
+    %% do not allow setting to "default" license key or any community license key
+    Key1 = <<"default">>,
+    LType = integer_to_list(?COMMUNITY),
+    Key2 = emqx_license_test_lib:make_license(#{max_sessions => "100", license_type => LType}),
+    {ok, 400, Message1} = request(post, uri(["license"]), #{key => Key1}),
+    {ok, 400, Message2} = request(post, uri(["license"]), #{key => Key2}),
+    ?assertEqual(Message1, Message2),
     ?assertEqual(
         #{
-            <<"customer">> => <<"Foo">>,
-            <<"customer_type">> => 10,
-            <<"deployment">> => <<"bar-deployment">>,
-            <<"email">> => <<"contact@foo.com">>,
-            <<"expiry">> => false,
-            <<"expiry_at">> => <<"2295-10-27">>,
-            <<"max_connections">> => 999,
-            <<"start_at">> => <<"2022-01-11">>,
-            <<"type">> => <<"trial">>
+            <<"code">> => <<"BAD_REQUEST">>,
+            <<"message">> => <<"SINGLE_NODE_LICENSE">>
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Message1)
+    ),
+    ok.
+
+t_license_upload_key_success({init, Config}) ->
+    Config;
+t_license_upload_key_success({'end', _Config}) ->
+    ok;
+t_license_upload_key_success(_Config) ->
+    NewKey = emqx_license_test_lib:make_license(#{max_sessions => "999"}),
+    Res = request(
+        post,
+        uri(["license"]),
+        #{key => NewKey}
+    ),
+    ?assertMatch({ok, 200, _}, Res),
+    {ok, 200, Payload} = Res,
+    ?assertMatch(
+        #{
+            <<"customer">> := <<"Foo">>,
+            <<"customer_type">> := 11,
+            <<"deployment">> := <<"bar-deployment">>,
+            <<"email">> := <<"contact@foo.com">>,
+            <<"expiry">> := false,
+            <<"expiry_at">> := <<"2295-10-27">>,
+            <<"max_sessions">> := 999,
+            <<"start_at">> := <<"2022-01-11">>,
+            <<"type">> := <<"community">>
+        },
+        emqx_utils_json:decode(Payload)
     ),
     ?assertMatch(
-        #{max_connections := 999},
+        #{max_sessions := 999},
         get_license()
     ),
     ok.
 
+t_license_upload_key_bad_key({init, Config}) ->
+    Config;
+t_license_upload_key_bad_key({'end', _Config}) ->
+    ok;
 t_license_upload_key_bad_key(_Config) ->
     BadKey = <<"bad key">>,
     Res = request(
@@ -164,13 +211,17 @@ t_license_upload_key_bad_key(_Config) ->
     ?assertEqual(
         #{
             <<"code">> => <<"BAD_REQUEST">>,
-            <<"message">> => <<"Bad license key">>
+            <<"message">> => <<"Bad license key, see logs for more details">>
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
     assert_untouched_license(),
     ok.
 
+t_license_upload_key_not_json({init, Config}) ->
+    Config;
+t_license_upload_key_not_json({'end', _Config}) ->
+    ok;
 t_license_upload_key_not_json(_Config) ->
     Res = request(
         post,
@@ -184,11 +235,15 @@ t_license_upload_key_not_json(_Config) ->
             <<"code">> => <<"BAD_REQUEST">>,
             <<"message">> => <<"Invalid request params">>
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ),
     assert_untouched_license(),
     ok.
 
+t_license_setting({init, Config}) ->
+    Config;
+t_license_setting({'end', _Config}) ->
+    ok;
 t_license_setting(_Config) ->
     %% get
     GetRes = request(get, uri(["license", "setting"]), []),
@@ -232,20 +287,43 @@ t_license_setting(_Config) ->
     ),
     ok.
 
+t_license_setting_updated_from_cli({init, Config}) ->
+    Config;
+t_license_setting_updated_from_cli({'end', _Config}) ->
+    ok;
+t_license_setting_updated_from_cli(_Config) ->
+    %% update license from cli
+    LicenseValue = binary_to_list(
+        emqx_license_test_lib:make_license(#{max_sessions => "201"})
+    ),
+    _ = emqx_license_cli:license(["update", LicenseValue]),
+    ?assertMatch(#{<<"max_sessions">> := 201}, request_dump()),
+    ok.
+
+t_license_setting_bc({init, Config}) ->
+    Config;
+t_license_setting_bc({'end', _Config}) ->
+    ok;
 t_license_setting_bc(_Config) ->
     %% Create a BC license
     Key = emqx_license_test_lib:make_license(#{
         customer_type => "3",
-        max_connections => "33"
+        max_sessions => "33"
     }),
     Res = request(post, uri(["license"]), #{key => Key}),
     ?assertMatch({ok, 200, _}, Res),
     %% for bc customer, before setting dynamic limit,
-    %% the default limit is always 25, as if no license
-    ?assertMatch(#{<<"max_connections">> := 25}, request_dump()),
+    %% the default limit is ?DEFAULT_MAX_SESSIONS_CTYPE3
+    ?assertMatch(
+        #{
+            <<"max_connections">> := ?DEFAULT_MAX_SESSIONS_CTYPE3,
+            <<"max_sessions">> := ?DEFAULT_MAX_SESSIONS_CTYPE3
+        },
+        request_dump()
+    ),
     %% get
     GetRes = request(get, uri(["license", "setting"]), []),
-    %% aslo check that the settings return correctly
+    %% also check that the settings return correctly
     validate_setting(GetRes, <<"75%">>, <<"80%">>, 25),
     %% update
     Low = <<"50%">>,
@@ -259,12 +337,14 @@ t_license_setting_bc(_Config) ->
     %% assert it's changed to 26
     validate_setting(UpdateRes, Low, High, 26),
     ?assertMatch(#{<<"max_connections">> := 26}, request_dump()),
+    ?assertMatch(#{<<"max_sessions">> := 26}, request_dump()),
     ?assertEqual(26, emqx_config:get([license, dynamic_max_connections])),
     %% Try to set it beyond the limit, it's allowed, but no effect
     Settings2 = Settings#{<<"dynamic_max_connections">> => 99999},
     UpdateRes2 = request(put, uri(["license", "setting"]), Settings2),
     validate_setting(UpdateRes2, Low, High, 99999),
     ?assertMatch(#{<<"max_connections">> := 33}, request_dump()),
+    ?assertMatch(#{<<"max_sessions">> := 33}, request_dump()),
     ?assertEqual(99999, emqx_config:get([license, dynamic_max_connections])),
     ok.
 
@@ -280,7 +360,7 @@ validate_setting(Res, ExpectLow, ExpectHigh) ->
             <<"connection_low_watermark">> => ExpectLow,
             <<"connection_high_watermark">> => ExpectHigh
         },
-        emqx_utils_json:decode(Payload, [return_maps])
+        emqx_utils_json:decode(Payload)
     ).
 
 validate_setting(Res, ExpectLow, ExpectHigh, DynMax) ->
@@ -291,4 +371,4 @@ validate_setting(Res, ExpectLow, ExpectHigh, DynMax) ->
         <<"connection_high_watermark">> := ExpectHigh,
         <<"dynamic_max_connections">> := DynMax
     } =
-        emqx_utils_json:decode(Payload, [return_maps]).
+        emqx_utils_json:decode(Payload).

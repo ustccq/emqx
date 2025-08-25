@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_kafka_consumer_schema).
 
@@ -62,9 +62,7 @@ fields(source_parameters) ->
     Fields = lists:map(
         fun
             ({topic_mapping = Name, Sc}) ->
-                %% to please dialyzer...
                 Override = #{
-                    type => hocon_schema:field_schema(Sc, type),
                     required => false,
                     default => [],
                     validator => fun legacy_consumer_topic_mapping_validator/1,
@@ -90,10 +88,15 @@ fields(source_parameters) ->
                 binary(),
                 #{
                     required => false,
-                    validator => [
-                        emqx_resource_validator:not_empty("Group id must not be empty")
-                    ],
                     desc => ?DESC(group_id)
+                }
+            )},
+        {max_wait_time,
+            mk(
+                emqx_schema:timeout_duration_ms(),
+                #{
+                    default => <<"1s">>,
+                    desc => ?DESC("max_wait_time")
                 }
             )}
         | Fields
@@ -112,7 +115,7 @@ fields(Field) when
 %%=========================================
 fields("config_connector") ->
     emqx_connector_schema:common_fields() ++
-        emqx_bridge_kafka:kafka_connector_config_fields();
+        connector_config_fields();
 %%=========================================
 %% HTTP API fields: connector
 %%=========================================
@@ -124,7 +127,7 @@ fields(Field) when
     emqx_connector_schema:api_fields(
         Field,
         ?CONNECTOR_TYPE,
-        emqx_bridge_kafka:kafka_connector_config_fields()
+        connector_config_fields()
     ).
 
 desc("config_connector") ->
@@ -250,3 +253,20 @@ legacy_consumer_topic_mapping_validator(_TopicMapping = []) ->
     ok;
 legacy_consumer_topic_mapping_validator(TopicMapping = [_ | _]) ->
     emqx_bridge_kafka:consumer_topic_mapping_validator(TopicMapping).
+
+connector_config_fields() ->
+    lists:map(
+        fun
+            ({health_check_topic = Name, Sc}) ->
+                %% This field was accidentally added to the consumer schema because it was
+                %% added to the shared, v1 field in the shared schema module.
+                Override = #{
+                    deprecated => {since, "5.9.0"},
+                    importance => ?IMPORTANCE_HIDDEN
+                },
+                {Name, hocon_schema:override(Sc, Override)};
+            (FieldSchema) ->
+                FieldSchema
+        end,
+        emqx_bridge_kafka:kafka_connector_config_fields()
+    ).

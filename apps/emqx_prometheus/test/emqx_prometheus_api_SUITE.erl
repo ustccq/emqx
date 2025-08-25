@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_prometheus_api_SUITE).
@@ -21,6 +9,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx_prometheus/include/emqx_prometheus.hrl").
 
 %%--------------------------------------------------------------------
 %% Setups
@@ -32,21 +23,29 @@ all() ->
     ].
 
 groups() ->
+    LegacyTCs = legacy_config_test_cases(),
+    AllTCs = emqx_common_test_helpers:all(?MODULE),
     [
-        {new_config, [sequence], [t_stats_auth_api, t_stats_no_auth_api, t_prometheus_api]},
-        {legacy_config, [sequence], [t_stats_no_auth_api, t_legacy_prometheus_api]}
+        {new_config, [sequence], AllTCs -- LegacyTCs},
+        {legacy_config, [sequence], LegacyTCs}
     ].
+
+legacy_config_test_cases() ->
+    [t_stats_no_auth_api, t_legacy_prometheus_api].
 
 init_per_suite(Config) ->
     Apps = emqx_cth_suite:start(
-        [
+        lists:flatten([
             emqx,
             emqx_conf,
             emqx_management,
             {emqx_prometheus, #{start => false}},
             {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"},
-            {emqx_license, "license.key = default"}
-        ],
+            [
+                {emqx_license, "license.key = default"}
+             || emqx_release:edition() == ee
+            ]
+        ]),
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
     {ok, _} = emqx_common_test_http:create_default_app(),
@@ -81,7 +80,7 @@ t_legacy_prometheus_api(_) ->
     {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
 
     OldConf = emqx:get_raw_config([prometheus]),
-    Conf = emqx_utils_json:decode(Response, [return_maps]),
+    Conf = emqx_utils_json:decode(Response),
     %% Always return new config.
     ?assertMatch(
         #{
@@ -100,7 +99,7 @@ t_legacy_prometheus_api(_) ->
                     <<"enable">> := true,
                     <<"headers">> := #{<<"Authorization">> := <<"some-authz-tokens">>},
                     <<"interval">> := <<"1s">>,
-                    <<"job_name">> := <<"${name}~${host}">>,
+                    <<"job_name">> := <<"${cluster_name}~${name}~${host}">>,
                     <<"url">> := <<"http://127.0.0.1:9091">>
                 }
         },
@@ -119,7 +118,7 @@ t_legacy_prometheus_api(_) ->
     },
     {ok, Response2} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, NewConf),
 
-    Conf2 = emqx_utils_json:decode(Response2, [return_maps]),
+    Conf2 = emqx_utils_json:decode(Response2),
     ?assertEqual(NewConf, Conf2),
 
     EnvCollectors = env_collectors(),
@@ -176,7 +175,7 @@ t_prometheus_api(_) ->
     Auth = emqx_mgmt_api_test_util:auth_header_(),
     {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
 
-    Conf = emqx_utils_json:decode(Response, [return_maps]),
+    Conf = emqx_utils_json:decode(Response),
     ?assertMatch(
         #{
             <<"push_gateway">> := #{},
@@ -212,7 +211,7 @@ t_prometheus_api(_) ->
     },
     {ok, Response2} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, NewConf),
 
-    Conf2 = emqx_utils_json:decode(Response2, [return_maps]),
+    Conf2 = emqx_utils_json:decode(Response2),
     ?assertMatch(NewConf, Conf2),
 
     EnvCollectors = env_collectors(),
@@ -270,6 +269,67 @@ t_prometheus_api(_) ->
     ),
     ok.
 
+t_prometheus_auth_api_aggregated(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "auth?mode=all_nodes_aggregated"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+
+    %% Provide some predefined metrics
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate'),
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize'),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate', total_latency, 100
+    ),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize', total_latency, 100
+    ),
+
+    %% Pretend we have 3 nodes
+    meck:new(mria, [passthrough, no_history]),
+    meck:expect(mria, running_nodes, fun() -> [node(), node(), node()] end),
+
+    %% Get the same single observation duplicated across 3 nodes
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    ?assert(
+        lists:member(
+            "emqx_authn_latency_count{name=\"total_latency\"} 3",
+            string:split(Response, "\n", all)
+        )
+    ),
+    ?assert(
+        lists:member(
+            "emqx_authz_latency_count{name=\"total_latency\"} 3",
+            string:split(Response, "\n", all)
+        )
+    ),
+    meck:unload(mria),
+    ok.
+
+t_prometheus_auth_api(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "auth"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate'),
+    emqx_metrics_worker:reset_metrics(?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize'),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authenticate', total_latency, 100
+    ),
+    emqx_metrics_worker:observe_hist(
+        ?ACCESS_CONTROL_METRICS_WORKER, 'client.authorize', total_latency, 100
+    ),
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    ?assert(
+        lists:member(
+            "emqx_authn_latency_count{name=\"total_latency\"} 1",
+            string:split(Response, "\n", all)
+        )
+    ),
+    ?assert(
+        lists:member(
+            "emqx_authz_latency_count{name=\"total_latency\"} 1",
+            string:split(Response, "\n", all)
+        )
+    ),
+    ok.
+
 t_stats_no_auth_api(_) ->
     %% undefined is legacy prometheus
     case emqx:get_config([prometheus, enable_basic_auth], undefined) of
@@ -278,33 +338,230 @@ t_stats_no_auth_api(_) ->
         _ ->
             ok
     end,
-    emqx_dashboard_listener:regenerate_minirest_dispatch(),
-    Headers = accept_josn_header(),
+    #{started := Started} = emqx_dashboard:listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
+    Headers = accept_json_header(),
     request_stats(Headers, []).
 
 t_stats_auth_api(_) ->
     {ok, _} = emqx:update_config([prometheus, enable_basic_auth], true),
-    emqx_dashboard_listener:regenerate_minirest_dispatch(),
+    #{started := Started} = emqx_dashboard:listeners_status(),
+    ok = emqx_dashboard_dispatch:regenerate_dispatch(Started),
     Auth = emqx_mgmt_api_test_util:auth_header_(),
-    Headers = [Auth | accept_josn_header()],
+    Headers = [Auth | accept_json_header()],
     request_stats(Headers, Auth),
     ok.
 
-accept_josn_header() ->
+%% Simple smoke test for verifying reason code labels in `emqx_client_disconnected_reason'
+%% counter metric.
+t_listener_shutdown_count(_Config) ->
+    ClientId1 = <<"shutdown_count_test">>,
+    {ok, C1} = emqtt:start_link(#{clientid => ClientId1}),
+    {ok, _} = emqtt:connect(C1),
+    %% Takeover
+    unlink(C1),
+    {ok, C2} = emqtt:start_link(#{clientid => ClientId1}),
+    {ok, _} = emqtt:connect(C2),
+    %% Kick
+    unlink(C2),
+    ok = emqx_cm:kick_session(ClientId1),
+    %% Normal disconnect
+    ClientId2 = <<"shutdown_count_test2">>,
+    {ok, C3} = emqtt:start_link(#{clientid => ClientId2}),
+    {ok, _} = emqtt:connect(C3),
+    ok = emqtt:stop(C3),
+    %% Disconnect with reason code
+    {ok, C4} = emqtt:start_link(#{clientid => ClientId2}),
+    {ok, _} = emqtt:connect(C4),
+    ok = emqtt:disconnect(C4, ?RC_IMPLEMENTATION_SPECIFIC_ERROR),
+    OnlyDisconnectStats = fun(Stats0) ->
+        Stats = lists:filter(
+            fun
+                (#{<<"emqx_client_disconnected_reason">> := _}) ->
+                    true;
+                (_) ->
+                    false
+            end,
+            Stats0
+        ),
+        lists:sort(Stats)
+    end,
+    #{<<"client">> := JSONClientStatsNode} = get_stats(json, ?PROM_DATA_MODE__NODE),
+    ?assertEqual(
+        [
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"discarded">>
+            },
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"kicked">>
+            },
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"tcp_closed">>
+            }
+        ],
+        OnlyDisconnectStats(JSONClientStatsNode)
+    ),
+    #{<<"client">> := JSONClientStatsAgg} = get_stats(json, ?PROM_DATA_MODE__ALL_NODES_AGGREGATED),
+    ?assertEqual(
+        [
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"discarded">>
+            },
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"kicked">>
+            },
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"tcp_closed">>
+            }
+        ],
+        OnlyDisconnectStats(JSONClientStatsAgg)
+    ),
+    #{<<"client">> := JSONClientStatsUnagg} = get_stats(
+        json, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED
+    ),
+    NodeBin = atom_to_binary(node()),
+    ?assertEqual(
+        [
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"node">> => NodeBin,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"discarded">>
+            },
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"node">> => NodeBin,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"kicked">>
+            },
+            #{
+                <<"emqx_client_disconnected_reason">> => 1,
+                <<"node">> => NodeBin,
+                <<"listener_type">> => <<"tcp">>,
+                <<"listener_name">> => <<"default">>,
+                <<"reason">> => <<"tcp_closed">>
+            }
+        ],
+        OnlyDisconnectStats(JSONClientStatsUnagg)
+    ),
+    AssertExpectedLines = fun(ExpectedLines, Output) ->
+        lists:foreach(
+            fun(ExpectedLine) ->
+                ?assertEqual(
+                    match,
+                    re:run(Output, ExpectedLine, [global, {capture, none}]),
+                    #{
+                        expected => ExpectedLine,
+                        output => string:split(Output, <<"\n">>, all)
+                    }
+                )
+            end,
+            ExpectedLines
+        )
+    end,
+    %% Verify that disabling unrelated listener does not affect anything.
+    ok = emqx_listeners:stop_listener('ssl:default'),
+    PromClientStatsNode = get_stats(prometheus, ?PROM_DATA_MODE__NODE),
+    ExpectedLines1 = [
+        iolist_to_binary(
+            io_lib:format(
+                "emqx_client_disconnected_reason{"
+                "listener_type=\"tcp\",listener_name=\"default\","
+                "reason=\"~s\"} ~b",
+                [Reason, N]
+            )
+        )
+     || {Reason, N} <- [
+            {"discarded", 1},
+            {"kicked", 1},
+            {"tcp_closed", 1}
+        ]
+    ],
+    AssertExpectedLines(ExpectedLines1, PromClientStatsNode),
+    PromClientStatsAgg = get_stats(prometheus, ?PROM_DATA_MODE__ALL_NODES_AGGREGATED),
+    AssertExpectedLines(ExpectedLines1, PromClientStatsAgg),
+    PromClientStatsUnagg = get_stats(prometheus, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED),
+    ExpectedLines2 = [
+        iolist_to_binary(
+            io_lib:format(
+                "emqx_client_disconnected_reason{"
+                "node=\"~s\",listener_type=\"tcp\",listener_name=\"default\","
+                "reason=\"~s\"} ~b",
+                [NodeBin, Reason, N]
+            )
+        )
+     || {Reason, N} <- [
+            {"discarded", 1},
+            {"kicked", 1},
+            {"tcp_closed", 1}
+        ]
+    ],
+    AssertExpectedLines(ExpectedLines2, PromClientStatsUnagg),
+    ok.
+
+t_latency_metrics(_) ->
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
+    Conf = emqx_utils_json:decode(Response, [return_maps]),
+
+    NewConf = Conf#{
+        <<"latency_buckets">> => <<"13ms, 123s">>
+    },
+    {ok, _} = emqx_mgmt_api_test_util:request_api(put, Path, "", Auth, NewConf),
+
+    lists:foreach(
+        fun(Id) ->
+            Hists = emqx_metrics_worker:get_hists(?ACCESS_CONTROL_METRICS_WORKER, Id),
+            lists:foreach(
+                fun({_Name, Value}) ->
+                    ?assertMatch(
+                        #{bucket_counts := [{13, 0}, {123000, 0}, {infinity, 0}]},
+                        Value
+                    )
+                end,
+                maps:to_list(Hists)
+            )
+        end,
+        ['client.authenticate', 'client.authorize']
+    ).
+
+%%--------------------------------------------------------------------
+%% Helper functions
+%%--------------------------------------------------------------------
+
+accept_json_header() ->
     [{"accept", "application/json"}].
 
 request_stats(Headers, Auth) ->
     Path = emqx_mgmt_api_test_util:api_path(["prometheus", "stats"]),
     {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, "", Headers),
-    Data = emqx_utils_json:decode(Response, [return_maps]),
+    Data = emqx_utils_json:decode(Response),
     ?assertMatch(#{<<"client">> := _, <<"delivery">> := _}, Data),
     {ok, _} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth),
     ok = meck:expect(mria_rlog, backend, fun() -> rlog end),
     {ok, _} = emqx_mgmt_api_test_util:request_api(get, Path, "", Auth).
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% Internal Functions
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 env_collectors() ->
     do_env_collectors(application:get_env(prometheus, collectors, []), []).
@@ -318,3 +575,19 @@ do_env_collectors([Collector | Rest], Acc) when is_atom(Collector) ->
 
 all_collectors() ->
     emqx_prometheus_config:all_collectors().
+
+get_stats(Format, Mode) ->
+    Headers =
+        case Format of
+            json -> accept_json_header();
+            prometheus -> []
+        end,
+    QueryString = uri_string:compose_query([{"mode", atom_to_binary(Mode)}]),
+    Path = emqx_mgmt_api_test_util:api_path(["prometheus", "stats"]),
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(get, Path, QueryString, Headers),
+    case Format of
+        json ->
+            emqx_utils_json:decode(Response);
+        prometheus ->
+            Response
+    end.

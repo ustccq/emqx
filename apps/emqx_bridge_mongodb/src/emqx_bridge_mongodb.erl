@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_mongodb).
 
@@ -100,8 +100,10 @@ fields(mongodb_action) ->
     );
 fields(action_parameters) ->
     [
-        {collection, mk(binary(), #{desc => ?DESC("collection"), default => <<"mqtt">>})},
-        {payload_template, mk(binary(), #{required => false, desc => ?DESC("payload_template")})}
+        {collection,
+            mk(emqx_schema:template(), #{desc => ?DESC("collection"), default => <<"mqtt">>})},
+        {payload_template,
+            mk(emqx_schema:template(), #{required => false, desc => ?DESC("payload_template")})}
     ];
 fields(connector_resource_opts) ->
     emqx_connector_schema:resource_opts_fields();

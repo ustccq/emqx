@@ -1,15 +1,17 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_mysql_connector).
 
 -behaviour(emqx_resource).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 %% `emqx_resource' API
 -export([
     on_remove_channel/3,
+    resource_type/0,
     callback_mode/0,
     on_add_channel/4,
     on_batch_query/3,
@@ -21,11 +23,42 @@
     on_stop/2
 ]).
 
+-export_type([connector_state/0]).
+
+%%========================================================================================
+%% Type definitiions
+%%========================================================================================
+
+-type connector_state() :: #{
+    connector_state := emqx_mysql:state(),
+    channels := #{action_resource_id() => map()}
+}.
+
 %%========================================================================================
 %% `emqx_resource' API
 %%========================================================================================
+resource_type() -> emqx_mysql:resource_type().
 
 callback_mode() -> emqx_mysql:callback_mode().
+
+-spec on_start(binary(), hocon:config()) ->
+    {ok, connector_state()} | {error, _}.
+on_start(InstanceId, Config) ->
+    case emqx_mysql:on_start(InstanceId, Config) of
+        {ok, ConnectorState} ->
+            State = #{
+                connector_state => ConnectorState,
+                channels => #{}
+            },
+            {ok, State};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+on_stop(InstanceId, _State = #{connector_state := ConnectorState}) ->
+    ok = emqx_mysql:on_stop(InstanceId, ConnectorState),
+    ?tp(mysql_connector_stopped, #{instance_id => InstanceId}),
+    ok.
 
 on_add_channel(
     _InstanceId,
@@ -49,7 +82,7 @@ on_add_channel(
                     {error, {prepare_statement, Context}};
                 {error, undefined_table} ->
                     {error, {unhealthy_target, <<"Undefined table">>}};
-                _ ->
+                ok ->
                     State = State0#{
                         channels => maps:put(ChannelId, ChannelConfig, Channels),
                         connector_state => ConnectorState
@@ -63,36 +96,16 @@ on_add_channel(
 on_get_channel_status(_InstanceId, ChannelId, #{channels := Channels}) ->
     case maps:get(ChannelId, Channels) of
         #{prepares := ok} ->
-            connected;
+            ?status_connected;
         #{prepares := {error, _}} ->
-            connecting
+            ?status_connecting
     end.
 
 on_get_channels(InstanceId) ->
     emqx_bridge_v2:get_channels_for_connector(InstanceId).
 
-on_get_status(InstanceId, #{channels := Channels0, connector_state := ConnectorState} = State0) ->
-    case emqx_mysql:on_get_status(InstanceId, ConnectorState) of
-        WithState when is_tuple(WithState) ->
-            NewConnectorState = element(2, WithState),
-            State = State0#{connector_state => NewConnectorState},
-            setelement(2, WithState, State);
-        connected ->
-            Channels =
-                maps:map(
-                    fun
-                        (_ChannelId, #{prepares := ok} = ChannelConfig) ->
-                            ChannelConfig;
-                        (_ChannelId, #{prepares := {error, _}} = ChannelConfig) ->
-                            set_prepares(ChannelConfig, ConnectorState)
-                    end,
-                    Channels0
-                ),
-            State = State0#{channels => Channels},
-            {connected, State};
-        Other ->
-            Other
-    end.
+on_get_status(InstanceId, #{connector_state := ConnectorState}) ->
+    emqx_mysql:on_get_status(InstanceId, ConnectorState).
 
 on_query(InstId, {TypeOrKey, SQLOrKey}, State) ->
     on_query(InstId, {TypeOrKey, SQLOrKey, [], default_timeout}, State);
@@ -128,41 +141,23 @@ on_batch_query(
     Result = emqx_mysql:on_batch_query(
         InstanceId,
         BatchRequest,
-        MergedState1
+        MergedState1,
+        ChannelConfig
     ),
     ?tp(mysql_connector_on_batch_query_return, #{instance_id => InstanceId, result => Result}),
     Result;
 on_batch_query(InstanceId, BatchRequest, _State = #{connector_state := ConnectorState}) ->
-    emqx_mysql:on_batch_query(InstanceId, BatchRequest, ConnectorState).
+    emqx_mysql:on_batch_query(InstanceId, BatchRequest, ConnectorState, #{}).
 
 on_remove_channel(
     _InstanceId, #{channels := Channels, connector_state := ConnectorState} = State, ChannelId
 ) when is_map_key(ChannelId, Channels) ->
     ChannelConfig = maps:get(ChannelId, Channels),
-    emqx_mysql:unprepare_sql(maps:merge(ChannelConfig, ConnectorState)),
+    emqx_mysql:unprepare_sql(ChannelId, maps:merge(ChannelConfig, ConnectorState)),
     NewState = State#{channels => maps:remove(ChannelId, Channels)},
     {ok, NewState};
 on_remove_channel(_InstanceId, State, _ChannelId) ->
     {ok, State}.
-
--spec on_start(binary(), hocon:config()) ->
-    {ok, #{connector_state := emqx_mysql:state(), channels := map()}} | {error, _}.
-on_start(InstanceId, Config) ->
-    case emqx_mysql:on_start(InstanceId, Config) of
-        {ok, ConnectorState} ->
-            State = #{
-                connector_state => ConnectorState,
-                channels => #{}
-            },
-            {ok, State};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-on_stop(InstanceId, _State = #{connector_state := ConnectorState}) ->
-    ok = emqx_mysql:on_stop(InstanceId, ConnectorState),
-    ?tp(mysql_connector_stopped, #{instance_id => InstanceId}),
-    ok.
 
 %%========================================================================================
 %% Helper fns

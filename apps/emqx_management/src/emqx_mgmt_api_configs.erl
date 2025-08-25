@@ -1,23 +1,13 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_api_configs).
 
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
+
 -behaviour(minirest_api).
 
 -export([api_spec/0, namespace/0]).
@@ -29,7 +19,6 @@
     configs/3,
     get_full_config/0,
     global_zone_configs/3,
-    limiter/3,
     get_raw_config/1
 ]).
 -export([request_config/3]).
@@ -40,22 +29,14 @@
 -define(OPTS, #{rawconf_with_defaults => true, override_to => cluster}).
 -define(TAGS, ["Configs"]).
 
--if(?EMQX_RELEASE_EDITION == ee).
--define(ROOT_KEYS_EE, [
-    <<"file_transfer">>
-]).
--else.
--define(ROOT_KEYS_EE, []).
--endif.
-
 -define(ROOT_KEYS, [
     <<"dashboard">>,
     <<"alarm">>,
     <<"sys_topics">>,
     <<"sysmon">>,
     <<"log">>,
-    <<"broker">>
-    | ?ROOT_KEYS_EE
+    <<"broker">>,
+    <<"file_transfer">>
 ]).
 
 %% erlfmt-ignore
@@ -93,8 +74,7 @@ paths() ->
     [
         "/configs",
         "/configs_reset/:rootname",
-        "/configs/global_zone",
-        "/configs/limiter"
+        "/configs/global_zone"
     ] ++
         lists:map(fun({Name, _Type}) -> ?PREFIX ++ binary_to_list(Name) end, config_list()).
 
@@ -218,30 +198,6 @@ schema("/configs/global_zone") ->
             }
         }
     };
-schema("/configs/limiter") ->
-    #{
-        'operationId' => limiter,
-        get => #{
-            tags => ?TAGS,
-            hidden => true,
-            description => ?DESC(get_node_level_limiter_configs),
-            responses => #{
-                200 => hoconsc:mk(hoconsc:ref(emqx_limiter_schema, limiter)),
-                404 => emqx_dashboard_swagger:error_codes(['NOT_FOUND'], <<"config not found">>)
-            }
-        },
-        put => #{
-            tags => ?TAGS,
-            hidden => true,
-            description => ?DESC(update_node_level_limiter_configs),
-            'requestBody' => hoconsc:mk(hoconsc:ref(emqx_limiter_schema, limiter)),
-            responses => #{
-                200 => hoconsc:mk(hoconsc:ref(emqx_limiter_schema, limiter)),
-                400 => emqx_dashboard_swagger:error_codes(['UPDATE_FAILED']),
-                403 => emqx_dashboard_swagger:error_codes(['UPDATE_FAILED'])
-            }
-        }
-    };
 schema(Path) ->
     {RootKey, {_Root, Schema}} = find_schema(Path),
     GetDesc = iolist_to_binary([
@@ -314,15 +270,15 @@ global_zone_configs(get, _Params, _Req) ->
     {200, get_zones()};
 global_zone_configs(put, #{body := Body}, _Req) ->
     PrevZones = get_zones(),
-    Res =
+    {Res, Error} =
         maps:fold(
-            fun(Path, Value, Acc) ->
+            fun(Path, Value, {Acc, Error}) ->
                 PrevValue = maps:get(Path, PrevZones),
                 case Value =/= PrevValue of
                     true ->
                         case emqx_conf:update([Path], Value, ?OPTS) of
                             {ok, #{raw_config := RawConf}} ->
-                                Acc#{Path => RawConf};
+                                {Acc#{Path => RawConf}, Error};
                             {error, Reason} ->
                                 ?SLOG(error, #{
                                     msg => "update_global_zone_failed",
@@ -330,18 +286,18 @@ global_zone_configs(put, #{body := Body}, _Req) ->
                                     path => Path,
                                     value => Value
                                 }),
-                                Acc
+                                {Acc, Error#{Path => Reason}}
                         end;
                     false ->
-                        Acc#{Path => Value}
+                        {Acc#{Path => Value}, Error}
                 end
             end,
-            #{},
+            {#{}, #{}},
             Body
         ),
     case maps:size(Res) =:= maps:size(Body) of
         true -> {200, Res};
-        false -> {400, #{code => 'UPDATE_FAILED'}}
+        false -> {400, #{code => 'UPDATE_FAILED', message => ?ERR_MSG(Error)}}
     end.
 
 config_reset(post, _Params, Req) ->
@@ -364,17 +320,18 @@ configs(get, #{query_string := QueryStr, headers := Headers}, _Req) ->
         {error, _} = Error -> {400, #{code => 'INVALID_ACCEPT', message => ?ERR_MSG(Error)}}
     end;
 configs(put, #{body := Conf, query_string := #{<<"mode">> := Mode} = QS}, _Req) ->
-    IngnoreReadonly = maps:get(<<"ignore_readonly">>, QS, false),
+    %% Note: currently, this API is available only for global namespace.
+    IgnoreReadonly = maps:get(<<"ignore_readonly">>, QS, false),
     case
-        emqx_conf_cli:load_config(Conf, #{
-            mode => Mode, log => none, ignore_readonly => IngnoreReadonly
+        emqx_conf_cli:load_config(?global_ns, Conf, #{
+            mode => Mode, log => none, ignore_readonly => IgnoreReadonly
         })
     of
         ok ->
             {200};
         %% bad hocon format
         {error, Errors} ->
-            Msg = emqx_logger_jsonfmt:best_effort_json_obj(#{errors => Errors}),
+            Msg = emqx_utils_json:best_effort_json_obj(#{errors => Errors}),
             {400, #{<<"content-type">> => <<"text/plain">>}, Msg}
     end.
 
@@ -428,31 +385,15 @@ get_configs_v2(QueryStr) ->
     Conf =
         case maps:find(<<"key">>, QueryStr) of
             error ->
-                emqx_conf_proto_v3:get_hocon_config(Node);
+                emqx_conf_proto_v5:get_hocon_config(Node, ?global_ns);
             {ok, Key} ->
-                emqx_conf_proto_v3:get_hocon_config(Node, atom_to_binary(Key))
+                emqx_conf_proto_v5:get_hocon_config(Node, ?global_ns, atom_to_binary(Key))
         end,
     {
         200,
         #{<<"content-type">> => <<"text/plain">>},
         iolist_to_binary(hocon_pp:do(Conf, #{}))
     }.
-
-limiter(get, _Params, _Req) ->
-    {200, format_limiter_config(get_raw_config(limiter))};
-limiter(put, #{body := NewConf}, _Req) ->
-    case emqx_conf:update([limiter], NewConf, ?OPTS) of
-        {ok, #{raw_config := RawConf}} ->
-            {200, format_limiter_config(RawConf)};
-        {error, {permission_denied, Reason}} ->
-            {403, #{code => 'UPDATE_FAILED', message => Reason}};
-        {error, Reason} ->
-            {400, #{code => 'UPDATE_FAILED', message => ?ERR_MSG(Reason)}}
-    end.
-
-format_limiter_config(RawConf) ->
-    Shorts = lists:map(fun erlang:atom_to_binary/1, emqx_limiter_schema:short_paths()),
-    maps:with(Shorts, RawConf).
 
 conf_path_reset(Req) ->
     <<"/api/v5", ?PREFIX_RESET, Path/binary>> = cowboy_req:path(Req),

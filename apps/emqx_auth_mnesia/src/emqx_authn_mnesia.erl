@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mnesia).
@@ -102,7 +90,7 @@ init_tables() ->
 %% Data backup
 %%------------------------------------------------------------------------------
 
-backup_tables() -> [?TAB].
+backup_tables() -> {<<"builtin_authn">>, [?TAB]}.
 
 %%------------------------------------------------------------------------------
 %% APIs
@@ -116,7 +104,7 @@ create(
         user_id_type := Type,
         password_hash_algorithm := Algorithm,
         user_group := UserGroup
-    }
+    } = Config
 ) ->
     ok = emqx_authn_password_hashing:init(Algorithm),
     State = #{
@@ -124,6 +112,7 @@ create(
         user_id_type => Type,
         password_hash_algorithm => Algorithm
     },
+    ok = boostrap_user_from_file(Config, State),
     {ok, State}.
 
 update(Config, _State) ->
@@ -170,66 +159,52 @@ do_destroy(UserGroup) ->
         mnesia:select(?TAB, group_match_spec(UserGroup), write)
     ).
 
-import_users({PasswordType, Filename, FileData}, State) ->
+import_users(ImportSource, State) ->
+    import_users(ImportSource, State, #{override => true}).
+
+import_users({PasswordType, Filename, FileData}, State, Opts) ->
     Convertor = convertor(PasswordType, State),
-    try
-        {_NewUsersCnt, Users} = parse_import_users(Filename, FileData, Convertor),
-        case length(Users) > 0 andalso do_import_users(Users) of
-            false ->
-                error(empty_users);
-            ok ->
-                ok;
-            {error, Reason} ->
-                _ = do_clean_imported_users(Users),
-                error(Reason)
-        end
+    try parse_import_users(Filename, FileData, Convertor) of
+        {_NewUsersCnt, Users} ->
+            case do_import_users(Users, Opts#{filename => Filename}) of
+                {ok, Result} ->
+                    {ok, Result};
+                %% Do not log empty user entries.
+                %% The default etc/auth-built-in-db.csv file contains an empty user entry.
+                {error, empty_users} ->
+                    {error, empty_users}
+            end
     catch
-        error:Reason1:Stk ->
+        error:Reason:Stk ->
             ?SLOG(
                 warning,
                 #{
-                    msg => "import_users_failed",
-                    reason => Reason1,
+                    msg => "parse_authn_users_failed",
+                    reason => Reason,
                     type => PasswordType,
                     filename => Filename,
                     stacktrace => Stk
                 }
             ),
-            {error, Reason1}
+            {error, Reason}
     end.
 
-do_import_users(Users) ->
-    trans(
-        fun() ->
-            lists:foreach(
-                fun(
-                    #{
-                        <<"user_group">> := UserGroup,
-                        <<"user_id">> := UserID,
-                        <<"password_hash">> := PasswordHash,
-                        <<"salt">> := Salt,
-                        <<"is_superuser">> := IsSuperuser
-                    }
-                ) ->
-                    insert_user(UserGroup, UserID, PasswordHash, Salt, IsSuperuser)
-                end,
-                Users
-            )
-        end
-    ).
-
-do_clean_imported_users(Users) ->
-    lists:foreach(
-        fun(
-            #{
-                <<"user_group">> := UserGroup,
-                <<"user_id">> := UserID
-            }
-        ) ->
-            mria:dirty_delete(?TAB, {UserGroup, UserID})
-        end,
-        Users
-    ).
+do_import_users([], _Opts) ->
+    {error, empty_users};
+do_import_users(Users, Opts) ->
+    Fun = fun() ->
+        lists:foldl(
+            fun(User, Acc) ->
+                Return = insert_user(User, Opts),
+                N = maps:get(Return, Acc, 0),
+                maps:put(Return, N + 1, Acc)
+            end,
+            #{success => 0, skipped => 0, override => 0, failed => 0},
+            Users
+        )
+    end,
+    Res = trans(Fun),
+    {ok, Res#{total => length(Users)}}.
 
 add_user(
     UserInfo,
@@ -246,7 +221,7 @@ do_add_user(
 ) ->
     case mnesia:read(?TAB, DBUserID, write) of
         [] ->
-            insert_user(UserInfoRecord),
+            ok = insert_user(UserInfoRecord),
             {ok, #{user_id => UserID, is_superuser => IsSuperuser}};
         [_] ->
             {error, already_exist}
@@ -286,7 +261,7 @@ do_update_user(
             {error, not_found};
         [#user_info{} = UserInfoRecord] ->
             NUserInfoRecord = update_user_record(UserInfoRecord, FieldsToUpdate),
-            insert_user(NUserInfoRecord),
+            ok = insert_user(NUserInfoRecord),
             {ok, #{user_id => UserID, is_superuser => NUserInfoRecord#user_info.is_superuser}}
     end.
 
@@ -337,9 +312,43 @@ run_fuzzy_filter(
 %% Internal functions
 %%------------------------------------------------------------------------------
 
-insert_user(UserGroup, UserID, PasswordHash, Salt, IsSuperuser) ->
-    UserInfoRecord = user_info_record(UserGroup, UserID, PasswordHash, Salt, IsSuperuser),
-    insert_user(UserInfoRecord).
+-spec insert_user(map(), map()) -> success | skipped | override | failed.
+insert_user(User, Opts) ->
+    #{
+        <<"user_group">> := UserGroup,
+        <<"user_id">> := UserID,
+        <<"password_hash">> := PasswordHash,
+        <<"salt">> := Salt,
+        <<"is_superuser">> := IsSuperuser
+    } = User,
+    UserInfoRecord =
+        #user_info{user_id = DBUserID} =
+        user_info_record(UserGroup, UserID, PasswordHash, Salt, IsSuperuser),
+    case mnesia:read(?TAB, DBUserID, write) of
+        [] ->
+            ok = insert_user(UserInfoRecord),
+            success;
+        [UserInfoRecord] ->
+            skipped;
+        [_] ->
+            LogF = fun(Msg) ->
+                ?SLOG(warning, #{
+                    msg => Msg,
+                    user_id => UserID,
+                    group_id => UserGroup,
+                    bootstrap_file => maps:get(filename, Opts)
+                })
+            end,
+            case maps:get(override, Opts, false) of
+                true ->
+                    ok = insert_user(UserInfoRecord),
+                    LogF("override_an_exists_userid_into_authentication_database_ok"),
+                    override;
+                false ->
+                    LogF("import_an_exists_userid_into_authentication_database_failed"),
+                    failed
+            end
+    end.
 
 insert_user(#user_info{} = UserInfoRecord) ->
     mnesia:write(?TAB, UserInfoRecord, write).
@@ -479,7 +488,7 @@ reader_fn(Filename0, Data) ->
     case filename:extension(to_binary(Filename0)) of
         <<".json">> ->
             %% Example: data/user-credentials.json
-            case emqx_utils_json:safe_decode(Data, [return_maps]) of
+            case emqx_utils_json:safe_decode(Data) of
                 {ok, List} when is_list(List) ->
                     emqx_utils_stream:list(List);
                 {ok, _} ->
@@ -488,7 +497,7 @@ reader_fn(Filename0, Data) ->
                     error(Reason)
             end;
         <<".csv">> ->
-            %% Example: data/user-credentials.csv
+            %% Example: etc/auth-built-in-db-bootstrap.csv
             emqx_utils_stream:csv(Data);
         <<>> ->
             error(unknown_file_format);
@@ -531,3 +540,24 @@ find_password_hash(_, _, _) ->
 is_superuser(#{<<"is_superuser">> := <<"true">>}) -> true;
 is_superuser(#{<<"is_superuser">> := true}) -> true;
 is_superuser(_) -> false.
+
+boostrap_user_from_file(Config, State) ->
+    case maps:get(bootstrap_file, Config, <<>>) of
+        <<>> ->
+            ok;
+        FileName0 ->
+            #{bootstrap_type := Type} = Config,
+            FileName = emqx_schema:naive_env_interpolation(FileName0),
+            case file:read_file(FileName) of
+                {ok, FileData} ->
+                    _ = import_users({Type, FileName, FileData}, State, #{override => false}),
+                    ok;
+                {error, Reason} ->
+                    ?SLOG(warning, #{
+                        msg => "boostrap_authn_built_in_database_failed",
+                        boostrap_file => FileName,
+                        boostrap_type => Type,
+                        reason => emqx_utils:explain_posix(Reason)
+                    })
+            end
+    end.

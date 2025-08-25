@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent).
@@ -9,7 +9,6 @@
 -include_lib("emqx/include/types.hrl").
 -include_lib("emqx/include/emqx_hooks.hrl").
 
--include_lib("stdlib/include/qlc.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -export([
@@ -24,10 +23,12 @@
     all_channels_count/0,
     session_count/0,
     session_count/1,
+    durable_session_count/0,
     evict_connections/1,
     evict_sessions/2,
     evict_sessions/3,
-    purge_sessions/1
+    purge_sessions/1,
+    purge_durable_sessions/1
 ]).
 
 %% RPC targets
@@ -60,7 +61,11 @@
 -export_type([server_reference/0, kind/0, options/0]).
 
 -define(CONN_MODULES, [
-    emqx_connection, emqx_ws_connection, emqx_quic_connection, emqx_eviction_agent_channel
+    emqx_connection,
+    emqx_socket_connection,
+    emqx_ws_connection,
+    emqx_quic_connection,
+    emqx_eviction_agent_channel
 ]).
 
 %%--------------------------------------------------------------------
@@ -120,7 +125,8 @@ enable_status() ->
 evict_connections(N) ->
     case enable_status() of
         {enabled, _Kind, ServerReference, _Options} ->
-            ok = do_evict_connections(N, ServerReference);
+            Stream = emqx_utils_stream:limit_length(N, connection_pid_stream()),
+            ok = do_evict_connections(Stream, ServerReference);
         disabled ->
             {error, disabled}
     end.
@@ -139,16 +145,30 @@ evict_sessions(N, Nodes, ConnState) when
 ->
     case enable_status() of
         {enabled, _Kind, _ServerReference, _Options} ->
-            ok = do_evict_sessions(N, Nodes, ConnState);
+            Stream = emqx_utils_stream:limit_length(N, channel_stream(ConnState)),
+            ok = do_evict_sessions(Nodes, Stream);
         disabled ->
             {error, disabled}
     end.
 
 -spec purge_sessions(non_neg_integer()) -> ok_or_error(disabled).
-purge_sessions(N) ->
+purge_sessions(N) when N > 0 ->
     case enable_status() of
         {enabled, _Kind, _ServerReference, _Options} ->
-            ok = do_purge_sessions(N);
+            Stream = emqx_utils_stream:limit_length(N, channel_stream(any)),
+            ok = do_purge_sessions(Stream);
+        disabled ->
+            {error, disabled}
+    end.
+
+-spec purge_durable_sessions(non_neg_integer()) -> ok | done | {error, disabled}.
+purge_durable_sessions(N) ->
+    PersistenceEnabled = emqx_persistent_message:is_persistence_enabled(),
+    case enable_status() of
+        {enabled, _Kind, _ServerReference, _Options} when PersistenceEnabled ->
+            do_purge_durable_sessions(N);
+        {enabled, _Kind, _ServerReference, _Options} ->
+            done;
         disabled ->
             {error, disabled}
     end.
@@ -253,25 +273,31 @@ stats() ->
         sessions => session_count()
     }.
 
-connection_table() ->
-    emqx_cm:live_connection_table(?CONN_MODULES).
+connection_stream() ->
+    emqx_cm:live_connection_stream(?CONN_MODULES).
 
 connection_count() ->
-    table_count(connection_table()).
+    stream_count(connection_stream()).
 
-channel_table(any) ->
-    qlc:q([
-        {ClientId, ConnInfo, ClientInfo}
-     || {ClientId, _, ConnInfo, ClientInfo} <-
-            emqx_cm:all_channels_table(?CONN_MODULES)
-    ]);
-channel_table(RequiredConnState) ->
-    qlc:q([
-        {ClientId, ConnInfo, ClientInfo}
-     || {ClientId, ConnState, ConnInfo, ClientInfo} <-
-            emqx_cm:all_channels_table(?CONN_MODULES),
-        RequiredConnState =:= ConnState
-    ]).
+channel_stream(any) ->
+    emqx_utils_stream:map(
+        fun({ClientId, ChanPid, _, ConnInfo, ClientInfo}) ->
+            {ClientId, ChanPid, ConnInfo, ClientInfo}
+        end,
+        emqx_cm:all_channels_stream(?CONN_MODULES)
+    );
+channel_stream(RequiredConnState) ->
+    WithRequiredConnStateStream =
+        emqx_utils_stream:filter(
+            fun({_, _, ConnState, _, _}) -> RequiredConnState =:= ConnState end,
+            emqx_cm:all_channels_stream(?CONN_MODULES)
+        ),
+    emqx_utils_stream:map(
+        fun({ClientId, ChanPid, _, ConnInfo, ClientInfo}) ->
+            {ClientId, ChanPid, ConnInfo, ClientInfo}
+        end,
+        WithRequiredConnStateStream
+    ).
 
 -spec all_channels_count() -> non_neg_integer().
 all_channels_count() ->
@@ -298,58 +324,82 @@ all_channels_count() ->
 
 -spec all_local_channels_count() -> non_neg_integer().
 all_local_channels_count() ->
-    table_count(channel_table(any)).
+    stream_count(channel_stream(any)).
 
 session_count() ->
-    session_count(any).
+    session_count(any) + durable_session_count().
+
+durable_session_count() ->
+    emqx_persistent_session_bookkeeper:get_disconnected_session_count().
 
 session_count(ConnState) ->
-    table_count(channel_table(ConnState)).
+    stream_count(channel_stream(ConnState)).
 
-table_count(QH) ->
-    qlc:fold(fun(_, Acc) -> Acc + 1 end, 0, QH).
+stream_count(Stream) ->
+    emqx_utils_stream:fold(fun(_, Acc) -> Acc + 1 end, 0, Stream).
 
-take_connections(N) ->
-    ChanQH = qlc:q([ChanPid || {_ClientId, ChanPid} <- connection_table()]),
-    ChanPidCursor = qlc:cursor(ChanQH),
-    ChanPids = qlc:next_answers(ChanPidCursor, N),
-    ok = qlc:delete_cursor(ChanPidCursor),
-    ChanPids.
+connection_pid_stream() ->
+    connection_stream().
 
-take_channels(N) ->
-    QH = qlc:q([
-        {ClientId, ConnInfo, ClientInfo}
-     || {ClientId, _, ConnInfo, ClientInfo} <-
-            emqx_cm:all_channels_table(?CONN_MODULES)
-    ]),
-    ChanPidCursor = qlc:cursor(QH),
-    Channels = qlc:next_answers(ChanPidCursor, N),
-    ok = qlc:delete_cursor(ChanPidCursor),
-    Channels.
-
-take_channels(N, ConnState) ->
-    ChanPidCursor = qlc:cursor(channel_table(ConnState)),
-    Channels = qlc:next_answers(ChanPidCursor, N),
-    ok = qlc:delete_cursor(ChanPidCursor),
-    Channels.
-
-do_evict_connections(N, ServerReference) when N > 0 ->
-    ChanPids = take_connections(N),
-    ok = lists:foreach(
+do_evict_connections(ChanPidStream, ServerReference) ->
+    ok = emqx_utils_stream:foreach(
         fun(ChanPid) ->
             disconnect_channel(ChanPid, ServerReference)
         end,
-        ChanPids
+        ChanPidStream
     ).
 
-do_evict_sessions(N, Nodes, ConnState) when N > 0 ->
-    Channels = take_channels(N, ConnState),
-    ok = lists:foreach(
-        fun({ClientId, ConnInfo, ClientInfo}) ->
-            evict_session_channel(Nodes, ClientId, ConnInfo, ClientInfo)
+do_evict_sessions(Nodes, ChannelStream) ->
+    ok = emqx_utils_stream:foreach(
+        fun({ClientId, ChanPid, ConnInfo, ClientInfo}) ->
+            case is_session_evictable(ClientId, ChanPid) of
+                true ->
+                    EvictResult = evict_session_channel(Nodes, ClientId, ConnInfo, ClientInfo),
+                    case EvictResult of
+                        {error, {badrpc, _Reason}} ->
+                            ok;
+                        {ok, _} ->
+                            %% Successful eviction means that the session
+                            %% received and replied to {takeover, 'end'} message
+                            %% and so is currently terminating.
+                            %% We unregister the channel immediately to avoid another attempt
+                            %% to evict the same session if `emqx_cm` is under load and is slow.
+                            emqx_cm:unregister_channel(ClientId, ChanPid);
+                        {error, _} ->
+                            %% We do not want to retry evicting the same session
+                            %% on the next iteration; something wrong with it anyway.
+                            discard_session_channel(ClientId, ChanPid)
+                    end;
+                false ->
+                    %% This should not happen normally.
+                    %% But session may slip from the `emqx_cm_registry` due to cluster errors.
+                    %% Such sessions cannot be evicted to another node.
+                    %% If we do nothing here, we may enter a dead loop of evicting the same session.
+                    %%
+                    %% But
+                    %% * In case of node evacuation, the session is doomed anyway.
+                    %% * In case of node rebalance, we evict disconnected sessions only,
+                    %% and a disconnected session slipped from `emqx_cm_registry` cannot be
+                    %% taken over by a reconnecting client, so it is already lost.
+                    %%
+                    %% Therefore, it is safe to just discard the session here.
+                    discard_session_channel(ClientId, ChanPid)
+            end
         end,
-        Channels
+        ChannelStream
     ).
+
+is_session_evictable(ClientId, ChanPid) ->
+    emqx_cm_registry:lookup_channels(ClientId) =/= [] andalso
+        is_process_alive(ChanPid).
+
+discard_session_channel(ClientId, ChanPid) ->
+    _ = emqx_cm:discard_session(ClientId, ChanPid),
+    %% We do not wait for the channel to be unregistered by emqx_cm
+    %% * If emqx_cm is under load, this may happen late. We do not want a second attempt
+    %%   to evict the same channel.
+    %% * If the channel is already dead, this will make cleanup.
+    emqx_cm:unregister_channel(ClientId, ChanPid).
 
 evict_session_channel(Nodes, ClientId, ConnInfo, ClientInfo) ->
     Node = select_random(Nodes),
@@ -374,7 +424,7 @@ evict_session_channel(Nodes, ClientId, ConnInfo, ClientInfo) ->
                     reason => Reason
                 }
             ),
-            {error, Reason};
+            {error, {badrpc, Reason}};
         {error, {no_session, _}} = Error ->
             ?SLOG(
                 warning,
@@ -446,14 +496,29 @@ disconnect_channel(ChanPid, ServerReference) ->
             'Server-Reference' => ServerReference
         }}.
 
-do_purge_sessions(N) when N > 0 ->
-    Channels = take_channels(N),
-    ok = lists:foreach(
-        fun({ClientId, _ConnInfo, _ClientInfo}) ->
-            emqx_cm:discard_session(ClientId)
+do_purge_sessions(Stream) ->
+    ok = emqx_utils_stream:foreach(
+        fun({ClientId, ChanPid, _ConnInfo, _ClientInfo}) ->
+            discard_session_channel(ClientId, ChanPid)
         end,
-        Channels
+        Stream
     ).
+
+do_purge_durable_sessions(N) when N > 0 ->
+    Iterator = emqx_persistent_session_ds_state:make_session_iterator(),
+    {Sessions, _NewIterator} = emqx_persistent_session_ds_state:session_iterator_next(Iterator, N),
+    lists:foreach(
+        fun({ClientId, _Metadata}) ->
+            emqx_persistent_session_ds:destroy_session(ClientId)
+        end,
+        Sessions
+    ),
+    case Sessions of
+        [] ->
+            done;
+        _ ->
+            ok
+    end.
 
 select_random(List) when length(List) > 0 ->
     lists:nth(rand:uniform(length(List)), List).

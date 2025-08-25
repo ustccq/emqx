@@ -1,34 +1,73 @@
 emqx_limiter_schema {
 
 max_conn_rate.desc:
-"""Maximum connection rate.<br/>
-This is used to limit the connection rate for this node.
-Once the limit is reached, new connections will be deferred or refused.<br/>
-For example:<br/>
-- <code>1000/s</code> :: Only accepts 1000 connections per second<br/>
-- <code>1000/10s</code> :: Only accepts 1000 connections every 10 seconds."""
+"""Limits how quickly this listener accepts connections, per each node.
+
+Once the limit is reached, EMQX will automatically close any new connections right after they’re accepted, effectively draining the queue of connections waiting to be accepted.
+
+For example:
+
+- `1000/s`: Only accepts 1000 connections per second.
+- `1000/10s`: Only accepts 1000 connections every 10 seconds."""
+
 max_conn_rate.label:
 """Maximum Connection Rate"""
 
+max_conn_burst.desc:
+"""Number of connections that can be accepted in a burst, on top of regular rate, per each node.
+
+For example: `10000/60m`: Once every 60 minutes, up to 10000 connections can be accepted in a short period of time."""
+
+max_conn_burst.label:
+"""Maximum Connection Burst"""
+
 messages_rate.desc:
-"""Messages publish rate.<br/>
-This is used to limit the inbound message numbers for this node.
-Once the limit is reached, the restricted client will slow down and even be hung for a while.<br/>
-For example:<br/>
-- <code>500/s</code> :: Only the first 500 messages are sent per second and other messages are buffered.<br/>
-- <code>500/10s</code> :: Only the first 500 messages are sent even 10 second and other messages are buffered."""
+"""Limits the number of messages a single client can send to the broker, per each node.
+
+Once the limit is reached, EMQX will drop QoS 0 messages and reject QoS 1 and QoS 2 messages
+with "Quota Exceeded" error code (0x97).
+
+For example:
+
+- `500/s`: Only 500 messages will be received per second, and the remaining messages will be dropped/rejected.
+- `500/10s`: Only 500 messages will be received every 10 seconds and the remaining messages will be dropped/rejected."""
+
 messages_rate.label:
 """Messages Publish Rate"""
 
+messages_burst.desc:
+"""Number of messages that can be sent in a burst, on top of regular `messages_rate`, per each node.
+
+For example: `10000/60m`: Once in 60 minutes, up to 10000 messages can be sent in a short period of time."""
+
+messages_burst.label:
+"""Messages Publish Burst"""
+
 bytes_rate.desc:
-"""Data publish rate.<br/>
-This is used to limit the inbound bytes rate for this node.
-Once the limit is reached, the restricted client will slow down and even be hung for a while.<br/>
-The unit of the bytes could be:KB MB GB.<br/>
-For example:<br/>
-- <code>500KB/s</code> :: Only the first 500 kilobytes are sent per second and other messages are buffered.<br/>
-- <code>500MB/10s</code> :: Only the first 500 megabytes are sent even 10 second and other messages are buffered."""
+"""Limits the number of bytes a single client can send to the broker, per each node.
+
+Once the limit is reached, EMQX will drop QoS 0 messages and reject QoS 1 and QoS 2 messages
+with "Quota Exceeded" error code (0x97).
+
+The unit of the bytes could be: B, KB, MB, GB.
+
+For example:
+
+- `500KB/s`: Only 500 kilobytes per second will be received, and the remaining bytes will be dropped/rejected.
+- `500MB/10s`: Only 500 megabytes will be received every 10 seconds, and the remaining bytes will be dropped/rejected."""
+
 bytes_rate.label:
 """Data Publish Rate"""
+
+bytes_burst.desc:
+"""Number of bytes that can be sent in a burst, on top of regular `bytes_rate`.
+
+For example: `100MB/60m`: Once every 60 minutes, up to 100 megabytes can be sent in a short period of time."""
+
+bytes_burst.label:
+"""Data Publish Burst"""
+
+mqtt.desc:
+"""MQTT related limiters."""
 
 }

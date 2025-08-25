@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_s3_aggreg_upload_SUITE).
@@ -10,6 +10,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/test_macros.hrl").
+-include_lib("emqx_utils/include/emqx_message.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(emqx_utils_conv, [bin/1]).
 
@@ -52,11 +54,10 @@ init_per_suite(Config) ->
             emqx_bridge,
             emqx_rule_engine,
             emqx_management,
-            {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
+            emqx_mgmt_api_test_util:emqx_dashboard()
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    {ok, _} = emqx_common_test_http:create_default_app(),
     [
         {apps, Apps},
         {proxy_host, ProxyHost},
@@ -105,6 +106,7 @@ connector_config(Name, _Config) ->
             <<"access_key_id">> => maps:get(<<"access_key_id">>, BaseConf),
             <<"secret_access_key">> => maps:get(<<"secret_access_key">>, BaseConf),
             <<"transport_options">> => #{
+                <<"ssl">> => #{<<"enable">> => false},
                 <<"connect_timeout">> => <<"500ms">>,
                 <<"request_timeout">> => <<"1s">>,
                 <<"pool_size">> => 4,
@@ -156,14 +158,60 @@ t_create_via_http(Config) ->
 t_on_get_status(Config) ->
     emqx_bridge_v2_testlib:t_on_get_status(Config, #{}).
 
-t_invalid_config(Config) ->
+t_create_invalid_config(Config) ->
     ?assertMatch(
         {error,
             {_Status, _, #{
                 <<"code">> := <<"BAD_REQUEST">>,
-                <<"message">> := #{<<"kind">> := <<"validation_error">>}
+                <<"message">> := #{
+                    <<"kind">> := <<"validation_error">>,
+                    <<"reason">> := <<"Inconsistent 'min_part_size'", _/bytes>>
+                }
             }}},
         emqx_bridge_v2_testlib:create_bridge_api(
+            Config,
+            _Overrides = #{
+                <<"parameters">> => #{
+                    <<"min_part_size">> => <<"5GB">>,
+                    <<"max_part_size">> => <<"100MB">>
+                }
+            }
+        )
+    ).
+
+t_create_invalid_config_key_template(Config) ->
+    ?assertMatch(
+        {error,
+            {_Status, _, #{
+                <<"code">> := <<"BAD_REQUEST">>,
+                <<"message">> := #{
+                    <<"kind">> := <<"validation_error">>,
+                    <<"reason">> := <<"Template placeholders are disallowed:", _/bytes>>,
+                    <<"path">> := <<"root.parameters.key">>
+                }
+            }}},
+        emqx_bridge_v2_testlib:create_bridge_api(
+            Config,
+            _Overrides = #{
+                <<"parameters">> => #{
+                    <<"key">> => <<"${action}/${foo}:${bar.rfc3339}">>
+                }
+            }
+        )
+    ).
+
+t_update_invalid_config(Config) ->
+    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge(Config)),
+    ?assertMatch(
+        {error,
+            {_Status, _, #{
+                <<"code">> := <<"BAD_REQUEST">>,
+                <<"message">> := #{
+                    <<"kind">> := <<"validation_error">>,
+                    <<"reason">> := <<"Inconsistent 'min_part_size'", _/bytes>>
+                }
+            }}},
+        emqx_bridge_v2_testlib:update_bridge_api(
             Config,
             _Overrides = #{
                 <<"parameters">> => #{
@@ -206,11 +254,73 @@ t_aggreg_upload(Config) ->
     ?assertMatch(
         {ok, [
             ?CONF_COLUMN_ORDER(_),
-            [TS, <<"C1">>, T1, P1, <<>> | _],
-            [TS, <<"C2">>, T2, P2, <<>> | _],
-            [TS, <<"C3">>, T3, P3, <<>> | _]
+            [_TS1, <<"C1">>, T1, P1, <<>> | _],
+            [_TS2, <<"C2">>, T2, P2, <<>> | _],
+            [_TS3, <<"C3">>, T3, P3, <<>> | _]
         ]},
         erl_csv:decode(Content)
+    ).
+
+%% Smoke test for using JSON Lines container type.
+t_aggreg_upload_json_lines(Config0) ->
+    Bucket = ?config(s3_bucket, Config0),
+    BridgeName = ?config(bridge_name, Config0),
+    AggregId = aggreg_id(BridgeName),
+    BridgeNameString = unicode:characters_to_list(BridgeName),
+    NodeString = atom_to_list(node()),
+    Config = emqx_bridge_v2_testlib:proplist_update(Config0, bridge_config, fun(Old) ->
+        Cfg = emqx_utils_maps:deep_put(
+            [<<"parameters">>, <<"container">>, <<"type">>],
+            Old,
+            <<"json_lines">>
+        ),
+        emqx_utils_maps:deep_remove(
+            [<<"parameters">>, <<"container">>, <<"column_order">>],
+            Cfg
+        )
+    end),
+    %% Create a bridge with the sample configuration.
+    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge(Config)),
+    %% Prepare some sample messages that look like Rule SQL productions.
+    MessageEvents = lists:map(fun mk_message_event/1, [
+        {<<"C1">>, T1 = <<"a/b/c">>, P1 = <<"{\"hello\":\"world\"}">>},
+        {<<"C2">>, T2 = <<"foo/bar">>, P2 = <<"baz">>},
+        {<<"C3">>, T3 = <<"t/42">>, P3 = <<"">>}
+    ]),
+    ok = send_messages(BridgeName, MessageEvents),
+    %% Wait until the delivery is completed.
+    ?block_until(#{?snk_kind := connector_aggreg_delivery_completed, action := AggregId}),
+    %% Check the uploaded objects.
+    _Uploads = [#{key := Key}] = emqx_bridge_s3_test_helpers:list_objects(Bucket),
+    ?assertMatch(
+        [BridgeNameString, NodeString, _Datetime, _Seq = "0"],
+        string:split(Key, "/", all)
+    ),
+    Upload = #{content := Content} = emqx_bridge_s3_test_helpers:get_object(Bucket, Key),
+    ?assertMatch(
+        #{content_type := "application/jsonl", "x-amz-meta-version" := "42"},
+        Upload
+    ),
+    %% Verify that column order is respected.
+    ?assertMatch(
+        [
+            #{
+                <<"clientid">> := <<"C1">>,
+                <<"payload">> := P1,
+                <<"topic">> := T1
+            },
+            #{
+                <<"clientid">> := <<"C2">>,
+                <<"payload">> := P2,
+                <<"topic">> := T2
+            },
+            #{
+                <<"clientid">> := <<"C3">>,
+                <<"payload">> := P3,
+                <<"topic">> := T3
+            }
+        ],
+        emqx_connector_aggreg_json_lines_test_utils:decode(Content)
     ).
 
 t_aggreg_upload_rule(Config) ->
@@ -272,7 +382,7 @@ t_aggreg_upload_restart(Config) ->
     BridgeName = ?config(bridge_name, Config),
     AggregId = aggreg_id(BridgeName),
     %% Create a bridge with the sample configuration.
-    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge(Config)),
+    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge_api(Config)),
     %% Send some sample messages that look like Rule SQL productions.
     MessageEvents = lists:map(fun mk_message_event/1, [
         {<<"C1">>, T1 = <<"a/b/c">>, P1 = <<"{\"hello\":\"world\"}">>},
@@ -282,9 +392,9 @@ t_aggreg_upload_restart(Config) ->
     ok = send_messages(BridgeName, MessageEvents),
     {ok, _} = ?block_until(#{?snk_kind := connector_aggreg_records_written, action := AggregId}),
     %% Restart the bridge.
-    {ok, _} = emqx_bridge_v2:disable_enable(disable, ?BRIDGE_TYPE, BridgeName),
-    {ok, _} = emqx_bridge_v2:disable_enable(enable, ?BRIDGE_TYPE, BridgeName),
-    %% Send some more messages.
+    {204, _} = emqx_bridge_v2_testlib:disable_kind_api(action, ?BRIDGE_TYPE, BridgeName),
+    {204, _} = emqx_bridge_v2_testlib:enable_kind_api(action, ?BRIDGE_TYPE, BridgeName),
+    %% Send some more messages (wuth same timestamps though).
     ok = send_messages(BridgeName, MessageEvents),
     {ok, _} = ?block_until(#{?snk_kind := connector_aggreg_records_written, action := AggregId}),
     %% Wait until the delivery is completed.
@@ -295,68 +405,70 @@ t_aggreg_upload_restart(Config) ->
     ?assertMatch(
         {ok, [
             _Header = [_ | _],
-            [TS1, <<"C1">>, T1, P1 | _],
-            [TS1, <<"C2">>, T2, P2 | _],
-            [TS1, <<"C3">>, T3, P3 | _],
-            [TS2, <<"C1">>, T1, P1 | _],
-            [TS2, <<"C2">>, T2, P2 | _],
-            [TS2, <<"C3">>, T3, P3 | _]
+            [_TS1, <<"C1">>, T1, P1 | _],
+            [_TS2, <<"C2">>, T2, P2 | _],
+            [_TS3, <<"C3">>, T3, P3 | _],
+            [_TS1, <<"C1">>, T1, P1 | _],
+            [_TS2, <<"C2">>, T2, P2 | _],
+            [_TS3, <<"C3">>, T3, P3 | _]
         ]},
         erl_csv:decode(Content)
     ).
 
+%% NOTE
+%% This test verifies that the bridge can recover from a buffer file corruption,
+%% and does so while preserving uncompromised data.
 t_aggreg_upload_restart_corrupted(Config) ->
-    %% NOTE
-    %% This test verifies that the bridge can recover from a buffer file corruption,
-    %% and does so while preserving uncompromised data.
     Bucket = ?config(s3_bucket, Config),
     BridgeName = ?config(bridge_name, Config),
-    AggregId = aggreg_id(BridgeName),
     BatchSize = ?CONF_MAX_RECORDS div 2,
-    %% Create a bridge with the sample configuration.
-    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge(Config)),
-    %% Send some sample messages that look like Rule SQL productions.
-    Messages1 = [
-        {integer_to_binary(N), <<"a/b/c">>, <<"{\"hello\":\"world\"}">>}
-     || N <- lists:seq(1, BatchSize)
-    ],
-    %% Ensure that they span multiple batch queries.
-    ok = send_messages_delayed(BridgeName, lists:map(fun mk_message_event/1, Messages1), 1),
-    {ok, _} = ?block_until(
-        #{?snk_kind := connector_aggreg_records_written, action := AggregId},
-        infinity,
-        0
-    ),
-    %% Find out the buffer file.
-    {ok, #{filename := Filename}} = ?block_until(
-        #{?snk_kind := connector_aggreg_buffer_allocated, action := AggregId}
-    ),
-    %% Stop the bridge, corrupt the buffer file, and restart the bridge.
-    {ok, _} = emqx_bridge_v2:disable_enable(disable, ?BRIDGE_TYPE, BridgeName),
-    BufferFileSize = filelib:file_size(Filename),
-    ok = emqx_connector_aggregator_test_helpers:truncate_at(Filename, BufferFileSize div 2),
-    {ok, _} = emqx_bridge_v2:disable_enable(enable, ?BRIDGE_TYPE, BridgeName),
-    %% Send some more messages.
-    Messages2 = [
-        {integer_to_binary(N), <<"c/d/e">>, <<"{\"hello\":\"world\"}">>}
-     || N <- lists:seq(1, BatchSize)
-    ],
-    ok = send_messages_delayed(BridgeName, lists:map(fun mk_message_event/1, Messages2), 0),
-    %% Wait until the delivery is completed.
-    {ok, _} = ?block_until(#{?snk_kind := connector_aggreg_delivery_completed, action := AggregId}),
-    %% Check that upload contains part of the first batch and all of the second batch.
-    _Uploads = [#{key := Key}] = emqx_bridge_s3_test_helpers:list_objects(Bucket),
-    CSV = [_Header | Rows] = fetch_parse_csv(Bucket, Key),
-    NRows = length(Rows),
-    ?assert(
-        NRows > BatchSize,
-        CSV
-    ),
-    ?assertEqual(
-        lists:sublist(Messages1, NRows - BatchSize) ++ Messages2,
-        [{ClientID, Topic, Payload} || [_TS, ClientID, Topic, Payload | _] <- Rows],
-        CSV
-    ).
+    Opts = #{
+        aggreg_id => aggreg_id(BridgeName),
+        batch_size => BatchSize,
+        rule_sql => <<
+            "SELECT"
+            "  *,"
+            "  strlen(payload) as psize,"
+            "  unix_ts_to_rfc3339(publish_received_at, 'millisecond') as publish_received_at"
+            "  FROM 's3/#'"
+        >>,
+        make_message_fn => fun(N) ->
+            mk_message(
+                {integer_to_binary(N), <<"s3/a/b/c">>, <<"{\"hello\":\"world\"}">>}
+            )
+        end,
+        message_check_fn => fun(Context) ->
+            #{
+                messages_before := Messages1,
+                messages_after := Messages2
+            } = Context,
+
+            _Uploads = [#{key := Key}] = emqx_bridge_s3_test_helpers:list_objects(Bucket),
+            CSV = [_Header | Rows] = fetch_parse_csv(Bucket, Key),
+            NRows = length(Rows),
+            ?assert(
+                NRows > BatchSize,
+                CSV
+            ),
+            Expected = [
+                {ClientId, Topic, Payload}
+             || #message{
+                    from = ClientId,
+                    topic = Topic,
+                    payload = Payload
+                } <- lists:sublist(Messages1, NRows - BatchSize) ++ Messages2
+            ],
+            ?assertEqual(
+                Expected,
+                [{ClientID, Topic, Payload} || [_TS, ClientID, Topic, Payload | _] <- Rows],
+                CSV
+            ),
+
+            ok
+        end
+    },
+    emqx_bridge_v2_testlib:t_aggreg_upload_restart_corrupted(Config, Opts),
+    ok.
 
 t_aggreg_pending_upload_restart(Config) ->
     %% NOTE
@@ -366,7 +478,7 @@ t_aggreg_pending_upload_restart(Config) ->
     BridgeName = ?config(bridge_name, Config),
     AggregId = aggreg_id(BridgeName),
     %% Create a bridge with the sample configuration.
-    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge(Config)),
+    ?assertMatch({ok, _Bridge}, emqx_bridge_v2_testlib:create_bridge_api(Config)),
     %% Send few large messages that will require multipart upload.
     %% Ensure that they span multiple batch queries.
     Payload = iolist_to_binary(lists:duplicate(128 * 1024, "PAYLOAD!")),
@@ -376,7 +488,7 @@ t_aggreg_pending_upload_restart(Config) ->
     {ok, #{key := ObjectKey}} =
         ?block_until(#{?snk_kind := s3_client_multipart_started, bucket := Bucket}),
     %% Stop the bridge.
-    {ok, _} = emqx_bridge_v2:disable_enable(disable, ?BRIDGE_TYPE, BridgeName),
+    {204, _} = emqx_bridge_v2_testlib:disable_kind_api(action, ?BRIDGE_TYPE, BridgeName),
     %% Verify that pending uploads have been gracefully aborted.
     %% NOTE: Minio does not support multipart upload listing w/o prefix.
     ?assertEqual(
@@ -384,7 +496,7 @@ t_aggreg_pending_upload_restart(Config) ->
         emqx_bridge_s3_test_helpers:list_pending_uploads(Bucket, ObjectKey)
     ),
     %% Restart the bridge.
-    {ok, _} = emqx_bridge_v2:disable_enable(enable, ?BRIDGE_TYPE, BridgeName),
+    {204, _} = emqx_bridge_v2_testlib:enable_kind_api(action, ?BRIDGE_TYPE, BridgeName),
     %% Wait until the delivery is completed.
     {ok, _} = ?block_until(#{?snk_kind := connector_aggreg_delivery_completed, action := AggregId}),
     %% Check that delivery contains all the messages.
@@ -465,6 +577,9 @@ receive_sender_reports([]) ->
 
 %%
 
+mk_message({ClientId, Topic, Payload}) ->
+    emqx_message:make(bin(ClientId), bin(Topic), Payload).
+
 mk_message_event({ClientID, Topic, Payload}) ->
     emqx_bridge_s3_test_helpers:mk_message_event(ClientID, Topic, Payload).
 
@@ -483,8 +598,11 @@ send_messages_delayed(BridgeName, MessageEvents, Delay) ->
         MessageEvents
     ).
 
+%% todo: messages should be sent via rules in tests...
 send_message(BridgeName, Message) ->
-    ?assertEqual(ok, emqx_bridge_v2:send_message(?BRIDGE_TYPE, BridgeName, Message, #{})).
+    ?assertEqual(
+        ok, emqx_bridge_v2:send_message(?global_ns, ?BRIDGE_TYPE, BridgeName, Message, #{})
+    ).
 
 fetch_parse_csv(Bucket, Key) ->
     #{content := Content} = emqx_bridge_s3_test_helpers:get_object(Bucket, Key),

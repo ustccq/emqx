@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ prop_object_proplist_to_proplist() ->
         json_object(),
         begin
             {ok, J} = safe_encode(T),
-            {ok, T} = safe_decode(J),
+            {ok, T} = safe_decode(J, []),
             T = decode(encode(T), []),
             true
         end
@@ -92,7 +92,8 @@ prop_object_proplist_to_map() ->
             T = to_map(T0),
             {ok, J} = safe_encode(T0),
             {ok, T} = safe_decode(J, [return_maps]),
-            T = decode(encode(T0), [return_maps]),
+            {ok, T} = safe_decode(J),
+            T = decode(encode(T0)),
             true
         end
     ).
@@ -107,7 +108,7 @@ prop_object_map_to_proplist() ->
             %% see: the `to_list` implementation
             T = to_list(T0),
             {ok, J} = safe_encode(T0),
-            {ok, T} = safe_decode(J),
+            {ok, T} = safe_decode(J, []),
             T = decode(encode(T0), []),
             true
         end
@@ -137,7 +138,7 @@ prop_safe_decode() ->
 %% Helpers
 %%--------------------------------------------------------------------
 
-to_map([{_, _} | _] = L) ->
+to_map({L}) when is_list(L) ->
     lists:foldl(
         fun({Name, Value}, Acc) ->
             Acc#{Name => to_map(Value)}
@@ -153,13 +154,13 @@ to_map(T) ->
 to_list(L) when is_list(L) ->
     [to_list(E) || E <- L];
 to_list(M) when is_map(M) ->
-    maps:fold(
+    {maps:fold(
         fun(K, V, Acc) ->
             [{K, to_list(V)} | Acc]
         end,
         [],
         M
-    );
+    )};
 to_list(T) ->
     T.
 
@@ -172,7 +173,15 @@ json_basic() ->
     oneof([true, false, null, number(), json_string()]).
 
 latin_atom() ->
-    emqx_proper_types:limited_latin_atom().
+    limited_latin_atom().
+
+limited_latin_atom() ->
+    oneof([
+        'abc_atom',
+        '0123456789',
+        'ABC-ATOM',
+        'abc123ABC'
+    ]).
 
 json_string() -> utf8().
 
@@ -196,17 +205,21 @@ json_array_2() ->
     list([json_basic(), json_array_1()]).
 
 json_object_1() ->
-    list({json_key(), json_basic()}).
+    ?LET(Ps, list({json_key(), json_basic()}), {Ps}).
 
 json_object_2() ->
-    list({
-        json_key(),
-        oneof([
-            json_basic(),
-            json_array_1(),
-            json_object_1()
-        ])
-    }).
+    ?LET(
+        Ps,
+        list({
+            json_key(),
+            oneof([
+                json_basic(),
+                json_array_1(),
+                json_object_1()
+            ])
+        }),
+        {Ps}
+    ).
 
 json_array_object_1() ->
     list(json_object_1()).

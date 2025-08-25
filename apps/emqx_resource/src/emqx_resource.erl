@@ -1,24 +1,14 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_resource).
 
 -include("emqx_resource.hrl").
 -include("emqx_resource_errors.hrl").
+-include("emqx_resource_id.hrl").
 -include_lib("emqx/include/logger.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 %% APIs for resource types
 
@@ -39,19 +29,19 @@
 
 -export([
     %% store the config and start the instance
-    create_local/4,
     create_local/5,
     create_dry_run_local/2,
     create_dry_run_local/3,
     create_dry_run_local/4,
-    recreate_local/3,
     recreate_local/4,
     %% remove the config and stop the instance
     remove_local/1,
     reset_metrics/1,
     reset_metrics_local/1,
+    reset_metrics_local/2,
     %% Create metrics for a resource ID
     create_metrics/1,
+    ensure_metrics/1,
     %% Delete metrics for a resource ID
     clear_metrics/1
 ]).
@@ -64,14 +54,12 @@
     start/2,
     restart/1,
     restart/2,
-    %% verify if the resource is working normally
-    health_check/1,
-    channel_health_check/2,
     get_channels/1,
     %% set resource status to disconnected
     set_resource_status_connecting/1,
     %% stop the instance
     stop/1,
+    stop/2,
     %% query the instance
     query/2,
     query/3,
@@ -79,12 +67,14 @@
     simple_sync_query/2,
     %% functions used by connectors to register resources that must be
     %% freed when stopping or even when a resource manager crashes.
-    allocate_resource/3,
+    allocate_resource/4,
     has_allocated_resources/1,
+    get_allocated_resource_module/1,
     get_allocated_resources/1,
     get_allocated_resources_list/1,
     forget_allocated_resources/1,
     deallocate_resource/2,
+    clean_allocated_resources/1,
     %% Get channel config from resource
     call_get_channel_config/3,
     % Call the format query result function
@@ -96,6 +86,9 @@
 -export([
     %% get the callback mode of a specific module
     get_callback_mode/1,
+    get_resource_type/1,
+    get_callback_mode/2,
+    get_query_opts/2,
     %% start the instance
     call_start/3,
     %% verify if the resource is working normally
@@ -105,6 +98,7 @@
     %% stop the instance
     call_stop/3,
     %% get the query mode of the resource
+    query_mode/2,
     query_mode/3,
     %% Add channel to resource
     call_add_channel/5,
@@ -121,6 +115,7 @@
     list_instances_verbose/0,
     %% return the data of the instance
     get_instance/1,
+    is_exist/1,
     get_metrics/1,
     fetch_creation_opts/1,
     %% return all the instances of the same resource type
@@ -134,12 +129,26 @@
 %% common validations
 -export([
     parse_resource_id/2,
+    parse_connector_id/1,
+    parse_channel_id/1,
+    parse_connector_id_from_channel_id/1,
+    extract_namespace_from_resource_id/1,
     validate_type/1,
     validate_name/1
 ]).
 
+-export([is_dry_run/1]).
+
+%% N.B.: This ONLY for tests; actual health checks should be triggered by timers in the
+%% process.  Avoid doing manual health checks outside tests.
+-export([health_check/1, channel_health_check/2]).
+
+-export([get_health_check_timeout/1]).
+
 -export_type([
     query_mode/0,
+    query_kind/0,
+    resource_query_mode/0,
     resource_id/0,
     channel_id/0,
     resource_data/0,
@@ -157,8 +166,12 @@
     on_remove_channel/3,
     on_get_channels/1,
     query_mode/1,
-    on_format_query_result/1
+    on_format_query_result/1,
+    callback_mode/1,
+    query_opts/1
 ]).
+
+-type namespace() :: binary().
 
 %% when calling emqx_resource:start/1
 -callback on_start(resource_id(), resource_config()) ->
@@ -168,7 +181,10 @@
 -callback on_stop(resource_id(), resource_state()) -> term().
 
 %% when calling emqx_resource:get_callback_mode/1
--callback callback_mode() -> callback_mode().
+-callback callback_mode() -> callback_mode() | undefined.
+
+%% when calling emqx_resource:get_callback_mode/1
+-callback callback_mode(resource_state()) -> callback_mode().
 
 %% when calling emqx_resource:query/3
 -callback on_query(resource_id(), Request :: term(), resource_state()) -> query_result().
@@ -196,15 +212,16 @@
 %% when calling emqx_resource:health_check/2
 -callback on_get_status(resource_id(), resource_state()) ->
     health_check_status()
-    | {health_check_status(), resource_state()}
-    | {health_check_status(), resource_state(), term()}.
+    | {health_check_status(), Reason :: term()}.
 
 -callback on_get_channel_status(resource_id(), channel_id(), resource_state()) ->
     channel_status()
     | {channel_status(), Reason :: term()}
     | {error, term()}.
 
--callback query_mode(Config :: term()) -> query_mode().
+-callback query_mode(Config :: term()) -> resource_query_mode().
+
+-callback query_opts(Config :: term()) -> #{timeout => timeout()}.
 
 %% This callback handles the installation of a specified channel.
 %%
@@ -241,6 +258,9 @@
     QueryResult :: term()
 ) -> term().
 
+%% Used for tagging log entries.
+-callback resource_type() -> atom().
+
 -define(SAFE_CALL(EXPR),
     (fun() ->
         try
@@ -257,6 +277,8 @@
         end
     end)()
 ).
+
+-type channel_config() :: map().
 
 -spec list_types() -> [module()].
 list_types() ->
@@ -277,16 +299,10 @@ is_resource_mod(Module) ->
 %% =================================================================================
 %% APIs for resource instances
 %% =================================================================================
-
--spec create_local(resource_id(), resource_group(), resource_type(), resource_config()) ->
-    {ok, resource_data() | 'already_created'} | {error, Reason :: term()}.
-create_local(ResId, Group, ResourceType, Config) ->
-    create_local(ResId, Group, ResourceType, Config, #{}).
-
 -spec create_local(
     resource_id(),
     resource_group(),
-    resource_type(),
+    resource_module(),
     resource_config(),
     creation_opts()
 ) ->
@@ -294,7 +310,7 @@ create_local(ResId, Group, ResourceType, Config) ->
 create_local(ResId, Group, ResourceType, Config, Opts) ->
     emqx_resource_manager:ensure_resource(ResId, Group, ResourceType, Config, Opts).
 
--spec create_dry_run_local(resource_type(), resource_config()) ->
+-spec create_dry_run_local(resource_module(), resource_config()) ->
     ok | {error, Reason :: term()}.
 create_dry_run_local(ResourceType, Config) ->
     emqx_resource_manager:create_dry_run(ResourceType, Config).
@@ -302,19 +318,21 @@ create_dry_run_local(ResourceType, Config) ->
 create_dry_run_local(ResId, ResourceType, Config) ->
     emqx_resource_manager:create_dry_run(ResId, ResourceType, Config).
 
--spec create_dry_run_local(resource_id(), resource_type(), resource_config(), OnReadyCallback) ->
+-spec create_dry_run_local(
+    resource_id(),
+    resource_module(),
+    resource_config(),
+    OnReadyCallback
+) ->
     ok | {error, Reason :: term()}
 when
     OnReadyCallback :: fun((resource_id()) -> ok | {error, Reason :: term()}).
 create_dry_run_local(ResId, ResourceType, Config, OnReadyCallback) ->
     emqx_resource_manager:create_dry_run(ResId, ResourceType, Config, OnReadyCallback).
 
--spec recreate_local(resource_id(), resource_type(), resource_config()) ->
-    {ok, resource_data()} | {error, Reason :: term()}.
-recreate_local(ResId, ResourceType, Config) ->
-    recreate_local(ResId, ResourceType, Config, #{}).
-
--spec recreate_local(resource_id(), resource_type(), resource_config(), creation_opts()) ->
+-spec recreate_local(
+    resource_id(), resource_module(), resource_config(), creation_opts()
+) ->
     {ok, resource_data()} | {error, Reason :: term()}.
 recreate_local(ResId, ResourceType, Config, Opts) ->
     emqx_resource_manager:recreate(ResId, ResourceType, Config, Opts).
@@ -328,16 +346,25 @@ remove_local(ResId) ->
             ok;
         Error ->
             %% Only log, the ResId worker is always removed in manager's remove action.
-            ?SLOG(warning, #{
-                msg => "remove_local_resource_failed",
-                error => Error,
-                resource_id => ResId
-            }),
+            ?SLOG(
+                warning,
+                #{
+                    msg => "remove_resource_failed",
+                    error => Error,
+                    resource_id => ResId
+                },
+                #{tag => ?TAG}
+            ),
             ok
     end.
 
+%% Tip: Don't delete reset_metrics_local/1, use before v572 rpc
 -spec reset_metrics_local(resource_id()) -> ok.
 reset_metrics_local(ResId) ->
+    reset_metrics_local(ResId, #{}).
+
+-spec reset_metrics_local(resource_id(), map()) -> ok.
+reset_metrics_local(ResId, _ClusterOpts) ->
     emqx_resource_manager:reset_metrics(ResId).
 
 -spec reset_metrics(resource_id()) -> ok | {error, Reason :: term()}.
@@ -351,44 +378,64 @@ query(ResId, Request) ->
 
 -spec query(resource_id(), Request :: term(), query_opts()) ->
     Result :: term().
-query(ResId, Request, Opts) ->
-    case emqx_resource_manager:get_query_mode_and_last_error(ResId, Opts) of
+query(ResId, Request, QueryOpts) ->
+    %% Note: `ResId` here, in Actions context, is the action resource id.  In other contexts
+    %% (e.g.: authn/authz), this is connector resource id.
+    case emqx_resource_manager:get_query_mode_and_last_error(ResId, QueryOpts) of
         {error, _} = ErrorTuple ->
             ErrorTuple;
         {ok, {_, unhealthy_target}} ->
             emqx_resource_metrics:matched_inc(ResId),
             emqx_resource_metrics:dropped_resource_stopped_inc(ResId),
+            emqx_resource_buffer_worker:unhealthy_target_maybe_trigger_fallback_actions(
+                ResId, Request, "unhealthy_target", #{}, QueryOpts
+            ),
             ?RESOURCE_ERROR(unhealthy_target, "unhealthy target");
         {ok, {_, {unhealthy_target, Message}}} ->
             emqx_resource_metrics:matched_inc(ResId),
             emqx_resource_metrics:dropped_resource_stopped_inc(ResId),
+            emqx_resource_buffer_worker:unhealthy_target_maybe_trigger_fallback_actions(
+                ResId, Request, "unhealthy_target", #{reason => Message}, QueryOpts
+            ),
             ?RESOURCE_ERROR(unhealthy_target, Message);
         {ok, {simple_async, _}} ->
             %% TODO(5.1.1): pass Resource instead of ResId to simple APIs
             %% so the buffer worker does not need to lookup the cache again
-            emqx_resource_buffer_worker:simple_async_query(ResId, Request, Opts);
+            emqx_resource_buffer_worker:simple_async_query(ResId, Request, QueryOpts);
         {ok, {simple_sync, _}} ->
             %% TODO(5.1.1): pass Resource instead of ResId to simple APIs
             %% so the buffer worker does not need to lookup the cache again
-            emqx_resource_buffer_worker:simple_sync_query(ResId, Request, Opts);
+            emqx_resource_buffer_worker:simple_sync_query(ResId, Request, QueryOpts);
         {ok, {simple_async_internal_buffer, _}} ->
             %% This is for bridges/connectors that have internal buffering, such
             %% as Kafka and Pulsar producers.
             %% TODO(5.1.1): pass Resource instead of ResId to simple APIs
             %% so the buffer worker does not need to lookup the cache again
-            emqx_resource_buffer_worker:simple_async_query(ResId, Request, Opts);
+            emqx_resource_buffer_worker:simple_async_internal_buffer_query(
+                ResId, Request, QueryOpts
+            );
         {ok, {simple_sync_internal_buffer, _}} ->
             %% This is for bridges/connectors that have internal buffering, such
             %% as Kafka and Pulsar producers.
             %% TODO(5.1.1): pass Resource instead of ResId to simple APIs
             %% so the buffer worker does not need to lookup the cache again
             emqx_resource_buffer_worker:simple_sync_internal_buffer_query(
-                ResId, Request, Opts
+                ResId, Request, QueryOpts
             );
         {ok, {sync, _}} ->
-            emqx_resource_buffer_worker:sync_query(ResId, Request, Opts);
+            emqx_resource_buffer_worker:sync_query(ResId, Request, QueryOpts);
+        {ok, {async, ?not_added_yet_error_atom}} ->
+            %% Since the request is async and the action has not yet been added to the
+            %% state, the message will be cast into the void, and will not trigger any
+            %% trace events that someone may be expecting...  So we trigger them here and
+            %% now...
+            emqx_resource_buffer_worker:unhealthy_target_maybe_trigger_fallback_actions(
+                ResId, Request, "action_not_added_yet", #{}, QueryOpts
+            ),
+            %% ... and still cast the message in the void, to keep counters consistent.
+            emqx_resource_buffer_worker:async_query(ResId, Request, QueryOpts);
         {ok, {async, _}} ->
-            emqx_resource_buffer_worker:async_query(ResId, Request, Opts)
+            emqx_resource_buffer_worker:async_query(ResId, Request, QueryOpts)
     end.
 
 -spec simple_sync_query(resource_id(), Request :: term()) -> Result :: term().
@@ -415,10 +462,18 @@ restart(ResId, Opts) ->
 stop(ResId) ->
     emqx_resource_manager:stop(ResId).
 
+-spec stop(resource_id(), timeout()) -> ok | {error, Reason :: term()}.
+stop(ResId, Timeout) ->
+    emqx_resource_manager:stop(ResId, Timeout).
+
+%% N.B.: This ONLY for tests; actual health checks should be triggered by timers in the
+%% process.  Avoid doing manual health checks outside tests.
 -spec health_check(resource_id()) -> {ok, resource_status()} | {error, term()}.
 health_check(ResId) ->
     emqx_resource_manager:health_check(ResId).
 
+%% N.B.: This ONLY for tests; actual health checks should be triggered by timers in the
+%% process.  Avoid doing manual health checks outside tests.
 -spec channel_health_check(resource_id(), channel_id()) ->
     #{status := resource_status(), error := term()}.
 channel_health_check(ResId, ChannelId) ->
@@ -441,6 +496,10 @@ set_resource_status_connecting(ResId) ->
 get_instance(ResId) ->
     emqx_resource_manager:lookup_cached(ResId).
 
+-spec is_exist(resource_id()) -> boolean().
+is_exist(ResId) ->
+    emqx_resource_manager:is_exist(ResId).
+
 -spec get_metrics(resource_id()) ->
     emqx_metrics_worker:metrics().
 get_metrics(ResId) ->
@@ -452,14 +511,16 @@ fetch_creation_opts(Opts) ->
 
 -spec list_instances() -> [resource_id()].
 list_instances() ->
-    [Id || #{id := Id} <- list_instances_verbose()].
+    emqx_resource_cache:all_ids().
 
 -spec list_instances_verbose() -> [_ResourceDataWithMetrics :: map()].
 list_instances_verbose() ->
-    [
-        Res#{metrics => get_metrics(ResId)}
-     || #{id := ResId} = Res <- emqx_resource_manager:list_all()
-    ].
+    lists:map(
+        fun(#{id := ResId} = Res) ->
+            Res#{metrics => get_metrics(ResId)}
+        end,
+        emqx_resource_manager:list_all()
+    ).
 
 -spec list_instances_by_type(module()) -> [resource_id()].
 list_instances_by_type(ResourceType) ->
@@ -473,12 +534,35 @@ generate_id(Name) when is_binary(Name) ->
     Id = integer_to_binary(erlang:unique_integer([monotonic, positive])),
     <<Name/binary, ":", Id/binary>>.
 
+%% Note: currently, connectors/actions/sources from all namespaces are returned here.
 -spec list_group_instances(resource_group()) -> [resource_id()].
 list_group_instances(Group) -> emqx_resource_manager:list_group(Group).
 
 -spec get_callback_mode(module()) -> callback_mode().
 get_callback_mode(Mod) ->
     Mod:callback_mode().
+
+-spec get_resource_type(module()) -> resource_type().
+get_resource_type(Mod) ->
+    Mod:resource_type().
+
+-spec get_callback_mode(module(), resource_state()) -> callback_mode() | undefined.
+get_callback_mode(Mod, State) ->
+    case erlang:function_exported(Mod, callback_mode, 1) of
+        true ->
+            Mod:callback_mode(State);
+        _ ->
+            undefined
+    end.
+
+-spec get_query_opts(module(), map()) -> #{timeout => timeout()}.
+get_query_opts(Mod, ActionOrSourceConfig) ->
+    case erlang:function_exported(Mod, query_opts, 1) of
+        true ->
+            Mod:query_opts(ActionOrSourceConfig);
+        false ->
+            emqx_bridge:query_opts(ActionOrSourceConfig)
+    end.
 
 -spec call_start(resource_id(), module(), resource_config()) ->
     {ok, resource_state()} | {error, Reason :: term()}.
@@ -487,7 +571,7 @@ call_start(ResId, Mod, Config) ->
         begin
             %% If the previous manager process crashed without cleaning up
             %% allocated resources, clean them up.
-            clean_allocated_resources(ResId, Mod),
+            clean_allocated_resources(ResId),
             Mod:on_start(ResId, Config)
         end
     ).
@@ -583,16 +667,21 @@ call_stop(ResId, Mod, ResourceState) ->
         Res
     end).
 
--spec query_mode(module(), term(), creation_opts()) -> query_mode().
-query_mode(Mod, Config, Opts) ->
+-spec query_mode(module(), channel_config()) -> resource_query_mode().
+query_mode(Mod, ChannelConfig) ->
+    ResourceOpts = fetch_creation_opts(ChannelConfig),
+    query_mode(Mod, ChannelConfig, ResourceOpts).
+
+-spec query_mode(module(), channel_config(), creation_opts()) -> resource_query_mode().
+query_mode(Mod, ChannelConfig, Opts) ->
     case erlang:function_exported(Mod, query_mode, 1) of
         true ->
-            Mod:query_mode(Config);
+            Mod:query_mode(ChannelConfig);
         false ->
             maps:get(query_mode, Opts, sync)
     end.
 
--spec check_config(resource_type(), raw_resource_config()) ->
+-spec check_config(resource_module(), raw_resource_config()) ->
     {ok, resource_config()} | {error, term()}.
 check_config(ResourceType, Conf) ->
     emqx_hocon:check(ResourceType, Conf).
@@ -600,7 +689,7 @@ check_config(ResourceType, Conf) ->
 -spec check_and_create_local(
     resource_id(),
     resource_group(),
-    resource_type(),
+    resource_module(),
     raw_resource_config()
 ) ->
     {ok, resource_data()} | {error, term()}.
@@ -610,7 +699,7 @@ check_and_create_local(ResId, Group, ResourceType, RawConfig) ->
 -spec check_and_create_local(
     resource_id(),
     resource_group(),
-    resource_type(),
+    resource_module(),
     raw_resource_config(),
     creation_opts()
 ) -> {ok, resource_data()} | {error, term()}.
@@ -623,7 +712,7 @@ check_and_create_local(ResId, Group, ResourceType, RawConfig, Opts) ->
 
 -spec check_and_recreate_local(
     resource_id(),
-    resource_type(),
+    resource_module(),
     raw_resource_config(),
     creation_opts()
 ) ->
@@ -647,8 +736,11 @@ apply_reply_fun({F, A}, Result) when is_function(F) ->
 apply_reply_fun(From, Result) ->
     gen_server:reply(From, Result).
 
--spec allocate_resource(resource_id(), any(), term()) -> ok.
-allocate_resource(InstanceId, Key, Value) ->
+-define(RES_MOD_KEY, {?MODULE, resource_mod}).
+
+-spec allocate_resource(resource_id(), module(), any(), term()) -> ok.
+allocate_resource(InstanceId, ResourceMod, Key, Value) ->
+    _ = ets:insert_new(?RESOURCE_ALLOCATION_TAB, {InstanceId, ?RES_MOD_KEY, ResourceMod}),
     true = ets:insert(?RESOURCE_ALLOCATION_TAB, {InstanceId, Key, Value}),
     ok.
 
@@ -656,14 +748,28 @@ allocate_resource(InstanceId, Key, Value) ->
 has_allocated_resources(InstanceId) ->
     ets:member(?RESOURCE_ALLOCATION_TAB, InstanceId).
 
+-spec get_allocated_resource_module(resource_id()) -> {ok, module()} | error.
+get_allocated_resource_module(InstanceId) ->
+    MS = [{{InstanceId, ?RES_MOD_KEY, '$1'}, [], ['$1']}],
+    case ets:select(?RESOURCE_ALLOCATION_TAB, MS) of
+        [ResourceMod] ->
+            {ok, ResourceMod};
+        [] ->
+            error
+    end.
+
 -spec get_allocated_resources(resource_id()) -> map().
 get_allocated_resources(InstanceId) ->
-    Objects = ets:lookup(?RESOURCE_ALLOCATION_TAB, InstanceId),
+    Objects = get_allocated_resources_list(InstanceId),
     maps:from_list([{K, V} || {_InstanceId, K, V} <- Objects]).
 
 -spec get_allocated_resources_list(resource_id()) -> list(tuple()).
 get_allocated_resources_list(InstanceId) ->
-    ets:lookup(?RESOURCE_ALLOCATION_TAB, InstanceId).
+    [
+        {Id, K, V}
+     || {Id, K, V} <- ets:lookup(?RESOURCE_ALLOCATION_TAB, InstanceId),
+        K =/= ?RES_MOD_KEY
+    ].
 
 -spec forget_allocated_resources(resource_id()) -> ok.
 forget_allocated_resources(InstanceId) ->
@@ -674,46 +780,58 @@ deallocate_resource(InstanceId, Key) ->
     true = ets:match_delete(?RESOURCE_ALLOCATION_TAB, {InstanceId, Key, '_'}),
     ok.
 
+-undef(RES_MOD_KEY).
+
 -spec create_metrics(resource_id()) -> ok.
 create_metrics(ResId) ->
-    emqx_metrics_worker:create_metrics(
-        ?RES_METRICS,
-        ResId,
-        [
-            'matched',
-            'retried',
-            'retried.success',
-            'retried.failed',
-            'success',
-            'late_reply',
-            'failed',
-            'dropped',
-            'dropped.expired',
-            'dropped.queue_full',
-            'dropped.resource_not_found',
-            'dropped.resource_stopped',
-            'dropped.other',
-            'received'
-        ],
-        [matched]
-    ).
+    emqx_metrics_worker:create_metrics(?RES_METRICS, ResId, metrics(), rate_metrics()).
+
+-spec ensure_metrics(resource_id()) -> {ok, created | already_created}.
+ensure_metrics(ResId) ->
+    emqx_metrics_worker:ensure_metrics(?RES_METRICS, ResId, metrics(), rate_metrics()).
 
 -spec clear_metrics(resource_id()) -> ok.
 clear_metrics(ResId) ->
     emqx_metrics_worker:clear_metrics(?RES_METRICS, ResId).
+
+get_health_check_timeout(Opts) ->
+    emqx_utils_maps:deep_get([resource_opts, health_check_timeout], Opts, ?HEALTHCHECK_TIMEOUT).
+
 %% =================================================================================
+
+metrics() ->
+    [
+        'matched',
+        'retried',
+        'retried.success',
+        'retried.failed',
+        'success',
+        'late_reply',
+        'failed',
+        'dropped',
+        'dropped.expired',
+        'dropped.queue_full',
+        'dropped.resource_not_found',
+        'dropped.resource_stopped',
+        'dropped.other',
+        'received'
+    ].
+
+rate_metrics() ->
+    ['matched'].
 
 filter_instances(Filter) ->
     [Id || #{id := Id, mod := Mod} <- list_instances_verbose(), Filter(Id, Mod)].
 
-clean_allocated_resources(ResourceId, ResourceMod) ->
-    case emqx_resource:has_allocated_resources(ResourceId) of
-        true ->
+clean_allocated_resources(ResourceId) ->
+    case emqx_resource:get_allocated_resource_module(ResourceId) of
+        {ok, ResourceMod} ->
             %% The resource entries in the ETS table are erased inside
             %% `call_stop' if the call is successful.
             ok = call_stop(ResourceId, ResourceMod, _ResourceState = undefined),
             ok;
-        false ->
+        error ->
+            %% Nothing allocated
             ok
     end.
 
@@ -731,6 +849,121 @@ parse_resource_id(Id0, Opts) ->
             invalid_data(
                 <<"should be of pattern {type}:{name}, but got: ", Id/binary>>
             )
+    end.
+
+parse_connector_id(Id) when is_binary(Id) ->
+    case binary:split(Id, ?RES_SEP, [global]) of
+        ?NAMESPACED_CONNECTOR_PAT(Namespace, Type, Name) ->
+            {ok, #{
+                namespace => Namespace,
+                type => Type,
+                name => Name
+            }};
+        ?NON_NAMESPACED_CONNECTOR_PAT(Type, Name) ->
+            {ok, #{
+                namespace => ?global_ns,
+                type => Type,
+                name => Name
+            }};
+        _ ->
+            {error, invalid_id}
+    end.
+
+-doc """
+Parses a binary action or source resource id into a structured map.
+
+Throws `{invalid_id, Id}` if the input `Id` has an invalid format.
+""".
+-spec parse_channel_id(binary()) ->
+    #{
+        namespace := ?global_ns | namespace(),
+        kind := action | source,
+        type := binary(),
+        name := binary(),
+        connector_type := binary(),
+        connector_name := binary()
+    }.
+parse_channel_id(<<?NS_SEG_PREFIX_STR, NsAndIds/binary>> = Id) ->
+    case binary:split(NsAndIds, ?RES_SEP) of
+        [Ns, Rest] ->
+            case do_parse_channel_id(Rest) of
+                {ok, Parsed} ->
+                    Parsed#{namespace := Ns};
+                {error, invalid_id} ->
+                    throw({invalid_id, Id})
+            end;
+        _ ->
+            throw({invalid_id, Id})
+    end;
+parse_channel_id(Id) ->
+    case do_parse_channel_id(Id) of
+        {ok, Parsed} ->
+            Parsed;
+        {error, invalid_id} ->
+            throw({invalid_id, Id})
+    end.
+
+%% Without namespace
+do_parse_channel_id(Id) ->
+    case binary:split(Id, ?RES_SEP, [global]) of
+        ?NON_NAMESPACED_CHANNEL_PAT(?ACTION_SEG, Type, Name, ConnectorType, ConnectorName) ->
+            {ok, #{
+                namespace => ?global_ns,
+                kind => action,
+                type => Type,
+                name => Name,
+                connector_type => ConnectorType,
+                connector_name => ConnectorName
+            }};
+        ?NON_NAMESPACED_CHANNEL_PAT(?SOURCE_SEG, Type, Name, ConnectorType, ConnectorName) ->
+            {ok, #{
+                namespace => ?global_ns,
+                kind => source,
+                type => Type,
+                name => Name,
+                connector_type => ConnectorType,
+                connector_name => ConnectorName
+            }};
+        _ ->
+            {error, invalid_id}
+    end.
+
+parse_connector_id_from_channel_id(Id) ->
+    try parse_channel_id(Id) of
+        #{
+            namespace := Namespace,
+            connector_type := ConnectorType,
+            connector_name := ConnectorName
+        } ->
+            ConnResId =
+                case is_binary(Namespace) of
+                    true ->
+                        lists:join(
+                            ?RES_SEP, ?NAMESPACED_CONNECTOR(Namespace, ConnectorType, ConnectorName)
+                        );
+                    false ->
+                        lists:join(
+                            ?RES_SEP, ?NON_NAMESPACED_CONNECTOR(ConnectorType, ConnectorName)
+                        )
+                end,
+            {ok, iolist_to_binary(ConnResId)}
+    catch
+        throw:{invalid_id, _} ->
+            {error, iolist_to_binary(io_lib:format("Invalid action/source ID: ~p", [Id]))}
+    end.
+
+extract_namespace_from_resource_id(Id) ->
+    case binary:split(Id, ?RES_SEP, [global]) of
+        ?NAMESPACED_CHANNEL_PAT(Namespace, _Kind, _ChanType, _ChanName, _ConnType, _ConnName) ->
+            {ok, Namespace};
+        ?NAMESPACED_CONNECTOR_PAT(Namespace, _ConnType, _ConnName) ->
+            {ok, Namespace};
+        ?NON_NAMESPACED_CHANNEL_PAT(_Kind, _ChanType, _ChanName, _ConnType, _ConnName) ->
+            {ok, ?global_ns};
+        ?NON_NAMESPACED_CONNECTOR(_ConnType, _ConnName) ->
+            {ok, ?global_ns};
+        _ ->
+            {error, invalid_id}
     end.
 
 to_type_atom(Type) when is_binary(Type) ->
@@ -761,6 +994,15 @@ bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom, utf8).
 validate_name(Name) ->
     _ = validate_name(Name, #{atom_name => false}),
     ok.
+
+-spec is_dry_run(resource_id()) -> boolean().
+is_dry_run(?PROBE_ID_MATCH(_)) ->
+    %% A probe connector
+    true;
+is_dry_run(ID) ->
+    %% A probe action/source
+    RE = ":" ++ ?PROBE_ID_PREFIX ++ "[a-zA-Z0-9]{8}:",
+    match =:= re:run(ID, RE, [{capture, none}]).
 
 validate_name(<<>>, _Opts) ->
     invalid_data("Name cannot be empty string");

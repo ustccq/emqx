@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_validation_http_api_SUITE).
 
@@ -11,6 +11,7 @@
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("emqx/include/asserts.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -26,17 +27,15 @@ all() ->
 init_per_suite(Config) ->
     emqx_common_test_helpers:clear_screen(),
     Apps = emqx_cth_suite:start(
-        lists:flatten(
-            [
-                emqx,
-                emqx_conf,
-                emqx_rule_engine,
-                emqx_schema_validation,
-                emqx_management,
-                emqx_mgmt_api_test_util:emqx_dashboard(),
-                emqx_schema_registry
-            ]
-        ),
+        [
+            emqx,
+            emqx_conf,
+            emqx_rule_engine,
+            emqx_schema_validation,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard(),
+            emqx_schema_registry
+        ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
     {ok, _} = emqx_common_test_http:create_default_app(),
@@ -51,6 +50,7 @@ init_per_testcase(_TestCase, Config) ->
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
+    emqx_bridge_v2_testlib:delete_all_rules(),
     clear_all_validations(),
     snabbkaffe:stop(),
     reset_all_global_metrics(),
@@ -80,7 +80,7 @@ reset_all_global_metrics() ->
     ).
 
 maybe_json_decode(X) ->
-    case emqx_utils_json:safe_decode(X, [return_maps]) of
+    case emqx_utils_json:safe_decode(X) of
         {ok, Decoded} -> Decoded;
         {error, _} -> X
     end.
@@ -94,7 +94,7 @@ request(Method, Path, Params) ->
             {ok, {Status, Headers, Body}};
         {error, {Status, Headers, Body0}} ->
             Body =
-                case emqx_utils_json:safe_decode(Body0, [return_maps]) of
+                case emqx_utils_json:safe_decode(Body0) of
                     {ok, Decoded0 = #{<<"message">> := Msg0}} ->
                         Msg = maybe_json_decode(Msg0),
                         Decoded0#{<<"message">> := Msg};
@@ -243,7 +243,7 @@ upload_backup(BackupFilePath) ->
 
 export_backup() ->
     Path = emqx_mgmt_api_test_util:api_path(["data", "export"]),
-    Res = request(post, Path, []),
+    Res = request(post, Path, {raw, <<>>}),
     simplify_result(Res).
 
 import_backup(BackupName) ->
@@ -356,24 +356,35 @@ protobuf_invalid_payloads() ->
     ].
 
 protobuf_create_serde(SerdeName) ->
-    Source =
-        <<
-            "message Person {\n"
-            "     required string name = 1;\n"
-            "     required int32 id = 2;\n"
-            "     optional string email = 3;\n"
-            "  }\n"
-            "message UnionValue {\n"
-            "    oneof u {\n"
-            "        int32  a = 1;\n"
-            "        string b = 2;\n"
-            "    }\n"
-            "}"
-        >>,
+    protobuf_upsert_serde(SerdeName, <<"Person">>).
+
+protobuf_upsert_serde(SerdeName, MessageType) ->
+    Source = protobuf_source(MessageType),
     Schema = #{type => protobuf, source => Source},
     ok = emqx_schema_registry:add_schema(SerdeName, Schema),
     on_exit(fun() -> ok = emqx_schema_registry:delete_schema(SerdeName) end),
     ok.
+
+protobuf_source(MessageType) ->
+    iolist_to_binary(
+        [
+            <<"message ">>,
+            MessageType,
+            <<" {\n">>,
+            <<
+                "     required string name = 1;\n"
+                "     required int32 id = 2;\n"
+                "     optional string email = 3;\n"
+                "  }\n"
+                "message UnionValue {\n"
+                "    oneof u {\n"
+                "        int32  a = 1;\n"
+                "        string b = 2;\n"
+                "    }\n"
+                "}"
+            >>
+        ]
+    ).
 
 %% Checks that the internal order in the registry/index matches expectation.
 assert_index_order(ExpectedOrder, Topic, Comment) ->
@@ -392,16 +403,13 @@ create_failure_tracing_rule() ->
         sql => <<"select * from \"$events/schema_validation_failed\" ">>,
         actions => [make_trace_fn_action()]
     },
+    create_rule(Params).
+
+create_rule(Params) ->
     Path = emqx_mgmt_api_test_util:api_path(["rules"]),
     Res = request(post, Path, Params),
-    ct:pal("create failure tracing rule result:\n  ~p", [Res]),
-    case Res of
-        {ok, {{_, 201, _}, _, #{<<"id">> := RuleId}}} ->
-            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-            simplify_result(Res);
-        _ ->
-            simplify_result(Res)
-    end.
+    ct:pal("create rule result:\n  ~p", [Res]),
+    simplify_result(Res).
 
 make_trace_fn_action() ->
     persistent_term:put({?MODULE, test_pid}, self()),
@@ -1041,6 +1049,7 @@ t_duplicated_schema_checks(_Config) ->
     Name1 = <<"foo">>,
     SerdeName = <<"myserde">>,
     Check = schema_check(json, SerdeName),
+    json_create_serde(SerdeName),
 
     Validation1 = validation(Name1, [Check, sql_check(), Check]),
     ?assertMatch({400, _}, insert(Validation1)),
@@ -1130,18 +1139,87 @@ t_multiple_validations(_Config) ->
 
     ok.
 
+%% Test that we validate schema registry serde existency when using the HTTP API.
 t_schema_check_non_existent_serde(_Config) ->
     SerdeName = <<"idontexist">>,
     Name1 = <<"foo">>,
+
     Check1 = schema_check(json, SerdeName),
     Validation1 = validation(Name1, [Check1]),
-    {201, _} = insert(Validation1),
+    ?assertMatch({400, _}, insert(Validation1)),
 
-    C = connect(<<"c1">>),
-    {ok, _, [_]} = emqtt:subscribe(C, <<"t/#">>),
+    Check2 = schema_check(avro, SerdeName),
+    Validation2 = validation(Name1, [Check2]),
+    ?assertMatch({400, _}, insert(Validation2)),
 
-    ok = publish(C, <<"t/1">>, #{i => 10, s => <<"s">>}),
-    ?assertNotReceive({publish, _}),
+    MessageType = <<"idontexisteither">>,
+    Check3 = schema_check(protobuf, SerdeName, #{<<"message_type">> => MessageType}),
+    Validation3 = validation(Name1, [Check3]),
+    ?assertMatch({400, _}, insert(Validation3)),
+
+    protobuf_create_serde(SerdeName),
+    %% Still fails because reference message type doesn't exist.
+    ?assertMatch({400, _}, insert(Validation3)),
+
+    ok.
+
+%% Test that we validate schema registry serde existency when loading configs.
+t_schema_check_non_existent_serde_load_config(_Config) ->
+    Name1 = <<"1">>,
+    SerdeName1 = <<"serde1">>,
+    MessageType1 = <<"mt">>,
+    Check1A = schema_check(protobuf, SerdeName1, #{<<"message_type">> => MessageType1}),
+    Validation1A = validation(Name1, [Check1A]),
+    protobuf_upsert_serde(SerdeName1, MessageType1),
+    {201, _} = insert(Validation1A),
+    Name2 = <<"2">>,
+    SerdeName2 = <<"serde2">>,
+    Check2A = schema_check(json, SerdeName2),
+    Validation2A = validation(Name2, [Check2A]),
+    json_create_serde(SerdeName2),
+    {201, _} = insert(Validation2A),
+
+    %% Config to load
+    %% Will replace existing config
+    MissingMessageType = <<"missing_mt">>,
+    Check1B = schema_check(protobuf, SerdeName1, #{<<"message_type">> => MissingMessageType}),
+    Validation1B = validation(Name1, [Check1B]),
+
+    %% Will replace existing config
+    MissingSerdeName1 = <<"missing1">>,
+    Check2B = schema_check(json, MissingSerdeName1),
+    Validation2B = validation(Name2, [Check2B]),
+
+    %% New validation; should be appended
+    Name3 = <<"3">>,
+    MissingSerdeName2 = <<"missing2">>,
+    Check3 = schema_check(avro, MissingSerdeName2),
+    Validation3 = validation(Name3, [Check3]),
+
+    ConfRootBin = <<"schema_validation">>,
+    ConfigToLoad1 = #{
+        ConfRootBin => #{
+            <<"validations">> => [Validation1B, Validation2B, Validation3]
+        }
+    },
+    ConfigToLoadBin1 = iolist_to_binary(hocon_pp:do(ConfigToLoad1, #{})),
+    %% Merge
+    ResMerge = emqx_conf_cli:load_config(?global_ns, ConfigToLoadBin1, #{mode => merge}),
+    ?assertMatch({error, _}, ResMerge),
+    {error, ErrorMessage1} = ResMerge,
+    ?assertEqual(match, re:run(ErrorMessage1, <<"missing_schemas">>, [{capture, none}])),
+    ?assertEqual(match, re:run(ErrorMessage1, MissingSerdeName1, [{capture, none}])),
+    ?assertEqual(match, re:run(ErrorMessage1, MissingSerdeName2, [{capture, none}])),
+    ?assertEqual(match, re:run(ErrorMessage1, MissingMessageType, [{capture, none}])),
+
+    %% Replace
+    ResReplace = emqx_conf_cli:load_config(?global_ns, ConfigToLoadBin1, #{mode => replace}),
+    ?assertMatch({error, _}, ResReplace),
+    {error, ErrorMessage2} = ResReplace,
+    ?assertEqual(match, re:run(ErrorMessage2, <<"missing_schemas">>, [{capture, none}])),
+    ?assertEqual(match, re:run(ErrorMessage2, MissingSerdeName1, [{capture, none}])),
+    ?assertEqual(match, re:run(ErrorMessage2, MissingSerdeName2, [{capture, none}])),
+    ?assertEqual(match, re:run(ErrorMessage2, MissingMessageType, [{capture, none}])),
 
     ok.
 
@@ -1232,17 +1310,47 @@ t_schema_check_protobuf(_Config) ->
     ),
 
     %% Bad config: unknown message name
-    Check2 = schema_check(protobuf, SerdeName, #{<<"message_type">> => <<"idontexist">>}),
-    Validation2 = validation(Name1, [Check2]),
-    {200, _} = update(Validation2),
+    %% Schema updated to use another message type after validation was created
+    OtherMessageType = <<"NewPersonType">>,
+    protobuf_upsert_serde(SerdeName, OtherMessageType),
 
     lists:foreach(
         fun(Payload) ->
             ok = publish(C, <<"t/1">>, {raw, Payload}),
             ?assertNotReceive({publish, _})
         end,
-        protobuf_valid_payloads(SerdeName, MessageType)
+        protobuf_valid_payloads(SerdeName, OtherMessageType)
     ),
+
+    ok.
+
+t_schema_check_external_http(_Config) ->
+    SerdeName = <<"myserde">>,
+    {ok, Port} = emqx_schema_registry_http_api_SUITE:start_external_http_serde_server(),
+    Opts = #{name => SerdeName, port => Port},
+    Params = emqx_schema_registry_http_api_SUITE:mk_external_http_create_params(Opts),
+
+    on_exit(fun() -> ok = emqx_schema_registry:delete_schema(SerdeName) end),
+    {201, _} = emqx_schema_registry_http_api_SUITE:create_schema(Params),
+
+    Name1 = <<"foo">>,
+    Check1 = schema_check(external_http, SerdeName),
+    Validation1 = validation(Name1, [Check1]),
+    {201, _} = insert(Validation1),
+
+    C = connect(<<"c1">>),
+    {ok, _, [_]} = emqtt:subscribe(C, <<"t/#">>),
+
+    %% Payload for this mocked server doesn't matter
+    ok = publish(C, <<"t/1">>, #{<<"whatever">> => true}),
+    ?assertReceive({publish, _}),
+    %% ... only if we make it return non-200 results, crash, or return invalid responses...
+    emqx_utils_http_test_server:set_handler(fun(Req, State) ->
+        Rep = cowboy_req:reply(400, #{}, <<"I didn't like your payload">>, Req),
+        {ok, Rep, State}
+    end),
+    ok = publish(C, <<"t/1">>, #{<<"whatever">> => true}),
+    ?assertNotReceive({publish, _}),
 
     ok.
 
@@ -1342,7 +1450,7 @@ t_load_config(_Config) ->
         }
     },
     ConfigToLoadBin1 = iolist_to_binary(hocon_pp:do(ConfigToLoad1, #{})),
-    ?assertMatch(ok, emqx_conf_cli:load_config(ConfigToLoadBin1, #{mode => merge})),
+    ?assertMatch(ok, emqx_conf_cli:load_config(?global_ns, ConfigToLoadBin1, #{mode => merge})),
     ExpectedValidations1 = normalize_validations([
         Validation1A,
         Validation2A,
@@ -1355,7 +1463,7 @@ t_load_config(_Config) ->
                 <<"validations">> := ExpectedValidations1
             }
         },
-        emqx_conf_cli:get_config(<<"schema_validation">>)
+        emqx_conf_cli:get_config_namespaced(?global_ns, <<"schema_validation">>)
     ),
     ?assertIndexOrder([Name1, Name2, Name3, Name4], <<"t/a">>),
 
@@ -1371,7 +1479,7 @@ t_load_config(_Config) ->
         ConfRootBin => #{<<"validations">> => [Validation4B, Validation3, Validation5]}
     },
     ConfigToLoadBin2 = iolist_to_binary(hocon_pp:do(ConfigToLoad2, #{})),
-    ?assertMatch(ok, emqx_conf_cli:load_config(ConfigToLoadBin2, #{mode => replace})),
+    ?assertMatch(ok, emqx_conf_cli:load_config(?global_ns, ConfigToLoadBin2, #{mode => replace})),
     ExpectedValidations2 = normalize_validations([Validation4B, Validation3, Validation5]),
     ?assertMatch(
         #{
@@ -1379,8 +1487,107 @@ t_load_config(_Config) ->
                 <<"validations">> := ExpectedValidations2
             }
         },
-        emqx_conf_cli:get_config(<<"schema_validation">>)
+        emqx_conf_cli:get_config_namespaced(?global_ns, <<"schema_validation">>)
     ),
     ?assertIndexOrder([Name4, Name3, Name5], <<"t/a">>),
 
+    ok.
+
+%% Checks that the republish action failure metric increases when schema validation fails
+%% for an outgoing message.  Though this is arguably more appropriate as an
+%% `emqx_rule_runtime' test case, it's simpler to setup the conditions here.
+t_republish_action_failure(_Config) ->
+    ?check_trace(
+        begin
+            Name1 = <<"1">>,
+            %% Always fails
+            Check1A = sql_check(<<"select 1 where false">>),
+            Validation1A = validation(Name1, [Check1A]),
+            {201, _} = insert(Validation1A),
+
+            RuleTopic = <<"some/topic">>,
+            Params = #{
+                enable => true,
+                sql => iolist_to_binary([
+                    <<"select * from \"">>,
+                    RuleTopic,
+                    <<"\"">>
+                ]),
+                actions => [
+                    #{
+                        function => <<"republish">>,
+                        args =>
+                            #{
+                                <<"mqtt_properties">> => #{},
+                                <<"payload">> => <<"aaa">>,
+                                <<"qos">> => 0,
+                                <<"retain">> => false,
+                                <<"topic">> => <<"t/republished">>,
+                                <<"user_properties">> => <<>>,
+                                <<"direct_dispatch">> => false
+                            }
+                    }
+                ]
+            },
+            {201, #{<<"id">> := RuleId}} = create_rule(Params),
+            C = connect(<<"c1">>),
+            {ok, _, [_]} = emqtt:subscribe(C, <<"t/#">>),
+            ok = publish(C, RuleTopic, #{}),
+            ?assertNotReceive({publish, _}),
+
+            ?assertMatch(
+                #{
+                    matched := 1,
+                    failed := 0,
+                    passed := 1,
+                    'actions.total' := 1,
+                    'actions.success' := 0,
+                    'actions.failed' := 1,
+                    'actions.failed.unknown' := 1,
+                    'actions.failed.out_of_service' := 0
+                },
+                emqx_metrics_worker:get_counters(rule_metrics, RuleId)
+            ),
+
+            %% `publish' return type is different when failure action is `disconnect'
+            Validation1B = validation(Name1, [Check1A], #{<<"failure_action">> => <<"disconnect">>}),
+            {200, _} = update(Validation1B),
+
+            ok = publish(C, RuleTopic, #{}),
+            ?assertNotReceive({publish, _}),
+
+            ?assertMatch(
+                #{
+                    matched := 2,
+                    failed := 0,
+                    passed := 2,
+                    'actions.total' := 2,
+                    'actions.success' := 0,
+                    'actions.failed' := 2,
+                    'actions.failed.unknown' := 2,
+                    'actions.failed.out_of_service' := 0
+                },
+                emqx_metrics_worker:get_counters(rule_metrics, RuleId)
+            ),
+
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Checks that index/config order is indeed preserved when we have "many" (> 32)
+%% validations.
+t_many_validations_order(_Config) ->
+    Names = lists:map(
+        fun(N) ->
+            Name = integer_to_binary(50 - N),
+            Validation = validation(Name, [sql_check()]),
+            {201, _} = insert(Validation),
+            Name
+        end,
+        lists:seq(1, 50)
+    ),
+    Topic = <<"t/a">>,
+    ?assertIndexOrder(Names, Topic),
     ok.

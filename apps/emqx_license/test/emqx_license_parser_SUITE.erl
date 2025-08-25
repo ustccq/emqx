@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_parser_SUITE).
@@ -217,7 +217,7 @@ t_dump(_Config) ->
             {customer, <<"Foo">>},
             {email, <<"contact@foo.com">>},
             {deployment, <<"default-deployment">>},
-            {max_connections, 10},
+            {max_sessions, 10},
             {start_at, <<"2022-01-11">>},
             {expiry_at, <<"2295-10-27">>},
             {type, <<"trial">>},
@@ -237,10 +237,21 @@ t_license_type(_Config) ->
 
     ?assertEqual(0, emqx_license_parser:license_type(License)).
 
-t_max_connections(_Config) ->
+t_max_sessions(_Config) ->
     {ok, License} = emqx_license_parser:parse(sample_license(), public_key_pem()),
 
-    ?assertEqual(10, emqx_license_parser:max_connections(License)).
+    ?assertEqual(10, emqx_license_parser:max_sessions(License)).
+
+t_max_uptime_seconds(_Config) ->
+    {ok, LicenseEvaluation} = emqx_license_parser:parse(
+        emqx_license_test_lib:make_license(#{customer_type => "10"}), public_key_pem()
+    ),
+    {ok, LicenseMedium} = emqx_license_parser:parse(
+        emqx_license_test_lib:make_license(#{customer_type => "1"}), public_key_pem()
+    ),
+
+    ?assert(is_integer(emqx_license_parser:max_uptime_seconds(LicenseEvaluation))),
+    ?assertEqual(infinity, emqx_license_parser:max_uptime_seconds(LicenseMedium)).
 
 t_expiry_date(_Config) ->
     {ok, License} = emqx_license_parser:parse(sample_license(), public_key_pem()),
@@ -260,6 +271,13 @@ t_empty_string(_Config) ->
         }},
         emqx_license_parser:parse(<<>>)
     ).
+
+t_default_is_not_community_in_ct(_Config) ->
+    Default = emqx_license_parser:default(),
+    Community = emqx_license_parser:community(),
+    Evaluation = emqx_license_parser:evaluation(),
+    ?assertEqual(Evaluation, Default),
+    ?assertNotEqual(Community, Default).
 
 %%------------------------------------------------------------------------------
 %% Helpers

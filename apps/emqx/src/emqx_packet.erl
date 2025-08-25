@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_packet).
@@ -20,6 +8,7 @@
 
 -include("emqx.hrl").
 -include("emqx_mqtt.hrl").
+-include("emqx_trace.hrl").
 
 %% Header APIs
 -export([
@@ -51,11 +40,10 @@
 ]).
 
 -export([
-    format/1,
     format/2
 ]).
 
--export([format_truncated_payload/3]).
+-export([format_payload/2]).
 
 -define(TYPE_NAMES,
     {'CONNECT', 'CONNACK', 'PUBLISH', 'PUBACK', 'PUBREC', 'PUBREL', 'PUBCOMP', 'SUBSCRIBE',
@@ -66,6 +54,15 @@
 -type publish() :: #mqtt_packet_publish{}.
 -type subscribe() :: #mqtt_packet_subscribe{}.
 -type unsubscribe() :: #mqtt_packet_unsubscribe{}.
+-type payload_encode() :: hex | text | hidden.
+-type payload_format_opts() :: #{
+    %% required option
+    payload_encode := payload_encode(),
+    %% Truncate if over this limit, default is ?MAX_PAYLOAD_FORMAT_SIZE
+    truncate_above => non_neg_integer(),
+    %% Truncate to this number of bytes, default is ?TRUNCATED_PAYLOAD_SIZE
+    truncate_to => non_neg_integer()
+}.
 
 %%--------------------------------------------------------------------
 %% MQTT Packet Type and Flags.
@@ -359,7 +356,8 @@ check_client_id(
     #mqtt_packet_connect{clientid = ClientId},
     #{max_clientid_len := MaxLen} = _Opts
 ) ->
-    case (1 =< (Len = byte_size(ClientId))) andalso (Len =< MaxLen) of
+    Len = byte_size(ClientId),
+    case (1 =< Len) andalso (Len =< MaxLen) of
         true -> ok;
         false -> {error, ?RC_CLIENT_IDENTIFIER_NOT_VALID}
     end.
@@ -453,7 +451,7 @@ to_message(
 ) ->
     Msg = emqx_message:make(ClientId, QoS, Topic, Payload),
     {Extra, Props1} =
-        case maps:take(internal_extra, Props) of
+        case maps:take(?MQTT_INTERNAL_EXTRA, Props) of
             error -> {#{}, Props};
             ExtraProps -> ExtraProps
         end,
@@ -482,20 +480,18 @@ will_msg(#mqtt_packet_connect{
     }.
 
 %% @doc Format packet
--spec format(emqx_types:packet()) -> iolist().
-format(Packet) -> format(Packet, emqx_trace_handler:payload_encode()).
-
-%% @doc Format packet
--spec format(emqx_types:packet(), hex | text | hidden) -> iolist().
-format(#mqtt_packet{header = Header, variable = Variable, payload = Payload}, PayloadEncode) ->
+-spec format(emqx_types:packet(), payload_encode() | payload_format_opts()) -> iolist().
+format(Packet, PayloadEncode) when is_atom(PayloadEncode) ->
+    format(Packet, #{payload_encode => PayloadEncode});
+format(#mqtt_packet{header = Header, variable = Variable, payload = Payload}, PayloadFormatOpts) ->
     HeaderIO = format_header(Header),
-    case format_variable(Variable, Payload, PayloadEncode) of
+    case format_variable(Variable, Payload, PayloadFormatOpts) of
         "" -> [HeaderIO, ")"];
         VarIO -> [HeaderIO, ", ", VarIO, ")"]
     end;
 %% receive a frame error packet, such as {frame_error,#{cause := frame_too_large}} or
 %% {frame_error,#{expected => <<"'MQTT' or 'MQIsdp'">>,cause => invalid_proto_name,received => <<"bad_name">>}}
-format(FrameError, _PayloadEncode) ->
+format(FrameError, _PayloadFormatOpts) ->
     lists:flatten(io_lib:format("~tp", [FrameError])).
 
 format_header(#mqtt_packet_header{
@@ -508,10 +504,14 @@ format_header(#mqtt_packet_header{
 
 format_variable(undefined, _, _) ->
     "";
-format_variable(Variable, undefined, PayloadEncode) ->
-    format_variable(Variable, PayloadEncode);
-format_variable(Variable, Payload, PayloadEncode) ->
-    [format_variable(Variable, PayloadEncode), ", ", format_payload(Payload, PayloadEncode)].
+format_variable(Variable, undefined, PayloadFormatOpts) ->
+    format_variable(Variable, PayloadFormatOpts);
+format_variable(Variable, Payload, PayloadFormatOpts) ->
+    [
+        format_variable(Variable, PayloadFormatOpts),
+        ", ",
+        format_payload_label(Payload, PayloadFormatOpts)
+    ].
 
 format_variable(
     #mqtt_packet_connect{
@@ -528,7 +528,7 @@ format_variable(
         username = Username,
         password = Password
     },
-    PayloadEncode
+    PayloadFormatOpts
 ) ->
     Base = io_lib:format(
         "ClientId=~ts, ProtoName=~ts, ProtoVsn=~p, CleanStart=~ts, KeepAlive=~p, Username=~ts, Password=~ts",
@@ -542,7 +542,7 @@ format_variable(
                     ", Will(Q~p, R~p, Topic=~ts ",
                     [WillQoS, i(WillRetain), WillTopic]
                 ),
-                format_payload(WillPayload, PayloadEncode),
+                format_payload_label(WillPayload, PayloadFormatOpts),
                 ")"
             ];
         false ->
@@ -622,32 +622,78 @@ format_password(undefined) -> "";
 format_password(<<>>) -> "";
 format_password(_Password) -> "******".
 
-format_payload(_, hidden) ->
-    "Payload=******";
-format_payload(Payload, text) when ?MAX_PAYLOAD_FORMAT_LIMIT(Payload) ->
-    ["Payload=", unicode:characters_to_list(Payload)];
-format_payload(Payload, hex) when ?MAX_PAYLOAD_FORMAT_LIMIT(Payload) ->
-    ["Payload(hex)=", binary:encode_hex(Payload)];
-format_payload(<<Part:?TRUNCATED_PAYLOAD_SIZE/binary, _/binary>> = Payload, Type) ->
-    [
-        "Payload=",
-        format_truncated_payload(Part, byte_size(Payload), Type)
-    ].
+format_payload_label(Payload, PayloadFormatOpts) ->
+    {FPayload, Type1} = format_payload(Payload, PayloadFormatOpts),
+    [io_lib:format("Payload(~s)=", [Type1]), FPayload].
 
-format_truncated_payload(Bin, Size, Type) ->
-    Bin2 =
-        case Type of
-            text -> Bin;
-            hex -> binary:encode_hex(Bin)
-        end,
-    unicode:characters_to_list(
-        [
-            Bin2,
-            "... The ",
-            integer_to_list(Size - ?TRUNCATED_PAYLOAD_SIZE),
-            " bytes of this log are truncated"
-        ]
-    ).
+-spec format_payload(binary(), payload_encode() | payload_format_opts()) ->
+    {iolist(), payload_encode()}.
+format_payload(Payload, Type) when is_atom(Type) ->
+    format_payload(Payload, #{payload_encode => Type});
+format_payload(_, #{payload_encode := hidden}) ->
+    {"******", hidden};
+format_payload(<<>>, #{payload_encode := Type}) ->
+    {"", Type};
+format_payload(Payload, PayloadFormatOpts) when is_map(PayloadFormatOpts) ->
+    Type = maps:get(payload_encode, PayloadFormatOpts),
+    Limit = maps:get(truncate_above, PayloadFormatOpts, ?MAX_PAYLOAD_FORMAT_SIZE),
+    TruncateTo = maps:get(truncate_to, PayloadFormatOpts, ?TRUNCATED_PAYLOAD_SIZE),
+    PayloadSize = size(Payload),
+    case PayloadSize =< Limit of
+        true ->
+            format_truncated_payload(Type, Payload, PayloadSize);
+        false ->
+            format_truncated_payload(Type, Payload, TruncateTo)
+    end.
+
+format_truncated_payload(Type0, Payload, TruncateTo) when size(Payload) > TruncateTo ->
+    {Type, Part, TruncatedBytes} = truncate_payload(Type0, TruncateTo, Payload),
+    case TruncatedBytes > 0 of
+        true ->
+            {
+                ?TRUNCATED_IOLIST(do_format_payload(Type, Part), TruncatedBytes),
+                Type
+            };
+        false ->
+            {do_format_payload(Type, Payload), Type}
+    end;
+format_truncated_payload(text, Payload, _TruncateTo) ->
+    case is_utf8(Payload) of
+        true ->
+            {do_format_payload(text, Payload), text};
+        false ->
+            {do_format_payload(hex, Payload), hex}
+    end;
+format_truncated_payload(hex, Payload, _TruncateTo) ->
+    {do_format_payload(hex, Payload), hex}.
+
+do_format_payload(text, Bytes) ->
+    %% utf8 ensured
+    Bytes;
+do_format_payload(hex, Bytes) ->
+    binary:encode_hex(Bytes).
+
+is_utf8(Bytes) ->
+    case emqx_utils_fmt:trim_utf8(size(Bytes), Bytes) of
+        {ok, 0} ->
+            true;
+        _ ->
+            false
+    end.
+
+truncate_payload(hex, Limit, Payload) ->
+    <<Part:Limit/binary, Rest/binary>> = Payload,
+    {hex, Part, size(Rest)};
+truncate_payload(text, Limit, Payload) ->
+    case emqx_utils_fmt:find_complete_utf8_len(Limit, Payload) of
+        {ok, Len} ->
+            <<Part:Len/binary, Rest/binary>> = Payload,
+            {text, Part, size(Rest)};
+        error ->
+            %% not a valid utf8 string, force hex
+            <<Part:Limit/binary, Rest/binary>> = Payload,
+            {hex, Part, size(Rest)}
+    end.
 
 i(true) -> 1;
 i(false) -> 0;

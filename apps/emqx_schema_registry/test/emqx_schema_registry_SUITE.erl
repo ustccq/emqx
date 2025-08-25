@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_registry_SUITE).
 
@@ -9,12 +9,13 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -include("emqx_schema_registry.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
--define(APPS, [emqx_conf, emqx_rule_engine, emqx_schema_registry]).
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
 
 %%------------------------------------------------------------------------------
 %% CT boilerplate
@@ -25,13 +26,20 @@ all() ->
         {group, avro},
         {group, protobuf},
         {group, json}
-    ] ++ sparkplug_tests().
+    ] ++ sparkplug_tests() ++ only_once_tcs().
 
 groups() ->
-    AllTCsExceptSP = emqx_common_test_helpers:all(?MODULE) -- sparkplug_tests(),
+    OnlyOnceTCs = only_once_tcs(),
+    AllTCsExceptSP = emqx_common_test_helpers:all(?MODULE) -- (sparkplug_tests() ++ OnlyOnceTCs),
     ProtobufOnlyTCs = protobuf_only_tcs(),
     TCs = AllTCsExceptSP -- ProtobufOnlyTCs,
     [{avro, TCs}, {json, TCs}, {protobuf, AllTCsExceptSP}].
+
+only_once_tcs() ->
+    [
+        t_import_config,
+        t_external_registry_load_config
+    ].
 
 protobuf_only_tcs() ->
     [
@@ -44,16 +52,27 @@ sparkplug_tests() ->
         t_sparkplug_decode,
         t_sparkplug_encode,
         t_sparkplug_decode_encode_with_message_name,
-        t_sparkplug_encode_float_to_uint64_key
+        t_sparkplug_encode_float_to_uint64_key,
+        t_decode_fail
     ].
 
 init_per_suite(Config) ->
-    emqx_config:save_schema_mod_and_names(emqx_schema_registry_schema),
-    emqx_mgmt_api_test_util:init_suite(?APPS),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_rule_engine,
+            emqx_schema_registry,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite(lists:reverse(?APPS)),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_group(avro, Config) ->
@@ -75,7 +94,9 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, _Config) ->
     ok = snabbkaffe:stop(),
     emqx_common_test_helpers:call_janitor(),
+    emqx_bridge_v2_testlib:delete_all_rules(),
     clear_schemas(),
+    clear_external_registries(),
     ok.
 
 %%------------------------------------------------------------------------------
@@ -124,9 +145,7 @@ create_rule_http(RuleParams, Overrides) ->
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
         {ok, Res0} ->
-            Res = #{<<"id">> := RuleId} = emqx_utils_json:decode(Res0, [return_maps]),
-            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
-            {ok, Res};
+            {ok, emqx_utils_json:decode(Res0)};
         Error ->
             Error
     end.
@@ -336,6 +355,14 @@ clear_schemas() ->
         emqx_schema_registry:list_schemas()
     ).
 
+clear_external_registries() ->
+    maps:foreach(
+        fun(Name, _Schema) ->
+            ok = emqx_schema_registry_config:delete_external_registry(Name)
+        end,
+        emqx_schema_registry_config:list_external_registries()
+    ).
+
 receive_action_results() ->
     receive
         {action, #{data := _} = Res} ->
@@ -351,7 +378,7 @@ receive_published(Line) ->
             maps:update_with(
                 payload,
                 fun(Raw) ->
-                    case emqx_utils_json:safe_decode(Raw, [return_maps]) of
+                    case emqx_utils_json:safe_decode(Raw) of
                         {ok, Decoded} -> Decoded;
                         {error, _} -> Raw
                     end
@@ -362,63 +389,6 @@ receive_published(Line) ->
         ct:pal("mailbox: ~p", [process_info(self(), messages)]),
         ct:fail("publish not received, line ~b", [Line])
     end.
-
-cluster(Config) ->
-    PrivDataDir = ?config(priv_dir, Config),
-    Cluster = emqx_common_test_helpers:emqx_cluster(
-        [core, core],
-        [
-            {apps, ?APPS},
-            {listener_ports, []},
-            {priv_data_dir, PrivDataDir},
-            {load_schema, true},
-            {start_autocluster, true},
-            {schema_mod, emqx_enterprise_schema},
-            {load_apps, [emqx_machine]},
-            {env_handler, fun
-                (emqx) ->
-                    application:set_env(emqx, boot_modules, [broker]),
-                    ok;
-                (emqx_conf) ->
-                    ok;
-                (_) ->
-                    ok
-            end}
-        ]
-    ),
-    ct:pal("cluster:\n  ~p", [Cluster]),
-    Cluster.
-
-start_cluster(Cluster) ->
-    Nodes = [
-        emqx_common_test_helpers:start_peer(Name, Opts)
-     || {Name, Opts} <- Cluster
-    ],
-    NumNodes = length(Nodes),
-    on_exit(fun() ->
-        emqx_utils:pmap(
-            fun(N) ->
-                ct:pal("stopping ~p", [N]),
-                ok = emqx_common_test_helpers:stop_peer(N)
-            end,
-            Nodes
-        )
-    end),
-    {ok, _} = snabbkaffe:block_until(
-        %% -1 because only those that join the first node will emit the event.
-        ?match_n_events(NumNodes - 1, #{?snk_kind := emqx_machine_boot_apps_started}),
-        30_000
-    ),
-    Nodes.
-
-wait_for_cluster_rpc(Node) ->
-    %% need to wait until the config handler is ready after
-    %% restarting during the cluster join.
-    ?retry(
-        _Sleep0 = 100,
-        _Attempts0 = 50,
-        true = is_pid(erpc:call(Node, erlang, whereis, [emqx_config_handler]))
-    ).
 
 protobuf_unique_cache_hit_spec(#{serde_type := protobuf} = Res, Trace) ->
     #{nodes := Nodes} = Res,
@@ -449,8 +419,136 @@ protobuf_unique_cache_hit_spec(#{serde_type := protobuf} = Res, Trace) ->
 protobuf_unique_cache_hit_spec(_Res, _Trace) ->
     ok.
 
+eval_encode(Serde, Args) ->
+    emqx_schema_registry_serde:eval_encode(Serde, Args).
+
+eval_decode(Serde, Args) ->
+    emqx_schema_registry_serde:eval_decode(Serde, Args).
+
+encode_then_decode(Serde, Payload, ExtraArgs) ->
+    Encoded = eval_encode(Serde, [Payload | ExtraArgs]),
+    eval_decode(Serde, [Encoded | ExtraArgs]).
+
+sparkplug_example_data_base64() ->
+    <<
+        "CPHh67HrMBIqChxjb3VudGVyX2dyb3VwMS9jb3VudGVyMV8xc2VjGPXh67HrMCACUKgD"
+        "EikKHGNvdW50ZXJfZ3JvdXAxL2NvdW50ZXIxXzVzZWMY9eHrseswIAJQVBIqCh1jb3Vu"
+        "dGVyX2dyb3VwMS9jb3VudGVyMV8xMHNlYxj14eux6zAgAlAqEigKG2NvdW50ZXJfZ3Jv"
+        "dXAxL2NvdW50ZXIxX3J1bhj14eux6zAgBVABEioKHWNvdW50ZXJfZ3JvdXAxL2NvdW50"
+        "ZXIxX3Jlc2V0GPXh67HrMCAFUAAYWA=="
+    >>.
+
+sparkplug_example_data() ->
+    #{
+        <<"metrics">> =>
+            [
+                #{
+                    <<"datatype">> => 2,
+                    <<"int_value">> => 424,
+                    <<"name">> => <<"counter_group1/counter1_1sec">>,
+                    <<"timestamp">> => 1678094561525
+                },
+                #{
+                    <<"datatype">> => 2,
+                    <<"int_value">> => 84,
+                    <<"name">> => <<"counter_group1/counter1_5sec">>,
+                    <<"timestamp">> => 1678094561525
+                },
+                #{
+                    <<"datatype">> => 2,
+                    <<"int_value">> => 42,
+                    <<"name">> => <<"counter_group1/counter1_10sec">>,
+                    <<"timestamp">> => 1678094561525
+                },
+                #{
+                    <<"datatype">> => 5,
+                    <<"int_value">> => 1,
+                    <<"name">> => <<"counter_group1/counter1_run">>,
+                    <<"timestamp">> => 1678094561525
+                },
+                #{
+                    <<"datatype">> => 5,
+                    <<"int_value">> => 0,
+                    <<"name">> => <<"counter_group1/counter1_reset">>,
+                    <<"timestamp">> => 1678094561525
+                }
+            ],
+        <<"seq">> => 88,
+        <<"timestamp">> => 1678094561521
+    }.
+
+wait_for_sparkplug_schema_registered() ->
+    ?retry(
+        100,
+        100,
+        [_] = ets:lookup(?SERDE_TAB, ?EMQX_SCHEMA_REGISTRY_SPARKPLUGB_SCHEMA_NAME)
+    ).
+
+proto_file_path(File) ->
+    Base = code:lib_dir(emqx_schema_registry),
+    filename:join([Base, "test", "protobuf_data", File]).
+
+proto_file(File) ->
+    {ok, Contents} = file:read_file(proto_file_path(File)),
+    Contents.
+
+%% Emulate `init_load`, since our CTH doesn't actually perform that.
+emulate_emqx_conf_init_load(NewNode, SeedNode) ->
+    ?ON(SeedNode, ok = emqx_config_backup_manager:flush()),
+    ?ON(NewNode, begin
+        Res = emqx_conf_app:sync_cluster_conf(),
+        ct:pal("Synced config:\n  ~p", [Res]),
+        DataDir = emqx:data_dir(),
+        Path = filename:join([DataDir, "configs", "cluster.hocon"]),
+        {ok, Contents0} = file:read_file(Path),
+        ok = file:write_file(Path, [
+            Contents0,
+            <<"node.cookie = cookie \n">>,
+            [
+                <<"node.data_dir = \"">>,
+                DataDir,
+                <<"\" \n">>
+            ]
+        ]),
+
+        SchemaMod = emqx_enterprise_schema,
+        ok = application:stop(emqx_schema_registry),
+        ok = emqx_config:init_load(SchemaMod),
+        ok = application:start(emqx_schema_registry)
+    end).
+
+str(X) -> emqx_utils_conv:str(X).
+
+list_schema_files(Name) ->
+    SchemaDir = str(emqx_schema_registry_config:protobuf_bundle_data_dir(Name)),
+    filelib:fold_files(
+        SchemaDir,
+        _Regex = "",
+        _Recursive = true,
+        fun(Path0, Acc) ->
+            Path = lists:flatten(string:replace(Path0, SchemaDir ++ "/", "", leading)),
+            [Path | Acc]
+        end,
+        []
+    ).
+
+export_backup() ->
+    URL = emqx_mgmt_api_test_util:api_path(["data", "export"]),
+    simple_request(#{method => post, url => URL, body => {raw, <<>>}}).
+
+import_backup(BackupName) ->
+    URL = emqx_mgmt_api_test_util:api_path(["data", "import"]),
+    Body = #{<<"filename">> => unicode:characters_to_binary(BackupName)},
+    simple_request(#{method => post, url => URL, body => Body}).
+
+simple_request(Opts) ->
+    emqx_mgmt_api_test_util:simple_request(Opts).
+
+import_config(RawConf) ->
+    emqx_schema_registry_config:import_config(?global_ns, RawConf).
+
 %%------------------------------------------------------------------------------
-%% Testcases
+%% Test cases
 %%------------------------------------------------------------------------------
 
 t_unknown_calls(_Config) ->
@@ -530,6 +628,23 @@ t_encode(Config) ->
             {ok, Serde} = emqx_schema_registry:get_serde(SerdeName),
             ?assertEqual(Payload, eval_decode(Serde, [Encoded | ExtraArgs]))
     end,
+    ok.
+
+t_decode_fail(_Config) ->
+    SerdeName = my_serde,
+    SerdeType = protobuf,
+    ok = create_serde(SerdeType, SerdeName),
+    Payload = <<"ss">>,
+    ?assertThrow(
+        {schema_decode_error, #{
+            data := <<"ss">>,
+            error_type := decoding_failure,
+            explain := _,
+            message_type := 'Person',
+            schema_name := <<"my_serde">>
+        }},
+        emqx_rule_funcs:schema_decode(<<"my_serde">>, Payload, <<"Person">>)
+    ),
     ok.
 
 t_decode(Config) ->
@@ -657,7 +772,15 @@ t_fail_rollback(Config) ->
 
 t_cluster_serde_build(Config) ->
     SerdeType = ?config(serde_type, Config),
-    Cluster = cluster(Config),
+    AppSpecs = [
+        emqx_conf,
+        emqx_rule_engine,
+        emqx_schema_registry
+    ],
+    ClusterSpec = [
+        {cluster_serde_build1, #{apps => AppSpecs}},
+        {cluster_serde_build2, #{apps => AppSpecs}}
+    ],
     SerdeName = my_serde,
     Schema = schema_params(SerdeType),
     #{
@@ -666,9 +789,13 @@ t_cluster_serde_build(Config) ->
     } = test_params_for(SerdeType, encode_decode1),
     ?check_trace(
         begin
-            Nodes = [N1, N2 | _] = start_cluster(Cluster),
+            Nodes =
+                [N1, N2 | _] = emqx_cth_cluster:start(
+                    ClusterSpec,
+                    #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+                ),
+            on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
             NumNodes = length(Nodes),
-            wait_for_cluster_rpc(N2),
             ?assertMatch(
                 ok,
                 erpc:call(N2, emqx_schema_registry, add_schema, [SerdeName, Schema])
@@ -723,6 +850,94 @@ t_cluster_serde_build(Config) ->
     ),
     ok.
 
+%% Verifies that importing in both `merge' and `replace' modes work with external
+%% registries, when importing configurations from the CLI interface.
+t_external_registry_load_config(_Config) ->
+    %% Existing config
+    Name0 = <<"preexisting">>,
+    Config0 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(),
+    {201, _} = emqx_schema_registry_http_api_SUITE:create_external_registry(Config0#{
+        <<"name">> => Name0
+    }),
+    [_] = emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name0),
+
+    %% Config to load
+    %% Will update existing config
+    Name1 = Name0,
+    URL1 = <<"http://new_url:8081">>,
+    Config1 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(#{
+        <<"url">> => URL1
+    }),
+    %% New config
+    Name2 = <<"new">>,
+    URL2 = <<"http://yet_another_url:8081">>,
+    Config2 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(#{
+        <<"url">> => URL2
+    }),
+    ConfigToLoad1 = #{
+        <<"schema_registry">> => #{
+            <<"external">> => #{
+                Name1 => Config1,
+                Name2 => Config2
+            }
+        }
+    },
+    ConfigToLoad1Bin = iolist_to_binary(hocon_pp:do(ConfigToLoad1, #{})),
+    ?assertMatch(ok, emqx_conf_cli:load_config(?global_ns, ConfigToLoad1Bin, #{mode => merge})),
+
+    Path = [schema_registry, external],
+    PathBin = [emqx_utils_conv:bin(PS) || PS <- Path],
+    Name1Atom = binary_to_atom(Name1),
+    Name2Atom = binary_to_atom(Name2),
+    ?assertMatch(
+        #{
+            Name1 := #{<<"url">> := URL1},
+            Name2 := #{<<"url">> := URL2}
+        },
+        emqx_config:get_raw(PathBin)
+    ),
+    ?assertMatch(
+        #{
+            Name1Atom := #{url := URL1},
+            Name2Atom := #{url := URL2}
+        },
+        emqx_config:get(Path)
+    ),
+    %% Correctly starts new processes
+    ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name1)),
+    ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name2)),
+
+    %% New config; will replace everything
+    Name3 = Name0,
+    URL3 = <<"http://final_url:8081">>,
+    Config3 = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(#{
+        <<"url">> => URL3
+    }),
+    ConfigToLoad2 = #{
+        <<"schema_registry">> => #{
+            <<"external">> => #{
+                Name3 => Config3
+            }
+        }
+    },
+    ConfigToLoad2Bin = iolist_to_binary(hocon_pp:do(ConfigToLoad2, #{})),
+    ?assertMatch(ok, emqx_conf_cli:load_config(?global_ns, ConfigToLoad2Bin, #{mode => replace})),
+
+    Name3Atom = binary_to_atom(Name3),
+    ?assertMatch(
+        #{Name3 := #{<<"url">> := URL3}},
+        emqx_config:get_raw(PathBin)
+    ),
+    ?assertMatch(
+        #{Name3Atom := #{url := URL3}},
+        emqx_config:get(Path)
+    ),
+    %% Correctly stops old processes
+    ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name3)),
+    ?assertMatch([], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name2)),
+
+    ok.
+
 t_import_config(_Config) ->
     RawConf = #{
         <<"schema_registry">> =>
@@ -754,70 +969,49 @@ t_import_config(_Config) ->
         RawConf,
         <<"Updated description">>
     ),
-    Path = [schema_registry, schemas, <<"my_avro_schema">>],
+    %% Config without old schema, should be merged with previous schemas.
+    RawConf2 = #{
+        <<"schema_registry">> =>
+            #{
+                <<"schemas">> =>
+                    #{
+                        <<"my_json_schema">> =>
+                            #{
+                                <<"description">> => <<"My Json Schema">>,
+                                <<"source">> => emqx_utils_json:encode(#{
+                                    <<"$schema">> => <<"http://json-schema.org/draft-06/schema#">>,
+                                    <<"type">> => <<"object">>
+                                }),
+                                <<"type">> => <<"json">>
+                            }
+                    }
+            }
+    },
+    Path1 = [schema_registry, schemas, my_avro_schema],
+    Path2 = [schema_registry, schemas, my_json_schema],
     ?assertEqual(
-        {ok, #{root_key => schema_registry, changed => []}},
-        emqx_schema_registry:import_config(RawConf)
+        {ok, #{root_key => schema_registry, changed => [Path1]}},
+        import_config(RawConf)
     ),
     ?assertEqual(
-        {ok, #{root_key => schema_registry, changed => [Path]}},
-        emqx_schema_registry:import_config(RawConf1)
-    ).
-
-sparkplug_example_data_base64() ->
-    <<
-        "CPHh67HrMBIqChxjb3VudGVyX2dyb3VwMS9jb3VudGVyMV8xc2VjGPXh67HrMCACUKgD"
-        "EikKHGNvdW50ZXJfZ3JvdXAxL2NvdW50ZXIxXzVzZWMY9eHrseswIAJQVBIqCh1jb3Vu"
-        "dGVyX2dyb3VwMS9jb3VudGVyMV8xMHNlYxj14eux6zAgAlAqEigKG2NvdW50ZXJfZ3Jv"
-        "dXAxL2NvdW50ZXIxX3J1bhj14eux6zAgBVABEioKHWNvdW50ZXJfZ3JvdXAxL2NvdW50"
-        "ZXIxX3Jlc2V0GPXh67HrMCAFUAAYWA=="
-    >>.
-
-sparkplug_example_data() ->
-    #{
-        <<"metrics">> =>
-            [
-                #{
-                    <<"datatype">> => 2,
-                    <<"int_value">> => 424,
-                    <<"name">> => <<"counter_group1/counter1_1sec">>,
-                    <<"timestamp">> => 1678094561525
-                },
-                #{
-                    <<"datatype">> => 2,
-                    <<"int_value">> => 84,
-                    <<"name">> => <<"counter_group1/counter1_5sec">>,
-                    <<"timestamp">> => 1678094561525
-                },
-                #{
-                    <<"datatype">> => 2,
-                    <<"int_value">> => 42,
-                    <<"name">> => <<"counter_group1/counter1_10sec">>,
-                    <<"timestamp">> => 1678094561525
-                },
-                #{
-                    <<"datatype">> => 5,
-                    <<"int_value">> => 1,
-                    <<"name">> => <<"counter_group1/counter1_run">>,
-                    <<"timestamp">> => 1678094561525
-                },
-                #{
-                    <<"datatype">> => 5,
-                    <<"int_value">> => 0,
-                    <<"name">> => <<"counter_group1/counter1_reset">>,
-                    <<"timestamp">> => 1678094561525
-                }
-            ],
-        <<"seq">> => 88,
-        <<"timestamp">> => 1678094561521
-    }.
-
-wait_for_sparkplug_schema_registered() ->
-    ?retry(
-        100,
-        100,
-        [_] = ets:lookup(?SERDE_TAB, ?EMQX_SCHEMA_REGISTRY_SPARKPLUGB_SCHEMA_NAME)
-    ).
+        {ok, #{root_key => schema_registry, changed => [Path1]}},
+        import_config(RawConf1)
+    ),
+    ?assertEqual(
+        {ok, #{root_key => schema_registry, changed => [Path2]}},
+        import_config(RawConf2)
+    ),
+    %% Both schemas should be present.
+    ?assertMatch(
+        #{
+            <<"schemas">> := #{
+                <<"my_avro_schema">> := #{<<"description">> := <<"Updated description">>},
+                <<"my_json_schema">> := #{<<"description">> := <<"My Json Schema">>}
+            }
+        },
+        emqx_config:get_raw([<<"schema_registry">>])
+    ),
+    ok.
 
 t_sparkplug_decode(_Config) ->
     SQL =
@@ -885,12 +1079,603 @@ t_sparkplug_decode_encode_with_message_name(_Config) ->
     ?assertMatch(#{data := ExpectedRuleOutput}, Res),
     ok.
 
-eval_encode(Serde, Args) ->
-    emqx_schema_registry_serde:eval_encode(Serde, Args).
+%% Simple smoke, happy path test for adding a protobuf schema with bundle of files as
+%% sources, whose files need to be copied to emqx data dir.
+t_smoke_protobuf_bundle_file_conversion(_Config) ->
+    Name = <<"bundled">>,
+    Schema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => false,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"a.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"contents">> => proto_file(<<"c.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(ok, emqx_schema_registry:add_schema(Name, Schema1)),
+    {ok, #{source := #{root_proto_path := Path1}}} = emqx_schema_registry:get_schema(Name),
+    ?assertEqual({ok, proto_file(<<"a.proto">>)}, file:read_file(Path1)),
+    %% Roundtrip
+    Data1 = #{
+        <<"name">> => <<"aaa">>,
+        <<"id">> => 1,
+        <<"bah">> => #{
+            <<"bah">> => <<"bah">>,
+            <<"boh">> => #{<<"boh">> => <<"boh">>}
+        }
+    },
+    EncodedData1 = emqx_schema_registry_serde:encode(Name, Data1, [<<"Person">>]),
+    ?assertEqual(Data1, emqx_schema_registry_serde:decode(Name, EncodedData1, [<<"Person">>])),
+    %% Update leaf schema; only c.proto's contents are changed.
+    Schema2 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => false,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"a.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"contents">> => proto_file(<<"c1.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(ok, emqx_schema_registry:add_schema(Name, Schema2)),
+    Data2 = #{
+        <<"name">> => <<"aaa">>,
+        <<"id">> => 1,
+        <<"bah">> => #{
+            <<"bah">> => <<"bah">>,
+            <<"boh">> => #{<<"boh">> => 999}
+        }
+    },
+    EncodedData2 = emqx_schema_registry_serde:encode(Name, Data2, [<<"Person">>]),
+    ?assertEqual(Data2, emqx_schema_registry_serde:decode(Name, EncodedData2, [<<"Person">>])),
+    ok.
 
-eval_decode(Serde, Args) ->
-    emqx_schema_registry_serde:eval_decode(Serde, Args).
+%% Similar to `t_smoke_protobuf_bundle_file_conversion`, but with a cluster; checks cache
+%% hits and misses.
+t_smoke_protobuf_bundle_file_conversion_cluster(Config) ->
+    AppSpecs = [
+        emqx_conf,
+        emqx_rule_engine,
+        emqx_schema_registry
+    ],
+    ClusterSpec = [
+        {proto_bundle1, #{apps => AppSpecs}},
+        {proto_bundle2, #{apps => AppSpecs}}
+    ],
+    Name = <<"bundled">>,
+    Schema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => false,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"a.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"contents">> => proto_file(<<"c.proto">>)
+                }
+            ]
+        }
+    },
+    Nodes =
+        [N1 | _] = emqx_cth_cluster:start(
+            ClusterSpec,
+            #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+        ),
+    on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
+    Data1 = #{
+        <<"name">> => <<"aaa">>,
+        <<"id">> => 1,
+        <<"bah">> => #{
+            <<"bah">> => <<"bah">>,
+            <<"boh">> => #{<<"boh">> => <<"boh">>}
+        }
+    },
+    ?check_trace(
+        begin
+            ?ON(N1, ?assertMatch(ok, emqx_schema_registry:add_schema(Name, Schema1))),
+            lists:foreach(
+                fun(N) ->
+                    ok = ?ON(N, begin
+                        Res0 = emqx_schema_registry:get_serde(Name),
+                        ?assertMatch({ok, #serde{}}, Res0, #{node => N}),
+                        {ok, Serde} = Res0,
+                        ?assertEqual(
+                            Data1,
+                            encode_then_decode(Serde, Data1, [<<"Person">>]),
+                            #{node => N}
+                        ),
+                        ok
+                    end)
+                end,
+                Nodes
+            )
+        end,
+        [{"protobuf is only built on one node", fun ?MODULE:protobuf_unique_cache_hit_spec/2}]
+    ),
+    snabbkaffe:stop(),
+    ok.
 
-encode_then_decode(Serde, Payload, ExtraArgs) ->
-    Encoded = eval_encode(Serde, [Payload | ExtraArgs]),
-    eval_decode(Serde, [Encoded | ExtraArgs]).
+%% Simple smoke, happy path test for adding a protobuf schema with bundle of files as
+%% sources, already pointing to a correctly set up directory.
+t_smoke_protobuf_bundle_direct_path(_Config) ->
+    Name = <<"bundled">>,
+    Schema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"root_proto_path">> => proto_file_path(<<"c.proto">>)
+        }
+    },
+    ?assertMatch(ok, emqx_schema_registry:add_schema(Name, Schema1)),
+    {ok, #{source := #{root_proto_path := Path1}}} = emqx_schema_registry:get_schema(Name),
+    ?assertEqual(proto_file_path(<<"c.proto">>), Path1),
+    %% Roundtrip
+    Data1 = #{<<"boh">> => <<"boh">>},
+    EncodedData1 = emqx_schema_registry_serde:encode(Name, Data1, [<<"Boh">>]),
+    ?assertEqual(Data1, emqx_schema_registry_serde:decode(Name, EncodedData1, [<<"Boh">>])),
+    ok.
+
+%% A protobuf bundle with no files is invalid.
+t_protobuf_bundle_no_files(_Config) ->
+    Name = <<"bundled">>,
+    %% No files
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => []
+        }
+    },
+    ?assertMatch(
+        {error, {pre_config_update, _, <<"must have exactly one root file">>}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% A protobuf bundle with no file marked as root is invalid.
+t_protobuf_bundle_no_roots(_Config) ->
+    Name = <<"bundled">>,
+    %% No files
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => false,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"contents">> => proto_file(<<"c.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error, {pre_config_update, _, <<"must have exactly one root file">>}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% A protobuf bundle with multiple files marked as root is invalid.
+t_protobuf_bundle_multiple_roots(_Config) ->
+    Name = <<"bundled">>,
+    %% No files
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"c.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error, {pre_config_update, _, <<"must have exactly one root file">>}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% A protobuf bundle with traversal attack is invalid.
+t_protobuf_bundle_traversal_attack(_Config) ->
+    Name = <<"bundled">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"pwn.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"traversal_attack.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error,
+            {pre_config_update, _,
+                {invalid_or_missing_imports, #{
+                    invalid := [_],
+                    missing := []
+                }}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% A protobuf bundle with a missing import is invalid.
+t_protobuf_bundle_missing_import(_Config) ->
+    Name = <<"bundled">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"missing.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"missing.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error,
+            {pre_config_update, _,
+                {invalid_or_missing_imports, #{
+                    invalid := [],
+                    missing := [_]
+                }}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% A protobuf bundle with traversal attack is invalid.
+t_protobuf_bundle_no_conversion_traversal_attack(_Config) ->
+    Name = <<"bundled">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"root_proto_path">> => proto_file_path(<<"traversal_attack.proto">>)
+        }
+    },
+    ?assertMatch(
+        {error,
+            {pre_config_update, _,
+                {invalid_or_missing_imports, #{
+                    invalid := [_],
+                    missing := []
+                }}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% The destination path of a file must not contain `..`.
+t_protobuf_bundle_converted_name_traversal(_Config) ->
+    Name = <<"bundled">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"../traversal.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error, {pre_config_update, _, {bad_path, <<"../traversal.proto">>}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% Checks an update config request with invalid structure.
+t_protobuf_bundle_bad_file(_Config) ->
+    Name = <<"bundled">>,
+    %% Missing `contents`
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"root">> => true,
+                    <<"path">> => <<"a.proto">>
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error, {pre_config_update, _, {bad_file, #{}}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    %% Missing `path`
+    BadSchema2 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                }
+            ]
+        }
+    },
+    ?assertMatch(
+        {error, {pre_config_update, _, {bad_file, #{}}}},
+        emqx_schema_registry:add_schema(Name, BadSchema2)
+    ),
+    ok.
+
+%% Path pointing to directory is invalid.
+t_protobuf_bundle_no_conversion_file_is_directory(_Config) ->
+    Name = <<"bundled">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"root_proto_path">> => <<"/tmp">>
+        }
+    },
+    %% `gpb` detects it as "missing"
+    ?assertMatch(
+        {error,
+            {pre_config_update, _,
+                {invalid_or_missing_imports, #{
+                    invalid := [],
+                    missing := [_]
+                }}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% Path pointing to unreadable file is invalid.
+t_protobuf_bundle_no_conversion_unreadable(_Config) ->
+    Name = <<"bundled">>,
+    Path = <<"/tmp/unreadable">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"root_proto_path">> => Path
+        }
+    },
+    file:change_mode(Path, 8#777),
+    ok = file:write_file(Path, <<"">>),
+    ok = file:change_mode(Path, 8#000),
+    %% `gpb` detects it as "missing"
+    ?assertMatch(
+        {error,
+            {pre_config_update, _,
+                {invalid_or_missing_imports, #{
+                    invalid := [],
+                    missing := [_]
+                }}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok = file:change_mode(Path, 8#777),
+    ok = file:delete(Path),
+    ok.
+
+%% Not a bundle, but contains traversal attack
+t_protobuf_single_traversal_attack(_Config) ->
+    Name = <<"bundled">>,
+    BadSchema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => proto_file(<<"traversal_attack.proto">>)
+    },
+    ?assertMatch(
+        {error,
+            {pre_config_update, _,
+                {invalid_or_missing_imports, #{
+                    invalid := [_],
+                    missing := []
+                }}}},
+        emqx_schema_registry:add_schema(Name, BadSchema1)
+    ),
+    ok.
+
+%% Checks that we sync the `data/schemas/protobuf` directory when a new node joins an
+%% existing cluster.
+t_protobuf_bundle_cluster_sync_join_later(Config) ->
+    AppSpecs = [
+        emqx,
+        emqx_conf,
+        emqx_rule_engine,
+        emqx_schema_registry,
+        emqx_management
+    ],
+    ClusterSpec = [
+        {proto_sync1, #{apps => AppSpecs}},
+        {proto_sync2, #{apps => AppSpecs}}
+    ],
+    [N1Spec, N2Spec] = emqx_cth_cluster:mk_nodespecs(
+        ClusterSpec,
+        #{
+            work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config),
+            %% Call `init:stop' instead of `erlang:halt/0' for clean mnesia
+            %% shutdown and restart
+            shutdown => 5_000
+        }
+    ),
+    {Names0, _} = lists:unzip(ClusterSpec),
+    Nodes = lists:map(fun emqx_cth_cluster:node_name/1, Names0),
+    on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
+    [N1, N2] = emqx_cth_cluster:start([N1Spec, N2Spec]),
+    ok = emqx_cth_cluster:stop([N2]),
+
+    %% Create schema on existing cluster
+    Name = <<"bundled">>,
+    Schema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => false,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"a.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"contents">> => proto_file(<<"c.proto">>)
+                }
+            ]
+        }
+    },
+    ?ON(N1, ?assertMatch(ok, emqx_schema_registry:add_schema(Name, Schema1))),
+
+    %% Now, `N2` joins the cluster.  It must sync the already unpacked bundle.
+    ct:pal("(re)starting other node"),
+    [N2] = emqx_cth_cluster:restart([N2Spec]),
+    {_, {ok, _}} =
+        ?wait_async_action(
+            emulate_emqx_conf_init_load(N2, N1),
+            #{?snk_kind := schema_registry_serdes_built}
+        ),
+
+    Data1 = #{
+        <<"name">> => <<"aaa">>,
+        <<"id">> => 1,
+        <<"bah">> => #{
+            <<"bah">> => <<"bah">>,
+            <<"boh">> => #{<<"boh">> => <<"boh">>}
+        }
+    },
+    lists:foreach(
+        fun(N) ->
+            ok = ?ON(N, begin
+                Res0 = emqx_schema_registry:get_serde(Name),
+                ?retry(200, 10, ?assertMatch({ok, #serde{}}, Res0, #{node => N})),
+                {ok, Serde} = Res0,
+                ?assertEqual(
+                    Data1,
+                    encode_then_decode(Serde, Data1, [<<"Person">>]),
+                    #{node => N}
+                ),
+                ok
+            end)
+        end,
+        Nodes
+    ),
+    SchemaFiles = ?ON(N2, list_schema_files(Name)),
+    ?assertEqual(
+        [
+            "a.proto",
+            "c.proto",
+            "nested/b.proto"
+        ],
+        lists:sort(SchemaFiles)
+    ),
+    ok.
+
+%% Checks that we back up the `data/schemas/protobuf` directory when exporting a config
+%% backup.
+t_protobuf_bundle_backup_export_import(_Config) ->
+    Name = <<"bundled">>,
+    Schema1 = #{
+        <<"type">> => <<"protobuf">>,
+        <<"source">> => #{
+            <<"type">> => <<"bundle">>,
+            <<"files">> => [
+                #{
+                    <<"path">> => <<"nested/b.proto">>,
+                    <<"root">> => false,
+                    <<"contents">> => proto_file(<<"b.proto">>)
+                },
+                #{
+                    <<"path">> => <<"a.proto">>,
+                    <<"root">> => true,
+                    <<"contents">> => proto_file(<<"a.proto">>)
+                },
+                #{
+                    <<"path">> => <<"c.proto">>,
+                    <<"contents">> => proto_file(<<"c.proto">>)
+                }
+            ]
+        }
+    },
+    ok = emqx_schema_registry:add_schema(Name, Schema1),
+    {200, #{<<"filename">> := BackupName}} = export_backup(),
+
+    ok = emqx_schema_registry:delete_schema(Name),
+    %% Ensure there are no lingering files (they are actually deleted by delete schema above)
+    SchemaDir = emqx_schema_registry_config:protobuf_bundle_data_dir(Name),
+    ?assertMatch({error, enoent}, file:del_dir_r(SchemaDir)),
+
+    ?assertMatch({204, _}, import_backup(BackupName)),
+    ?assertEqual(
+        [
+            "a.proto",
+            "c.proto",
+            "nested/b.proto"
+        ],
+        lists:sort(list_schema_files(Name))
+    ),
+    Data1 = #{
+        <<"name">> => <<"aaa">>,
+        <<"id">> => 1,
+        <<"bah">> => #{
+            <<"bah">> => <<"bah">>,
+            <<"boh">> => #{<<"boh">> => <<"boh">>}
+        }
+    },
+    EncodedData1 = emqx_schema_registry_serde:encode(Name, Data1, [<<"Person">>]),
+    ?assertEqual(Data1, emqx_schema_registry_serde:decode(Name, EncodedData1, [<<"Person">>])),
+
+    ok.

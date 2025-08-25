@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_engine_schema).
@@ -114,7 +102,7 @@ fields("builtin_action_console") ->
         %% the field needs to be included in the schema even though it is not a valid field.
         {args,
             ?HOCON(map(), #{
-                deprecated => true,
+                deprecated => {since, "5.2.1"},
                 importance => ?IMPORTANCE_HIDDEN,
                 desc => "The arguments of the built-in 'console' action",
                 default => #{}
@@ -144,7 +132,7 @@ fields("republish_args") ->
     [
         {topic,
             ?HOCON(
-                binary(),
+                emqx_schema:template(),
                 #{
                     desc => ?DESC("republish_args_topic"),
                     required => true,
@@ -162,7 +150,7 @@ fields("republish_args") ->
             )},
         {retain,
             ?HOCON(
-                hoconsc:union([boolean(), binary()]),
+                hoconsc:union([boolean(), emqx_schema:template()]),
                 #{
                     desc => ?DESC("republish_args_retain"),
                     default => <<"${retain}">>,
@@ -171,7 +159,7 @@ fields("republish_args") ->
             )},
         {payload,
             ?HOCON(
-                binary(),
+                emqx_schema:template(),
                 #{
                     desc => ?DESC("republish_args_payload"),
                     default => <<"${payload}">>,
@@ -188,24 +176,34 @@ fields("republish_args") ->
             )},
         {user_properties,
             ?HOCON(
-                binary(),
+                emqx_schema:template(),
                 #{
                     desc => ?DESC("republish_args_user_properties"),
                     default => <<"${user_properties}">>,
                     example => <<"${pub_props.'User-Property'}">>
+                }
+            )},
+        {direct_dispatch,
+            ?HOCON(
+                hoconsc:union([boolean(), emqx_schema:template()]),
+                #{
+                    desc => ?DESC("republish_args_direct_dispatch"),
+                    default => false
                 }
             )}
     ];
 fields("republish_mqtt_properties") ->
     [
         {'Payload-Format-Indicator',
-            ?HOCON(binary(), #{required => false, desc => ?DESC('Payload-Format-Indicator')})},
+            ?HOCON(binary(), #{required => false, desc => ?DESC("republish_mqtt_properties_prop")})},
         {'Message-Expiry-Interval',
-            ?HOCON(binary(), #{required => false, desc => ?DESC('Message-Expiry-Interval')})},
-        {'Content-Type', ?HOCON(binary(), #{required => false, desc => ?DESC('Content-Type')})},
-        {'Response-Topic', ?HOCON(binary(), #{required => false, desc => ?DESC('Response-Topic')})},
+            ?HOCON(binary(), #{required => false, desc => ?DESC("republish_mqtt_properties_prop")})},
+        {'Content-Type',
+            ?HOCON(binary(), #{required => false, desc => ?DESC("republish_mqtt_properties_prop")})},
+        {'Response-Topic',
+            ?HOCON(binary(), #{required => false, desc => ?DESC("republish_mqtt_properties_prop")})},
         {'Correlation-Data',
-            ?HOCON(binary(), #{required => false, desc => ?DESC('Correlation-Data')})}
+            ?HOCON(binary(), #{required => false, desc => ?DESC("republish_mqtt_properties_prop")})}
     ].
 
 desc("rule_engine") ->
@@ -220,6 +218,8 @@ desc("user_provided_function") ->
     ?DESC("desc_user_provided_function");
 desc("republish_args") ->
     ?DESC("desc_republish_args");
+desc("republish_mqtt_properties") ->
+    ?DESC("republish_args_mqtt_properties");
 desc(_) ->
     undefined.
 
@@ -263,7 +263,7 @@ actions() ->
     end.
 
 qos() ->
-    hoconsc:union([emqx_schema:qos(), binary()]).
+    hoconsc:union([emqx_schema:qos(), emqx_schema:template()]).
 
 rule_engine_settings() ->
     [

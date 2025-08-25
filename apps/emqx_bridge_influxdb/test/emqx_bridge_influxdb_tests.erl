@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_influxdb_tests).
 
@@ -338,7 +338,7 @@
 ]).
 
 invalid_write_syntax_line_test_() ->
-    [?_assertThrow(_, to_influx_lines(L)) || L <- ?INVALID_LINES].
+    [?_assertMatch({error, _}, to_influx_lines(L)) || L <- ?INVALID_LINES].
 
 invalid_write_syntax_multiline_test_() ->
     LinesList = [
@@ -346,7 +346,7 @@ invalid_write_syntax_multiline_test_() ->
         join("\n\n\n", ?INVALID_LINES),
         join("\n\n", lists:reverse(?INVALID_LINES))
     ],
-    [?_assertThrow(_, to_influx_lines(Lines)) || Lines <- LinesList].
+    [?_assertMatch({error, _}, to_influx_lines(Lines)) || Lines <- LinesList].
 
 valid_write_syntax_test_() ->
     test_pairs(?VALID_LINE_PARSED_PAIRS).

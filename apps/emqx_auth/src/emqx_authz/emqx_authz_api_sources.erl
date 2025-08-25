@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_api_sources).
@@ -73,7 +61,7 @@ paths() ->
     ].
 
 fields(sources) ->
-    emqx_authz_schema:api_authz_fields();
+    emqx_authz_schema:sources_fields();
 fields(position) ->
     [
         {position,
@@ -244,7 +232,8 @@ sources(get, _) ->
         fun(Source0, AccIn) ->
             try emqx_authz:maybe_read_source_files(Source0) of
                 Source1 ->
-                    lists:append(AccIn, [Source1])
+                    Source2 = emqx_utils:redact(Source1),
+                    lists:append(AccIn, [Source2])
             catch
                 _Error:_Reason ->
                     lists:append(AccIn, [Source0])
@@ -267,7 +256,8 @@ source(get, #{bindings := #{type := Type}}) ->
         fun(Source0) ->
             try emqx_authz:maybe_read_source_files(Source0) of
                 Source1 ->
-                    {200, Source1}
+                    Source2 = emqx_utils:redact(Source1),
+                    {200, Source2}
             catch
                 _Error:Reason ->
                     {500, #{
@@ -280,8 +270,9 @@ source(get, #{bindings := #{type := Type}}) ->
 source(put, #{bindings := #{type := Type}, body := #{<<"type">> := Type} = Body}) ->
     with_source(
         Type,
-        fun(_) ->
-            update_config({?CMD_REPLACE, Type}, Body)
+        fun(RawConf) ->
+            Conf = emqx_utils:deobfuscate(Body, RawConf),
+            update_config({?CMD_REPLACE, Type}, Conf)
         end
     );
 source(put, #{bindings := #{type := Type}, body := #{<<"type">> := _OtherType}}) ->
@@ -380,8 +371,8 @@ sources_order(put, #{body := AuthzOrder}) ->
 
 lookup_from_local_node(Type) ->
     NodeId = node(self()),
-    try emqx_authz:lookup(Type) of
-        #{annotations := #{id := ResourceId}} ->
+    try emqx_authz:lookup_state(Type) of
+        #{resource_id := ResourceId} ->
             Metrics = emqx_metrics_worker:get_metrics(authz_metrics, Type),
             case emqx_resource:get_instance(ResourceId) of
                 {error, not_found} ->
@@ -467,7 +458,13 @@ make_result_map(ResList) ->
     lists:foldl(Fun, {maps:new(), maps:new(), maps:new(), maps:new()}, ResList).
 
 restructure_map(#{
-    counters := #{deny := Failed, total := Total, allow := Succ, nomatch := Nomatch},
+    counters := #{
+        ignore := Ignore,
+        deny := Failed,
+        total := Total,
+        allow := Succ,
+        nomatch := Nomatch
+    },
     rate := #{total := #{current := Rate, last5m := Rate5m, max := RateMax}}
 }) ->
     #{
@@ -475,6 +472,7 @@ restructure_map(#{
         allow => Succ,
         deny => Failed,
         nomatch => Nomatch,
+        ignore => Ignore,
         rate => Rate,
         rate_last5m => Rate5m,
         rate_max => RateMax
@@ -516,10 +514,10 @@ get_raw_sources() ->
     Schema = emqx_hocon:make_schema(emqx_authz_schema:authz_fields()),
     Conf = #{<<"sources">> => RawSources},
     #{<<"sources">> := Sources} = hocon_tconf:make_serializable(Schema, Conf, #{}),
-    merge_defaults(Sources).
+    format_for_api(Sources).
 
-merge_defaults(Sources) ->
-    lists:map(fun emqx_authz:merge_defaults/1, Sources).
+format_for_api(Sources) ->
+    lists:map(fun emqx_authz:format_for_api/1, Sources).
 
 get_raw_source(Type) ->
     lists:filter(

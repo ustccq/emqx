@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@
     lookup_value/2,
     lookup_value/3
 ]).
+
+-export([keyfoldl/3]).
 
 -export([delete/1]).
 
@@ -55,6 +57,24 @@ lookup_value(Tab, Key, Def) ->
         ets:lookup_element(Tab, Key, 2)
     catch
         error:badarg -> Def
+    end.
+
+-spec keyfoldl(fun((_Key :: term(), Acc) -> Acc), Acc, ets:tab()) -> Acc.
+keyfoldl(F, Acc, Tab) ->
+    true = ets:safe_fixtable(Tab, true),
+    First = ets:first(Tab),
+    try
+        keyfoldl(F, Acc, First, Tab)
+    after
+        ets:safe_fixtable(Tab, false)
+    end.
+
+keyfoldl(F, Acc, Key, Tab) ->
+    case Key of
+        '$end_of_table' ->
+            Acc;
+        _ ->
+            keyfoldl(F, F(Key, Acc), ets:next(Tab, Key), Tab)
     end.
 
 %% Delete the ets table.

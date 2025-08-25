@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_v1_compatibility_layer_SUITE).
@@ -22,6 +11,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("emqx/include/asserts.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -69,7 +59,7 @@ init_per_testcase(_TestCase, Config) ->
     setup_mocks(),
     ets:new(fun_table_name(), [named_table, public]),
     %% Create a fake connector
-    {ok, _} = emqx_connector:create(con_type(), con_name(), con_config()),
+    {ok, _} = emqx_connector:create(?global_ns, con_type(), con_name(), con_config()),
     Config.
 
 end_per_testcase(t_upgrade_raw_conf_with_deprecated_files = _TestCase, Config) ->
@@ -274,20 +264,7 @@ registered_process_name() ->
     my_registered_process.
 
 delete_all_bridges_and_connectors() ->
-    lists:foreach(
-        fun(#{name := Name, type := Type}) ->
-            ct:pal("removing bridge ~p", [{Type, Name}]),
-            emqx_bridge_v2:remove(Type, Name)
-        end,
-        emqx_bridge_v2:list()
-    ),
-    lists:foreach(
-        fun(#{name := Name, type := Type}) ->
-            ct:pal("removing connector ~p", [{Type, Name}]),
-            emqx_connector:remove(Type, Name)
-        end,
-        emqx_connector:list()
-    ),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
     update_root_config(#{}),
     ok.
 
@@ -320,7 +297,7 @@ delete_all_bridges() ->
     ok.
 
 maybe_json_decode(X) ->
-    case emqx_utils_json:safe_decode(X, [return_maps]) of
+    case emqx_utils_json:safe_decode(X) of
         {ok, Decoded} -> Decoded;
         {error, _} -> X
     end.
@@ -334,7 +311,7 @@ request(Method, Path, Params) ->
             {ok, {Status, Headers, Body}};
         {error, {Status, Headers, Body0}} ->
             Body =
-                case emqx_utils_json:safe_decode(Body0, [return_maps]) of
+                case emqx_utils_json:safe_decode(Body0) of
                     {ok, Decoded0 = #{<<"message">> := Msg0}} ->
                         Msg = maybe_json_decode(Msg0),
                         Decoded0#{<<"message">> := Msg};
@@ -523,7 +500,7 @@ bridge_node_operation_http_api_v2(Name, Node0, Op0) ->
     Res.
 
 is_rule_enabled(RuleId) ->
-    {ok, #{enable := Enable}} = emqx_rule_engine:get_rule(RuleId),
+    {ok, #{enable := Enable}} = emqx_rule_engine:get_rule(?global_ns, RuleId),
     Enable.
 
 update_rule_http(RuleId, Params) ->
@@ -604,8 +581,7 @@ deprecated_config() ->
 t_name_too_long(_Config) ->
     LongName = list_to_binary(lists:duplicate(256, $a)),
     ?assertMatch(
-        {error,
-            {{_, 400, _}, _, #{<<"message">> := #{<<"reason">> := <<"Name is too long", _/binary>>}}}},
+        {error, {{_, 400, _}, _, #{<<"message">> := #{<<"reason">> := <<"invalid_map_key">>}}}},
         create_bridge_http_api_v1(#{name => LongName})
     ),
     ok.
@@ -942,7 +918,7 @@ t_scenario_2(Config) ->
     ok.
 
 t_create_with_bad_name(_Config) ->
-    BadBridgeName = <<"test_哈哈">>,
+    BadBridgeName = <<"test_哈哈"/utf8>>,
     %% Note: must contain SSL options to trigger bug.
     Cacertfile = emqx_common_test_helpers:app_path(
         emqx,
@@ -960,7 +936,7 @@ t_create_with_bad_name(_Config) ->
             <<"code">> := <<"BAD_REQUEST">>,
             <<"message">> := #{
                 <<"kind">> := <<"validation_error">>,
-                <<"reason">> := <<"Invalid name format.", _/binary>>
+                <<"reason">> := <<"invalid_map_key">>
             }
         }}} = create_bridge_http_api_v1(Opts),
     ok.

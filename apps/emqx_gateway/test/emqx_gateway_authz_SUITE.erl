@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_authz_SUITE).
@@ -57,7 +45,6 @@ init_per_group(AuthName, Conf) ->
     Apps = emqx_cth_suite:start(
         [
             {emqx_conf, "authorization { no_match = deny, cache { enable = false } }"},
-            emqx_auth,
             emqx_auth_http,
             {emqx_gateway, emqx_gateway_auth_ct:list_gateway_conf()}
             | emqx_gateway_test_utils:all_gateway_apps()
@@ -99,7 +86,8 @@ t_case_coap_publish(_) ->
     end,
     Case = fun(Channel, Token) ->
         Fun(Channel, Token, <<"/publish">>, ?checkMatch({ok, changed, _})),
-        Fun(Channel, Token, <<"/badpublish">>, ?checkMatch({error, uauthorized}))
+        Fun(Channel, Token, <<"/badpublish">>, ?checkMatch({error, uauthorized})),
+        true
     end,
     Mod:with_connection(Case).
 
@@ -115,7 +103,8 @@ t_case_coap_subscribe(_) ->
     end,
     Case = fun(Channel, Token) ->
         Fun(Channel, Token, <<"/subscribe">>, ?checkMatch({ok, content, _})),
-        Fun(Channel, Token, <<"/badsubscribe">>, ?checkMatch({error, uauthorized}))
+        Fun(Channel, Token, <<"/badsubscribe">>, ?checkMatch({error, uauthorized})),
+        true
     end,
     Mod:with_connection(Case).
 
@@ -158,7 +147,7 @@ t_case_lwm2m(_) ->
     Test("lwm2m", fun(SubTopic, Msg) ->
         ?assertEqual(true, lists:member(SubTopic, test_mqtt_broker:get_subscrbied_topics())),
         Payload = emqx_message:payload(Msg),
-        Cmd = emqx_utils_json:decode(Payload, [return_maps]),
+        Cmd = emqx_utils_json:decode(Payload),
         ?assertMatch(#{<<"msgType">> := <<"register">>, <<"data">> := _}, Cmd)
     end),
 
@@ -343,7 +332,7 @@ t_case_exproto_publish(_) ->
 
                 Mod:send(Sock, ConnBin),
                 {ok, Recv} = Mod:recv(Sock, 5000),
-                C = ?FUNCTOR(Bin, emqx_utils_json:decode(Bin, [return_maps])),
+                C = ?FUNCTOR(Bin, emqx_utils_json:decode(Bin)),
                 ?assertEqual(C(SvrMod:frame_connack(0)), C(Recv)),
 
                 Send = fun() ->
@@ -380,7 +369,7 @@ t_case_exproto_subscribe(_) ->
 
                 Mod:send(Sock, ConnBin),
                 {ok, Recv} = Mod:recv(Sock, WaitTime),
-                C = ?FUNCTOR(Bin, emqx_utils_json:decode(Bin, [return_maps])),
+                C = ?FUNCTOR(Bin, emqx_utils_json:decode(Bin)),
                 ?assertEqual(C(SvrMod:frame_connack(0)), C(Recv)),
 
                 SubBin = SvrMod:frame_subscribe(Topic, 0),

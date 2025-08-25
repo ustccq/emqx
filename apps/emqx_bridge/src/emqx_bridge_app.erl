@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_app).
 
@@ -47,14 +35,9 @@ stop(_State) ->
     emqx_action_info:clean_cache(),
     ok.
 
--if(?EMQX_RELEASE_EDITION == ee).
 ensure_enterprise_schema_loaded() ->
-    _ = emqx_bridge_enterprise:module_info(),
+    emqx_utils:interactive_load(emqx_bridge_enterprise),
     ok.
--else.
-ensure_enterprise_schema_loaded() ->
-    ok.
--endif.
 
 %% NOTE: We depends on the `emqx_bridge:pre_config_update/3` to restart/stop the
 %%       underlying resources.

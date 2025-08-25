@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_authn_ldap_bind_SUITE).
 
@@ -21,10 +9,10 @@
 -include_lib("emqx_auth/include/emqx_authn.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include("emqx_auth_ldap.hrl").
 
 -define(LDAP_HOST, "ldap").
 -define(LDAP_DEFAULT_PORT, 389).
--define(LDAP_RESOURCE, <<"emqx_authn_ldap_bind_SUITE">>).
 
 -define(PATH, [authentication]).
 -define(ResourceID, <<"password_based:ldap">>).
@@ -39,6 +27,14 @@ init_per_testcase(_, Config) ->
     ),
     Config.
 
+end_per_testcase(_, Config) ->
+    emqx_authn_test_lib:delete_authenticators(
+        [authentication],
+        ?GLOBAL
+    ),
+    ok = emqx_authn_test_lib:enable_node_cache(false),
+    Config.
+
 init_per_suite(Config) ->
     _ = application:load(emqx_conf),
     case emqx_common_test_helpers:is_tcp_server_available(?LDAP_HOST, ?LDAP_DEFAULT_PORT) of
@@ -46,13 +42,6 @@ init_per_suite(Config) ->
             Apps = emqx_cth_suite:start([emqx, emqx_conf, emqx_auth, emqx_auth_ldap], #{
                 work_dir => ?config(priv_dir, Config)
             }),
-            {ok, _} = emqx_resource:create_local(
-                ?LDAP_RESOURCE,
-                ?AUTHN_RESOURCE_GROUP,
-                emqx_ldap,
-                ldap_config(),
-                #{}
-            ),
             [{apps, Apps} | Config];
         false ->
             {skip, no_ldap}
@@ -63,7 +52,6 @@ end_per_suite(Config) ->
         [authentication],
         ?GLOBAL
     ),
-    ok = emqx_resource:remove_local(?LDAP_RESOURCE),
     ok = emqx_cth_suite:stop(?config(apps, Config)).
 
 %%------------------------------------------------------------------------------
@@ -117,7 +105,7 @@ t_authenticate(_Config) ->
 test_user_auth(#{
     credentials := Credentials0,
     config_params := SpecificConfigParams,
-    result := Result
+    result := ExpectedResult
 }) ->
     AuthConfig = maps:merge(raw_ldap_auth_config(), SpecificConfigParams),
 
@@ -131,7 +119,10 @@ test_user_auth(#{
         protocol => mqtt
     },
 
-    ?assertEqual(Result, emqx_access_control:authenticate(Credentials)),
+    %% Compare only the fields that are present in the expected result
+    ActualAuthResult0 = emqx_access_control:authenticate(Credentials),
+    ActualAuthResult = filter_expected_fields(ExpectedResult, ActualAuthResult0),
+    ?assertEqual(ExpectedResult, ActualAuthResult),
 
     emqx_authn_test_lib:delete_authenticators(
         [authentication],
@@ -211,6 +202,126 @@ t_update(_Config) ->
         }
     ).
 
+t_update_with_zone_and_listener(_Config) ->
+    Tester = self(),
+    ZoneListener = "default-tcp:default",
+    meck:new(eldap, [passthrough, no_link, no_history]),
+    meck:expect(eldap, search, fun(_Pid, SearchOptions) ->
+        {_, Base} = lists:keyfind(base, 1, SearchOptions),
+        case iolist_to_binary(Base) of
+            <<"cn=checkalive">> ->
+                {ok, []};
+            Base1 ->
+                {_, Filter} = lists:keyfind(filter, 1, SearchOptions),
+                %% Filter is a deep tuple, we do not want to
+                %% assert its layout, just to check if ZoneListener is in it
+                Filter1 = iolist_to_binary(io_lib:format("~0p", [Filter])),
+                Tester ! {check, Base1, Filter1},
+                {error, 'noSuchObject'}
+        end
+    end),
+    try
+        CorrectConfig = raw_ldap_auth_config(),
+        IncorrectConfig =
+            CorrectConfig#{
+                <<"base_dn">> => <<"ou=${zone}-${listener},dc=emqx,dc=io">>,
+                <<"filter">> => <<"(objectClass=${zone}-${listener})">>
+            },
+
+        {ok, _} = emqx:update_config(
+            ?PATH,
+            {create_authenticator, ?GLOBAL, IncorrectConfig}
+        ),
+
+        {error, not_authorized} = emqx_access_control:authenticate(
+            #{
+                username => <<"mqttuser0001">>,
+                password => <<"mqttuser0001">>,
+                listener => 'tcp:default',
+                zone => default,
+                protocol => mqtt
+            }
+        ),
+        receive
+            {check, Base, Filter} ->
+                ?assertMatch({match, _}, re:run(Base, ZoneListener)),
+                ?assertMatch({match, _}, re:run(Filter, ZoneListener))
+        after 5000 ->
+            ct:fail("the eldap:search function is not called")
+        end
+    after
+        meck:unload(eldap)
+    end.
+
+t_node_cache(_Config) ->
+    Config = maps:merge(raw_ldap_auth_config(), #{
+        <<"base_dn">> => <<"ou=${cert_common_name},dc=emqx,dc=io">>
+    }),
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, Config}
+    ),
+    ok = emqx_authn_test_lib:enable_node_cache(true),
+    Credentials = #{
+        listener => 'tcp:default',
+        protocol => mqtt,
+        username => <<"mqttuser0001">>,
+        password => <<"mqttuser0001">>,
+        cn => <<"testdevice">>
+    },
+
+    %% First time should be a miss, second time should be a hit
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        {ok, #{is_superuser := false}},
+        emqx_access_control:authenticate(Credentials)
+    ),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 1}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ),
+
+    %% Change a variable in the different parts of the query, should be 3 misses
+    _ = emqx_access_control:authenticate(Credentials#{username => <<"user2">>}),
+    _ = emqx_access_control:authenticate(Credentials#{cn => <<"testdevice2">>}),
+    _ = emqx_access_control:authenticate(Credentials#{password => <<"password2">>}),
+    ?assertMatch(
+        #{hits := #{value := 1}, misses := #{value := 4}},
+        emqx_auth_cache:metrics(?AUTHN_CACHE)
+    ).
+
+-doc """
+Checks that, if an authentication backend returns the `clientid_override` attribute, it's
+used to override.
+""".
+t_clientid_override(TCConfig) when is_list(TCConfig) ->
+    OverriddenClientId = <<"overridden_clientid">>,
+    Username = <<"mqttuser0010">>,
+    Password = <<"mqttuser0010">>,
+    MkConfigFn = fun() ->
+        maps:merge(raw_ldap_auth_config(), #{
+            <<"base_dn">> => <<"uid=${username},ou=testdevice,dc=emqx,dc=io">>,
+            <<"method">> => #{
+                <<"type">> => <<"bind">>,
+                <<"bind_password">> => <<"${password}">>,
+                <<"clientid_override_attribute">> => <<"clientIdOverride">>
+            }
+        })
+    end,
+    Opts = #{
+        client_opts => #{
+            username => Username,
+            password => Password
+        },
+        mk_config_fn => MkConfigFn,
+        overridden_clientid => OverriddenClientId
+    },
+    emqx_authn_test_lib:t_clientid_override(TCConfig, Opts),
+    ok.
+
 %%------------------------------------------------------------------------------
 %% Helpers
 %%------------------------------------------------------------------------------
@@ -245,21 +356,25 @@ user_seeds() ->
 
     Normal = lists:map(
         fun(Idx) ->
-            erlang:iolist_to_binary(io_lib:format("mqttuser000~b", [Idx]))
+            {erlang:iolist_to_binary(io_lib:format("mqttuser000~b", [Idx])), false}
         end,
         lists:seq(1, 5)
     ),
 
-    Specials = [<<"mqttuser0008 (test)">>, <<"mqttuser0009 \\\\test\\\\">>],
-
     Valid =
         lists:map(
-            fun(Username) ->
-                New(Username, Username, {ok, #{is_superuser => false}})
+            fun({Username, IsSuperuser}) ->
+                New(Username, Username, {ok, #{is_superuser => IsSuperuser}})
             end,
-            Normal ++ Specials
+            Normal
         ),
     [
+        New(<<"mqttuser0008 (test)">>, <<"mqttuser0008 (test)">>, {ok, #{is_superuser => true}}),
+        New(
+            <<"mqttuser0009 \\test\\">>,
+            <<"mqttuser0009 \\\\test\\\\">>,
+            {ok, #{is_superuser => true}}
+        ),
         %% Not exists
         New(<<"notexists">>, <<"notexists">>, {error, not_authorized}),
         %% Wrong Password
@@ -270,5 +385,7 @@ user_seeds() ->
 ldap_server() ->
     iolist_to_binary(io_lib:format("~s:~B", [?LDAP_HOST, ?LDAP_DEFAULT_PORT])).
 
-ldap_config() ->
-    emqx_ldap_SUITE:ldap_config([]).
+filter_expected_fields({ok, Expected}, {ok, Actual}) ->
+    {ok, maps:with(maps:keys(Expected), Actual)};
+filter_expected_fields(_Expected, Actual) ->
+    Actual.

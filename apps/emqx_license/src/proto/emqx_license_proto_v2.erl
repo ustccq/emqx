@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_proto_v2).
@@ -15,7 +15,6 @@
 ]).
 
 -define(TIMEOUT, 500).
--define(BACKUP_TIMEOUT, 15_000).
 
 introduced_in() ->
     "e5.0.0".

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_sso_schema).
@@ -36,7 +36,7 @@ fields(sso) ->
     ).
 
 desc(sso) ->
-    "Dashboard Single Sign-On";
+    ?DESC("sso_struct");
 desc(_) ->
     undefined.
 
@@ -47,6 +47,7 @@ common_backend_schema(Backend) ->
             mk(
                 boolean(), #{
                     desc => ?DESC(backend_enable),
+                    %% importance => ?IMPORTANCE_NO_DOC,
                     required => false,
                     default => false
                 }

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_test_lib).
@@ -46,9 +34,9 @@ reset_authorizers(Nomatch, CacheEnabled) ->
 
 setup_config(BaseConfig, SpecialParams) ->
     Config = maps:merge(BaseConfig, SpecialParams),
-    case emqx_authz:update(?CMD_REPLACE, [Config]) of
-        {ok, _} -> ok;
-        {error, Reason} -> {error, Reason}
+    maybe
+        {ok, _} ?= emqx_authz:update(?CMD_REPLACE, [Config]),
+        ok
     end.
 
 register_fake_sources(SourceTypes) ->
@@ -61,13 +49,23 @@ register_fake_sources(SourceTypes) ->
 
 deregister_sources() ->
     {BuiltInTypes, _} = lists:unzip(?BUILTIN_SOURCES),
-    SourceTypes = emqx_authz_source_registry:get(),
+    SourceTypes = emqx_authz_source_registry:registered_types(),
     lists:foreach(
         fun(Type) ->
-            emqx_authz_source_registry:register(Type, emqx_authz_fake_source)
+            emqx_authz_source_registry:unregister(Type)
         end,
         SourceTypes -- BuiltInTypes
     ).
+
+enable_node_cache(Enable) ->
+    {ok, _} = emqx:update_config(
+        [authorization, node_cache],
+        #{<<"enable">> => Enable}
+    ),
+    ok.
+
+reset_node_cache() ->
+    emqx_auth_cache:reset(?AUTHZ_CACHE).
 
 %%--------------------------------------------------------------------
 %% Table-based test helpers
@@ -97,25 +95,14 @@ base_client_info() ->
         username => <<"username">>,
         peerhost => {127, 0, 0, 1},
         zone => default,
-        listener => {tcp, default}
+        listener => 'tcp:default'
     }.
 
 client_info(Overrides) ->
     maps:merge(base_client_info(), Overrides).
 
-enable_features(Case) ->
-    Features = maps:get(features, Case, []),
-    lists:foreach(
-        fun(Feature) ->
-            Enable = lists:member(Feature, Features),
-            emqx_authz:set_feature_available(Feature, Enable)
-        end,
-        ?AUTHZ_FEATURES
-    ).
-
 run_checks(#{checks := Checks} = Case) ->
     _ = setup_default_permission(Case),
-    _ = enable_features(Case),
     ClientInfoOverrides = maps:get(client_info, Case, #{}),
     ClientInfo = client_info(ClientInfoOverrides),
     lists:foreach(

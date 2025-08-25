@@ -3,7 +3,7 @@
 ## Declare variables to be passed into your templates.
 
 ## It is recommended to have odd number of nodes in a cluster, otherwise the emqx cluster cannot be automatically healed in case of net-split.
-replicaCount: 3
+replicaCount: 1
 image:
   repository: emqx/emqx-enterprise
   pullPolicy: IfNotPresent
@@ -43,7 +43,11 @@ priorityClassName:
 
 clusterDomain: cluster.local
 
+## Custom annotations to be added to the pods
 podAnnotations: {}
+
+## Custom labels to be added to the pods
+podLabels: {}
 
 # Pod deployment policy
 # value: OrderedReady | Parallel
@@ -125,10 +129,14 @@ emqxConfig:
   EMQX_DASHBOARD__DEFAULT_USERNAME: "admin"
   EMQX_DASHBOARD__DEFAULT_PASSWORD: "public"
 
-## EMQX Enterprise Edition requires manual creation of a Secret containing the licensed content. Write the name of Secret to the value of "emqxLicenseSecretName"
-## Example:
-##   kubectl create secret generic emqx-license-secret-name --from-file=/path/to/emqx.lic
+## Deprecated parameter
 emqxLicenseSecretName:
+## Example:
+##   kubectl create secret generic emqx-license --from-literal="license=your-license-token"
+##   helm install emq-enterprise emqx/emqx-enterprise --set emqxLicenseSecretRef.name=emqx-license --set emqxLicenseSecretRef.key=license
+emqxLicenseSecretRef:
+  name:
+  key:
 
 service:
   ## Service type
@@ -155,6 +163,17 @@ service:
   ## Port for dashboard and API over HTTPS
   ##
   # dashboardtls: 18084
+
+  ## Custom Ports
+  ## Expose the ports of additional custom listeners.
+  ## Example:
+  ## customPorts:
+  ##  - name: custom1
+  ##    port: 1884
+  ##    targetPort: 1884
+  ##
+  customPorts: {}
+
   ## Specify the nodePort(s) value for the LoadBalancer and NodePort service types.
   ## ref: https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport
   ##
@@ -166,6 +185,20 @@ service:
     wss:
     dashboard:
     dashboardtls:
+
+  ## NodePort for customPorts
+  ## Specify the nodePort(s) value for the custoPorts inside LoadBalancer and NodePort service types.
+  ##
+  ## To link the customPorts with the nodePort, use the customPorts name as the key.
+  ## Example:
+  ## customPorts:
+  ##  - name: custom1
+  ## ...
+  ## customNodePorts:
+  ##   custom1: 30000
+  ##
+  customNodePorts: {}
+
   ## Specifies the load balancer implementation this Service belongs to.
   ## Once set, it can not be changed.
   ##
@@ -229,6 +262,19 @@ ingress:
     pathType: ImplementationSpecific
     hosts:
     - mqtt.emqx.local
+    tls: []
+  ws:
+    enabled: false
+    # ingressClassName: haproxy
+    annotations: {}
+      # kubernetes.io/ingress.class: haproxy
+      # kubernetes.io/tls-acme: "true"
+      # haproxy-ingress.github.io/tcp-service-port: "8883"
+      # haproxy-ingress.github.io/proxy-protocol: "v2"
+    path: /mqtt
+    pathType: ImplementationSpecific
+    hosts:
+      - mqtt.emqx.local
     tls: []
 
 podSecurityContext:

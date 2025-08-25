@@ -1,6 +1,6 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%%--------------------------------------------------------------------
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%--------------------------------------------------------------------
 
 -module(emqx_node_rebalance_cli_SUITE).
 
@@ -288,6 +288,14 @@ t_rebalance(Config) ->
     ),
 
     ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--evacuation", "--conn-evict-rpc-timeout", "foobar"])
+    ),
+
+    ?assertNot(
+        emqx_node_rebalance_cli:cli(["start", "--evacuation", "--sess-evict-rpc-timeout", "foobar"])
+    ),
+
+    ?assertNot(
         emqx_node_rebalance_cli(DonorNode, [
             "start",
             "--nodes",
@@ -333,6 +341,10 @@ t_rebalance(Config) ->
             "--rel-sess-threshold",
             "1.1",
             "--wait-takeover",
+            "10",
+            "--conn-evict-rpc-timeout",
+            "10",
+            "--sess-evict-rpc-timeout",
             "10",
             "--nodes",
             atom_to_list(DonorNode) ++ "," ++

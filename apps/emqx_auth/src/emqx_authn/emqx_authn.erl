@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn).
@@ -27,23 +15,12 @@
     deregister_provider/1
 ]).
 
--export([merge_config/1, merge_config_local/2, import_config/1]).
+-export([merge_config/1, merge_config_local/2, import_config/2]).
 
 -include("emqx_authn.hrl").
 
 fill_defaults(Config) ->
-    #{?CONF_NS_BINARY := WithDefaults} = do_fill_defaults(Config),
-    WithDefaults.
-
-do_fill_defaults(Config0) ->
-    Config = #{?CONF_NS_BINARY => Config0},
-    Schema = #{roots => [{?CONF_NS, hoconsc:mk(emqx_authn_schema:authenticator_type())}]},
-    case emqx_hocon:check(Schema, Config, #{make_serializable => true}) of
-        {ok, Checked} ->
-            Checked;
-        {error, Reason} ->
-            throw(Reason)
-    end.
+    emqx_schema:fill_defaults_for_type(emqx_authn_schema:authenticator_type(), Config).
 
 -spec get_enabled_authns() ->
     #{
@@ -91,7 +68,7 @@ deregister_provider(ProviderType) ->
 
 -define(IMPORT_OPTS, #{override_to => cluster}).
 
-import_config(RawConf) ->
+import_config(_Namespace, RawConf) ->
     AuthnList = authn_list(maps:get(?CONF_NS_BINARY, RawConf, [])),
     OldAuthnList = emqx:get_raw_config([?CONF_NS_BINARY], []),
     MergedAuthnList = emqx_utils:merge_lists(

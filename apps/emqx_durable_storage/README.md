@@ -7,17 +7,23 @@ This makes the storage disk requirements very predictable: only the number of _p
 
 # Features
 
-## Callback modules
+## Utility modules
 
-### Backend
+Business logic is advised to use utility modules provided by this application:
+
+- `emqx_ds_client` for consuming stream-like data
+- `emqx_ds_pmap` for key-value data
+
+## Backends
+
+### Backend behavior
 
 DS _backend_ is a callback module that implements `emqx_ds` behavior.
 
-EMQX repository contains the "builtin" backend, implemented in `emqx_ds_replication_layer` module, that uses Raft algorithm for data replication, and RocksDB as the main storage.
+EMQX repository contains two builtin backends based on RocksDB:
 
-Note that builtin backend introduces the concept of **site** to alleviate the problem of changing node names.
-Site IDs are persistent, and they are randomly generated at the first startup of the node.
-Each node in the cluster has a unique site ID, that is independent from the Erlang node name (`emqx@...`).
+- `emqx_ds_builtin_local`
+- `emqx_ds_builtin_raft`
 
 ### Layout
 
@@ -53,7 +59,6 @@ Messages are organized in the following hierarchy:
    In fact, in order to change the layout of the data the application must create a new generation, so the previously recorded messages remain readable without having to perform a heavy migration procedure.
    Generations can also be used for the garbage collection and message retention policies: since all messages in the generation belong to a certain interval of time, old messages can be efficiently deleted by dropping the entire generation.
 
-
 4. *Stream*.
    Finally, messages in each shard and generation are split into streams.
    Every stream can contain messages from multiple topics.
@@ -68,6 +73,8 @@ Messages are organized in the following hierarchy:
 
 `emqx_ds` provides `store_batch/3` function that saves a list of MQTT messages to the durable storage.
 
+Additionally, `trans/2` function can be used to perform multiple read and write operations atomically.
+
 ## Message replay
 
 All the API functions in EMQX DS are batch-oriented.
@@ -76,17 +83,16 @@ Consumption of messages is done in several stages:
 
 1. The consumer calls `emqx_ds:get_streams` function to get the list of streams that contain messages from a given topic filter, and a given time range.
 
-2. `get_streams` returns the list of streams together with their _ranks_.
-   The rank of the stream is a tuple with two elements, called `X` and `Y`.
+2. `get_streams` returns the list of streams together with their shards and generations.
 
    The consumer must follow the below rules to avoid reordering of the messages:
 
-   - Streams with different `X`-ranks can always be replayed in parallel, regardless of their `Y`-rank.
-   - Streams with the same `X` and `Y`-rank can be replayed in parallel.
-   - Groups of streams with the same `X` rank should be replayed in order of their `Y`-rank
+   - Streams from different shards can always be replayed in parallel, regardless of their generation.
+   - Streams from the same shard and generation can be replayed in parallel.
+   - Groups of streams with the same shard should be replayed in order of their generation.
 
 3. In order to start replay of the stream, the consumer calls `emqx_ds:make_iterator` function that returns an _iterator_ object.
-   Iterators are the pointers to a particular position in the stream, they can be saved and restored as regular Erlang terms.
+   Iterators are the pointers to a particular position in the stream, they can be saved and restored as regular Erlang terms or using `emqx_ds:iterator_to_binary` function.
 
 4. The consumer then proceeds to call `emqx_ds:next` function to fetch messages.
    - If this function returns `{ok, end_of_stream}`, it means the stream is fully replayed.
@@ -96,25 +102,25 @@ Consumption of messages is done in several stages:
    It cannot rely on an assumption that it can reach the end of a stream in a finite time.
 
 5. The consumer must periodically refresh the list of streams as explained in 1, because new streams can appear from time to time.
+   `emqx_ds_new_streams` allows to subscribe to new stream events.
+
+## Subscriptions
+
+EMQX DS allows to subscribe to new messages.
+It's best done using `emqx_ds_client` module that automates stream management, creation of iterators, advancement of generations and error handling.
 
 # Limitation
 
-- There is no local cache of messages, which may result in transferring the same data multiple times
-
 # Documentation links
 
-TBD
+https://docs.emqx.com/en/enterprise/latest/durability/durability_introduction.html
 
 # Usage
 
-Currently it's only used to implement persistent sessions.
-
-In the future it can serve as a storage for retained messages or as a generic message buffering layer for the bridges.
-
 # Configurations
 
-Global options for `emqx_durable_storage` application are configured via OTP application environment.
-Database-specific settings are stored in the schema table.
+Common global options for builtin backends are configured via OTP application environment.
+Database-specific settings are stored in EMQX config.
 
 The following application environment variables are available:
 
@@ -124,27 +130,44 @@ The following application environment variables are available:
 
 - `emqx_durable_storage.egress_flush_interval`: period at which the batches of messages are committed to the durable storage.
 
-Runtime settings for the durable storages can be modified via CLI as well as the REST API.
-The following CLI commands are available:
-
-- `emqx ctl ds info` — get a quick overview of the durable storage state
-- `emqx ctl ds set_replicas <DS> <Site1> <Site2> ...` — update the list of replicas for a durable storage.
-- `emqx ctl ds join <DS> <Site>` — add a replica of durable storage on the site
-- `emqx ctl ds leave <DS> <Site>` — remove a replica of a durable storage from the site
-
 # HTTP APIs
 
-The following REST APIs are available for managing the builtin durable storages:
-
-- `/ds/sites` — list known sites.
-- `/ds/sites/:site` — get information about the site (its status, current EMQX node name managing the site, etc.)
-- `/ds/storages` — list durable storages
-- `/ds/storages/:ds` — get information about the durable storage and its shards
-- `/ds/storages/:ds/replicas` — list or update sites that contain replicas of a durable storage
-- `/ds/storages/:ds/replicas/:site` — add or remove replica of the durable storage on the site
+None
 
 # Other
-TBD
+
+Note: this application contains main interface module and some common utility modules used by the backends, but it doesn't contain any ready-to-use DS backends.
+The backends are instead implemented as separate OTP applications, such as `emqx_ds_backend_local` and `emqx_ds_backend_raft`.
+
+There is a helper placeholder application `emqx_ds_backends` that depends on all backend applications available in the release.
+Business logic applications must have `emqx_ds_backends` as a dependency.
+
+The dependency diagram is the following:
+
+```
+                              +------------------------+
+                              |  emqx_durable_storage  |
+                              +------------------------+
+                              /           |            \
+                             /            |             \
+                            /             |              \
+   +------------------------+  +----------------------+   +------+
+   | emqx_ds_backend_local  |  | emqx_ds_builtin_raft |   | ...  |
+   +------------------------+  +-----------+----------+   +------+
+                            \            |               /
+                             \           |              /
+                              \          |             /
+                             +-------------------------+
+                             |    emqx_ds_backends     |
+                             +-------------------------+
+                                 /              \
+                                /                \
+       ......................../.. business apps .\........................
+                              /                    \
+                         +------+                +-------+
+                         | emqx |                |  ...  |
+                         +------+                +-------+
+```
 
 # Contributing
 Please see our [contributing.md](../../CONTRIBUTING.md).

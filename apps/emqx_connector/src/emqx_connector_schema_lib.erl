@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_connector_schema_lib).
 
@@ -23,6 +11,7 @@
     pool_size/1,
     relational_db_fields/0,
     ssl_fields/0,
+    ssl_fields/1,
     prepare_statement_fields/0,
     password_field/0,
     password_field/1
@@ -45,10 +34,13 @@
 ]).
 
 ssl_fields() ->
+    ssl_fields(_EnableByDefault = false).
+
+ssl_fields(EnableByDefault) ->
     [
         {ssl, #{
             type => hoconsc:ref(emqx_schema, "ssl_client_opts"),
-            default => #{<<"enable">> => false},
+            default => #{<<"enable">> => EnableByDefault},
             desc => ?DESC("ssl")
         }}
     ].

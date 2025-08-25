@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_logger_textfmt).
@@ -20,11 +8,12 @@
 
 -export([format/2]).
 -export([check_config/1]).
--export([try_format_unicode/1]).
+-export([try_format_unicode/1, try_encode_meta/2]).
 %% Used in the other log formatters
 -export([evaluate_lazy_values_if_dbg_level/1, evaluate_lazy_values/1]).
 
-check_config(X) -> logger_formatter:check_config(maps:without([timestamp_format], X)).
+check_config(X) ->
+    logger_formatter:check_config(maps:without([timestamp_format, with_mfa, payload_encode], X)).
 
 %% Principle here is to delegate the formatting to logger_formatter:format/2
 %% as much as possible, and only enrich the report with clientid, peername, topic, username
@@ -32,7 +21,7 @@ format(#{msg := {report, ReportMap0}, meta := _Meta} = Event0, Config) when is_m
     #{msg := {report, ReportMap}, meta := Meta} = Event = evaluate_lazy_values_if_dbg_level(Event0),
     %% The most common case, when entering from SLOG macro
     %% i.e. logger:log(Level, #{msg => "my_msg", foo => bar})
-    ReportList = enrich_report(ReportMap, Meta),
+    ReportList = enrich_report(ReportMap, Meta, Config),
     Report =
         case is_list_report_acceptable(Meta) of
             true ->
@@ -40,18 +29,24 @@ format(#{msg := {report, ReportMap0}, meta := _Meta} = Event0, Config) when is_m
             false ->
                 maps:from_list(ReportList)
         end,
-    fmt(Event#{msg := {report, Report}}, Config);
+    fmt(Event#{msg := {report, Report}}, maps:remove(with_mfa, Config));
 format(#{msg := {string, String}} = Event, Config) ->
     %% copied from logger_formatter:format/2
     %% unsure how this case is triggered
-    format(Event#{msg => {"~ts ", [String]}}, Config);
+    format(Event#{msg => {"~ts ", [String]}}, maps:remove(with_mfa, Config));
 format(#{msg := _Msg, meta := _Meta} = Event0, Config) ->
     #{msg := Msg0, meta := Meta} = Event1 = evaluate_lazy_values_if_dbg_level(Event0),
     %% For format strings like logger:log(Level, "~p", [Var])
     %% and logger:log(Level, "message", #{key => value})
     Msg1 = enrich_client_info(Msg0, Meta),
-    Msg2 = enrich_topic(Msg1, Meta),
-    fmt(Event1#{msg := Msg2}, Config).
+    Msg2 = enrich_mfa(Msg1, Meta, Config),
+    Msg3 = enrich_topic(Msg2, Meta),
+    fmt(Event1#{msg := Msg3}, maps:remove(with_mfa, Config)).
+
+enrich_mfa({Fmt, Args}, Data, #{with_mfa := true} = Config) when is_list(Fmt) ->
+    {Fmt ++ " mfa: ~ts", Args ++ [emqx_utils:format_mfal(Data, Config)]};
+enrich_mfa(Msg, _, _) ->
+    Msg.
 
 %% Most log entries with lazy values are trace events with level debug. So to
 %% be more efficient we only search for lazy values to evaluate in the entries
@@ -101,9 +96,10 @@ is_list_report_acceptable(#{report_cb := Cb}) ->
 is_list_report_acceptable(_) ->
     false.
 
-enrich_report(ReportRaw, Meta) ->
+enrich_report(ReportRaw0, Meta, Config) ->
     %% clientid and peername always in emqx_conn's process metadata.
     %% topic and username can be put in meta using ?SLOG/3, or put in msg's report by ?SLOG/2
+    ReportRaw = try_encode_meta(ReportRaw0, Config),
     Topic =
         case maps:get(topic, Meta, undefined) of
             undefined -> maps:get(topic, ReportRaw, undefined);
@@ -114,9 +110,11 @@ enrich_report(ReportRaw, Meta) ->
             undefined -> maps:get(username, ReportRaw, undefined);
             Username0 -> Username0
         end,
+    Tns = maps:get(tns, Meta, undefined),
     ClientId = maps:get(clientid, Meta, undefined),
     Peer = maps:get(peername, Meta, undefined),
     Msg = maps:get(msg, ReportRaw, undefined),
+    MFA = emqx_utils:format_mfal(Meta, Config),
     %% TODO: move all tags to Meta so we can filter traces
     %% based on tags (currently not supported)
     Tag = maps:get(tag, ReportRaw, maps:get(tag, Meta, undefined)),
@@ -126,13 +124,15 @@ enrich_report(ReportRaw, Meta) ->
             ({_, undefined}, Acc) -> Acc;
             (Item, Acc) -> [Item | Acc]
         end,
-        maps:to_list(maps:without([topic, msg, clientid, username, tag], ReportRaw)),
+        maps:to_list(maps:without([topic, msg, tns, clientid, username, tag], ReportRaw)),
         [
             {topic, try_format_unicode(Topic)},
             {username, try_format_unicode(Username)},
             {peername, Peer},
+            {mfa, try_format_unicode(MFA)},
             {msg, Msg},
             {clientid, try_format_unicode(ClientId)},
+            {tns, try_format_unicode(Tns)},
             {tag, Tag}
         ]
     ).
@@ -169,3 +169,63 @@ enrich_topic({Fmt, Args}, #{topic := Topic}) when is_list(Fmt) ->
     {" topic: ~ts" ++ Fmt, [Topic | Args]};
 enrich_topic(Msg, _) ->
     Msg.
+
+try_encode_meta(Report, Config) ->
+    lists:foldl(
+        fun({MetaKeyName, FmtFun}, Meta) ->
+            try_encode_meta(MetaKeyName, FmtFun, Meta, Config)
+        end,
+        Report,
+        [
+            {?FORMAT_META_KEY_PACKET, fun format_packet/2},
+            {?FORMAT_META_KEY_PAYLOAD, fun format_payload/2}
+        ] ++ need_truncate_log_metas()
+    ).
+
+need_truncate_log_metas() ->
+    %% ?SLOG macro traced terms, meta key e.g.
+    [
+        {MetaKey, fun format_term/2}
+     || MetaKey <-
+            [
+                ?FORMAT_META_KEY_DATA,
+                ?FORMAT_META_KEY_SQL,
+                ?FORMAT_META_KEY_QUERY,
+                ?FORMAT_META_KEY_SEND_MESSAGE,
+                ?FORMAT_META_KEY_REQUESTS,
+                ?FORMAT_META_KEY_POINTS,
+                ?FORMAT_META_KEY_REQUEST,
+                ?FORMAT_META_KEY_COMMANDS,
+                ?FORMAT_META_KEY_BATCH_DATA_LIST
+            ]
+    ].
+
+try_encode_meta(MetaKeyName, FmtFun, Report, PayloadFmtOpts) ->
+    case Report of
+        #{MetaKeyName := Value} ->
+            {FValue, NEncode} = FmtFun(Value, PayloadFmtOpts),
+            Report#{MetaKeyName => FValue, payload_encode => NEncode};
+        _ ->
+            Report
+    end.
+
+format_packet(undefined, #{payload_encode := Encode}) ->
+    {"", Encode};
+format_packet(Packet, #{payload_encode := Encode}) when is_list(Packet); is_binary(Packet) ->
+    {try_format_unicode(Packet), Encode};
+format_packet(Packet, #{payload_encode := Encode}) when is_tuple(Packet) ->
+    {try_format_unicode(emqx_packet:format(Packet, Encode)), Encode}.
+
+format_payload(undefined, #{payload_encode := Encode}) ->
+    {"", Encode};
+format_payload(Payload, #{payload_encode := Encode}) when is_binary(Payload) ->
+    {Payload1, Encode1} = emqx_packet:format_payload(Payload, Encode),
+    {try_format_unicode(Payload1), Encode1};
+format_payload(Payload, #{payload_encode := Encode}) ->
+    {Payload, Encode}.
+
+format_term(Term, #{payload_fmt_opts := PayloadFmtOpts} = _Config) ->
+    format_term(Term, PayloadFmtOpts);
+format_term(Term, #{payload_encode := _Encode} = Config) ->
+    {FTerm, #{payload_encode := Encode}} = emqx_trace_formatter:format_term(Term, Config),
+    {try_format_unicode(FTerm), Encode}.

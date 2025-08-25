@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
     reverse/1,
     rtrim/1,
     rtrim/2,
+    rm_prefix/2,
     strlen/1,
     substr/2,
     substr/3,
@@ -52,7 +53,9 @@
     join_to_string/1,
     join_to_string/2,
     unescape/1,
-    any_to_str/1
+    any_to_str/1,
+    is_empty_val/1,
+    'not'/1
 ]).
 
 %% Array functions
@@ -74,39 +77,100 @@
 -export([hash/2, hash_to_range/3, map_to_range/3]).
 
 %% String compare functions
--export([str_comp/2, str_eq/2, str_lt/2, str_lte/2, str_gt/2, str_gte/2]).
+-export([str_comp/2, str_eq/2, str_neq/2, str_lt/2, str_lte/2, str_gt/2, str_gte/2]).
 
 %% Number compare functions
--export([num_comp/2, num_eq/2, num_lt/2, num_lte/2, num_gt/2, num_gte/2]).
+-export([num_comp/2, num_eq/2, num_neq/2, num_lt/2, num_lte/2, num_gt/2, num_gte/2]).
+
+%% System
+-export([getenv/1]).
+
+-define(CACHE(Key), {?MODULE, Key}).
+-define(ENV_CACHE(Env), ?CACHE({env, Env})).
+-define(IS_NULL(S), (S =:= null orelse S =:= undefined)).
+-define(BADARG(), throw(#{reason => badarg, function => ?FUNCTION_NAME})).
+
+-type null() :: null | undefined.
 
 %%------------------------------------------------------------------------------
 %% String Funcs
 %%------------------------------------------------------------------------------
 
+lower(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+lower(A) when is_atom(A) ->
+    lower(atom_to_binary(A, utf8));
 lower(S) when is_binary(S) ->
     string:lowercase(S).
 
-ltrim(S) when is_binary(S) ->
+ltrim(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+ltrim(A) when is_atom(A) ->
+    ltrim(atom_to_binary(A, utf8));
+ltrim(S) ->
     string:trim(S, leading).
 
+ltrim(S, _) when ?IS_NULL(S) ->
+    ?BADARG();
+ltrim(S, Chars) when is_atom(S) ->
+    ltrim(atom_to_binary(S, utf8), Chars);
 ltrim(S, Chars) ->
-    string:trim(S, leading, Chars).
+    string:trim(S, leading, unicode:characters_to_list(Chars, utf8)).
 
+reverse(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+reverse(A) when is_atom(A) ->
+    reverse(atom_to_binary(A, utf8));
 reverse(S) when is_binary(S) ->
     iolist_to_binary(string:reverse(S)).
 
+rtrim(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+rtrim(A) when is_atom(A) ->
+    rtrim(atom_to_binary(A, utf8));
 rtrim(S) when is_binary(S) ->
     string:trim(S, trailing).
 
+rtrim(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+rtrim(S, Chars) when is_atom(S) ->
+    rtrim(atom_to_binary(S, utf8), Chars);
 rtrim(S, Chars) when is_binary(S) ->
-    string:trim(S, trailing, Chars).
+    string:trim(S, trailing, unicode:characters_to_list(Chars, utf8)).
 
+%% @doc Remove the prefix of a string if there is a match.
+%% The original stirng is returned if there is no match.
+rm_prefix(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+rm_prefix(S, Prefix) when is_atom(S) ->
+    rm_prefix(atom_to_binary(S, utf8), Prefix);
+rm_prefix(S, Prefix) ->
+    Size = size(Prefix),
+    case S of
+        <<P:Size/binary, Rem/binary>> when P =:= Prefix ->
+            Rem;
+        _ ->
+            S
+    end.
+
+strlen(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+strlen(A) when is_atom(A) ->
+    strlen(atom_to_binary(A, utf8));
 strlen(S) when is_binary(S) ->
     string:length(S).
 
+substr(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+substr(S, Start) when is_atom(S) ->
+    substr(atom_to_binary(S, utf8), Start);
 substr(S, Start) when is_binary(S), is_integer(Start) ->
     string:slice(S, Start).
 
+substr(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+substr(S, Start, Length) when is_atom(S) ->
+    substr(atom_to_binary(S, utf8), Start, Length);
 substr(S, Start, Length) when
     is_binary(S),
     is_integer(Start),
@@ -114,18 +178,38 @@ substr(S, Start, Length) when
 ->
     string:slice(S, Start, Length).
 
+trim(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+trim(S) when is_atom(S) ->
+    trim(atom_to_binary(S, utf8));
 trim(S) when is_binary(S) ->
     string:trim(S).
 
+trim(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+trim(S, Chars) when is_atom(S) ->
+    trim(atom_to_binary(S, utf8), Chars);
 trim(S, Chars) when is_binary(S) ->
-    string:trim(S, both, Chars).
+    string:trim(S, both, unicode:characters_to_list(Chars, utf8)).
 
+upper(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+upper(A) when is_atom(A) ->
+    upper(atom_to_binary(A, utf8));
 upper(S) when is_binary(S) ->
     string:uppercase(S).
 
+split(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+split(S, P) when is_atom(S) ->
+    split(atom_to_binary(S, utf8), P);
 split(S, P) when is_binary(S), is_binary(P) ->
     [R || R <- string:split(S, P, all), R =/= <<>> andalso R =/= ""].
 
+split(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+split(S, P, Option) when is_atom(S) ->
+    split(atom_to_binary(S, utf8), P, Option);
 split(S, P, <<"notrim">>) ->
     string:split(S, P, all);
 split(S, P, <<"leading_notrim">>) ->
@@ -137,9 +221,17 @@ split(S, P, <<"trailing_notrim">>) ->
 split(S, P, <<"trailing">>) when is_binary(S), is_binary(P) ->
     [R || R <- string:split(S, P, trailing), R =/= <<>> andalso R =/= ""].
 
+tokens(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+tokens(S, Separators) when is_atom(S) ->
+    tokens(atom_to_binary(S, utf8), Separators);
 tokens(S, Separators) ->
     [list_to_binary(R) || R <- string:lexemes(binary_to_list(S), binary_to_list(Separators))].
 
+tokens(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+tokens(S, Separators, <<"nocrlf">>) when is_atom(S) ->
+    tokens(atom_to_binary(S, utf8), Separators, <<"nocrlf">>);
 tokens(S, Separators, <<"nocrlf">>) ->
     [
         list_to_binary(R)
@@ -158,9 +250,17 @@ concat(List) ->
 sprintf_s(Format, Args) when is_list(Args) ->
     erlang:iolist_to_binary(io_lib:format(binary_to_list(Format), Args)).
 
+pad(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+pad(S, Len) when is_atom(S) ->
+    pad(atom_to_binary(S, utf8), Len);
 pad(S, Len) when is_binary(S), is_integer(Len) ->
     iolist_to_binary(string:pad(S, Len, trailing)).
 
+pad(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+pad(S, Len, Option) when is_atom(S) ->
+    pad(atom_to_binary(S, utf8), Len, Option);
 pad(S, Len, <<"trailing">>) when is_binary(S), is_integer(Len) ->
     iolist_to_binary(string:pad(S, Len, trailing));
 pad(S, Len, <<"both">>) when is_binary(S), is_integer(Len) ->
@@ -168,6 +268,10 @@ pad(S, Len, <<"both">>) when is_binary(S), is_integer(Len) ->
 pad(S, Len, <<"leading">>) when is_binary(S), is_integer(Len) ->
     iolist_to_binary(string:pad(S, Len, leading)).
 
+pad(NULL, _, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+pad(S, Len, Option, Char) when is_atom(S) ->
+    pad(atom_to_binary(S, utf8), Len, Option, Char);
 pad(S, Len, <<"trailing">>, Char) when is_binary(S), is_integer(Len), is_binary(Char) ->
     Chars = unicode:characters_to_list(Char, utf8),
     iolist_to_binary(string:pad(S, Len, trailing, Chars));
@@ -178,9 +282,17 @@ pad(S, Len, <<"leading">>, Char) when is_binary(S), is_integer(Len), is_binary(C
     Chars = unicode:characters_to_list(Char, utf8),
     iolist_to_binary(string:pad(S, Len, leading, Chars)).
 
+replace(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+replace(SrcStr, P, RepStr) when is_atom(SrcStr) ->
+    replace(atom_to_binary(SrcStr, utf8), P, RepStr);
 replace(SrcStr, P, RepStr) when is_binary(SrcStr), is_binary(P), is_binary(RepStr) ->
     iolist_to_binary(string:replace(SrcStr, P, RepStr, all)).
 
+replace(NULL, _, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+replace(SrcStr, P, RepStr, Option) when is_atom(SrcStr) ->
+    replace(atom_to_binary(SrcStr, utf8), P, RepStr, Option);
 replace(SrcStr, P, RepStr, <<"all">>) when is_binary(SrcStr), is_binary(P), is_binary(RepStr) ->
     iolist_to_binary(string:replace(SrcStr, P, RepStr, all));
 replace(SrcStr, P, RepStr, <<"trailing">>) when
@@ -190,44 +302,67 @@ replace(SrcStr, P, RepStr, <<"trailing">>) when
 replace(SrcStr, P, RepStr, <<"leading">>) when is_binary(SrcStr), is_binary(P), is_binary(RepStr) ->
     iolist_to_binary(string:replace(SrcStr, P, RepStr, leading)).
 
+regex_match(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+regex_match(Str, RE) when is_atom(Str) ->
+    regex_match(atom_to_binary(Str, utf8), RE);
 regex_match(Str, RE) ->
     case re:run(Str, RE, [global, {capture, none}]) of
         match -> true;
         nomatch -> false
     end.
 
+regex_replace(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+regex_replace(SrcStr, RE, RepStr) when is_atom(SrcStr) ->
+    regex_replace(atom_to_binary(SrcStr, utf8), RE, RepStr);
 regex_replace(SrcStr, RE, RepStr) ->
     re:replace(SrcStr, RE, RepStr, [global, {return, binary}]).
 
-%% @doc Searches the string Str for patterns specified by Regexp.
+%% @doc Non-global search for specified regular expression pattern in the given string.
 %% If matches are found, it returns a list of all captured groups from these matches.
 %% If no matches are found or there are no groups captured, it returns an empty list.
 %% This function can be used to extract parts of a string based on a regular expression,
 %% excluding the complete match itself.
+%%
 %% Examples:
 %%  ("Number: 12345", "(\\d+)") -> [<<"12345">>]
-%%  ("Hello, world!", "(\\w+)") -> [<<"Hello">>, <<"world">>]
+%%  ("Hello, world!", "(\\w+).*\s(\\w+)") -> [<<"Hello">>, <<"world">>]
 %%  ("No numbers here!", "(\\d+)") -> []
 %%  ("Date: 2021-05-20", "(\\d{4})-(\\d{2})-(\\d{2})") -> [<<"2021">>, <<"05">>, <<"20">>]
+-spec regex_extract(null() | string() | binary(), string() | binary()) -> [binary()].
+regex_extract(NULL, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+regex_extract(Str, Regexp) when is_atom(Str) ->
+    regex_extract(atom_to_binary(Str, utf8), Regexp);
 regex_extract(Str, Regexp) ->
-    case re:run(Str, Regexp, [{capture, all_but_first, list}]) of
-        {match, [_ | _] = L} -> lists:map(fun erlang:iolist_to_binary/1, L);
-        _ -> []
+    case re:run(Str, Regexp, [{capture, all_but_first, binary}]) of
+        {match, CapturedGroups} ->
+            CapturedGroups;
+        _ ->
+            []
     end.
 
-ascii(Char) when is_binary(Char) ->
-    [FirstC | _] = binary_to_list(Char),
-    FirstC.
+ascii(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+ascii(Char) when is_atom(Char) ->
+    ascii(atom_to_binary(Char, utf8));
+ascii(<<Char:8, _/binary>>) ->
+    Char.
 
-find(S, P) when is_binary(S), is_binary(P) ->
+find(S, P) ->
     find_s(S, P, leading).
 
-find(S, P, <<"trailing">>) when is_binary(S), is_binary(P) ->
+find(S, P, <<"trailing">>) ->
     find_s(S, P, trailing);
-find(S, P, <<"leading">>) when is_binary(S), is_binary(P) ->
+find(S, P, <<"leading">>) ->
     find_s(S, P, leading).
 
-find_s(S, P, Dir) ->
+find_s(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+find_s(S, P, Dir) when is_atom(S) ->
+    find_s(atom_to_binary(S, utf8), P, Dir);
+find_s(S, P, Dir) when is_binary(S), is_binary(P) ->
     case string:find(S, P, Dir) of
         nomatch -> <<"">>;
         SubStr -> SubStr
@@ -239,6 +374,10 @@ join_to_string(List) when is_list(List) ->
 join_to_string(Sep, List) when is_list(List), is_binary(Sep) ->
     iolist_to_binary(lists:join(Sep, [any_to_str(Item) || Item <- List])).
 
+unescape(NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+unescape(Atom) when is_atom(Atom) ->
+    unescape(atom_to_binary(Atom, utf8));
 unescape(Bin) when is_binary(Bin) ->
     UnicodeList = unicode:characters_to_list(Bin, utf8),
     UnescapedUnicodeList = unescape_string(UnicodeList),
@@ -397,13 +536,11 @@ any_to_str(Data) ->
 %% Random functions
 %%------------------------------------------------------------------------------
 
-%% @doc Make a random string with urlsafe-base64 charset.
+%% @doc Make a random string with urlsafe-base62 charset.
 rand_str(Length) when is_integer(Length) andalso Length > 0 ->
-    RawBytes = erlang:ceil((Length * 3) / 4),
-    RandomData = rand:bytes(RawBytes),
-    urlsafe(binary:part(base64_encode(RandomData), 0, Length));
+    emqx_utils:rand_id(Length);
 rand_str(_) ->
-    throw(#{reason => badarg, function => ?FUNCTION_NAME}).
+    ?BADARG().
 
 %% @doc Make a random integer in the range `[1, N]`.
 rand_int(N) when is_integer(N) andalso N >= 1 ->
@@ -411,17 +548,11 @@ rand_int(N) when is_integer(N) andalso N >= 1 ->
 rand_int(N) ->
     throw(#{reason => badarg, function => ?FUNCTION_NAME, expected => "positive integer", got => N}).
 
-%% TODO: call base64:encode(Bin, #{mode => urlsafe, padding => false})
-%% when oldest OTP to support is 26 or newer.
-urlsafe(Str0) ->
-    Str = replace(Str0, <<"+">>, <<"-">>),
-    replace(Str, <<"/">>, <<"_">>).
-
 %%------------------------------------------------------------------------------
 %% Data encoding
 %%------------------------------------------------------------------------------
 
-%% @doc Encode an integer to hex string. e.g. 15 as 'f'
+%% @doc Encode an integer to hex string. e.g. 15 as 'F'
 int2hexstr(Int) ->
     erlang:integer_to_binary(Int, 16).
 
@@ -468,6 +599,10 @@ base64_decode(Bin) ->
 %% - blake2b | blake2s
 hash(<<"sha1">>, Bin) ->
     hash(sha, Bin);
+hash(_Algorithm, NULL) when ?IS_NULL(NULL) ->
+    ?BADARG();
+hash(Algorithm, Data) when is_atom(Data) ->
+    hash(Algorithm, atom_to_binary(Data, utf8));
 hash(Algorithm, Bin) when is_binary(Algorithm) ->
     Type =
         try
@@ -485,6 +620,10 @@ hash(Type, Bin) when is_atom(Type) ->
     emqx_utils:bin_to_hexstr(crypto:hash(Type, Bin), lower).
 
 %% @doc Hash binary data to an integer within a specified range [Min, Max]
+hash_to_range(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+hash_to_range(Atom, Min, Max) when is_atom(Atom) ->
+    hash_to_range(atom_to_binary(Atom, utf8), Min, Max);
 hash_to_range(Bin, Min, Max) when
     is_binary(Bin) andalso
         size(Bin) > 0 andalso
@@ -496,9 +635,16 @@ hash_to_range(Bin, Min, Max) when
     HashNum = binary_to_integer(Hash, 16),
     map_to_range(HashNum, Min, Max);
 hash_to_range(_, _, _) ->
-    throw(#{reason => badarg, function => ?FUNCTION_NAME}).
+    ?BADARG().
 
-map_to_range(Bin, Min, Max) when is_binary(Bin) andalso size(Bin) > 0 ->
+map_to_range(NULL, _, _) when ?IS_NULL(NULL) ->
+    ?BADARG();
+map_to_range(Atom, Min, Max) when is_atom(Atom) ->
+    map_to_range(atom_to_binary(Atom, utf8), Min, Max);
+map_to_range(Bin, Min, Max) when
+    is_binary(Bin) andalso
+        size(Bin) > 0
+->
     HashNum = binary:decode_unsigned(Bin),
     map_to_range(HashNum, Min, Max);
 map_to_range(Int, Min, Max) when
@@ -510,7 +656,7 @@ map_to_range(Int, Min, Max) when
     Range = Max - Min + 1,
     Min + (Int rem Range);
 map_to_range(_, _, _) ->
-    throw(#{reason => badarg, function => ?FUNCTION_NAME}).
+    ?BADARG().
 
 compare(A, A) -> eq;
 compare(A, B) when A < B -> lt;
@@ -527,6 +673,9 @@ str_comp(A0, B0) ->
 
 %% @doc Return 'true' if two strings are the same, otherwise 'false'.
 str_eq(A, B) -> eq =:= str_comp(A, B).
+
+%% @doc Return 'true' if two string are not the same.
+str_neq(A, B) -> eq =/= str_comp(A, B).
 
 %% @doc Return 'true' if arg-1 is ordered before arg-2, otherwise 'false'.
 str_lt(A, B) -> lt =:= str_comp(A, B).
@@ -550,6 +699,9 @@ num_comp(A, B) when is_number(A) andalso is_number(B) ->
 %% @doc Return 'true' if two numbers are the same, otherwise 'false'.
 num_eq(A, B) -> eq =:= num_comp(A, B).
 
+%% @doc Return 'true' if two numbers are not the same, otherwise 'false'.
+num_neq(A, B) -> eq =/= num_comp(A, B).
+
 %% @doc Return 'true' if arg-1 is ordered before arg-2, otherwise 'false'.
 num_lt(A, B) -> lt =:= num_comp(A, B).
 
@@ -565,3 +717,37 @@ num_lte(A, B) ->
 num_gte(A, B) ->
     R = num_comp(A, B),
     R =:= gt orelse R =:= eq.
+
+%% @doc Return 'true' if the argument is `undefined`, `null` or empty string, or empty array.
+is_empty_val(undefined) -> true;
+is_empty_val(null) -> true;
+is_empty_val(<<>>) -> true;
+is_empty_val([]) -> true;
+is_empty_val(_) -> false.
+
+%% @doc The 'not' operation for boolean values and strings.
+'not'(true) -> false;
+'not'(false) -> true;
+'not'(<<"true">>) -> <<"false">>;
+'not'(<<"false">>) -> <<"true">>.
+
+%%------------------------------------------------------------------------------
+%% System
+%%------------------------------------------------------------------------------
+getenv(Bin) when is_binary(Bin) ->
+    EnvKey = ?ENV_CACHE(Bin),
+    case persistent_term:get(EnvKey, undefined) of
+        undefined ->
+            Name = "EMQXVAR_" ++ erlang:binary_to_list(Bin),
+            Result =
+                case os:getenv(Name) of
+                    false ->
+                        <<>>;
+                    Value ->
+                        erlang:list_to_binary(Value)
+                end,
+            persistent_term:put(EnvKey, Result),
+            Result;
+        Result ->
+            Result
+    end.

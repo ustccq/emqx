@@ -1,24 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_storage_SUITE).
 
 -compile(export_all).
 -compile(nowarn_export_all).
 
--include_lib("emqx/include/emqx.hrl").
+-include("../../emqx/include/emqx.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
@@ -26,25 +14,6 @@ opts() ->
     #{storage => {emqx_ds_storage_reference, #{}}}.
 
 %%
-
-t_idempotent_store_batch(_Config) ->
-    Shard = {?FUNCTION_NAME, _ShardId = <<"42">>},
-    {ok, Pid} = emqx_ds_storage_layer:start_link(Shard, opts()),
-    %% Push some messages to the shard.
-    Msgs1 = [gen_message(N) || N <- lists:seq(10, 20)],
-    GenTs = 30,
-    Msgs2 = [gen_message(N) || N <- lists:seq(40, 50)],
-    ?assertEqual(ok, emqx_ds_storage_layer:store_batch(Shard, batch(Msgs1), #{})),
-    %% Add new generation and push the same batch + some more.
-    ?assertEqual(ok, emqx_ds_storage_layer:add_generation(Shard, GenTs)),
-    ?assertEqual(ok, emqx_ds_storage_layer:store_batch(Shard, batch(Msgs1), #{})),
-    ?assertEqual(ok, emqx_ds_storage_layer:store_batch(Shard, batch(Msgs2), #{})),
-    %% First batch should have been handled idempotently.
-    ?assertEqual(
-        Msgs1 ++ Msgs2,
-        lists:keysort(#message.timestamp, emqx_ds_test_helpers:storage_consume(Shard, ['#']))
-    ),
-    ok = stop_shard(Pid).
 
 t_snapshot_take_restore(_Config) ->
     Shard = {?FUNCTION_NAME, _ShardId = <<"42">>},
@@ -77,7 +46,7 @@ t_snapshot_take_restore(_Config) ->
 
     %% Verify that the restored shard contains the messages up until the snapshot.
     {ok, _Pid} = emqx_ds_storage_layer:start_link(Shard, opts()),
-    ?assertEqual(
+    snabbkaffe_diff:assert_lists_eq(
         Msgs1 ++ Msgs2,
         lists:keysort(#message.timestamp, emqx_ds_test_helpers:storage_consume(Shard, ['#']))
     ).

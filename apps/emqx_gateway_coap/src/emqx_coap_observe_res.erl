@@ -1,25 +1,15 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_coap_observe_res).
 
+-include("emqx_coap.hrl").
+
 %% API
 -export([
     new_manager/0,
-    insert/3,
+    insert/2,
     remove/2,
     res_changed/2,
     foreach/2,
@@ -34,7 +24,8 @@
 
 -type res() :: #{
     token := token(),
-    seq_id := seq_id()
+    seq_id := seq_id(),
+    subopts := emqx_types:subopts()
 }.
 
 -type manager() :: #{emqx_types:topic() => res()}.
@@ -46,12 +37,12 @@
 new_manager() ->
     #{}.
 
--spec insert(emqx_types:topic(), token(), manager()) -> {seq_id(), manager()}.
-insert(Topic, Token, Manager) ->
+-spec insert(sub_data(), manager()) -> {seq_id(), manager()}.
+insert(#{topic := Topic, token := Token, subopts := SubOpts}, Manager) ->
     Res =
         case maps:get(Topic, Manager, undefined) of
             undefined ->
-                new_res(Token);
+                new_res(Token, SubOpts);
             Any ->
                 Any
         end,
@@ -84,18 +75,24 @@ foreach(F, Manager) ->
     ),
     ok.
 
--spec subscriptions(manager()) -> [emqx_types:topic()].
+-spec subscriptions(manager()) -> _.
 subscriptions(Manager) ->
-    maps:keys(Manager).
+    maps:map(
+        fun(_Topic, #{subopts := SubOpts}) ->
+            SubOpts
+        end,
+        Manager
+    ).
 
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
--spec new_res(token()) -> res().
-new_res(Token) ->
+-spec new_res(token(), emqx_types:subopts()) -> res().
+new_res(Token, SubOpts) ->
     #{
         token => Token,
-        seq_id => 0
+        seq_id => 0,
+        subopts => SubOpts
     }.
 
 -spec res_changed(res()) -> res().

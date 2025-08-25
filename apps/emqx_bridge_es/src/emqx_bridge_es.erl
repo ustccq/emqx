@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_es).
 
@@ -30,22 +30,14 @@ fields(action) ->
             }
         )};
 fields(action_config) ->
-    emqx_resource_schema:override(
-        emqx_bridge_v2_schema:make_consumer_action_schema(
-            ?HOCON(
-                ?UNION(fun action_union_member_selector/1),
-                #{
-                    required => true, desc => ?DESC("action_parameters")
-                }
-            )
+    emqx_bridge_v2_schema:make_producer_action_schema(
+        ?HOCON(
+            ?UNION(fun action_union_member_selector/1),
+            #{
+                required => true, desc => ?DESC("action_parameters")
+            }
         ),
-        [
-            {resource_opts,
-                ?HOCON(?R_REF(action_resource_opts), #{
-                    default => #{},
-                    desc => ?DESC(emqx_resource_schema, "resource_opts")
-                })}
-        ]
+        #{resource_opts_ref => ?R_REF(action_resource_opts)}
     );
 fields(action_resource_opts) ->
     lists:filter(
@@ -56,7 +48,7 @@ fields(action_resource_opts) ->
     );
 fields(action_create) ->
     [
-        action(create),
+        action_field(create, ?DESC(create)),
         index(),
         id(false),
         doc(),
@@ -66,10 +58,10 @@ fields(action_create) ->
         | http_common_opts()
     ];
 fields(action_delete) ->
-    [action(delete), index(), id(true), routing() | http_common_opts()];
+    [action_field(delete, ?DESC(delete)), index(), id(true), routing() | http_common_opts()];
 fields(action_update) ->
     [
-        action(update),
+        action_field(update, ?DESC(update)),
         index(),
         id(true),
         doc(),
@@ -78,12 +70,12 @@ fields(action_update) ->
         require_alias()
         | http_common_opts()
     ];
-fields("post_bridge_v2") ->
-    emqx_bridge_schema:type_and_name_fields(elasticsearch) ++ fields(action_config);
-fields("put_bridge_v2") ->
-    fields(action_config);
-fields("get_bridge_v2") ->
-    emqx_bridge_schema:status_fields() ++ fields("post_bridge_v2").
+fields(Field) when
+    Field == "get_bridge_v2";
+    Field == "put_bridge_v2";
+    Field == "post_bridge_v2"
+->
+    emqx_bridge_v2_schema:api_fields(Field, ?ACTION_TYPE, fields(action_config)).
 
 action_union_member_selector(all_union_members) ->
     [
@@ -111,13 +103,13 @@ action_union_member_selector({value, Value}) ->
             })
     end.
 
-action(Action) ->
+action_field(Action, Desc) ->
     {action,
         ?HOCON(
             Action,
             #{
                 required => true,
-                desc => atom_to_binary(Action)
+                desc => Desc
             }
         )}.
 

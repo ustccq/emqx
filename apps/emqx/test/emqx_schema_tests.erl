@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_schema_tests).
@@ -905,28 +893,110 @@ timeout_types_test_() ->
             {ok, 4294967},
             typerefl:from_string(emqx_schema:timeout_duration_s(), <<"4294967000ms">>)
         ),
-        ?_assertThrow(
-            #{
-                kind := validation_error,
-                message := "timeout value too large (max: 4294967295 ms)",
-                schema_module := emqx_schema
-            },
+        ?_assertEqual(
+            {error, "timeout value too large (max: 4294967295 ms)"},
             typerefl:from_string(emqx_schema:timeout_duration(), <<"4294967296ms">>)
         ),
-        ?_assertThrow(
-            #{
-                kind := validation_error,
-                message := "timeout value too large (max: 4294967295 ms)",
-                schema_module := emqx_schema
-            },
+        ?_assertEqual(
+            {error, "timeout value too large (max: 4294967295 ms)"},
             typerefl:from_string(emqx_schema:timeout_duration_ms(), <<"4294967296ms">>)
         ),
-        ?_assertThrow(
-            #{
-                kind := validation_error,
-                message := "timeout value too large (max: 4294967 s)",
-                schema_module := emqx_schema
-            },
+        ?_assertEqual(
+            {error, "timeout value too large (max: 4294967 s)"},
             typerefl:from_string(emqx_schema:timeout_duration_s(), <<"4294967001ms">>)
         )
+    ].
+
+unicode_template_test() ->
+    Sc = #{
+        roots => [root],
+        fields => #{root => [{template, #{type => emqx_schema:template()}}]}
+    },
+    HoconText = <<"root = {template = \"中文\"}"/utf8>>,
+    {ok, Hocon} = hocon:binary(HoconText),
+    ?assertEqual(
+        #{<<"root">> => #{<<"template">> => <<"中文"/utf8>>}},
+        hocon_tconf:check_plain(Sc, Hocon)
+    ).
+
+max_packet_size_test_() ->
+    Sc = emqx_schema,
+    Check = fun(Input) ->
+        {ok, Hocon} = hocon:binary(Input),
+        hocon_tconf:check_plain(Sc, Hocon, #{}, [mqtt])
+    end,
+    [
+        {"one byte less than 256MB",
+            ?_assertMatch(
+                #{<<"mqtt">> := #{<<"max_packet_size">> := 268435455}},
+                Check(<<"mqtt.max_packet_size = 256MB">>)
+            )},
+        {"default value",
+            ?_assertMatch(
+                #{<<"mqtt">> := #{<<"max_packet_size">> := 1048576}},
+                Check(<<"mqtt.max_packet_size = null">>)
+            )},
+        {"1KB is 1024 bytes",
+            ?_assertMatch(
+                #{<<"mqtt">> := #{<<"max_packet_size">> := 1024}},
+                Check(<<"mqtt.max_packet_size = 1KB">>)
+            )},
+        {"257MB is not allowed",
+            ?_assertThrow(
+                {emqx_schema, [
+                    #{reason := #{cause := max_mqtt_packet_size_too_large, maximum := 268435455}}
+                ]},
+                Check(<<"mqtt.max_packet_size = 257MB">>)
+            )},
+        {"0 is not allowed",
+            ?_assertThrow(
+                {emqx_schema, [
+                    #{reason := #{cause := max_mqtt_packet_size_too_small, minimum := 1}}
+                ]},
+                Check(<<"mqtt.max_packet_size = 0">>)
+            )}
+    ].
+
+max_heap_size_test_() ->
+    WordSize = erlang:system_info(wordsize),
+    MaxWords = 128 * 1024 * 1024 * 1024 div WordSize,
+    MaxBytes = MaxWords * WordSize,
+    DefaultWords = 32 * 1024 * 1024 div WordSize,
+    Sc = emqx_schema,
+    Check = fun(Input) ->
+        {ok, Hocon} = hocon:binary(Input),
+        hocon_tconf:check_plain(Sc, Hocon, #{}, [force_shutdown])
+    end,
+    [
+        {"equal to default of 128GB",
+            ?_assertMatch(
+                #{<<"force_shutdown">> := #{<<"max_heap_size">> := MaxWords}},
+                Check(<<"force_shutdown.max_heap_size = 128GB">>)
+            )},
+        {"default value",
+            ?_assertMatch(
+                #{<<"force_shutdown">> := #{<<"max_heap_size">> := DefaultWords}},
+                Check(<<"force_shutdown.max_heap_size = null">>)
+            )},
+        {"divides by the wordsize",
+            ?_test(begin
+                Expected = 1024 div WordSize,
+                ?assertMatch(
+                    #{<<"force_shutdown">> := #{<<"max_heap_size">> := Expected}},
+                    Check(<<"force_shutdown.max_heap_size = 1KB">>),
+                    #{expected => Expected}
+                )
+            end)},
+        {"129GB is not allowed",
+            ?_assertThrow(
+                {emqx_schema, [
+                    #{reason := #{cause := max_heap_size_too_large, maximum := MaxBytes}}
+                ]},
+                Check(<<"force_shutdown.max_heap_size = 129GB">>)
+            )},
+        {"0 is allowed",
+            ?_assertMatch(
+                #{<<"force_shutdown">> := #{<<"max_heap_size">> := 0}},
+                Check(<<"force_shutdown.max_heap_size = 0KB">>)
+            )}
     ].

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_connection_SUITE).
@@ -75,7 +63,6 @@ end_per_suite(Config) ->
 init_per_testcase(TestCase, Config) when
     TestCase =/= t_ws_pingreq_before_connected
 ->
-    add_bucket(),
     ok = meck:expect(emqx_transport, wait, fun(Sock) -> {ok, Sock} end),
     ok = meck:expect(emqx_transport, type, fun(_Sock) -> tcp end),
     ok = meck:expect(
@@ -84,7 +71,8 @@ init_per_testcase(TestCase, Config) when
         fun
             (peername, [sock]) -> {ok, {{127, 0, 0, 1}, 3456}};
             (sockname, [sock]) -> {ok, {{127, 0, 0, 1}, 1883}};
-            (peercert, [sock]) -> undefined
+            (peercert, [sock]) -> undefined;
+            (peersni, [sock]) -> undefined
         end
     ),
     ok = meck:expect(emqx_transport, setopts, fun(_Sock, _Opts) -> ok end),
@@ -94,19 +82,16 @@ init_per_testcase(TestCase, Config) when
     ok = meck:expect(emqx_transport, getstat, fun(_Sock, Options) ->
         {ok, [{K, 0} || K <- Options]}
     end),
-    ok = meck:expect(emqx_transport, async_send, fun(_Sock, _Data) -> ok end),
-    ok = meck:expect(emqx_transport, async_send, fun(_Sock, _Data, _Opts) -> ok end),
+    ok = meck:expect(emqx_transport, send, fun(_Sock, _Data) -> ok end),
     ok = meck:expect(emqx_transport, fast_close, fun(_Sock) -> ok end),
     case erlang:function_exported(?MODULE, TestCase, 2) of
         true -> ?MODULE:TestCase(init, Config);
         _ -> Config
     end;
 init_per_testcase(_, Config) ->
-    add_bucket(),
     Config.
 
 end_per_testcase(TestCase, Config) ->
-    del_bucket(),
     case erlang:function_exported(?MODULE, TestCase, 2) of
         true -> ?MODULE:TestCase('end', Config);
         false -> ok
@@ -134,17 +119,12 @@ t_info(_) ->
     ?assertMatch(
         #{
             peername := {{127, 0, 0, 1}, 3456},
-            sockname := {{127, 0, 0, 1}, 1883},
+            sockname := {{127, 0, 0, 1}, 18083},
             sockstate := idle,
             socktype := tcp
         },
         SockInfo
     ).
-
-t_info_limiter(_) ->
-    Limiter = init_limiter(),
-    St = st(#{limiter => Limiter}),
-    ?assertEqual(Limiter, emqx_connection:info(limiter, St)).
 
 t_stats(_) ->
     CPid = spawn(fun() ->
@@ -188,22 +168,16 @@ t_process_msg(_) ->
     ).
 
 t_ensure_stats_timer(_) ->
-    NStats = emqx_connection:ensure_stats_timer(100, st()),
-    Stats_timer = emqx_connection:info(stats_timer, NStats),
-    ?assert(is_reference(Stats_timer)),
-    ?assertEqual(NStats, emqx_connection:ensure_stats_timer(100, NStats)).
+    NStats = emqx_connection:ensure_stats_timer(st(#{stats_timer => undefined})),
+    StatsTimer = emqx_connection:info(stats_timer, NStats),
+    ?assert(is_reference(StatsTimer)),
+    ?assertEqual(NStats, emqx_connection:ensure_stats_timer(NStats)).
 
 t_cancel_stats_timer(_) ->
     NStats = emqx_connection:cancel_stats_timer(st(#{stats_timer => make_ref()})),
-    Stats_timer = emqx_connection:info(stats_timer, NStats),
-    ?assertEqual(undefined, Stats_timer),
+    StatsTimer = emqx_connection:info(stats_timer, NStats),
+    ?assertEqual(undefined, StatsTimer),
     ?assertEqual(NStats, emqx_connection:cancel_stats_timer(NStats)).
-
-t_append_msg(_) ->
-    ?assertEqual([msg], emqx_connection:append_msg([], [msg])),
-    ?assertEqual([msg], emqx_connection:append_msg([], msg)),
-    ?assertEqual([msg1, msg], emqx_connection:append_msg([msg1], [msg])),
-    ?assertEqual([msg1, msg], emqx_connection:append_msg([msg1], msg)).
 
 t_handle_msg(_) ->
     From = {make_ref(), self()},
@@ -234,9 +208,11 @@ t_handle_msg_incoming(_) ->
     ?assertMatch({ok, _St}, handle_msg({incoming, undefined}, st())).
 
 t_handle_msg_outgoing(_) ->
-    ?assertEqual(ok, handle_msg({outgoing, ?PUBLISH_PACKET(?QOS_2, <<"Topic">>, 1, <<>>)}, st())),
-    ?assertEqual(ok, handle_msg({outgoing, ?PUBREL_PACKET(1)}, st())),
-    ?assertEqual(ok, handle_msg({outgoing, ?PUBCOMP_PACKET(1)}, st())).
+    ?assertMatch(
+        {ok, _}, handle_msg({outgoing, ?PUBLISH_PACKET(?QOS_2, <<"Topic">>, 1, <<>>)}, st())
+    ),
+    ?assertMatch({ok, _}, handle_msg({outgoing, ?PUBREL_PACKET(1)}, st())),
+    ?assertMatch({ok, _}, handle_msg({outgoing, ?PUBCOMP_PACKET(1)}, st())).
 
 t_handle_msg_tcp_error(_) ->
     ?assertMatch(
@@ -252,21 +228,13 @@ t_handle_msg_passive(_) ->
 
 t_handle_msg_deliver(_) ->
     ok = meck:expect(emqx_channel, handle_deliver, fun(_, Channel) -> {ok, Channel} end),
-    ?assertMatch({ok, _St}, handle_msg({deliver, topic, msg}, st())).
-
-t_handle_msg_inet_reply(_) ->
-    ok = meck:expect(emqx_pd, get_counter, fun(_) -> 10 end),
-    emqx_config:put_listener_conf(tcp, default, [tcp_options, active_n], 0),
-    ?assertMatch({ok, _St}, handle_msg({inet_reply, for_testing, ok}, st())),
-    emqx_config:put_listener_conf(tcp, default, [tcp_options, active_n], 100),
-    ?assertEqual(ok, handle_msg({inet_reply, for_testing, ok}, st())),
     ?assertMatch(
-        {stop, {shutdown, for_testing}, _St},
-        handle_msg({inet_reply, for_testing, {error, for_testing}}, st())
+        {ok, _St},
+        handle_msg({deliver, <<"#">>, emqx_message:make(<<"t">>, <<>>)}, st())
     ).
 
 t_handle_msg_connack(_) ->
-    ?assertEqual(ok, handle_msg({connack, ?CONNACK_PACKET(?CONNACK_ACCEPT)}, st())).
+    ?assertMatch({ok, _}, handle_msg({connack, ?CONNACK_PACKET(?CONNACK_ACCEPT)}, st())).
 
 t_handle_msg_close(_) ->
     ?assertMatch({stop, {shutdown, normal}, _St}, handle_msg({close, normal}, st())).
@@ -275,7 +243,7 @@ t_handle_msg_event(_) ->
     ok = meck:expect(emqx_cm, register_channel, fun(_, _, _) -> ok end),
     ok = meck:expect(emqx_cm, insert_channel_info, fun(_, _, _) -> ok end),
     ok = meck:expect(emqx_cm, set_chan_info, fun(_, _) -> ok end),
-    ?assertEqual(ok, handle_msg({event, connected}, st())),
+    ?assertMatch({ok, _St}, handle_msg({event, connected}, st())),
     ?assertMatch({ok, _St}, handle_msg({event, disconnected}, st())),
     ?assertMatch({ok, _St}, handle_msg({event, undefined}, st())).
 
@@ -286,7 +254,7 @@ t_handle_msg_shutdown(_) ->
     ?assertMatch({stop, {shutdown, for_testing}, _St}, handle_msg({shutdown, for_testing}, st())).
 
 t_handle_call(_) ->
-    St = st(#{limiter => init_limiter()}),
+    St = st(),
     ?assertMatch({ok, _St}, handle_msg({event, undefined}, St)),
     ?assertMatch({reply, _Info, _NSt}, handle_call(self(), info, St)),
     ?assertMatch({reply, _Stats, _NSt}, handle_call(self(), stats, St)),
@@ -298,7 +266,7 @@ t_handle_call(_) ->
 
 t_handle_timeout(_) ->
     TRef = make_ref(),
-    State = st(#{idle_timer => TRef, stats_timer => TRef, limiter => init_limiter()}),
+    State = st(#{stats_timer => TRef}),
     ?assertMatch(
         {stop, {shutdown, idle_timeout}, _NState},
         emqx_connection:handle_timeout(TRef, idle_timeout, State)
@@ -315,18 +283,17 @@ t_handle_timeout(_) ->
     ?assertMatch({ok, _NState}, emqx_connection:handle_timeout(TRef, undefined, State)).
 
 t_parse_incoming(_) ->
-    ?assertMatch({[], _NState}, emqx_connection:parse_incoming(<<>>, [], st())),
-    ?assertMatch({[], _NState}, emqx_connection:parse_incoming(<<"for_testing">>, [], st())).
+    ?assertMatch({0, [], _NState}, emqx_connection:parse_incoming(<<>>, st())),
+    ?assertMatch({0, [], _NState}, emqx_connection:parse_incoming(<<"for_testing">>, st())).
 
 t_next_incoming_msgs(_) ->
-    State = st(#{}),
     ?assertEqual(
-        {ok, [{incoming, packet}], State},
-        emqx_connection:next_incoming_msgs([packet], [], State)
+        {incoming, packet},
+        emqx_connection:next_incoming_msgs([packet])
     ),
     ?assertEqual(
-        {ok, [{incoming, packet2}, {incoming, packet1}], State},
-        emqx_connection:next_incoming_msgs([packet1, packet2], [], State)
+        [{incoming, packet2}, {incoming, packet1}],
+        emqx_connection:next_incoming_msgs([packet1, packet2])
     ).
 
 t_handle_incoming(_) ->
@@ -342,7 +309,7 @@ t_handle_outing_non_utf8_topic(_) ->
     StrictOff = #{version => 5, max_size => 16#FFFF, strict_mode => false},
     StOff = st(#{serialize => StrictOff}),
     OffResult = emqx_connection:handle_outgoing(Publish, StOff),
-    ?assertMatch(ok, OffResult),
+    ?assertMatch({ok, _}, OffResult),
     StrictOn = #{version => 5, max_size => 16#FFFF, strict_mode => true},
     StOn = st(#{serialize => StrictOn}),
     ?assertError(frame_serialize_error, emqx_connection:handle_outgoing(Publish, StOn)).
@@ -399,8 +366,8 @@ t_with_channel(_) ->
     meck:unload(emqx_channel).
 
 t_handle_outgoing(_) ->
-    ?assertEqual(ok, emqx_connection:handle_outgoing(?PACKET(?PINGRESP), st())),
-    ?assertEqual(ok, emqx_connection:handle_outgoing([?PACKET(?PINGRESP)], st())).
+    ?assertMatch({ok, _}, emqx_connection:handle_outgoing(?PACKET(?PINGRESP), st())),
+    ?assertMatch({ok, _}, emqx_connection:handle_outgoing([?PACKET(?PINGRESP)], st())).
 
 t_handle_info(_) ->
     ?assertMatch(
@@ -413,53 +380,10 @@ t_handle_info(_) ->
     ),
     ?assertMatch({ok, _NState}, emqx_connection:handle_info(for_testing, st())).
 
-t_ensure_rate_limit(_) ->
-    WhenOk = fun emqx_connection:next_incoming_msgs/3,
-    {ok, [], State} = emqx_connection:check_limiter(
-        [],
-        [],
-        WhenOk,
-        [],
-        st(#{limiter => undefined})
-    ),
-    ?assertEqual(undefined, emqx_connection:info(limiter, State)),
-
-    Limiter = init_limiter(),
-    {ok, [], State1} = emqx_connection:check_limiter([], [], WhenOk, [], st(#{limiter => Limiter})),
-    ?assertEqual(Limiter, emqx_connection:info(limiter, State1)),
-
-    ok = meck:new(emqx_htb_limiter, [passthrough, no_history, no_link]),
-
-    ok = meck:expect(
-        emqx_htb_limiter,
-        make_infinity_limiter,
-        fun() -> non_infinity end
-    ),
-
-    ok = meck:expect(
-        emqx_htb_limiter,
-        check,
-        fun(_, Client) -> {pause, 3000, undefined, Client} end
-    ),
-    {ok, State2} = emqx_connection:check_limiter(
-        [{1000, bytes}],
-        [],
-        WhenOk,
-        [],
-        st(#{limiter => init_limiter()})
-    ),
-    meck:unload(emqx_htb_limiter),
-
-    ?assertNotEqual(undefined, emqx_connection:info(limiter_timer, State2)).
-
 t_activate_socket(_) ->
-    Limiter = init_limiter(),
-    State = st(#{limiter => Limiter}),
+    State = st(#{}),
     {ok, NStats} = emqx_connection:activate_socket(State),
     ?assertEqual(running, emqx_connection:info(sockstate, NStats)),
-
-    State1 = st(#{sockstate => blocked, limiter_timer => any_timer}),
-    ?assertEqual({ok, State1}, emqx_connection:activate_socket(State1)),
 
     State2 = st(#{sockstate => closed}),
     ?assertEqual({ok, State2}, emqx_connection:activate_socket(State2)).
@@ -529,7 +453,7 @@ t_oom_shutdown(_) ->
     with_conn(
         fun(Pid) ->
             Pid ! {tcp_passive, foo},
-            {ok, _} = ?block_until(#{?snk_kind := check_oom}, 1000),
+            {ok, _} = ?block_until(#{?snk_kind := check_oom_shutdown}, 1000),
             {ok, _} = ?block_until(#{?snk_kind := terminate}, 100),
             Trace = snabbkaffe:collect_trace(),
             ?assertEqual(1, length(?of_kind(terminate, Trace))),
@@ -560,18 +484,14 @@ t_cancel_congestion_alarm(_) ->
     ),
     with_conn(
         fun(Pid) ->
-            #{
-                channel := Channel,
-                transport := Transport,
-                socket := Socket
-            } = emqx_connection:get_state(Pid),
+            State = sys:get_state(Pid),
             %% precondition
-            Zone = emqx_channel:info(zone, Channel),
+            Zone = emqx_connection:info({channel, zone}, State),
             true = emqx_config:get_zone_conf(Zone, [conn_congestion, enable_alarm]),
             %% should not raise errors
-            ok = emqx_congestion:maybe_alarm_conn_congestion(Socket, Transport, Channel),
+            ok = emqx_congestion:maybe_alarm_conn_congestion(emqx_connection, State),
             %% should not raise errors either
-            ok = emqx_congestion:cancel_alarms(Socket, Transport, Channel),
+            ok = emqx_congestion:cancel_alarms(emqx_connection, State),
             ok
         end,
         Opts
@@ -627,7 +547,7 @@ with_conn(TestFun, Opts) when is_map(Opts) ->
             Opts,
             #{
                 zone => default,
-                limiter => limiter_cfg(),
+                limiter => undefined,
                 listener => {tcp, default}
             }
         )
@@ -652,11 +572,12 @@ st() -> st(#{}, #{}).
 st(InitFields) when is_map(InitFields) ->
     st(InitFields, #{}).
 st(InitFields, ChannelFields) when is_map(InitFields) ->
-    St = emqx_connection:init_state(emqx_transport, sock, #{
+    St0 = emqx_connection:init_state(emqx_transport, sock, #{
         zone => default,
-        limiter => limiter_cfg(),
+        limiter => undefined,
         listener => {tcp, default}
     }),
+    St = emqx_connection:set_field(stats_timer, {idle, make_ref()}, St0),
     maps:fold(
         fun(N, V, S) -> emqx_connection:set_field(N, V, S) end,
         emqx_connection:set_field(channel, channel(ChannelFields), St),
@@ -699,7 +620,7 @@ channel(InitFields) ->
         end,
         emqx_channel:init(ConnInfo, #{
             zone => default,
-            limiter => limiter_cfg(),
+            limiter => undefined,
             listener => {tcp, default}
         }),
         maps:merge(
@@ -715,36 +636,3 @@ channel(InitFields) ->
 handle_msg(Msg, St) -> emqx_connection:handle_msg(Msg, St).
 
 handle_call(Pid, Call, St) -> emqx_connection:handle_call(Pid, Call, St).
-
--define(LIMITER_ID, 'tcp:default').
-
-init_limiter() ->
-    emqx_limiter_container:get_limiter_by_types(?LIMITER_ID, [bytes, messages], limiter_cfg()).
-
-limiter_cfg() ->
-    Cfg = bucket_cfg(),
-    Client = client_cfg(),
-    #{bytes => Cfg, messages => Cfg, client => #{bytes => Client, messages => Client}}.
-
-bucket_cfg() ->
-    #{rate => infinity, initial => 0, burst => 0}.
-
-client_cfg() ->
-    #{
-        rate => infinity,
-        initial => 0,
-        burst => 0,
-        low_watermark => 1,
-        divisible => false,
-        max_retry_time => timer:seconds(5),
-        failure_strategy => force
-    }.
-
-add_bucket() ->
-    Cfg = bucket_cfg(),
-    emqx_limiter_server:add_bucket(?LIMITER_ID, bytes, Cfg),
-    emqx_limiter_server:add_bucket(?LIMITER_ID, messages, Cfg).
-
-del_bucket() ->
-    emqx_limiter_server:del_bucket(?LIMITER_ID, bytes),
-    emqx_limiter_server:del_bucket(?LIMITER_ID, messages).

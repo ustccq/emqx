@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_testlib).
 
@@ -9,6 +9,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
@@ -98,10 +99,21 @@ delete_all_bridges() ->
     ).
 
 %% test helpers
-parse_and_check(BridgeType, BridgeName, ConfigString) ->
-    {ok, RawConf} = hocon:binary(ConfigString, #{format => map}),
-    hocon_tconf:check_plain(emqx_bridge_schema, RawConf, #{required => false, atom_key => false}),
-    #{<<"bridges">> := #{BridgeType := #{BridgeName := BridgeConfig}}} = RawConf,
+parse_and_check(BridgeType, BridgeName, ConfigIn) ->
+    RawConf =
+        case is_map(ConfigIn) of
+            true ->
+                #{<<"bridges">> => #{BridgeType => #{BridgeName => ConfigIn}}};
+            false ->
+                {ok, RawConf0} = hocon:binary(ConfigIn, #{format => map}),
+                RawConf0
+        end,
+    #{<<"bridges">> := #{BridgeType := #{BridgeName := BridgeConfig}}} =
+        hocon_tconf:check_plain(emqx_bridge_schema, RawConf, #{
+            required => false,
+            atom_key => false,
+            make_serializable => true
+        }),
     BridgeConfig.
 
 resource_id(Config) ->
@@ -126,6 +138,11 @@ create_bridge(Config, Overrides) ->
     ct:pal("creating bridge with config: ~p", [BridgeConfig]),
     emqx_bridge:create(BridgeType, BridgeName, BridgeConfig).
 
+%% For running RPCs in peers.
+infer_dashboard_base_url() ->
+    Port = emqx_config:get([dashboard, listeners, http, bind], 18083),
+    "http://127.0.0.1:" ++ integer_to_list(Port).
+
 list_bridges_api() ->
     Params = [],
     Path = emqx_mgmt_api_test_util:api_path(["bridges"]),
@@ -135,7 +152,7 @@ list_bridges_api() ->
     Res =
         case emqx_mgmt_api_test_util:request_api(get, Path, "", AuthHeader, Params, Opts) of
             {ok, {Status, Headers, Body0}} ->
-                {ok, {Status, Headers, emqx_utils_json:decode(Body0, [return_maps])}};
+                {ok, {Status, Headers, emqx_utils_json:decode(Body0)}};
             Error ->
                 Error
         end,
@@ -154,14 +171,17 @@ create_bridge_api(Config, Overrides) ->
 
 create_bridge_api(BridgeType, BridgeName, BridgeConfig) ->
     Params = BridgeConfig#{<<"type">> => BridgeType, <<"name">> => BridgeName},
-    Path = emqx_mgmt_api_test_util:api_path(["bridges"]),
+    Host = infer_dashboard_base_url(),
+    Path = emqx_mgmt_api_test_util:api_path(Host, ["bridges"]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     Opts = #{return_all => true},
     ct:pal("creating bridge (via http): ~p", [Params]),
     Res =
         case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params, Opts) of
             {ok, {Status, Headers, Body0}} ->
-                {ok, {Status, Headers, emqx_utils_json:decode(Body0, [return_maps])}};
+                ActionType = emqx_bridge_lib:upgrade_type(BridgeType),
+                ok = kickoff_health_check(ActionType, BridgeName),
+                {ok, {Status, Headers, emqx_utils_json:decode(Body0)}};
             Error ->
                 Error
         end,
@@ -184,10 +204,29 @@ update_bridge_api(Config, Overrides) ->
     ct:pal("updating bridge (via http): ~p", [Params]),
     Res =
         case emqx_mgmt_api_test_util:request_api(put, Path, "", AuthHeader, Params, Opts) of
-            {ok, {_Status, _Headers, Body0}} -> {ok, emqx_utils_json:decode(Body0, [return_maps])};
-            Error -> Error
+            {ok, {_Status, _Headers, Body0}} ->
+                ActionType = emqx_bridge_lib:upgrade_type(BridgeType),
+                ok = kickoff_health_check(ActionType, Name),
+                {ok, emqx_utils_json:decode(Body0)};
+            Error ->
+                Error
         end,
     ct:pal("bridge update result: ~p", [Res]),
+    Res.
+
+get_bridge_api(Config) ->
+    BridgeType = ?config(bridge_type, Config),
+    Name = ?config(bridge_name, Config),
+    BridgeId = emqx_bridge_resource:bridge_id(BridgeType, Name),
+    Path = emqx_mgmt_api_test_util:api_path(["bridges", BridgeId]),
+    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+    ct:pal("getting bridge (via http)", []),
+    Res =
+        case emqx_mgmt_api_test_util:request_api(get, Path, "", AuthHeader) of
+            {ok, Body0} -> {ok, emqx_utils_json:decode(Body0)};
+            Error -> Error
+        end,
+    ct:pal("bridge result: ~p", [Res]),
     Res.
 
 delete_bridge_http_api_v1(Opts) ->
@@ -234,9 +273,9 @@ probe_bridge_api(BridgeType, BridgeName, BridgeConfig) ->
     Res.
 
 try_decode_error(Body0) ->
-    case emqx_utils_json:safe_decode(Body0, [return_maps]) of
+    case emqx_utils_json:safe_decode(Body0) of
         {ok, #{<<"message">> := Msg0} = Body1} ->
-            case emqx_utils_json:safe_decode(Msg0, [return_maps]) of
+            case emqx_utils_json:safe_decode(Msg0) of
                 {ok, Msg1} -> Body1#{<<"message">> := Msg1};
                 {error, _} -> Body1
             end;
@@ -266,8 +305,8 @@ create_rule_and_action(Action, RuleTopic, Opts) ->
     ct:pal("rule action params: ~p", [Params]),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
         {ok, Res0} ->
-            Res = #{<<"id">> := RuleId} = emqx_utils_json:decode(Res0, [return_maps]),
-            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(RuleId) end),
+            Res = #{<<"id">> := RuleId} = emqx_utils_json:decode(Res0),
+            on_exit(fun() -> ok = emqx_rule_engine:delete_rule(?global_ns, RuleId) end),
             {ok, Res};
         Error ->
             Error
@@ -506,4 +545,34 @@ t_on_get_status(Config, Opts) ->
         _Attempts = 20,
         ?assertEqual({ok, connected}, emqx_resource_manager:health_check(ResourceId))
     ),
+    ok.
+
+kickoff_health_check(Type, Name) ->
+    Nodes = emqx:running_nodes(),
+    Results = erpc:multicall(Nodes, fun() -> do_kickoff_health_check(Type, Name) end),
+    Failed = lists:filter(
+        fun
+            ({_Node, {ok, ok}}) -> false;
+            (_) -> true
+        end,
+        lists:zip(Nodes, Results)
+    ),
+    Failed =:= [] orelse error(Failed),
+    ok.
+
+do_kickoff_health_check(Type, Name) when is_atom(Type) ->
+    do_kickoff_health_check(atom_to_binary(Type), Name);
+do_kickoff_health_check(Type, Name) when is_list(Type) ->
+    do_kickoff_health_check(list_to_binary(Type), Name);
+do_kickoff_health_check(<<"mqtt">> = Type, Name) ->
+    _ = emqx_bridge_v2_testlib:kickoff_action_health_check(Type, Name),
+    _ = emqx_bridge_v2_testlib:kickoff_source_health_check(Type, Name),
+    ok;
+do_kickoff_health_check(Type, Name) ->
+    case binary:match(Type, <<"consumer">>) of
+        nomatch ->
+            emqx_bridge_v2_testlib:kickoff_action_health_check(Type, Name);
+        _ ->
+            emqx_bridge_v2_testlib:kickoff_source_health_check(Type, Name)
+    end,
     ok.

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ft_conf_SUITE).
@@ -22,6 +10,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("snabbkaffe/include/test_macros.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
@@ -194,6 +183,7 @@ t_switch_exporter(_Config) ->
                     <<"host">> => <<"https://localhost">>,
                     <<"port">> => 9000,
                     <<"transport_options">> => #{
+                        <<"ssl">> => #{<<"enable">> => false},
                         <<"ipv6_probe">> => false
                     }
                 }
@@ -229,6 +219,10 @@ t_switch_exporter(_Config) ->
     ok = emqx_ft_test_helpers:upload_file(gen_clientid(), <<"f1">>, "f1", <<?MODULE_STRING>>).
 
 t_persist_ssl_certfiles(Config) ->
+    #{
+        cert := Cert,
+        key := Key
+    } = emqx_ft_test_helpers:generate_pki_files(Config),
     ?assertMatch(
         {ok, _},
         emqx_ft_conf:update(mk_storage(true))
@@ -238,7 +232,7 @@ t_persist_ssl_certfiles(Config) ->
         list_ssl_certfiles(Config)
     ),
     ?assertMatch(
-        {error, {pre_config_update, _, {bad_ssl_config, #{}}}},
+        {error, {pre_config_update, _, #{reason := <<"bad_ssl_config">>}}},
         emqx_ft_conf:update(
             mk_storage(true, #{
                 <<"s3">> => mk_s3_config(#{
@@ -259,8 +253,8 @@ t_persist_ssl_certfiles(Config) ->
                 <<"s3">> => mk_s3_config(#{
                     <<"transport_options">> => #{
                         <<"ssl">> => #{
-                            <<"certfile">> => emqx_ft_test_helpers:pem_privkey(),
-                            <<"keyfile">> => emqx_ft_test_helpers:pem_privkey()
+                            <<"certfile">> => Cert,
+                            <<"keyfile">> => Key
                         }
                     }
                 })
@@ -293,15 +287,19 @@ t_persist_ssl_certfiles(Config) ->
         emqx_ft_conf:update(mk_storage(true))
     ).
 
-t_import(_Config) ->
+t_import(Config) ->
+    #{
+        cert := Cert,
+        key := Key
+    } = emqx_ft_test_helpers:generate_pki_files(Config),
     {ok, _} =
         emqx_ft_conf:update(
             mk_storage(true, #{
                 <<"s3">> => mk_s3_config(#{
                     <<"transport_options">> => #{
                         <<"ssl">> => #{
-                            <<"certfile">> => emqx_ft_test_helpers:pem_privkey(),
-                            <<"keyfile">> => emqx_ft_test_helpers:pem_privkey()
+                            <<"certfile">> => Cert,
+                            <<"keyfile">> => Key
                         }
                     }
                 })
@@ -315,7 +313,7 @@ t_import(_Config) ->
 
     ?assertMatch(
         {ok, _},
-        emqx_ft_conf:import_config(FTBackupConfig)
+        emqx_ft_conf:import_config(?global_ns, FTBackupConfig)
     ),
 
     ?assertMatch(
@@ -349,7 +347,7 @@ mk_s3_config(S3Config) ->
     maps:merge(BaseS3Config, S3Config).
 
 gen_clientid() ->
-    emqx_base62:encode(emqx_guid:gen()).
+    emqx_utils:rand_id(16).
 
 list_ssl_certfiles(_Config) ->
     CertDir = emqx:mutable_certs_dir(),

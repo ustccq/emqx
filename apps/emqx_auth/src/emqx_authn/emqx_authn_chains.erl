@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Authenticator management API module.
@@ -25,6 +13,7 @@
 -include("emqx_authn_chains.hrl").
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("emqx/include/emqx_external_trace.hrl").
 -include_lib("stdlib/include/ms_transform.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
@@ -34,6 +23,7 @@
     id :: binary(),
     provider :: module(),
     enable :: boolean(),
+    precondition :: undefined | emqx_variform:compiled(),
     state :: map()
 }).
 
@@ -44,8 +34,7 @@
 
 %% The authentication entrypoint.
 -export([
-    authenticate/2,
-    authenticate_deny/2
+    authenticate/2
 ]).
 
 %% Authenticator manager process start/stop
@@ -151,40 +140,64 @@ end).
     atom() => term()
 }.
 
+-type import_users_result() :: #{
+    total := non_neg_integer(),
+    success := non_neg_integer(),
+    override := non_neg_integer(),
+    skipped := non_neg_integer(),
+    failed := non_neg_integer()
+}.
+
 -export_type([authenticator/0, config/0, state/0, extra/0, user_info/0]).
 
 %%------------------------------------------------------------------------------
 %% Authenticate
 %%------------------------------------------------------------------------------
 
-authenticate(#{listener := Listener, protocol := Protocol} = Credential, AuthResult) ->
+authenticate(#{listener := Listener, protocol := Protocol} = Credential, _AuthResult) ->
     case get_authenticators(Listener, global_chain(Protocol)) of
         {ok, ChainName, Authenticators} ->
             case get_enabled(Authenticators) of
                 [] ->
-                    ?TRACE_RESULT("authentication_result", AuthResult, empty_chain);
+                    %% Empty chain means allowed anonymous access.
+                    %% Further authentication hooks may still forbid the access.
+                    %% We return
+                    %% {
+                    %%   ok, %% to tell the hooks that we want to set a new AuthResult acc
+                    %%   ok %% the actual new AuthResult acc
+                    %% }
+                    ?TRACE_RESULT("authentication_result", {ok, ok}, empty_chain);
                 NAuthenticators ->
                     Result = do_authenticate(ChainName, NAuthenticators, Credential),
                     ?TRACE_RESULT("authentication_result", Result, chain_result)
             end;
         none ->
-            ?TRACE_RESULT("authentication_result", AuthResult, no_chain)
+            ?TRACE_RESULT("authentication_result", {ok, ok}, no_chain);
+        no_table ->
+            %% This basically means that authn app crashed or stopped or being restarted.
+            ?TRACE_RESULT("authentication_result", {ok, {error, not_authorized}}, no_chain_table)
     end.
 
-authenticate_deny(_Credential, _AuthResult) ->
-    ?TRACE_RESULT("authentication_result", {ok, {error, not_authorized}}, not_initialized).
-
 get_authenticators(Listener, Global) ->
-    case ets:lookup(?CHAINS_TAB, Listener) of
+    %% Under load, some clients may still execute this function
+    %% while the authn app crashed or stopped and removed the table.
+    %% So we handle this in restrictive manner (see authenticate/2).
+    try ets:lookup(?CHAINS_TAB, Listener) of
         [#chain{name = Name, authenticators = Authenticators}] ->
             {ok, Name, Authenticators};
         _ ->
-            case ets:lookup(?CHAINS_TAB, Global) of
+            try ets:lookup(?CHAINS_TAB, Global) of
                 [#chain{name = Name, authenticators = Authenticators}] ->
                     {ok, Name, Authenticators};
                 _ ->
                     none
+            catch
+                error:badarg ->
+                    no_table
             end
+    catch
+        error:badarg ->
+            no_table
     end.
 
 get_enabled(Authenticators) ->
@@ -317,7 +330,7 @@ reorder_authenticator(ChainName, AuthenticatorIDs) ->
     authenticator_id(),
     {plain | hash, prepared_user_list | binary(), binary()}
 ) ->
-    ok | {error, term()}.
+    {ok, import_users_result()} | {error, term()}.
 import_users(ChainName, AuthenticatorID, Filename) ->
     call({import_users, ChainName, AuthenticatorID, Filename}).
 
@@ -353,15 +366,13 @@ init(_Opts) ->
     Module = emqx_authn_config,
     ok = emqx_config_handler:add_handler([?CONF_ROOT], Module),
     ok = emqx_config_handler:add_handler([listeners, '?', '?', ?CONF_ROOT], Module),
-    ok = hook_deny(),
-    {ok, #{hooked => false, providers => #{}, init_done => false},
-        {continue, {initialize_authentication, init}}}.
+    {ok, #{providers => #{}, init_done => false}, {continue, initialize_authentication}}.
 
 handle_call(get_providers, _From, #{providers := Providers} = State) ->
     reply(Providers, State);
 handle_call(
     {register_providers, Providers},
-    From,
+    _From,
     #{providers := Reg0} = State
 ) ->
     case lists:filter(fun({T, _}) -> maps:is_key(T, Reg0) end, Providers) of
@@ -373,7 +384,7 @@ handle_call(
                 Reg0,
                 Providers
             ),
-            reply(ok, State#{providers := Reg}, {initialize_authentication, From});
+            reply(ok, State#{providers := Reg}, initialize_authentication);
         Clashes ->
             reply({error, {authentication_type_clash, Clashes}}, State)
     end;
@@ -396,19 +407,19 @@ handle_call({delete_chain, ChainName}, _From, State) ->
         {ok, ok, NewChain}
     end,
     Reply = with_chain(ChainName, UpdateFun),
-    reply(Reply, maybe_unhook(State));
+    reply(Reply, State);
 handle_call({create_authenticator, ChainName, Config}, _From, #{providers := Providers} = State) ->
     UpdateFun = fun(Chain) ->
         handle_create_authenticator(Chain, Config, Providers)
     end,
     Reply = with_new_chain(ChainName, UpdateFun),
-    reply(Reply, maybe_hook(State));
+    reply(Reply, State);
 handle_call({delete_authenticator, ChainName, AuthenticatorID}, _From, State) ->
     UpdateFun = fun(Chain) ->
         handle_delete_authenticator(Chain, AuthenticatorID)
     end,
     Reply = with_chain(ChainName, UpdateFun),
-    reply(Reply, maybe_unhook(State));
+    reply(Reply, State);
 handle_call({update_authenticator, ChainName, AuthenticatorID, Config}, _From, State) ->
     UpdateFun = fun(Chain) ->
         handle_update_authenticator(Chain, AuthenticatorID, Config)
@@ -449,11 +460,11 @@ handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", call => Req}),
     {reply, ignored, State}.
 
-handle_continue({initialize_authentication, _From}, #{init_done := true} = State) ->
+handle_continue(initialize_authentication, #{init_done := true} = State) ->
     {noreply, State};
-handle_continue({initialize_authentication, From}, #{providers := Providers} = State) ->
-    InitDone = initialize_authentication(Providers, From),
-    {noreply, maybe_hook(State#{init_done := InitDone})}.
+handle_continue(initialize_authentication, #{providers := Providers} = State) ->
+    InitDone = initialize_authentication(Providers),
+    {noreply, State#{init_done := InitDone}}.
 
 handle_cast(Req, State) ->
     ?SLOG(error, #{msg => "unexpected_cast", cast => Req}),
@@ -475,6 +486,7 @@ terminate(Reason, _State) ->
                 reason => Other
             })
     end,
+    ok = unhook(),
     emqx_config_handler:remove_handler([?CONF_ROOT]),
     emqx_config_handler:remove_handler([listeners, '?', '?', ?CONF_ROOT]),
     ok.
@@ -486,13 +498,11 @@ code_change(_OldVsn, State, _Extra) ->
 %% Private functions
 %%------------------------------------------------------------------------------
 
-initialize_authentication(Providers, From) ->
+initialize_authentication(Providers) ->
     ProviderTypes = maps:keys(Providers),
     Chains = chain_configs(),
     HasProviders = has_providers_for_configs(Chains, ProviderTypes),
-    Result = do_initialize_authentication(Providers, Chains, HasProviders),
-    ?tp(info, authn_chains_initialization_done, #{from => From, result => Result}),
-    Result.
+    do_initialize_authentication(Providers, Chains, HasProviders).
 
 do_initialize_authentication(_Providers, _Chains, _HasProviders = false) ->
     false;
@@ -503,7 +513,7 @@ do_initialize_authentication(Providers, Chains, _HasProviders = true) ->
         end,
         Chains
     ),
-    ok = unhook_deny(),
+    ok = hook(),
     true.
 
 initialize_chain_authentication(_Providers, _ChainName, []) ->
@@ -558,30 +568,41 @@ handle_update_authenticator(Chain, AuthenticatorID, Config) ->
     case lists:keyfind(AuthenticatorID, #authenticator.id, Authenticators) of
         false ->
             {error, {not_found, {authenticator, AuthenticatorID}}};
-        #authenticator{provider = Provider, state = ST} = Authenticator ->
+        #authenticator{} = Authenticator ->
             case AuthenticatorID =:= authenticator_id(Config) of
                 true ->
-                    NConfig = insert_user_group(Chain, Config),
-                    case Provider:update(NConfig, ST) of
-                        {ok, NewST} ->
-                            NewAuthenticator = Authenticator#authenticator{
-                                state = NewST,
-                                enable = maps:get(enable, NConfig)
-                            },
-                            NewAuthenticators = replace_authenticator(
-                                AuthenticatorID,
-                                NewAuthenticator,
-                                Authenticators
-                            ),
-                            NewChain = Chain#chain{authenticators = NewAuthenticators},
-                            Result = {ok, serialize_authenticator(NewAuthenticator)},
-                            {ok, Result, NewChain};
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
+                    handle_update_authenticator2(Chain, Authenticator, Config);
                 false ->
                     {error, change_of_authentication_type_is_not_allowed}
             end
+    end.
+
+handle_update_authenticator2(Chain, Authenticator, Config) ->
+    #chain{authenticators = Authenticators} = Chain,
+    #authenticator{id = AuthenticatorID, provider = Provider, state = ST} = Authenticator,
+    NConfig = insert_user_group(Chain, Config),
+    case compile_precondition(NConfig) of
+        {ok, Precondition} ->
+            case Provider:update(NConfig, ST) of
+                {ok, NewST} ->
+                    NewAuthenticator = Authenticator#authenticator{
+                        state = NewST,
+                        enable = maps:get(enable, NConfig),
+                        precondition = Precondition
+                    },
+                    NewAuthenticators = replace_authenticator(
+                        AuthenticatorID,
+                        NewAuthenticator,
+                        Authenticators
+                    ),
+                    NewChain = Chain#chain{authenticators = NewAuthenticators},
+                    Result = {ok, serialize_authenticator(NewAuthenticator)},
+                    {ok, Result, NewChain};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, #{cause => "bad_precondition_expression", reason => Reason}}
     end.
 
 handle_delete_authenticator(Chain, AuthenticatorID) ->
@@ -589,8 +610,9 @@ handle_delete_authenticator(Chain, AuthenticatorID) ->
         ID =:= AuthenticatorID
     end,
     case do_delete_authenticators(MatchFun, Chain) of
-        {[], _NewChain} ->
-            {error, {not_found, {authenticator, AuthenticatorID}}};
+        {[], NewChain} ->
+            %% Idempotence intended
+            {ok, ok, NewChain};
         {[AuthenticatorID], NewChain} ->
             {ok, ok, NewChain}
     end.
@@ -653,46 +675,71 @@ handle_create_authenticator(Chain, Config, Providers) ->
 do_authenticate(_ChainName, [], _) ->
     {ok, {error, not_authorized}};
 do_authenticate(
-    ChainName, [#authenticator{id = ID} = Authenticator | More], Credential
+    ChainName,
+    [#authenticator{id = ID, provider = _Module} = Authenticator | More],
+    Credential
 ) ->
     MetricsID = metrics_id(ChainName, ID),
     emqx_metrics_worker:inc(authn_metrics, MetricsID, total),
-    try authenticate_with_provider(Authenticator, Credential) of
-        ignore ->
-            ok = emqx_metrics_worker:inc(authn_metrics, MetricsID, nomatch),
-            do_authenticate(ChainName, More, Credential);
-        Result ->
-            %% {ok, Extra}
-            %% {ok, Extra, AuthData}
-            %% {continue, AuthCache}
-            %% {continue, AuthData, AuthCache}
-            %% {error, Reason}
-            case Result of
-                {ok, _} ->
-                    emqx_metrics_worker:inc(authn_metrics, MetricsID, success);
-                {error, _} ->
-                    emqx_metrics_worker:inc(authn_metrics, MetricsID, failed);
-                _ ->
-                    ok
-            end,
-            {stop, Result}
-    catch
-        Class:Reason:Stacktrace ->
-            ?TRACE_AUTHN(
-                warning,
-                "authenticator_error",
-                maybe_add_stacktrace(
-                    Class,
-                    #{
-                        exception => Class,
-                        reason => Reason,
-                        authenticator => ID
-                    },
-                    Stacktrace
-                )
-            ),
-            emqx_metrics_worker:inc(authn_metrics, MetricsID, nomatch),
-            do_authenticate(ChainName, More, Credential)
+
+    Result = ?EXT_TRACE_CLIENT_AUTHN_BACKEND(
+        ?EXT_TRACE_ATTR(#{
+            'client.clientid' => maps:get(clientid, Credential, undefined),
+            'client.username' => maps:get(username, Credential, undefined),
+            'authn.authenticator' => ID,
+            'authn.chain' => ChainName,
+            'authn.module' => _Module
+        }),
+        fun() ->
+            try authenticate_with_provider(Authenticator, Credential) of
+                ignore ->
+                    ok = emqx_metrics_worker:inc(authn_metrics, MetricsID, nomatch),
+                    ?EXT_TRACE_ADD_ATTRS(#{'authn.result' => ignore}),
+                    ignore;
+                Res ->
+                    %% {ok, Extra}
+                    %% {ok, Extra, AuthData} XXX: should inc metrics success for this clause?
+                    %% {continue, AuthCache}
+                    %% {continue, AuthData, AuthCache}
+                    %% {error, Reason}
+                    case Res of
+                        {ok, _} ->
+                            emqx_metrics_worker:inc(authn_metrics, MetricsID, success),
+                            ?EXT_TRACE_ADD_ATTRS(#{'authn.result' => ok});
+                        {error, _} ->
+                            emqx_metrics_worker:inc(authn_metrics, MetricsID, failed),
+                            ?EXT_TRACE_ADD_ATTRS(#{'authn.result' => error}),
+                            ?EXT_TRACE_SET_STATUS_ERROR();
+                        _ ->
+                            ?EXT_TRACE_ADD_ATTRS(#{'authn.result' => ok}),
+                            ok
+                    end,
+                    {stop, Res}
+            catch
+                Class:Reason:Stacktrace ->
+                    ?TRACE_AUTHN(
+                        warning,
+                        "authenticator_error",
+                        maybe_add_stacktrace(
+                            Class,
+                            #{
+                                exception => Class,
+                                reason => Reason,
+                                authenticator => ID
+                            },
+                            Stacktrace
+                        )
+                    ),
+                    emqx_metrics_worker:inc(authn_metrics, MetricsID, nomatch),
+                    with_provider_failed
+            end
+        end,
+        []
+    ),
+    case Result of
+        with_provider_failed -> do_authenticate(ChainName, More, Credential);
+        ignore -> do_authenticate(ChainName, More, Credential);
+        {stop, _} -> Result
     end.
 
 maybe_add_stacktrace('throw', Data, _Stacktrace) ->
@@ -700,7 +747,33 @@ maybe_add_stacktrace('throw', Data, _Stacktrace) ->
 maybe_add_stacktrace(_, Data, Stacktrace) ->
     Data#{stacktrace => Stacktrace}.
 
-authenticate_with_provider(#authenticator{id = ID, provider = Provider, state = State}, Credential) ->
+check_precondition(undefined, _) ->
+    true;
+check_precondition(Precondition, Credential0) ->
+    Credential = emqx_auth_template:rename_client_info_vars(Credential0),
+    case emqx_variform:render(Precondition, Credential) of
+        {ok, <<"true">>} ->
+            true;
+        Other ->
+            Other
+    end.
+
+authenticate_with_provider(#authenticator{precondition = Precondition} = A, Credential) ->
+    case check_precondition(Precondition, Credential) of
+        true ->
+            do_authenticate_with_provider(A, Credential);
+        Other ->
+            ?TRACE_AUTHN("precondition_not_met", #{
+                authenticator => A#authenticator.id,
+                expression => emqx_variform:decompile(Precondition),
+                result => Other
+            }),
+            ignore
+    end.
+
+do_authenticate_with_provider(
+    #authenticator{id = ID, provider = Provider, state = State}, Credential
+) ->
     AuthnResult = Provider:authenticate(Credential, State),
     ?TRACE_AUTHN("authenticator_result", #{
         authenticator => ID,
@@ -749,68 +822,73 @@ global_chain(stomp) ->
 global_chain(_) ->
     'unknown:global'.
 
-maybe_hook(#{hooked := false} = State) ->
-    case
-        lists:any(
-            fun
-                (#chain{authenticators = []}) -> false;
-                (_) -> true
-            end,
-            ets:tab2list(?CHAINS_TAB)
-        )
-    of
-        true ->
-            ok = emqx_hooks:put('client.authenticate', {?MODULE, authenticate, []}, ?HP_AUTHN),
-            State#{hooked => true};
-        false ->
-            State
-    end;
-maybe_hook(State) ->
-    State.
+hook() ->
+    ok = emqx_hooks:put('client.authenticate', {?MODULE, authenticate, []}, ?HP_AUTHN).
 
-maybe_unhook(#{hooked := true} = State) ->
-    case
-        lists:all(
-            fun
-                (#chain{authenticators = []}) -> true;
-                (_) -> false
-            end,
-            ets:tab2list(?CHAINS_TAB)
-        )
-    of
-        true ->
-            ok = emqx_hooks:del('client.authenticate', {?MODULE, authenticate, []}),
-            State#{hooked => false};
-        false ->
-            State
-    end;
-maybe_unhook(State) ->
-    State.
+unhook() ->
+    ok = emqx_hooks:del('client.authenticate', {?MODULE, authenticate, []}).
 
-hook_deny() ->
-    ok = emqx_hooks:put('client.authenticate', {?MODULE, authenticate_deny, []}, ?HP_AUTHN).
-
-unhook_deny() ->
-    ok = emqx_hooks:del('client.authenticate', {?MODULE, authenticate_deny, []}).
-
-do_create_authenticator(AuthenticatorID, #{enable := Enable} = Config, Providers) ->
+do_create_authenticator(AuthenticatorID, Config, Providers) ->
     Type = authn_type(Config),
     case maps:get(Type, Providers, undefined) of
         undefined ->
-            {error, {no_available_provider_for, Type}};
+            {error, #{cause => "no_available_provider", type => Type}};
         Provider ->
-            case Provider:create(AuthenticatorID, Config) of
-                {ok, State} ->
-                    Authenticator = #authenticator{
-                        id = AuthenticatorID,
-                        provider = Provider,
-                        enable = Enable,
-                        state = State
-                    },
-                    {ok, Authenticator};
-                {error, Reason} ->
-                    {error, Reason}
-            end
+            do_create_authenticator2(AuthenticatorID, Config, Provider)
+    end.
+
+%% Compile precondition and create authenticator
+do_create_authenticator2(AuthenticatorID, Config, Provider) ->
+    case compile_precondition(Config) of
+        {ok, Precondition} ->
+            do_create_authenticator3(AuthenticatorID, Config, Provider, Precondition);
+        {error, Reason} ->
+            {error, #{cause => "bad_precondition_expression", reason => Reason}}
+    end.
+
+%% Create authenticator with precondition
+do_create_authenticator3(AuthenticatorID, Config, Provider, Precondition) ->
+    #{enable := Enable} = Config,
+    try Provider:create(AuthenticatorID, Config) of
+        {ok, State} ->
+            Authenticator = #authenticator{
+                id = AuthenticatorID,
+                provider = Provider,
+                enable = Enable,
+                state = State,
+                precondition = Precondition
+            },
+            {ok, Authenticator};
+        {error, Reason} ->
+            {error, Reason}
+    catch
+        _Class:Reason:Stacktrace ->
+            ?SLOG(
+                warning,
+                #{
+                    msg => "create_authenticator_error",
+                    authenticator => AuthenticatorID,
+                    reason => Reason,
+                    stacktrace => Stacktrace
+                }
+            ),
+            {error, #{cause => "create_authenticator_error", reason => Reason}}
+    end.
+
+compile_precondition(Config) ->
+    Expr = maps:get(precondition, Config, undefined),
+    do_compile_precondition(Expr).
+
+do_compile_precondition(undefined) ->
+    {ok, undefined};
+do_compile_precondition(<<>>) ->
+    {ok, undefined};
+do_compile_precondition(Expr) ->
+    case emqx_variform:compile(Expr) of
+        {ok, Compiled} ->
+            {ok, Compiled};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 do_delete_authenticators(MatchFun, #chain{name = Name, authenticators = Authenticators} = Chain) ->

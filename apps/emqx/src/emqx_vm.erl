@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_vm).
@@ -142,33 +130,6 @@
     update_cpu_info,
     version,
     wordsize
-]).
-
--define(SOCKET_OPTS, [
-    active,
-    broadcast,
-    buffer,
-    delay_send,
-    dontroute,
-    exit_on_close,
-    header,
-    high_watermark,
-    ipv6_v6only,
-    keepalive,
-    linger,
-    low_watermark,
-    mode,
-    nodelay,
-    packet,
-    packet_size,
-    priority,
-    read_packets,
-    recbuf,
-    reuseaddr,
-    send_timeout,
-    send_timeout_close,
-    sndbuf,
-    tos
 ]).
 
 schedulers() ->
@@ -399,7 +360,6 @@ compat_windows(Fun) when is_function(Fun, 0) ->
             0.0
     end;
 compat_windows(Fun) ->
-    ?SLOG(warning, "Invalid function: ~p", [Fun]),
     error({badarg, Fun}).
 
 load(Avg) ->

@@ -1,9 +1,7 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_enterprise).
-
--if(?EMQX_RELEASE_EDITION == ee).
 
 -include_lib("hocon/include/hoconsc.hrl").
 -import(hoconsc, [mk/2, enum/1, ref/2]).
@@ -31,7 +29,6 @@ api_schemas(Method) ->
         api_ref(emqx_bridge_mongodb, <<"mongodb_rs">>, Method ++ "_rs"),
         api_ref(emqx_bridge_mongodb, <<"mongodb_sharded">>, Method ++ "_sharded"),
         api_ref(emqx_bridge_mongodb, <<"mongodb_single">>, Method ++ "_single"),
-        api_ref(emqx_bridge_hstreamdb, <<"hstreamdb">>, Method),
         api_ref(emqx_bridge_influxdb, <<"influxdb_api_v1">>, Method ++ "_api_v1"),
         api_ref(emqx_bridge_influxdb, <<"influxdb_api_v2">>, Method ++ "_api_v2"),
         api_ref(emqx_bridge_redis, <<"redis_single">>, Method ++ "_single"),
@@ -58,7 +55,6 @@ schema_modules() ->
     [
         emqx_bridge_kafka,
         emqx_bridge_cassandra,
-        emqx_bridge_hstreamdb,
         emqx_bridge_gcp_pubsub,
         emqx_bridge_influxdb,
         emqx_bridge_mongodb,
@@ -102,7 +98,6 @@ resource_type(Type) when is_binary(Type) -> resource_type(binary_to_atom(Type, u
 resource_type(kafka_consumer) -> emqx_bridge_kafka_impl_consumer;
 resource_type(kafka_producer) -> emqx_bridge_kafka_impl_producer;
 resource_type(cassandra) -> emqx_bridge_cassandra_connector;
-resource_type(hstreamdb) -> emqx_bridge_hstreamdb_connector;
 resource_type(gcp_pubsub) -> emqx_bridge_gcp_pubsub_impl_producer;
 resource_type(gcp_pubsub_consumer) -> emqx_bridge_gcp_pubsub_impl_consumer;
 resource_type(mongodb_rs) -> emqx_bridge_mongodb_connector;
@@ -144,14 +139,6 @@ namespace() -> undefined.
 
 fields(bridges) ->
     [
-        {hstreamdb,
-            mk(
-                hoconsc:map(name, ref(emqx_bridge_hstreamdb, "config")),
-                #{
-                    desc => <<"HStreamDB Bridge Config">>,
-                    required => false
-                }
-            )},
         {mysql,
             mk(
                 hoconsc:map(name, ref(emqx_bridge_mysql, "config")),
@@ -435,7 +422,3 @@ azure_event_hub_structs() ->
 
 api_ref(Module, Type, Method) ->
     {Type, ref(Module, Method)}.
-
--else.
-
--endif.

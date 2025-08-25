@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -ifndef(EMQX_PLACEHOLDER_HRL).
@@ -28,8 +16,10 @@
 %% cert
 -define(VAR_CERT_SUBJECT, "cert_subject").
 -define(VAR_CERT_CN_NAME, "cert_common_name").
+-define(VAR_CERT_PEM, "cert_pem").
 -define(PH_CERT_SUBJECT, ?PH(?VAR_CERT_SUBJECT)).
 -define(PH_CERT_CN_NAME, ?PH(?VAR_CERT_CN_NAME)).
+-define(PH_CERT_PEM, ?PH(?VAR_CERT_PEM)).
 
 %% MQTT/Gateway
 -define(VAR_PASSWORD, "password").
@@ -38,6 +28,8 @@
 -define(VAR_TOPIC, "topic").
 -define(VAR_ENDPOINT_NAME, "endpoint_name").
 -define(VAR_NS_CLIENT_ATTRS, {var_namespace, "client_attrs"}).
+-define(VAR_ZONE, "zone").
+-define(VAR_LISTENER, "listener").
 
 -define(PH_PASSWORD, ?PH(?VAR_PASSWORD)).
 -define(PH_CLIENTID, ?PH(?VAR_CLIENTID)).
@@ -50,6 +42,9 @@
 %% client IPAddress
 -define(VAR_PEERHOST, "peerhost").
 -define(PH_PEERHOST, ?PH(?VAR_PEERHOST)).
+%% client Port
+-define(VAR_PEERPORT, "peerport").
+-define(PH_PEERPORT, ?PH(?VAR_PEERPORT)).
 %% ip & port
 -define(PH_HOST, ?PH("host")).
 -define(PH_PORT, ?PH("port")).
@@ -121,6 +116,7 @@
 -define(PH_S_PUBLISH_RECEIVED_AT, "${publish_received_at}").
 -define(PH_S_MOUNTPOINT, "${mountpoint}").
 -define(PH_S_PEERNAME, "${peername}").
+-define(PH_S_PEERPORT, "${peerport}").
 -define(PH_S_SOCKNAME, "${sockname}").
 -define(PH_S_IS_BRIDGE, "${is_bridge}").
 -define(PH_S_CONNECTED_AT, "${connected_at}").

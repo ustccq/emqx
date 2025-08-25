@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge).
 
@@ -22,6 +10,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx_hooks.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -export([
     pre_config_update/3,
@@ -40,6 +29,7 @@
     unload/0,
     lookup/1,
     lookup/2,
+    is_exist_v1/2,
     get_metrics/2,
     create/3,
     disable_enable/3,
@@ -60,11 +50,7 @@
 -export([get_basic_usage_info/0]).
 
 %% Data backup
--export([
-    import_config/1,
-    %% exported for emqx_bridge_v2
-    import_config/4
-]).
+-export([import_config/2]).
 
 -export([query_opts/1]).
 
@@ -238,11 +224,12 @@ send_to_matched_egress_bridges_loop(Topic, Msg, [Id | Ids]) ->
     send_to_matched_egress_bridges_loop(Topic, Msg, Ids).
 
 send_message(BridgeId, Message) ->
-    {BridgeV1Type, BridgeName} = emqx_bridge_resource:parse_bridge_id(BridgeId),
+    #{type := BridgeV1Type, name := BridgeName} =
+        emqx_bridge_resource:parse_bridge_id(BridgeId),
     case emqx_bridge_v2:is_bridge_v2_type(BridgeV1Type) of
         true ->
             ActionType = emqx_action_info:bridge_v1_type_to_action_type(BridgeV1Type),
-            emqx_bridge_v2:send_message(ActionType, BridgeName, Message, #{});
+            emqx_bridge_v2:send_message(?global_ns, ActionType, BridgeName, Message, #{});
         false ->
             ResId = emqx_bridge_resource:resource_id(BridgeV1Type, BridgeName),
             send_message(BridgeV1Type, BridgeName, ResId, Message, #{})
@@ -256,7 +243,8 @@ send_message(BridgeType, BridgeName, ResId, Message, QueryOpts0) ->
             QueryOpts = maps:merge(query_opts(Config), QueryOpts0),
             emqx_resource:query(ResId, {send_message, Message}, QueryOpts);
         #{enable := false} ->
-            {error, bridge_stopped}
+            %% race
+            {error, bridge_disabled}
     end.
 
 query_opts(Config) ->
@@ -323,8 +311,11 @@ list() ->
     BridgeV1Bridges ++ BridgeV2Bridges.
 
 lookup(Id) ->
-    {Type, Name} = emqx_bridge_resource:parse_bridge_id(Id),
+    #{type := Type, name := Name} = emqx_bridge_resource:parse_bridge_id(Id),
     lookup(Type, Name).
+
+is_exist_v1(Type, Name) ->
+    emqx_resource:is_exist(emqx_bridge_resource:resource_id(Type, Name)).
 
 lookup(Type, Name) ->
     case emqx_bridge_v2:is_bridge_v2_type(Type) of
@@ -356,9 +347,9 @@ get_metrics(ActionType, Name) ->
                     BridgeV2Type = emqx_bridge_v2:bridge_v1_type_to_bridge_v2_type(ActionType),
                     try
                         ConfRootKey = emqx_bridge_v2:get_conf_root_key_if_only_one(
-                            BridgeV2Type, Name
+                            ?global_ns, BridgeV2Type, Name
                         ),
-                        emqx_bridge_v2:get_metrics(ConfRootKey, BridgeV2Type, Name)
+                        emqx_bridge_v2:get_metrics(?global_ns, ConfRootKey, BridgeV2Type, Name)
                     catch
                         error:Reason ->
                             {error, Reason}
@@ -456,7 +447,10 @@ check_deps_and_remove(BridgeType0, BridgeName, RemoveDeps) ->
     end.
 
 do_check_deps_and_remove(BridgeType, BridgeName, RemoveDeps) ->
-    case emqx_bridge_lib:maybe_withdraw_rule_action(BridgeType, BridgeName, RemoveDeps) of
+    Res = emqx_bridge_lib:maybe_withdraw_rule_action(
+        _Kind = undefined, BridgeType, BridgeName, RemoveDeps
+    ),
+    case Res of
         ok ->
             remove(BridgeType, BridgeName);
         {error, Reason} ->
@@ -467,43 +461,8 @@ do_check_deps_and_remove(BridgeType, BridgeName, RemoveDeps) ->
 %% Data backup
 %%----------------------------------------------------------------------------------------
 
-import_config(RawConf) ->
-    import_config(RawConf, <<"bridges">>, ?ROOT_KEY, config_key_path()).
-
-%% Used in emqx_bridge_v2
-import_config(RawConf, RawConfKey, RootKey, RootKeyPath) ->
-    BridgesConf = maps:get(RawConfKey, RawConf, #{}),
-    OldBridgesConf = emqx:get_raw_config(RootKeyPath, #{}),
-    MergedConf = merge_confs(OldBridgesConf, BridgesConf),
-    case emqx_conf:update(RootKeyPath, MergedConf, #{override_to => cluster}) of
-        {ok, #{raw_config := NewRawConf}} ->
-            {ok, #{root_key => RootKey, changed => changed_paths(OldBridgesConf, NewRawConf)}};
-        Error ->
-            {error, #{root_key => RootKey, reason => Error}}
-    end.
-
-merge_confs(OldConf, NewConf) ->
-    AllTypes = maps:keys(maps:merge(OldConf, NewConf)),
-    lists:foldr(
-        fun(Type, Acc) ->
-            NewBridges = maps:get(Type, NewConf, #{}),
-            OldBridges = maps:get(Type, OldConf, #{}),
-            Acc#{Type => maps:merge(OldBridges, NewBridges)}
-        end,
-        #{},
-        AllTypes
-    ).
-
-changed_paths(OldRawConf, NewRawConf) ->
-    maps:fold(
-        fun(Type, Bridges, ChangedAcc) ->
-            OldBridges = maps:get(Type, OldRawConf, #{}),
-            Changed = maps:get(changed, emqx_utils_maps:diff_maps(Bridges, OldBridges)),
-            [[?ROOT_KEY, Type, K] || K <- maps:keys(Changed)] ++ ChangedAcc
-        end,
-        [],
-        NewRawConf
-    ).
+import_config(_Namespace, RawConf) ->
+    emqx_bridge_v2:bridge_v1_import_config(RawConf).
 
 %%========================================================================================
 %% Helper functions

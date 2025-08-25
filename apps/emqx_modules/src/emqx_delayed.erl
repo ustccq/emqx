@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_delayed).
@@ -107,9 +95,23 @@
 
 -define(TAB, ?MODULE).
 -define(SERVER, ?MODULE).
--define(MAX_INTERVAL, 4294967).
+%% 42949670s (about 497 days) is 10x the maximum interval for Erlang timer.
+%% If the number is greater than this, it is considered to be a timestamp
+%% at which the message is scheduled for publish, but the timestamp cannot
+%% be 42949670 seconds earlier or later than the current system time.
+-define(MAX_INTERVAL, 42949670).
 -define(FORMAT_FUN, {?MODULE, format_delayed}).
 -define(NOW, erlang:system_time(milli_seconds)).
+
+-ifndef(TEST).
+%% Force the timer to expire at least once a day.
+%% So to allow the next message publish interval to be greater
+%% than 4294967 (Erlang's timer interval limit).
+-define(MIN_TIMER_INTERVAL, timer:seconds(86400)).
+-else.
+%% During test, expire every 2 seconds.
+-define(MIN_TIMER_INTERVAL, timer:seconds(2)).
+-endif.
 
 %%------------------------------------------------------------------------------
 %% Mnesia bootstrap
@@ -142,10 +144,10 @@ on_message_publish(
                 {Interval * 1000 + Ts, Interval};
             Timestamp ->
                 %% Check malicious timestamp?
-                Internal = Timestamp - erlang:round(Ts / 1000),
-                case Internal > ?MAX_INTERVAL of
+                Interval = Timestamp - erlang:round(Ts / 1000),
+                case abs(Interval) > ?MAX_INTERVAL of
                     true -> error(invalid_delayed_timestamp);
-                    false -> {Timestamp * 1000, Internal}
+                    false -> {Timestamp * 1000, Interval}
                 end
         end,
     PubMsg = Msg#message{topic = Topic1},
@@ -444,7 +446,7 @@ ensure_publish_timer(_Key, State) ->
     State.
 
 ensure_publish_timer(Ts, Now, State) ->
-    Interval = max(1, Ts - Now),
+    Interval = min(?MIN_TIMER_INTERVAL, max(1, Ts - Now)),
     TRef = emqx_utils:start_timer(Interval, do_publish),
     State#{publish_timer := TRef, publish_at := Now + Interval}.
 

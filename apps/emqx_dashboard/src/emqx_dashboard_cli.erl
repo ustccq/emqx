@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_cli).
@@ -26,11 +14,7 @@
 
 -export([bin/1, print_error/1]).
 
--if(?EMQX_RELEASE_EDITION == ee).
 -define(CLI_MOD, emqx_dashboard_sso_cli).
--else.
--define(CLI_MOD, ?MODULE).
--endif.
 
 load() ->
     emqx_ctl:register_command(admins, {?CLI_MOD, admins}, []).
@@ -45,7 +29,7 @@ admins(["add", Username, Password, Desc]) ->
             print_error(Reason)
     end;
 admins(["passwd", Username, Password]) ->
-    case emqx_dashboard_admin:change_password(bin(Username), bin(Password)) of
+    case emqx_dashboard_admin:change_password_trusted(bin(Username), bin(Password)) of
         {ok, _} ->
             emqx_ctl:print("ok~n");
         {error, Reason} ->

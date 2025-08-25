@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% Kafka connection configuration
@@ -7,7 +7,6 @@
 
 -export([
     hosts/1,
-    make_client_id/2,
     sasl/1,
     socket_opts/1
 ]).
@@ -23,14 +22,12 @@ hosts([#{hostname := _, port := _} | _] = Servers) ->
 hosts(Hosts) when is_list(Hosts) ->
     kpro:parse_endpoints(Hosts).
 
-%% Client ID is better to be unique to make it easier for Kafka side trouble shooting.
-make_client_id(BridgeType0, BridgeName0) ->
-    BridgeType = to_bin(BridgeType0),
-    BridgeName = to_bin(BridgeName0),
-    iolist_to_binary([BridgeType, ":", BridgeName, ":", atom_to_list(node())]).
-
 sasl(none) ->
     undefined;
+sasl(msk_iam) ->
+    {callback, brod_oauth, #{
+        token_callback => fun emqx_bridge_kafka_msk_iam_authn:token_callback/1
+    }};
 sasl(#{mechanism := Mechanism, username := Username, password := Secret}) ->
     {Mechanism, Username, Secret};
 sasl(#{
@@ -69,24 +66,5 @@ adjust_socket_buffer(Bytes, Opts) ->
             [{buffer, max(Bytes1, Bytes)} | Acc1]
     end.
 
-tcp_keepalive(None) when None =:= "none"; None =:= <<"none">> ->
-    [];
-tcp_keepalive(KeepAlive) ->
-    {Idle, Interval, Probes} = emqx_schema:parse_tcp_keepalive(KeepAlive),
-    case emqx_utils:tcp_keepalive_opts(os:type(), Idle, Interval, Probes) of
-        {ok, Opts} ->
-            Opts;
-        {error, {unsupported_os, OS}} ->
-            ?SLOG(warning, #{
-                msg => "unsupported_operation_set_tcp_keepalive",
-                os => OS
-            }),
-            []
-    end.
-
-to_bin(A) when is_atom(A) ->
-    atom_to_binary(A);
-to_bin(L) when is_list(L) ->
-    list_to_binary(L);
-to_bin(B) when is_binary(B) ->
-    B.
+tcp_keepalive(String) ->
+    emqx_schema:tcp_keepalive_opts(String).

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_listeners_update_SUITE).
@@ -109,8 +97,8 @@ t_update_conf(_Conf) ->
     ?assertEqual(0, current_conns(<<"tcp:default">>, BindTcp)),
     ?assertEqual(0, current_conns(<<"ssl:default">>, BindSsl)),
 
-    ?assertEqual({0, 0, 0, 0}, proplists:get_value(ip, ranch:info('ws:default'))),
-    ?assertEqual({127, 0, 0, 1}, proplists:get_value(ip, ranch:info('wss:default'))),
+    ?assertEqual({0, 0, 0, 0}, maps:get(ip, ranch:info('ws:default'))),
+    ?assertEqual({127, 0, 0, 1}, maps:get(ip, ranch:info('wss:default'))),
     ?assert(is_running('ws:default')),
     ?assert(is_running('wss:default')),
     ok.
@@ -226,6 +214,49 @@ t_update_tcp_keepalive_conf(_Conf) ->
     ),
     ok.
 
+t_tcp_change_parse_unit(_Conf) ->
+    test_change_parse_unit(?LISTENERS ++ [tcp, default], #{
+        hosts => [{{127, 0, 0, 1}, 1883}]
+    }).
+
+t_ssl_change_parse_unit(_Conf) ->
+    test_change_parse_unit(?LISTENERS ++ [ssl, default], #{
+        hosts => [{{127, 0, 0, 1}, 8883}],
+        ssl => true,
+        ssl_opts => [{verify, verify_none}]
+    }).
+
+test_change_parse_unit(ConfPath, ClientOpts) ->
+    ListenerRawConf0 = #{<<"parse_unit">> := <<"chunk">>} = emqx:get_raw_config(ConfPath),
+    ListenerRawConf1 = ListenerRawConf0#{
+        <<"parse_unit">> := <<"frame">>
+    },
+    %% Update listener and verify `parse_unit` came into effect:
+    ?assertMatch({ok, _}, emqx:update_config(ConfPath, {update, ListenerRawConf1})),
+    Client1 = emqtt_connect(ClientOpts),
+    pong = emqtt:ping(Client1),
+    CState1 = emqx_cth_broker:connection_state(Client1),
+    emqx_listeners:is_packet_parser_available(mqtt) andalso
+        ?assertMatch(
+            #{parser := {frame, _Options}},
+            CState1
+        ),
+    %% Restore original config and verify original `parse_unit` came into effect as well:
+    ?assertMatch({ok, _}, emqx:update_config(ConfPath, {update, ListenerRawConf0})),
+    Client2 = emqtt_connect(ClientOpts),
+    pong = emqtt:ping(Client2),
+    CState2 = emqx_cth_broker:connection_state(Client2),
+    emqx_listeners:is_packet_parser_available(mqtt) andalso
+        ?assertMatch(
+            #{parser := Parser} when Parser =/= map_get(parser, CState1),
+            CState2
+        ),
+    %% Existing connections should be preserved:
+    pong = emqtt:ping(Client1),
+    ok = emqtt:disconnect(Client1),
+    pong = emqtt:ping(Client2),
+    ok = emqtt:disconnect(Client2).
+
 t_update_empty_ssl_options_conf(_Conf) ->
     Raw = emqx:get_raw_config(?LISTENERS),
     Raw1 = emqx_utils_maps:deep_put(
@@ -316,8 +347,8 @@ t_update_empty_ssl_options_conf(_Conf) ->
     ?assertEqual(0, current_conns(<<"tcp:default">>, BindTcp)),
     ?assertEqual(0, current_conns(<<"ssl:default">>, BindSsl)),
 
-    ?assertEqual({0, 0, 0, 0}, proplists:get_value(ip, ranch:info('ws:default'))),
-    ?assertEqual({127, 0, 0, 1}, proplists:get_value(ip, ranch:info('wss:default'))),
+    ?assertEqual({0, 0, 0, 0}, maps:get(ip, ranch:info('ws:default'))),
+    ?assertEqual({127, 0, 0, 1}, maps:get(ip, ranch:info('wss:default'))),
     ?assert(is_running('ws:default')),
     ?assert(is_running('wss:default')),
 
@@ -337,7 +368,7 @@ t_update_empty_ssl_options_conf(_Conf) ->
         {error,
             {bad_ssl_config, #{
                 reason := pem_file_path_or_string_is_required,
-                which_options := [[<<"keyfile">>]]
+                which_option := <<"keyfile">>
             }}},
         emqx:update_config(?LISTENERS, BadRaw)
     ),
@@ -379,3 +410,17 @@ t_delete_default_conf(_Conf) ->
     ?assert(is_running('ws:default')),
     ?assert(is_running('wss:default')),
     ok.
+
+%%
+
+emqtt_connect(Opts) ->
+    case emqtt:start_link(Opts) of
+        {ok, Client} ->
+            true = erlang:unlink(Client),
+            case emqtt:connect(Client) of
+                {ok, _} -> Client;
+                {error, Reason} -> error(Reason, [Opts])
+            end;
+        {error, Reason} ->
+            error(Reason, [Opts])
+    end.

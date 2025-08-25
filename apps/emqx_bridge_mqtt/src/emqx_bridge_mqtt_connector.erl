@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_mqtt_connector).
 
@@ -25,11 +13,12 @@
 %% ecpool
 -export([connect/1]).
 
--export([on_message_received/3]).
+-export([on_message_received/4]).
 -export([handle_disconnect/1]).
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -54,27 +43,46 @@
 
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
+-elvis([{elvis_style, no_catch_expressions, disable}]).
+
 -define(HEALTH_CHECK_TIMEOUT, 1000).
--define(INGRESS, "I").
--define(EGRESS, "E").
+-define(NO_PREFIX, <<>>).
+-define(IS_NO_PREFIX(P), (P =:= undefined orelse P =:= ?NO_PREFIX)).
+-define(MAX_PREFIX_BYTES, 19).
+-define(AUTO_RECONNECT_INTERVAL_S, 2).
+
+-type clientid() :: binary().
+-type channel_resource_id() :: action_resource_id() | source_resource_id().
+-type connector_state() :: #{
+    pool_name := connector_resource_id(),
+    installed_channels := #{channel_resource_id() => channel_state()},
+    clean_start := boolean(),
+    available_clientids := [clientid()],
+    topic_to_handler_index := ets:table(),
+    server := string()
+}.
+-type channel_state() :: _Todo :: map().
 
 %% ===================================================================
 %% When use this bridge as a data source, ?MODULE:on_message_received will be called
 %% if the bridge received msgs from the remote broker.
 
-on_message_received(Msg, HookPoints, ResId) ->
+on_message_received(Msg, HookPoints, ResId, Namespace) ->
     emqx_resource_metrics:received_inc(ResId),
     lists:foreach(
         fun(HookPoint) ->
-            emqx_hooks:run(HookPoint, [Msg])
+            emqx_hooks:run(HookPoint, [Msg, Namespace])
         end,
         HookPoints
     ),
     ok.
 
 %% ===================================================================
+resource_type() -> mqtt.
+
 callback_mode() -> async_if_possible.
 
+-spec on_start(connector_resource_id(), map()) -> {ok, connector_state()} | {error, term()}.
 on_start(ResourceId, #{server := Server} = Conf) ->
     ?SLOG(info, #{
         msg => "starting_mqtt_connector",
@@ -92,7 +100,8 @@ on_start(ResourceId, #{server := Server} = Conf) ->
                 server => Server
             }};
         {error, Reason} ->
-            {error, Reason}
+            ets:delete(TopicToHandlerIndex),
+            {error, emqx_maybe:define(explain_error(Reason), Reason)}
     end.
 
 on_add_channel(
@@ -169,62 +178,112 @@ on_remove_channel(
     } = OldState,
     ChannelId
 ) ->
-    ChannelState = maps:get(ChannelId, InstalledChannels),
-    case ChannelState of
-        #{
-            config_root := sources
-        } ->
-            emqx_bridge_mqtt_ingress:unsubscribe_channel(
-                PoolName, ChannelState, ChannelId, TopicToHandlerIndex
-            ),
-            ok;
-        _ ->
-            ok
-    end,
-    NewInstalledChannels = maps:remove(ChannelId, InstalledChannels),
-    %% Update state
-    NewState = OldState#{installed_channels => NewInstalledChannels},
-    {ok, NewState}.
+    case maps:find(ChannelId, InstalledChannels) of
+        error ->
+            %% maybe the channel failed to be added, just ignore it
+            {ok, OldState};
+        {ok, ChannelState} ->
+            case ChannelState of
+                #{config_root := sources} ->
+                    ok = emqx_bridge_mqtt_ingress:unsubscribe_channel(
+                        PoolName, ChannelState, ChannelId, TopicToHandlerIndex
+                    );
+                _ ->
+                    ok
+            end,
+            NewInstalledChannels = maps:remove(ChannelId, InstalledChannels),
+            %% Update state
+            NewState = OldState#{installed_channels => NewInstalledChannels},
+            {ok, NewState}
+    end.
 
 on_get_channel_status(
     _ResId,
     ChannelId,
     #{
+        available_clientids := AvailableClientids,
         installed_channels := Channels
     } = _State
 ) when is_map_key(ChannelId, Channels) ->
-    %% The channel should be ok as long as the MQTT client is ok
-    connected.
+    case AvailableClientids of
+        [] ->
+            %% We should mark this connector as unhealthy so messages fail fast and an
+            %% alarm is raised.
+            {?status_disconnected, {unhealthy_target, <<"No clientids assigned to this node">>}};
+        [_ | _] ->
+            %% The channel should be ok as long as the MQTT client is ok
+            ?status_connected
+    end.
 
 on_get_channels(ResId) ->
     emqx_bridge_v2:get_channels_for_connector(ResId).
 
 start_mqtt_clients(ResourceId, Conf) ->
-    ClientOpts = mk_client_opts(ResourceId, Conf),
+    ClientOpts = mk_ecpool_client_opts(ResourceId, Conf),
     start_mqtt_clients(ResourceId, Conf, ClientOpts).
 
+find_my_static_clientids(#{static_clientids := [_ | _] = Entries}) ->
+    NodeBin = atom_to_binary(node()),
+    MyConfig =
+        lists:filtermap(
+            fun(#{node := N, ids := Ids}) ->
+                case N =:= NodeBin of
+                    true ->
+                        {true, Ids};
+                    false ->
+                        false
+                end
+            end,
+            Entries
+        ),
+    {ok, lists:flatten(MyConfig)};
+find_my_static_clientids(#{} = _Conf) ->
+    error.
+
 start_mqtt_clients(ResourceId, StartConf, ClientOpts) ->
-    PoolName = <<ResourceId/binary>>,
-    #{
-        pool_size := PoolSize
-    } = StartConf,
+    PoolName = ResourceId,
+    PoolSize = get_pool_size(StartConf),
+    AvailableClientids = get_available_clientids(StartConf, ClientOpts),
     Options = [
         {name, PoolName},
         {pool_size, PoolSize},
-        {client_opts, ClientOpts}
+        {available_clientids, AvailableClientids},
+        {client_opts, ClientOpts},
+        {auto_reconnect, ?AUTO_RECONNECT_INTERVAL_S}
     ],
-    ok = emqx_resource:allocate_resource(ResourceId, pool_name, PoolName),
+    ok = emqx_resource:allocate_resource(ResourceId, ?MODULE, pool_name, PoolName),
     case emqx_resource_pool:start(PoolName, ?MODULE, Options) of
         ok ->
-            {ok, #{pool_name => PoolName}};
+            {ok, #{pool_name => PoolName, available_clientids => AvailableClientids}};
         {error, {start_pool_failed, _, Reason}} ->
             {error, Reason}
+    end.
+
+get_pool_size(#{static_clientids := [_ | _]} = Conf) ->
+    {ok, Ids} = find_my_static_clientids(Conf),
+    length(Ids);
+get_pool_size(#{pool_size := PoolSize}) ->
+    PoolSize.
+
+get_available_clientids(#{} = Conf, ClientOpts) ->
+    case find_my_static_clientids(Conf) of
+        {ok, Ids} ->
+            Ids;
+        error ->
+            #{pool_size := PoolSize} = Conf,
+            #{clientid := ClientIdPrefix} = ClientOpts,
+            lists:map(
+                fun(WorkerId) ->
+                    mk_clientid(WorkerId, ClientIdPrefix)
+                end,
+                lists:seq(1, PoolSize)
+            )
     end.
 
 on_stop(ResourceId, State) ->
     ?SLOG(info, #{
         msg => "stopping_mqtt_connector",
-        connector => ResourceId
+        resource_id => ResourceId
     }),
     %% on_stop can be called with State = undefined
     StateMap =
@@ -264,11 +323,16 @@ on_query(
     ),
     Channels = maps:get(installed_channels, State),
     ChannelConfig = maps:get(ChannelId, Channels),
-    handle_send_result(with_egress_client(ChannelId, PoolName, send, [Msg, ChannelConfig]));
+    case is_expected_to_have_workers(State) of
+        true ->
+            handle_send_result(with_egress_client(ChannelId, PoolName, send, [Msg, ChannelConfig]));
+        false ->
+            {error, {unrecoverable_error, <<"This node has no assigned static clientid.">>}}
+    end;
 on_query(ResourceId, {_ChannelId, Msg}, #{}) ->
     ?SLOG(error, #{
         msg => "forwarding_unavailable",
-        connector => ResourceId,
+        resource_id => ResourceId,
         message => Msg,
         reason => "Egress is not configured"
     }).
@@ -283,19 +347,26 @@ on_query_async(
     Callback = {fun on_async_result/2, [CallbackIn]},
     Channels = maps:get(installed_channels, State),
     ChannelConfig = maps:get(ChannelId, Channels),
-    Result = with_egress_client(ChannelId, PoolName, send_async, [Msg, Callback, ChannelConfig]),
-    case Result of
-        ok ->
-            ok;
-        {ok, Pid} when is_pid(Pid) ->
-            {ok, Pid};
-        {error, Reason} ->
-            {error, classify_error(Reason)}
+    case is_expected_to_have_workers(State) of
+        true ->
+            Result = with_egress_client(ChannelId, PoolName, send_async, [
+                Msg, Callback, ChannelConfig
+            ]),
+            case Result of
+                ok ->
+                    ok;
+                {ok, Pid} when is_pid(Pid) ->
+                    {ok, Pid};
+                {error, Reason} ->
+                    {error, classify_error(Reason)}
+            end;
+        false ->
+            {error, {unrecoverable_error, <<"This node has no assigned static clientid.">>}}
     end;
 on_query_async(ResourceId, {_ChannelId, Msg}, _Callback, #{}) ->
     ?SLOG(error, #{
         msg => "forwarding_unavailable",
-        connector => ResourceId,
+        resource_id => ResourceId,
         message => Msg,
         reason => "Egress is not configured"
     }).
@@ -327,6 +398,10 @@ handle_send_result({ok, Reply}) ->
 handle_send_result({error, Reason}) ->
     {error, classify_error(Reason)}.
 
+classify_reply(Reply = #{reason_code := ?RC_PACKET_IDENTIFIER_IN_USE}) ->
+    %% If `emqtt' client restarted, it may re-use packet ids that the remote broker still
+    %% has memory of.  We should retry.
+    {recoverable_error, Reply};
 classify_reply(Reply = #{reason_code := _}) ->
     {unrecoverable_error, Reply}.
 
@@ -340,6 +415,12 @@ classify_error({shutdown, _} = Reason) ->
     {recoverable_error, Reason};
 classify_error(shutdown = Reason) ->
     {recoverable_error, Reason};
+classify_error(closed = Reason) ->
+    {recoverable_error, Reason};
+classify_error(tcp_closed = Reason) ->
+    {recoverable_error, Reason};
+classify_error(einval = Reason) ->
+    {recoverable_error, Reason};
 classify_error({unrecoverable_error, _Reason} = Error) ->
     Error;
 classify_error(Reason) ->
@@ -350,10 +431,10 @@ on_get_status(_ResourceId, State) ->
     Workers = [{Pool, Worker} || {Pool, PN} <- Pools, {_Name, Worker} <- ecpool:workers(PN)],
     try emqx_utils:pmap(fun get_status/1, Workers, ?HEALTH_CHECK_TIMEOUT) of
         Statuses ->
-            combine_status(Statuses)
+            combine_status(Statuses, State)
     catch
         exit:timeout ->
-            connecting
+            ?status_connecting
     end.
 
 get_status({_Pool, Worker}) ->
@@ -361,19 +442,44 @@ get_status({_Pool, Worker}) ->
         {ok, Client} ->
             emqx_bridge_mqtt_ingress:status(Client);
         {error, _} ->
-            disconnected
+            ?status_disconnected
     end.
 
-combine_status(Statuses) ->
+combine_status(Statuses, ConnState) ->
     %% NOTE
     %% Natural order of statuses: [connected, connecting, disconnected]
     %% * `disconnected` wins over any other status
     %% * `connecting` wins over `connected`
-    case lists:reverse(lists:usort(Statuses)) of
+    #{available_clientids := AvailableClientids} = ConnState,
+    ExpectedNoClientids =
+        case AvailableClientids of
+            _ when length(AvailableClientids) == 0 ->
+                true;
+            _ ->
+                false
+        end,
+    ToStatus = fun
+        ({S, _Reason}) -> S;
+        (S) when is_atom(S) -> S
+    end,
+    CompareFn = fun(S1A, S2A) ->
+        S1 = ToStatus(S1A),
+        S2 = ToStatus(S2A),
+        S1 > S2
+    end,
+    case lists:usort(CompareFn, Statuses) of
+        [{Status, Reason} | _] ->
+            case explain_error(Reason) of
+                undefined -> Status;
+                Msg -> {Status, Msg}
+            end;
         [Status | _] ->
             Status;
+        [] when ExpectedNoClientids ->
+            {?status_disconnected,
+                {unhealthy_target, <<"Connector has no assigned static clientids">>}};
         [] ->
-            disconnected
+            ?status_disconnected
     end.
 
 mk_ingress_config(
@@ -381,16 +487,18 @@ mk_ingress_config(
     IngressChannelConfig,
     TopicToHandlerIndex
 ) ->
+    #{namespace := Namespace} = emqx_resource:parse_channel_id(ChannelId),
     HookPoints = maps:get(hookpoints, IngressChannelConfig, []),
     NewConf = IngressChannelConfig#{
-        on_message_received => {?MODULE, on_message_received, [HookPoints, ChannelId]},
+        on_message_received => {?MODULE, on_message_received, [HookPoints, ChannelId, Namespace]},
         ingress_list => [IngressChannelConfig]
     },
     emqx_bridge_mqtt_ingress:config(NewConf, ChannelId, TopicToHandlerIndex).
 
-mk_client_opts(
-    ResourceId,
+mk_ecpool_client_opts(
+    ConnResId,
     Config = #{
+        connect_timeout := ConnectTimeoutS,
         server := Server,
         keepalive := KeepAlive,
         ssl := #{enable := EnableSsl} = Ssl
@@ -414,20 +522,20 @@ mk_client_opts(
         ],
         Config
     ),
-    Name = parse_id_to_name(ResourceId),
+    #{
+        name := Name,
+        namespace := Namespace
+    } =
+        emqx_connector_resource:parse_connector_id(ConnResId, #{atom_name => false}),
     mk_client_opt_password(Options#{
         hosts => [HostPort],
-        clientid => clientid(Name, Config),
-        connect_timeout => 30,
+        clientid => clientid(Namespace, Name, Config),
+        connect_timeout => ConnectTimeoutS,
         keepalive => ms_to_s(KeepAlive),
         force_ping => true,
         ssl => EnableSsl,
         ssl_opts => maps:to_list(maps:remove(enable, Ssl))
     }).
-
-parse_id_to_name(Id) ->
-    {_Type, Name} = emqx_connector_resource:parse_connector_id(Id, #{atom_name => false}),
-    Name.
 
 mk_client_opt_password(Options = #{password := Secret}) ->
     %% TODO: Teach `emqtt` to accept 0-arity closures as passwords.
@@ -438,12 +546,19 @@ mk_client_opt_password(Options) ->
 ms_to_s(Ms) ->
     erlang:ceil(Ms / 1000).
 
-clientid(Name, _Conf = #{clientid_prefix := Prefix}) when
+clientid(Namespace, Name0, _Conf = #{clientid_prefix := Prefix}) when
     is_binary(Prefix) andalso Prefix =/= <<>>
 ->
-    emqx_bridge_mqtt_lib:clientid_base([Prefix, $:, Name]);
-clientid(Name, _Conf) ->
-    emqx_bridge_mqtt_lib:clientid_base([Name]).
+    Name = maybe_prefix_namespce(Namespace, Name0),
+    {Prefix, emqx_bridge_mqtt_lib:clientid_base(Name)};
+clientid(Namespace, Name0, _Conf) ->
+    Name = maybe_prefix_namespce(Namespace, Name0),
+    {?NO_PREFIX, emqx_bridge_mqtt_lib:clientid_base(Name)}.
+
+maybe_prefix_namespce(Namespace, Name) when is_binary(Namespace) ->
+    <<Namespace/binary, ":", Name/binary>>;
+maybe_prefix_namespce(_Namespace, Name) ->
+    Name.
 
 %% @doc Start an ingress bridge worker.
 -spec connect([option() | {ecpool_worker_id, pos_integer()}]) ->
@@ -456,33 +571,47 @@ connect(Options) ->
     }),
     Name = proplists:get_value(name, Options),
     ClientOpts = proplists:get_value(client_opts, Options),
-    case emqtt:start_link(mk_client_opts(Name, WorkerId, ClientOpts)) of
+    AvailableClientids = proplists:get_value(available_clientids, Options),
+    case emqtt:start_link(mk_emqtt_client_opts(Name, WorkerId, AvailableClientids, ClientOpts)) of
         {ok, Pid} ->
             connect(Pid, Name);
         {error, Reason} = Error ->
-            ?SLOG(error, #{
+            IsDryRun = emqx_resource:is_dry_run(Name),
+            ?SLOG(?LOG_LEVEL(IsDryRun), #{
                 msg => "client_start_failed",
+                resource_id => Name,
                 config => emqx_utils:redact(ClientOpts),
                 reason => Reason
             }),
             Error
     end.
 
-mk_client_opts(
+mk_emqtt_client_opts(
     Name,
     WorkerId,
+    AvailableClientids,
     ClientOpts = #{
-        clientid := ClientId,
         topic_to_handler_index := TopicToHandlerIndex
     }
 ) ->
+    %% WorkerId :: 1..inf
     ClientOpts#{
-        clientid := mk_clientid(WorkerId, ClientId),
+        clientid := lists:nth(WorkerId, AvailableClientids),
         msg_handler => mk_client_event_handler(Name, TopicToHandlerIndex)
     }.
 
-mk_clientid(WorkerId, ClientId) ->
-    emqx_bridge_mqtt_lib:bytes23([ClientId], WorkerId).
+mk_clientid(WorkerId, {Prefix, ClientId}) when ?IS_NO_PREFIX(Prefix) ->
+    %% When there is no prefix, try to keep the client ID length within 23 bytes
+    emqx_bridge_mqtt_lib:bytes23(ClientId, WorkerId);
+mk_clientid(WorkerId, {Prefix, ClientId}) when
+    size(Prefix) =< ?MAX_PREFIX_BYTES
+->
+    %% Try to respect client ID prefix when it's no more than 19 bytes,
+    %% meaning there are at least 4 bytes as hash space.
+    emqx_bridge_mqtt_lib:bytes23_with_prefix(Prefix, ClientId, WorkerId);
+mk_clientid(WorkerId, {Prefix, ClientId}) ->
+    %% There is no other option but to use a long client ID
+    iolist_to_binary([Prefix, ClientId, $:, integer_to_binary(WorkerId)]).
 
 mk_client_event_handler(Name, TopicToHandlerIndex) ->
     #{
@@ -497,14 +626,59 @@ connect(Pid, Name) ->
         {ok, _Props} ->
             {ok, Pid};
         {error, Reason} = Error ->
-            ?SLOG(warning, #{
-                msg => "ingress_client_connect_failed",
-                reason => Reason,
-                name => Name
-            }),
+            IsDryRun = emqx_resource:is_dry_run(Name),
+            log_connect_error_reason(?LOG_LEVEL(IsDryRun), Reason, Name),
             _ = catch emqtt:stop(Pid),
             Error
     end.
+
+log_connect_error_reason(Level, {tcp_closed, _} = Reason, Name) ->
+    ?tp(emqx_bridge_mqtt_connector_tcp_closed, #{}),
+    ?SLOG(Level, #{
+        msg => "ingress_client_connect_failed",
+        reason => Reason,
+        name => Name,
+        explain => explain_error(Reason)
+    });
+log_connect_error_reason(Level, econnrefused = Reason, Name) ->
+    ?tp(emqx_bridge_mqtt_connector_econnrefused_error, #{}),
+    ?SLOG(Level, #{
+        msg => "ingress_client_connect_failed",
+        reason => Reason,
+        name => Name,
+        explain => explain_error(Reason)
+    });
+log_connect_error_reason(Level, Reason, Name) ->
+    ?SLOG(Level, #{
+        msg => "ingress_client_connect_failed",
+        reason => Reason,
+        name => Name
+    }).
+
+explain_error(econnrefused) ->
+    <<
+        "Connection refused. "
+        "This error indicates that your connection attempt to the MQTT server was rejected. "
+        "In simpler terms, the server you tried to connect to refused your request. "
+        "There can be multiple reasons for this. "
+        "For example, the MQTT server you're trying to connect to might be down or not "
+        "running at all or you might have provided the wrong address "
+        "or port number for the server."
+    >>;
+explain_error({tcp_closed, _}) ->
+    listener_max_limit_explanation();
+explain_error(closed) ->
+    listener_max_limit_explanation();
+explain_error(_Reason) ->
+    undefined.
+
+listener_max_limit_explanation() ->
+    <<
+        "Your MQTT connection attempt was unsuccessful. "
+        "It might be at its maximum capacity for handling new connections. "
+        "To diagnose the issue further, you can check the server logs for "
+        "any specific messages related to the unavailability or connection limits."
+    >>.
 
 handle_disconnect(_Reason) ->
     ok.
@@ -516,3 +690,8 @@ take(Key, Map0, Default) ->
         error ->
             {Default, Map0}
     end.
+
+is_expected_to_have_workers(#{available_clientids := []} = _ConnState) ->
+    false;
+is_expected_to_have_workers(_ConnState) ->
+    true.

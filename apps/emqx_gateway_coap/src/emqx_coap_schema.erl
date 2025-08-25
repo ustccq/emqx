@@ -1,29 +1,11 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_coap_schema).
 
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("typerefl/include/types.hrl").
-
--type duration() :: non_neg_integer().
-
--typerefl_from_string({duration/0, emqx_schema, to_duration}).
-
--reflect_type([duration/0]).
 
 %% config schema provides
 -export([namespace/0, fields/1, desc/1]).
@@ -34,7 +16,7 @@ fields(coap) ->
     [
         {heartbeat,
             sc(
-                duration(),
+                emqx_schema:duration_s(),
                 #{
                     default => <<"30s">>,
                     desc => ?DESC(coap_heartbeat)

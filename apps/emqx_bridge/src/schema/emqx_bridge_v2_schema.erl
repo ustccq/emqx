@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_v2_schema).
 
@@ -31,6 +19,7 @@
     actions_get_response/0,
     actions_put_request/0,
     actions_post_request/0,
+    action_api_schema/2,
     actions_examples/1,
     action_values/4
 ]).
@@ -39,6 +28,7 @@
     sources_get_response/0,
     sources_put_request/0,
     sources_post_request/0,
+    source_api_schema/2,
     sources_examples/1,
     source_values/4
 ]).
@@ -48,7 +38,8 @@
 %% export this
 -export([
     registered_actions_api_schemas/1,
-    registered_sources_api_schemas/1
+    registered_sources_api_schemas/1,
+    registered_action_types/0
 ]).
 
 -export([action_types/0, action_types_sc/0]).
@@ -57,12 +48,15 @@
 -export([source_resource_opts_fields/0, source_resource_opts_fields/1]).
 
 -export([
-    api_fields/3
+    api_fields/3,
+    undefined_as_null_field/0
 ]).
 
 -export([
     make_producer_action_schema/1, make_producer_action_schema/2,
     make_consumer_action_schema/1, make_consumer_action_schema/2,
+    common_fields/0,
+    common_action_fields/0,
     top_level_common_action_keys/0,
     top_level_common_source_keys/0,
     project_to_actions_resource_opts/1,
@@ -100,6 +94,15 @@ actions_api_schema(Method) ->
     APISchemas = ?MODULE:registered_actions_api_schemas(Method),
     hoconsc:union(bridge_api_union(APISchemas)).
 
+action_api_schema(Method, BridgeV2Type) ->
+    APISchemas = ?MODULE:registered_actions_api_schemas(Method),
+    case lists:keyfind(atom_to_binary(BridgeV2Type), 1, APISchemas) of
+        {_, SchemaRef} ->
+            hoconsc:mk(SchemaRef);
+        false ->
+            unknown_bridge_schema(BridgeV2Type)
+    end.
+
 registered_actions_api_schemas(Method) ->
     RegisteredSchemas = emqx_action_info:registered_schema_modules_actions(),
     [
@@ -120,7 +123,7 @@ action_values(Method, ActionType, ConnectorType, ActionValues) ->
             description => <<"My example ", ActionTypeBin/binary, " action">>,
             connector => <<ConnectorTypeBin/binary, "_connector">>,
             resource_opts => #{
-                health_check_interval => "30s"
+                health_check_interval => <<"30s">>
             }
         },
         [
@@ -158,6 +161,15 @@ sources_post_request() ->
 sources_api_schema(Method) ->
     APISchemas = ?MODULE:registered_sources_api_schemas(Method),
     hoconsc:union(bridge_api_union(APISchemas)).
+
+source_api_schema(Method, SourceType) ->
+    APISchemas = ?MODULE:registered_sources_api_schemas(Method),
+    case lists:keyfind(atom_to_binary(SourceType), 1, APISchemas) of
+        {_, SchemaRef} ->
+            hoconsc:mk(SchemaRef);
+        false ->
+            unknown_source_schema(SourceType)
+    end.
 
 registered_sources_api_schemas(Method) ->
     RegisteredSchemas = emqx_action_info:registered_schema_modules_sources(),
@@ -231,6 +243,25 @@ bridge_api_union(Refs) ->
             end
     end.
 
+unknown_bridge_schema(BridgeV2Type) ->
+    erroneous_value_schema(BridgeV2Type, <<"unknown bridge type">>).
+
+unknown_source_schema(SourceType) ->
+    erroneous_value_schema(SourceType, <<"unknown source type">>).
+
+%% @doc Construct a schema that always emits validation error.
+%% We need to silence dialyzer because inner anonymous function always throws.
+-dialyzer({nowarn_function, [erroneous_value_schema/2]}).
+erroneous_value_schema(Value, Reason) ->
+    hoconsc:mk(typerefl:any(), #{
+        validator => fun(_) ->
+            throw(#{
+                value => Value,
+                reason => Reason
+            })
+        end
+    }).
+
 -spec method_values(action | source, http_method(), atom()) -> schema_example_map().
 method_values(Kind, post, Type) ->
     KindBin = atom_to_binary(Kind),
@@ -290,6 +321,16 @@ api_fields("post_source", Type, Fields) ->
 api_fields("put_source", _Type, Fields) ->
     Fields.
 
+undefined_as_null_field() ->
+    {undefined_vars_as_null,
+        ?HOCON(
+            boolean(),
+            #{
+                default => false,
+                desc => ?DESC("undefined_vars_as_null")
+            }
+        )}.
+
 %%======================================================================================
 %% HOCON Schema Callbacks
 %%======================================================================================
@@ -307,10 +348,22 @@ roots() ->
             [] ->
                 [
                     {actions,
-                        ?HOCON(hoconsc:map(name, typerefl:map()), #{importance => ?IMPORTANCE_LOW})}
+                        ?HOCON(
+                            hoconsc:map(name, typerefl:map()),
+                            #{
+                                importance => ?IMPORTANCE_LOW,
+                                computed => fun fallback_actions_reverse_index_compute/2
+                            }
+                        )}
                 ];
             _ ->
-                [{actions, ?HOCON(?R_REF(actions), #{importance => ?IMPORTANCE_LOW})}]
+                [
+                    {actions,
+                        ?HOCON(?R_REF(actions), #{
+                            importance => ?IMPORTANCE_LOW,
+                            computed => fun fallback_actions_reverse_index_compute/2
+                        })}
+                ]
         end,
     SourcesRoot =
         [{sources, ?HOCON(?R_REF(sources), #{importance => ?IMPORTANCE_LOW})}],
@@ -323,7 +376,39 @@ fields(sources) ->
 fields(action_resource_opts) ->
     action_resource_opts_fields(_Overrides = []);
 fields(source_resource_opts) ->
-    source_resource_opts_fields(_Overrides = []).
+    source_resource_opts_fields(_Overrides = []);
+fields(fallback_action_reference) ->
+    [
+        {kind, mk(reference, #{required => true, desc => ?DESC("fallback_action_kind")})},
+        {type,
+            mk(
+                hoconsc:union(?MODULE:registered_action_types()),
+                #{required => true, desc => ?DESC("fallback_action_reference_type")}
+            )},
+        {name,
+            mk(
+                binary(),
+                #{required => true, desc => ?DESC("fallback_action_reference_name")}
+            )}
+    ];
+fields(fallback_action_republish) ->
+    [
+        {kind, mk(republish, #{required => true, desc => ?DESC("fallback_action_kind")})},
+        {args,
+            mk(
+                ref(emqx_rule_engine_schema, "republish_args"),
+                #{
+                    default => #{},
+                    computed => fun fallback_actions_republish_compute/2
+                }
+            )}
+    ].
+
+registered_action_types() ->
+    lists:map(
+        fun({Type, _Module}) -> Type end,
+        emqx_action_info:registered_schema_modules_actions()
+    ).
 
 registered_schema_fields_actions() ->
     [
@@ -345,6 +430,10 @@ desc(action_resource_opts) ->
     ?DESC(emqx_resource_schema, "resource_opts");
 desc(source_resource_opts) ->
     ?DESC(emqx_resource_schema, "resource_opts");
+desc(fallback_action_reference) ->
+    ?DESC("fallback_action_reference");
+desc(fallback_action_republish) ->
+    ?DESC("fallback_action_republish");
 desc(_) ->
     undefined.
 
@@ -377,6 +466,8 @@ common_action_resource_opts_subfields() ->
         buffer_mode,
         buffer_seg_bytes,
         health_check_interval,
+        health_check_interval_jitter,
+        health_check_timeout,
         inflight_window,
         max_buffer_bytes,
         metrics_flush_interval,
@@ -389,6 +480,8 @@ common_action_resource_opts_subfields() ->
 common_source_resource_opts_subfields() ->
     [
         health_check_interval,
+        health_check_interval_jitter,
+        health_check_timeout,
         resume_interval
     ].
 
@@ -417,6 +510,8 @@ top_level_common_action_keys() ->
         <<"connector">>,
         <<"tags">>,
         <<"description">>,
+        <<"created_at">>,
+        <<"last_modified_at">>,
         <<"enable">>,
         <<"local_topic">>,
         <<"parameters">>,
@@ -428,6 +523,8 @@ top_level_common_source_keys() ->
         <<"connector">>,
         <<"tags">>,
         <<"description">>,
+        <<"created_at">>,
+        <<"last_modified_at">>,
         <<"enable">>,
         <<"parameters">>,
         <<"resource_opts">>
@@ -444,7 +541,7 @@ make_producer_action_schema(ActionParametersRef, Opts) ->
     ResourceOptsRef = maps:get(resource_opts_ref, Opts, ref(?MODULE, action_resource_opts)),
     [
         {local_topic, mk(binary(), #{required => false, desc => ?DESC(mqtt_topic)})}
-        | common_schema(ActionParametersRef, Opts)
+        | common_action_schema(ActionParametersRef, Opts)
     ] ++
         [
             {resource_opts,
@@ -459,7 +556,7 @@ make_consumer_action_schema(ParametersRef) ->
 
 make_consumer_action_schema(ParametersRef, Opts) ->
     ResourceOptsRef = maps:get(resource_opts_ref, Opts, ref(?MODULE, source_resource_opts)),
-    common_schema(ParametersRef, Opts) ++
+    common_consumer_schema(ParametersRef, Opts) ++
         [
             {resource_opts,
                 mk(ResourceOptsRef, #{
@@ -468,16 +565,55 @@ make_consumer_action_schema(ParametersRef, Opts) ->
                 })}
         ].
 
-common_schema(ParametersRef, _Opts) ->
+common_action_fields() ->
     [
-        {enable, mk(boolean(), #{desc => ?DESC("config_enable"), default => true})},
+        {fallback_actions,
+            mk(
+                hoconsc:array(
+                    emqx_schema:mkunion(
+                        kind,
+                        #{
+                            <<"reference">> => ref(?MODULE, fallback_action_reference),
+                            <<"republish">> => ref(?MODULE, fallback_action_republish)
+                        }
+                    )
+                ),
+                #{
+                    default => [],
+                    desc => ?DESC("fallback_actions")
+                }
+            )}
+        | common_fields()
+    ].
+
+common_fields() ->
+    [
+        {enable,
+            mk(boolean(), #{
+                desc => ?DESC("config_enable"),
+                importance => ?IMPORTANCE_NO_DOC,
+                default => true
+            })},
         {connector,
             mk(binary(), #{
                 desc => ?DESC(emqx_connector_schema, "connector_field"), required => true
             })},
         {tags, emqx_schema:tags_schema()},
         {description, emqx_schema:description_schema()},
+        {created_at, mk(integer(), #{required => false, importance => ?IMPORTANCE_HIDDEN})},
+        {last_modified_at, mk(integer(), #{required => false, importance => ?IMPORTANCE_HIDDEN})}
+    ].
+
+common_action_schema(ParametersRef, _Opts) ->
+    [
         {parameters, ParametersRef}
+        | common_action_fields()
+    ].
+
+common_consumer_schema(ParametersRef, _Opts) ->
+    [
+        {parameters, ParametersRef}
+        | common_fields()
     ].
 
 project_to_actions_resource_opts(OldResourceOpts) ->
@@ -516,6 +652,66 @@ actions_convert_from_connectors(RawConf = #{<<"actions">> := Actions}) ->
     maps:put(<<"actions">>, Actions1, RawConf);
 actions_convert_from_connectors(RawConf) ->
     RawConf.
+
+fallback_actions_republish_compute(Args0, _HoconOpts) ->
+    Args = emqx_utils_maps:unsafe_atom_key_map(Args0),
+    emqx_rule_actions:pre_process_args(emqx_rule_actions, republish, Args).
+
+%% Creates a mapping from Referenced Actions (`{Type :: binary(), Name :: binary()}`) to
+%% lists of Referencing Actions that have it as their Fallback Action.
+fallback_actions_reverse_index_compute(ActionsRootRawConfig, _HoconOpts) ->
+    Index = fold_config(
+        fun
+            (ReferencingType, ReferencingName, #{<<"fallback_actions">> := FBAs}, Acc) ->
+                add_fallback_actions_to_index(ReferencingType, ReferencingName, FBAs, Acc);
+            (_Type, _Name, _Conf, Acc) ->
+                Acc
+        end,
+        #{},
+        ActionsRootRawConfig
+    ),
+    #{fallback_actions_index => Index}.
+
+add_fallback_actions_to_index(ReferencingType, ReferencingName, FBAs, Index) ->
+    lists:foldl(
+        fun
+            (
+                #{<<"kind">> := reference, <<"type">> := T, <<"name">> := N},
+                Acc
+            ) ->
+                ReferencingAction = #{
+                    type => bin(ReferencingType),
+                    name => bin(ReferencingName)
+                },
+                maps:update_with(
+                    {bin(T), bin(N)},
+                    fun(Refs) -> [ReferencingAction | Refs] end,
+                    [ReferencingAction],
+                    Acc
+                );
+            (_, Acc) ->
+                Acc
+        end,
+        Index,
+        FBAs
+    ).
+
+fold_config(Fn, Acc, RootRawConfig) ->
+    maps:fold(
+        fun(Type, NameAndConfs, Acc0) ->
+            maps:fold(
+                fun(Name, Conf, Acc1) ->
+                    Fn(Type, Name, Conf, Acc1)
+                end,
+                Acc0,
+                NameAndConfs
+            )
+        end,
+        Acc,
+        RootRawConfig
+    ).
+
+bin(X) -> emqx_utils_conv:bin(X).
 
 -ifdef(TEST).
 -include_lib("hocon/include/hocon_types.hrl").

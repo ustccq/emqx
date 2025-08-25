@@ -9,6 +9,7 @@ interval.desc:
 
 job_name.desc:
 """Job Name that is pushed to the Push Gateway. Available variables:<br/>
+- ${cluster_name}: Name of EMQX cluster.<br/>
 - ${name}: Name of EMQX node.<br/>
 - ${host}: Host name of EMQX node.<br/>
 For example, when the EMQX node name is <code>emqx@127.0.0.1</code> then the <code>name</code>
@@ -40,6 +41,12 @@ push_gateway_url.desc:
 """URL of Pushgateway server. Pushgateway is optional, should not be configured if prometheus is to scrape EMQX."""
 push_gateway_enable.desc:
 """Enable or disable Pushgateway"""
+
+push_gateway_method.desc:
+"""The HTTP Method of pushing metrics to Pushgateway. Available options:<br/>
+ - <code>put</code>: All metrics with the grouping key specified in the URL are replaced by the metrics pushed with PUT.<br/>
+ - <code>post</code>: POST works exactly like the PUT method but only metrics with the same name as the newly pushed metrics are replaced.<br/>
+The default value is <code>put</code>."""
 
 mnesia_collector.desc:
 """Collects Mnesia metrics mainly using <code> mnesia:system_info/1 </code>"""
@@ -99,5 +106,11 @@ legacy_vm_system_info_collector.desc:
 
 legacy_deprecated_setting.desc:
 """Deprecated since 5.4.0"""
+
+latency_buckets.desc:
+"""Comma separated duration values for latency histogram buckets."""
+
+latency_buckets.label:
+"""Latency Histogram Buckets"""
 
 }

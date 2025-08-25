@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mnesia_SUITE).
@@ -54,7 +42,89 @@ t_create(_) ->
     {ok, _} = emqx_authn_mnesia:create(?AUTHN_ID, Config0),
 
     Config1 = Config0#{password_hash_algorithm => #{name => sha256}},
-    {ok, _} = emqx_authn_mnesia:create(?AUTHN_ID, Config1).
+    {ok, _} = emqx_authn_mnesia:create(?AUTHN_ID, Config1),
+    ok.
+
+t_bootstrap_file(_) ->
+    Config = config(),
+    %% hash to hash
+    HashConfig = Config#{password_hash_algorithm => #{name => sha256, salt_position => suffix}},
+    ?assertMatch(
+        [
+            {user_info, {_, <<"myuser1">>}, _, _, true},
+            {user_info, {_, <<"myuser2">>}, _, _, false}
+        ],
+        test_bootstrap_file(HashConfig, hash, <<"user-credentials.json">>)
+    ),
+    ?assertMatch(
+        [
+            {user_info, {_, <<"myuser3">>}, _, _, true},
+            {user_info, {_, <<"myuser4">>}, _, _, false}
+        ],
+        test_bootstrap_file(HashConfig, hash, <<"user-credentials.csv">>)
+    ),
+
+    %% plain to plain
+    PlainConfig = Config#{
+        password_hash_algorithm =>
+            #{name => plain, salt_position => disable}
+    },
+    ?assertMatch(
+        [
+            {user_info, {_, <<"myuser1">>}, <<"password1">>, _, true},
+            {user_info, {_, <<"myuser2">>}, <<"password2">>, _, false}
+        ],
+        test_bootstrap_file(PlainConfig, plain, <<"user-credentials-plain.json">>)
+    ),
+    ?assertMatch(
+        [
+            {user_info, {_, <<"myuser3">>}, <<"password3">>, _, true},
+            {user_info, {_, <<"myuser4">>}, <<"password4">>, _, false}
+        ],
+        test_bootstrap_file(PlainConfig, plain, <<"user-credentials-plain.csv">>)
+    ),
+    %% plain to hash
+    ?assertMatch(
+        [
+            {user_info, {_, <<"myuser1">>}, _, _, true},
+            {user_info, {_, <<"myuser2">>}, _, _, false}
+        ],
+        test_bootstrap_file(HashConfig, plain, <<"user-credentials-plain.json">>)
+    ),
+    Opts = #{clean => false},
+    Result = test_bootstrap_file(HashConfig, plain, <<"user-credentials-plain.csv">>, Opts),
+    ?assertMatch(
+        [
+            {user_info, {_, <<"myuser3">>}, _, _, true},
+            {user_info, {_, <<"myuser4">>}, _, _, false}
+        ],
+        Result
+    ),
+    %% Don't override the exist user id.
+    ?assertMatch(
+        Result, test_bootstrap_file(HashConfig, plain, <<"user-credentials-plain_v2.csv">>)
+    ),
+    ok.
+
+test_bootstrap_file(Config0, Type, File) ->
+    test_bootstrap_file(Config0, Type, File, #{clean => true}).
+
+test_bootstrap_file(Config0, Type, File, Opts) ->
+    {Type, Filename, _FileData} = sample_filename_and_data(Type, File),
+    Config2 = Config0#{
+        bootstrap_file => Filename,
+        bootstrap_type => Type
+    },
+    {ok, State0} = emqx_authn_mnesia:create(?AUTHN_ID, Config2),
+    Result = ets:tab2list(emqx_authn_mnesia),
+    case maps:get(clean, Opts) of
+        true ->
+            ok = emqx_authn_mnesia:destroy(State0),
+            ?assertMatch([], ets:tab2list(emqx_authn_mnesia));
+        _ ->
+            ok
+    end,
+    Result.
 
 t_update(_) ->
     Config0 = config(),
@@ -197,16 +267,16 @@ t_import_users(_) ->
     Config = Config0#{password_hash_algorithm => #{name => sha256}},
     {ok, State} = emqx_authn_mnesia:create(?AUTHN_ID, Config),
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             sample_filename_and_data(<<"user-credentials.json">>),
             State
         )
     ),
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             sample_filename_and_data(<<"user-credentials.csv">>),
             State
@@ -290,8 +360,8 @@ t_import_users_plain(_) ->
     Config = Config0#{password_hash_algorithm => #{name => sha256, salt_position => suffix}},
     {ok, State} = emqx_authn_mnesia:create(?AUTHN_ID, Config),
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             sample_filename_and_data(plain, <<"user-credentials-plain.json">>),
             State
@@ -306,8 +376,8 @@ t_import_users_plain(_) ->
         )
     ),
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             sample_filename_and_data(plain, <<"user-credentials-plain.csv">>),
             State
@@ -340,16 +410,16 @@ t_import_users_prepared_list(_) ->
         }
     ],
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             {plain, prepared_user_list, Users1},
             State
         )
     ),
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             {hash, prepared_user_list, Users2},
             State
@@ -361,15 +431,15 @@ t_import_users_duplicated_records(_) ->
     Config = Config0#{password_hash_algorithm => #{name => plain, salt_position => disable}},
     {ok, State} = emqx_authn_mnesia:create(?AUTHN_ID, Config),
 
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             sample_filename_and_data(plain, <<"user-credentials-plain-dup.json">>),
             State
         )
     ),
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             sample_filename_and_data(plain, <<"user-credentials-plain-dup.csv">>),
             State
@@ -387,8 +457,8 @@ t_import_users_duplicated_records(_) ->
             <<"is_superuser">> => false
         }
     ],
-    ?assertEqual(
-        ok,
+    ?assertMatch(
+        {ok, _},
         emqx_authn_mnesia:import_users(
             {plain, prepared_user_list, Users1},
             State
@@ -410,8 +480,8 @@ t_import_users_duplicated_records(_) ->
 %%------------------------------------------------------------------------------
 
 sample_filename(Name) ->
-    Dir = code:lib_dir(emqx_auth, test),
-    filename:join([Dir, <<"data">>, Name]).
+    Dir = code:lib_dir(emqx_auth),
+    filename:join([Dir, <<"test">>, <<"data">>, Name]).
 
 sample_filename_and_data(Name) ->
     sample_filename_and_data(hash, Name).

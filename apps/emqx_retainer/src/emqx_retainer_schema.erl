@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer_schema).
@@ -43,38 +31,83 @@ roots() ->
 
 fields("retainer") ->
     [
-        {enable, sc(boolean(), enable, true)},
+        {enable,
+            ?HOCON(
+                boolean(),
+                #{
+                    desc => ?DESC(enable),
+                    default => true,
+                    deprecated => {since, "5.9.0"},
+                    importance => ?IMPORTANCE_NO_DOC
+                }
+            )},
         {msg_expiry_interval,
-            sc(
+            ?HOCON(
                 %% not used in a `receive ... after' block, just timestamp comparison
                 emqx_schema:duration_ms(),
-                msg_expiry_interval,
-                <<"0s">>
+                #{
+                    desc => ?DESC(msg_expiry_interval),
+                    default => <<"0s">>
+                }
+            )},
+        {msg_expiry_interval_override,
+            ?HOCON(
+                %% not used in a `receive ... after' block, just timestamp comparison
+                hoconsc:union([disabled, emqx_schema:duration_ms()]),
+                #{
+                    desc => ?DESC(msg_expiry_interval_override),
+                    default => disabled
+                }
+            )},
+        {allow_never_expire,
+            ?HOCON(
+                boolean(),
+                #{
+                    desc => ?DESC(allow_never_expire),
+                    default => true
+                }
             )},
         {msg_clear_interval,
-            sc(
+            ?HOCON(
                 emqx_schema:timeout_duration_ms(),
-                msg_clear_interval,
-                <<"0s">>
+                #{
+                    desc => ?DESC(msg_clear_interval),
+                    default => <<"0s">>
+                }
+            )},
+        {msg_clear_limit,
+            ?HOCON(
+                pos_integer(),
+                #{
+                    desc => ?DESC(msg_clear_limit),
+                    default => 50_000,
+                    importance => ?IMPORTANCE_HIDDEN
+                }
             )},
         {flow_control,
-            sc(
+            ?HOCON(
                 ?R_REF(flow_control),
-                flow_control,
-                #{},
-                ?IMPORTANCE_HIDDEN
+                #{
+                    desc => ?DESC(flow_control),
+                    default => #{},
+                    importance => ?IMPORTANCE_HIDDEN
+                }
             )},
         {max_payload_size,
-            sc(
+            ?HOCON(
                 emqx_schema:bytesize(),
-                max_payload_size,
-                <<"1MB">>
+                #{
+                    desc => ?DESC(max_payload_size),
+                    default => <<"1MB">>
+                }
             )},
         {stop_publish_clear_msg,
-            sc(
+            ?HOCON(
                 boolean(),
-                stop_publish_clear_msg,
-                false
+                #{
+                    desc => ?DESC(stop_publish_clear_msg),
+                    default => false
+                }
             )},
         {delivery_rate,
             ?HOCON(
@@ -85,6 +118,16 @@ fields("retainer") ->
                     default => <<"1000/s">>,
                     example => <<"1000/s">>,
                     aliases => [deliver_rate]
+                }
+            )},
+        {max_publish_rate,
+            ?HOCON(
+                emqx_limiter_schema:rate_type(),
+                #{
+                    required => false,
+                    desc => ?DESC(max_publish_rate),
+                    default => <<"1000/s">>,
+                    example => <<"1000/s">>
                 }
             )},
         {backend, backend_config()},
@@ -111,48 +154,61 @@ fields(mnesia_config) ->
                 }
             )},
         {storage_type,
-            sc(
+            ?HOCON(
                 hoconsc:enum([ram, disc]),
-                mnesia_config_storage_type,
-                ram
+                #{
+                    desc => ?DESC(mnesia_config_storage_type),
+                    default => ram
+                }
             )},
         {max_retained_messages,
-            sc(
+            ?HOCON(
                 non_neg_integer(),
-                max_retained_messages,
-                0
+                #{
+                    desc => ?DESC(max_retained_messages),
+                    default => 0
+                }
             )},
         {index_specs, fun retainer_indices/1},
         {enable,
-            ?HOCON(boolean(), #{
-                desc => ?DESC(mnesia_enable),
-                required => false,
-                default => true
-            })}
+            ?HOCON(
+                boolean(), #{
+                    desc => ?DESC(mnesia_enable),
+                    importance => ?IMPORTANCE_NO_DOC,
+                    required => false,
+                    default => true
+                }
+            )}
     ];
 fields(flow_control) ->
     [
         {batch_read_number,
-            sc(
+            ?HOCON(
                 non_neg_integer(),
-                batch_read_number,
-                0
+                #{
+                    desc => ?DESC(batch_read_number),
+                    default => 0
+                }
             )},
         {batch_deliver_number,
-            sc(
+            ?HOCON(
                 non_neg_integer(),
-                batch_deliver_number,
-                0
+                #{
+                    desc => ?DESC(batch_deliver_number),
+                    default => 0
+                }
             )},
         {batch_deliver_limiter,
-            sc(
-                ?R_REF(emqx_limiter_schema, internal),
-                batch_deliver_limiter,
-                undefined
+            ?HOCON(
+                emqx_limiter_schema:rate_type(),
+                #{
+                    desc => ?DESC(batch_deliver_limiter),
+                    default => <<"1000/s">>
+                }
             )}
     ];
 fields(external_backends) ->
-    emqx_schema_hooks:injection_point('retainer.external_backends').
+    emqx_schema_hooks:list_injection_point('retainer.external_backends').
 
 desc("retainer") ->
     "Configuration related to handling `PUBLISH` packets with a `retain` flag set to 1.";
@@ -166,11 +222,6 @@ desc(_) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
-
-sc(Type, DescId, Default) ->
-    sc(Type, DescId, Default, ?DEFAULT_IMPORTANCE).
-sc(Type, DescId, Default, Importance) ->
-    hoconsc:mk(Type, #{default => Default, desc => ?DESC(DescId), importance => Importance}).
 
 backend_config() ->
     hoconsc:mk(hoconsc:ref(?MODULE, mnesia_config), #{desc => ?DESC(backend)}).
@@ -216,27 +267,35 @@ check_duplicate(List) ->
         true -> ok
     end.
 
-retainer_converter(#{<<"delivery_rate">> := <<"infinity">>} = Conf, _Opts) ->
-    Conf#{
-        <<"flow_control">> => #{
-            <<"batch_read_number">> => 0,
-            <<"batch_deliver_number">> => 0
-        }
-    };
-retainer_converter(#{<<"delivery_rate">> := RateStr} = Conf, _Opts) ->
-    {ok, RateNum} = emqx_limiter_schema:to_rate(RateStr),
-    RawRate = erlang:floor(RateNum * 1000 / emqx_limiter_schema:default_period()),
-    Control = #{
-        <<"batch_read_number">> => RawRate,
-        <<"batch_deliver_number">> => RawRate,
-        %% Set the maximum delivery rate per session
-        <<"batch_deliver_limiter">> => #{<<"client">> => #{<<"rate">> => RateStr}}
-    },
-    Conf#{<<"flow_control">> => Control};
-retainer_converter(#{<<"deliver_rate">> := Delivery} = Conf, Opts) ->
+retainer_converter(Conf0, _Opts) ->
+    Conf1 = rename_delivery_rate(Conf0),
+    convert_delivery_rate(Conf1).
+
+rename_delivery_rate(#{<<"deliver_rate">> := Delivery} = Conf) ->
     Conf1 = maps:remove(<<"deliver_rate">>, Conf),
-    retainer_converter(Conf1#{<<"delivery_rate">> => Delivery}, Opts);
-retainer_converter(Conf, _Opts) ->
+    Conf1#{<<"delivery_rate">> => Delivery};
+rename_delivery_rate(Conf) ->
+    Conf.
+
+convert_delivery_rate(#{<<"delivery_rate">> := <<"infinity">>} = Conf) ->
+    FlowControl0 = maps:get(<<"flow_control">>, Conf, #{}),
+    FlowControl1 = FlowControl0#{
+        <<"batch_read_number">> => 0,
+        <<"batch_deliver_number">> => 0,
+        <<"batch_deliver_limiter">> => <<"infinity">>
+    },
+    Conf#{<<"flow_control">> => FlowControl1};
+convert_delivery_rate(#{<<"delivery_rate">> := RateStr} = Conf) ->
+    {ok, {Capacity, _Interval}} = emqx_limiter_schema:to_rate(RateStr),
+    FlowControl0 = maps:get(<<"flow_control">>, Conf, #{}),
+    FlowControl1 = FlowControl0#{
+        <<"batch_read_number">> => maps:get(<<"batch_read_number">>, FlowControl0, Capacity),
+        <<"batch_deliver_number">> => maps:get(<<"batch_deliver_number">>, FlowControl0, Capacity),
+        %% Set the maximum delivery rate per session
+        <<"batch_deliver_limiter">> => RateStr
+    },
+    Conf#{<<"flow_control">> => FlowControl1};
+convert_delivery_rate(Conf) ->
     Conf.
 
 validate_backends_enabled(Config) ->

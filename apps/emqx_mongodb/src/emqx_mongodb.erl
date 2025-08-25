@@ -1,20 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mongodb).
 
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("emqx_connector/include/emqx_connector.hrl").
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
@@ -26,6 +15,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -45,6 +35,8 @@
 -export([maybe_resolve_srv_and_txt_records/1]).
 
 -define(HEALTH_CHECK_TIMEOUT, 30000).
+-define(DEFAULT_MONGO_LIMIT, 1000).
+-define(DEFAULT_MONGO_BATCH_SIZE, 100).
 
 %% mongo servers don't need parse
 -define(MONGO_HOST_OPTIONS, #{
@@ -132,7 +124,8 @@ fields(topology) ->
                 pos_integer(),
                 #{
                     importance => ?IMPORTANCE_HIDDEN,
-                    default => 10
+                    %% In most cases we don't need the topology pool as we use ecpool
+                    default => 1
                 }
             )},
         {max_overflow, fun max_overflow/1},
@@ -172,6 +165,7 @@ desc(_) ->
     undefined.
 
 %% ===================================================================
+resource_type() -> mongodb.
 
 callback_mode() -> always_sync.
 
@@ -230,7 +224,7 @@ on_stop(InstId, _State) ->
 
 on_query(
     InstId,
-    {_ChannelId, Document},
+    {insert, Document},
     #{pool_name := PoolName, collection := Collection} = State
 ) ->
     Request = {insert, Collection, Document},
@@ -259,12 +253,21 @@ on_query(
         {{true, _Info}, _Document} ->
             ok
     end;
-on_query(
+on_query(InstId, {find_one, Collection, Filter}, State) ->
+    on_select_query(InstId, {find_one, Collection, Filter, #{}}, State);
+on_query(InstId, {find_one, _Collection, _Filter, _Options} = Request, State) ->
+    on_select_query(InstId, Request, State);
+on_query(InstId, {find, Collection, Filter}, State) ->
+    on_select_query(InstId, {find, Collection, Filter, #{}}, State);
+on_query(InstId, {find, _Collection, _Filter, _Options} = Request, State) ->
+    on_select_query(InstId, Request, State).
+
+on_select_query(
     InstId,
-    {Action, Collection, Filter, Projector},
+    {Action, Collection, Filter, Options},
     #{pool_name := PoolName} = State
 ) ->
-    Request = {Action, Collection, Filter, Projector},
+    Request = {Action, Collection, Filter, Options},
     ?TRACE(
         "QUERY",
         "mongodb_connector_received",
@@ -273,7 +276,7 @@ on_query(
     case
         ecpool:pick_and_do(
             PoolName,
-            {?MODULE, mongo_query, [Action, Collection, Filter, Projector]},
+            {?MODULE, mongo_query, [Action, Collection, Filter, Options]},
             no_handover
         )
     of
@@ -291,26 +294,27 @@ on_query(
                     {error, Reason}
             end;
         {ok, Cursor} when is_pid(Cursor) ->
-            {ok, mc_cursor:foldl(fun(O, Acc2) -> [O | Acc2] end, [], Cursor, 1000)};
+            Limit = maps:get(limit, Options, ?DEFAULT_MONGO_LIMIT),
+            {ok, mc_cursor:take(Cursor, Limit)};
         Result ->
             {ok, Result}
     end.
 
-on_get_status(InstId, State = #{pool_name := PoolName}) ->
+on_get_status(InstId, #{pool_name := PoolName}) ->
     case health_check(PoolName) of
         ok ->
             ?tp(debug, emqx_connector_mongo_health_check, #{
                 instance_id => InstId,
                 status => ok
             }),
-            connected;
+            ?status_connected;
         {error, Reason} ->
             ?tp(warning, emqx_connector_mongo_health_check, #{
                 instance_id => InstId,
                 reason => Reason,
                 status => failed
             }),
-            {disconnected, State, Reason}
+            {?status_disconnected, Reason}
     end.
 
 health_check(PoolName) ->
@@ -351,6 +355,9 @@ check_worker_health(Conn) ->
         _ ->
             ok
     catch
+        error:{error, #{<<"code">> := 13, <<"codeName">> := <<"Unauthorized">>}} ->
+            %% Doesn't matter: if we got this, we're connected.
+            ok;
         Class:Error ->
             ?SLOG(warning, #{
                 msg => "mongo_connection_get_status_exception",
@@ -378,12 +385,16 @@ connect(Opts) ->
     WorkerOptions = proplists:get_value(worker_options, Opts, []),
     mongo_api:connect(Type, Hosts, Options, WorkerOptions).
 
-mongo_query(Conn, find, Collection, Filter, Projector) ->
-    mongo_api:find(Conn, Collection, Filter, Projector);
-mongo_query(Conn, find_one, Collection, Filter, Projector) ->
-    mongo_api:find_one(Conn, Collection, Filter, Projector);
-%% Todo xxx
-mongo_query(_Conn, _Action, _Collection, _Filter, _Projector) ->
+mongo_query(Conn, find, Collection, Filter, Options) ->
+    Projector = maps:get(projector, Options, #{}),
+    Skip = maps:get(skip, Options, 0),
+    BatchSize = maps:get(batch_size, Options, ?DEFAULT_MONGO_BATCH_SIZE),
+    mongo_api:find(Conn, Collection, Filter, Projector, Skip, BatchSize);
+mongo_query(Conn, find_one, Collection, Filter, Options) ->
+    Projector = maps:get(projector, Options, #{}),
+    Skip = maps:get(skip, Options, 0),
+    mongo_api:find_one(Conn, Collection, Filter, Projector, Skip);
+mongo_query(_Conn, _Action, _Collection, _Filter, _Options) ->
     ok.
 
 mongo_insert(Conn, Collection, Documents) ->

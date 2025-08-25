@@ -1,32 +1,24 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_connector_api).
+
+-feature(maybe_expr, enable).
 
 -behaviour(minirest_api).
 
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
 -include_lib("emqx/include/logger.hrl").
--include_lib("emqx_utils/include/emqx_utils_api.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -import(hoconsc, [mk/2, array/1, enum/1]).
 
 %% Swagger specs from hocon schema
 -export([
     api_spec/0,
+    check_api_schema/2,
     paths/0,
     schema/1,
     namespace/0
@@ -42,7 +34,13 @@
     '/connectors_probe'/2
 ]).
 
--export([lookup_from_local_node/2]).
+%% RPC targets
+-export([
+    lookup_from_local_node/2,
+    v2_lookup/3
+]).
+
+-define(BPAPI_NAME, emqx_connector).
 
 -define(CONNECTOR_NOT_ENABLED,
     ?BAD_REQUEST(<<"Forbidden operation, connector not enabled">>)
@@ -58,7 +56,7 @@
 %% Don't turn connector_name to atom, it's maybe not a existing atom.
 -define(TRY_PARSE_ID(ID, EXPR),
     try emqx_connector_resource:parse_connector_id(Id, #{atom_name => false}) of
-        {ConnectorType, ConnectorName} ->
+        #{type := ConnectorType, name := ConnectorName} ->
             EXPR
     catch
         throw:#{reason := Reason} ->
@@ -69,7 +67,30 @@
 namespace() -> "connector".
 
 api_spec() ->
-    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => fun ?MODULE:check_api_schema/2}).
+
+check_api_schema(Request, #{path := "/connectors/:id", method := put = Method} = Metadata) ->
+    ConnectorId = emqx_utils_maps:deep_get([bindings, id], Request),
+    try emqx_connector_resource:parse_connector_id(ConnectorId, #{atom_name => false}) of
+        #{type := ConnectorType} ->
+            %% Since we know the connector type, we refine the schema to get more decent
+            %% error messages.
+            {_, Ref} = emqx_connector_info:api_schema(ConnectorType, atom_to_list(Method)),
+            Schema = hoconsc:mk(Ref),
+            emqx_dashboard_swagger:filter_check_request_and_translate_body_serializable(
+                Request, refine_api_schema(Schema, Metadata)
+            )
+    catch
+        throw:#{reason := Reason} ->
+            ?NOT_FOUND(<<"Invalid connector id, ", Reason/binary>>)
+    end;
+check_api_schema(Request, Metadata) ->
+    emqx_dashboard_swagger:filter_check_request_and_translate_body_serializable(Request, Metadata).
+
+refine_api_schema(Schema, Metadata = #{path := Path, method := Method}) ->
+    Spec = maps:get(Method, schema(Path)),
+    SpecRefined = Spec#{'requestBody' => Schema},
+    Metadata#{apispec => SpecRefined}.
 
 paths() ->
     [
@@ -317,21 +338,25 @@ schema("/connectors_probe") ->
         }
     }.
 
-'/connectors'(post, #{body := #{<<"type">> := ConnectorType, <<"name">> := ConnectorName} = Conf0}) ->
-    case emqx_connector:lookup(ConnectorType, ConnectorName) of
-        {ok, _} ->
+'/connectors'(
+    post, #{body := #{<<"type">> := ConnectorType, <<"name">> := ConnectorName} = Conf0} = Req
+) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    case emqx_connector:is_exist(Namespace, ConnectorType, ConnectorName) of
+        true ->
             ?BAD_REQUEST('ALREADY_EXISTS', <<"connector already exists">>);
-        {error, not_found} ->
+        false ->
             Conf = filter_out_request_body(Conf0),
-            create_connector(ConnectorType, ConnectorName, Conf)
+            create_connector(Namespace, ConnectorType, ConnectorName, Conf)
     end;
-'/connectors'(get, _Params) ->
-    Nodes = emqx:running_nodes(),
-    NodeReplies = emqx_connector_proto_v1:list_connectors_on_nodes(Nodes),
+'/connectors'(get, Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    Nodes = emqx_bpapi:nodes_supporting_bpapi_version(?BPAPI_NAME, 2),
+    NodeReplies = emqx_connector_proto_v2:list(Nodes, Namespace),
     case is_ok(NodeReplies) of
         {ok, NodeConnectors} ->
             AllConnectors = [
-                [format_resource(Data, Node) || Data <- Connectors]
+                [format_resource(Namespace, Data, Node) || Data <- Connectors]
              || {Node, Connectors} <- lists:zip(Nodes, NodeConnectors)
             ],
             ?OK(zip_connectors(AllConnectors));
@@ -339,27 +364,32 @@ schema("/connectors_probe") ->
             ?INTERNAL_ERROR(Reason)
     end.
 
-'/connectors/:id'(get, #{bindings := #{id := Id}}) ->
-    ?TRY_PARSE_ID(Id, lookup_from_all_nodes(ConnectorType, ConnectorName, 200));
-'/connectors/:id'(put, #{bindings := #{id := Id}, body := Conf0}) ->
+'/connectors/:id'(get, #{bindings := #{id := Id}} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    ?TRY_PARSE_ID(Id, lookup_from_all_nodes(Namespace, ConnectorType, ConnectorName, 200));
+'/connectors/:id'(put, #{bindings := #{id := Id}, body := Conf0} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
     Conf1 = filter_out_request_body(Conf0),
     ?TRY_PARSE_ID(
         Id,
-        case emqx_connector:lookup(ConnectorType, ConnectorName) of
-            {ok, _} ->
-                RawConf = emqx:get_raw_config([connectors, ConnectorType, ConnectorName], #{}),
+        case emqx_connector:is_exist(Namespace, ConnectorType, ConnectorName) of
+            true ->
+                RawConf = get_raw_config(
+                    Namespace, [connectors, ConnectorType, ConnectorName], #{}
+                ),
                 Conf = emqx_utils:deobfuscate(Conf1, RawConf),
-                update_connector(ConnectorType, ConnectorName, Conf);
-            {error, not_found} ->
+                update_connector(Namespace, ConnectorType, ConnectorName, Conf);
+            false ->
                 ?CONNECTOR_NOT_FOUND(ConnectorType, ConnectorName)
         end
     );
-'/connectors/:id'(delete, #{bindings := #{id := Id}}) ->
+'/connectors/:id'(delete, #{bindings := #{id := Id}} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
     ?TRY_PARSE_ID(
         Id,
-        case emqx_connector:lookup(ConnectorType, ConnectorName) of
-            {ok, _} ->
-                case emqx_connector:remove(ConnectorType, ConnectorName) of
+        case emqx_connector:is_exist(Namespace, ConnectorType, ConnectorName) of
+            true ->
+                case emqx_connector:remove(Namespace, ConnectorType, ConnectorName) of
                     ok ->
                         ?NO_CONTENT;
                     {error, {post_config_update, _HandlerMod, {active_channels, Channels}}} ->
@@ -372,16 +402,17 @@ schema("/connectors_probe") ->
                     {error, Reason} ->
                         ?INTERNAL_ERROR(Reason)
                 end;
-            {error, not_found} ->
+            false ->
                 ?CONNECTOR_NOT_FOUND(ConnectorType, ConnectorName)
         end
     ).
 
 '/connectors_probe'(post, Request) ->
+    Namespace = emqx_dashboard:get_namespace(Request),
     RequestMeta = #{module => ?MODULE, method => post, path => "/connectors_probe"},
     case emqx_dashboard_swagger:filter_check_request_and_translate_body(Request, RequestMeta) of
         {ok, #{body := #{<<"type">> := ConnType} = Params}} ->
-            Params1 = maybe_deobfuscate_connector_probe(Params),
+            Params1 = maybe_deobfuscate_connector_probe(Namespace, Params),
             case
                 emqx_connector_resource:create_dry_run(ConnType, maps:remove(<<"type">>, Params1))
             of
@@ -389,7 +420,7 @@ schema("/connectors_probe") ->
                     ?NO_CONTENT;
                 {error, #{kind := validation_error} = Reason0} ->
                     Reason = redact(Reason0),
-                    ?BAD_REQUEST('TEST_FAILED', map_to_json(Reason));
+                    ?BAD_REQUEST('TEST_FAILED', emqx_mgmt_api_lib:to_json(Reason));
                 {error, Reason0} when not is_tuple(Reason0); element(1, Reason0) =/= 'exit' ->
                     Reason1 =
                         case Reason0 of
@@ -404,24 +435,29 @@ schema("/connectors_probe") ->
     end.
 
 maybe_deobfuscate_connector_probe(
+    Namespace,
     #{<<"type">> := ConnectorType, <<"name">> := ConnectorName} = Params
 ) ->
-    case emqx_connector:lookup(ConnectorType, ConnectorName) of
-        {ok, _} ->
-            RawConf = emqx:get_raw_config([connectors, ConnectorType, ConnectorName], #{}),
+    case emqx_connector:is_exist(Namespace, ConnectorType, ConnectorName) of
+        true ->
+            RawConf = get_raw_config(Namespace, [connectors, ConnectorType, ConnectorName], #{}),
             emqx_utils:deobfuscate(Params, RawConf);
-        _ ->
+        false ->
             %% A connector may be probed before it's created, so not finding it here is fine
             Params
     end;
-maybe_deobfuscate_connector_probe(Params) ->
+maybe_deobfuscate_connector_probe(_Namespace, Params) ->
     Params.
 
-lookup_from_all_nodes(ConnectorType, ConnectorName, SuccCode) ->
-    Nodes = mria:running_nodes(),
-    case
-        is_ok(emqx_connector_proto_v1:lookup_from_all_nodes(Nodes, ConnectorType, ConnectorName))
-    of
+lookup_from_all_nodes(Namespace, ConnectorType, ConnectorName, SuccCode) ->
+    Nodes = emqx_bpapi:nodes_supporting_bpapi_version(?BPAPI_NAME, 2),
+    Res = emqx_connector_proto_v2:lookup(
+        Nodes,
+        Namespace,
+        ConnectorType,
+        ConnectorName
+    ),
+    case is_ok(Res) of
         {ok, [{ok, _} | _] = Results} ->
             {SuccCode, format_connector_info([R || {ok, R} <- Results])};
         {ok, [{error, not_found} | _]} ->
@@ -430,51 +466,66 @@ lookup_from_all_nodes(ConnectorType, ConnectorName, SuccCode) ->
             ?INTERNAL_ERROR(Reason)
     end.
 
+%% RPC Target; legacy API
 lookup_from_local_node(ConnectorType, ConnectorName) ->
-    case emqx_connector:lookup(ConnectorType, ConnectorName) of
-        {ok, Res} -> {ok, format_resource(Res, node())};
+    v2_lookup(?global_ns, ConnectorType, ConnectorName).
+
+%% RPC Target
+v2_lookup(Namespace, ConnectorType, ConnectorName) ->
+    case emqx_connector:lookup(Namespace, ConnectorType, ConnectorName) of
+        {ok, Res} -> {ok, format_resource(Namespace, Res, node())};
         Error -> Error
     end.
 
-create_connector(ConnectorType, ConnectorName, Conf) ->
-    create_or_update_connector(ConnectorType, ConnectorName, Conf, 201).
+create_connector(Namespace, ConnectorType, ConnectorName, Conf) ->
+    create_or_update_connector(Namespace, ConnectorType, ConnectorName, Conf, 201).
 
-update_connector(ConnectorType, ConnectorName, Conf) ->
-    create_or_update_connector(ConnectorType, ConnectorName, Conf, 200).
+update_connector(Namespace, ConnectorType, ConnectorName, Conf) ->
+    create_or_update_connector(Namespace, ConnectorType, ConnectorName, Conf, 200).
 
-create_or_update_connector(ConnectorType, ConnectorName, Conf, HttpStatusCode) ->
+create_or_update_connector(Namespace, ConnectorType, ConnectorName, Conf, HttpStatusCode) ->
     Check =
         try
             is_binary(ConnectorType) andalso emqx_resource:validate_type(ConnectorType),
             ok = emqx_resource:validate_name(ConnectorName)
         catch
             throw:Error ->
-                ?BAD_REQUEST(map_to_json(Error))
+                ?BAD_REQUEST(emqx_mgmt_api_lib:to_json(Error))
         end,
     case Check of
         ok ->
-            do_create_or_update_connector(ConnectorType, ConnectorName, Conf, HttpStatusCode);
+            do_create_or_update_connector(
+                Namespace, ConnectorType, ConnectorName, Conf, HttpStatusCode
+            );
         BadRequest ->
             BadRequest
     end.
 
-do_create_or_update_connector(ConnectorType, ConnectorName, Conf, HttpStatusCode) ->
-    case emqx_connector:create(ConnectorType, ConnectorName, Conf) of
+do_create_or_update_connector(Namespace, ConnectorType, ConnectorName, Conf, HttpStatusCode) ->
+    case emqx_connector:create(Namespace, ConnectorType, ConnectorName, Conf) of
         {ok, _} ->
-            lookup_from_all_nodes(ConnectorType, ConnectorName, HttpStatusCode);
+            lookup_from_all_nodes(Namespace, ConnectorType, ConnectorName, HttpStatusCode);
         {error, {PreOrPostConfigUpdate, _HandlerMod, Reason}} when
             PreOrPostConfigUpdate =:= pre_config_update;
             PreOrPostConfigUpdate =:= post_config_update
         ->
-            ?BAD_REQUEST(map_to_json(redact(Reason)));
-        {error, Reason} when is_map(Reason) ->
-            ?BAD_REQUEST(map_to_json(redact(Reason)))
+            ?BAD_REQUEST(emqx_mgmt_api_lib:to_json(redact(Reason)));
+        {error, Reason0} when is_map(Reason0) ->
+            %% When root validators fail, the returned value is the whole config root.  We
+            %% focus down to the config from the request to avoid returning a huge map.
+            Reason = maybe_focus_on_request_connector(Reason0, ConnectorType, ConnectorName),
+            ?BAD_REQUEST(emqx_mgmt_api_lib:to_json(redact(Reason)))
     end.
 
-'/connectors/:id/enable/:enable'(put, #{bindings := #{id := Id, enable := Enable}}) ->
+'/connectors/:id/enable/:enable'(put, #{bindings := #{id := Id, enable := Enable}} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
     ?TRY_PARSE_ID(
         Id,
-        case emqx_connector:disable_enable(enable_func(Enable), ConnectorType, ConnectorName) of
+        case
+            emqx_connector:disable_enable(
+                Namespace, enable_func(Enable), ConnectorType, ConnectorName
+            )
+        of
             {ok, _} ->
                 ?NO_CONTENT;
             {error, {pre_config_update, _, connector_not_found}} ->
@@ -488,51 +539,69 @@ do_create_or_update_connector(ConnectorType, ConnectorName, Conf, HttpStatusCode
         end
     ).
 
-'/connectors/:id/:operation'(post, #{
-    bindings :=
-        #{id := Id, operation := Op}
-}) ->
+'/connectors/:id/:operation'(post, #{bindings := #{id := Id, operation := Op}} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
     ?TRY_PARSE_ID(
         Id,
         begin
-            OperFunc = operation_func(all, Op),
-            Nodes = mria:running_nodes(),
-            call_operation_if_enabled(all, OperFunc, [Nodes, ConnectorType, ConnectorName])
+            {ProtoMod, OperFunc} = operation_func(Op),
+            Nodes = emqx_bpapi:nodes_supporting_bpapi_version(?BPAPI_NAME, 2),
+            call_operation_if_enabled(
+                ProtoMod,
+                OperFunc,
+                Namespace,
+                ConnectorType,
+                ConnectorName,
+                [Nodes, Namespace, ConnectorType, ConnectorName]
+            )
         end
     ).
 
-'/nodes/:node/connectors/:id/:operation'(post, #{
-    bindings :=
-        #{id := Id, operation := Op, node := Node}
-}) ->
+'/nodes/:node/connectors/:id/:operation'(
+    post,
+    #{
+        bindings :=
+            #{id := Id, operation := Op, node := Node}
+    } = Req
+) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
     ?TRY_PARSE_ID(
         Id,
-        case emqx_utils:safe_to_existing_atom(Node, utf8) of
-            {ok, TargetNode} ->
-                OperFunc = operation_func(TargetNode, Op),
-                call_operation_if_enabled(TargetNode, OperFunc, [
-                    TargetNode, ConnectorType, ConnectorName
-                ]);
+        maybe
+            {ok, TargetNode} ?= emqx_utils:safe_to_existing_atom(Node, utf8),
+            true ?= lists:member(TargetNode, emqx:running_nodes()),
+            {ProtoMod, OperFunc} = operation_func(Op),
+            call_operation_if_enabled(
+                ProtoMod,
+                OperFunc,
+                Namespace,
+                ConnectorType,
+                ConnectorName,
+                [[TargetNode], Namespace, ConnectorType, ConnectorName]
+            )
+        else
+            false ->
+                ?NOT_FOUND(<<"Node not found: ", Node/binary>>);
             {error, _} ->
                 ?NOT_FOUND(<<"Invalid node name: ", Node/binary>>)
         end
     ).
 
-call_operation_if_enabled(NodeOrAll, OperFunc, [Nodes, BridgeType, BridgeName]) ->
-    try is_enabled_connector(BridgeType, BridgeName) of
+call_operation_if_enabled(ProtoMod, OperFunc, Namespace, Type, Name, BPAPIArgs) ->
+    try is_enabled_connector(Namespace, Type, Name) of
         false ->
             ?CONNECTOR_NOT_ENABLED;
         true ->
-            call_operation(NodeOrAll, OperFunc, [Nodes, BridgeType, BridgeName])
+            call_operation(ProtoMod, OperFunc, Namespace, Type, Name, BPAPIArgs)
     catch
         throw:not_found ->
-            ?CONNECTOR_NOT_FOUND(BridgeType, BridgeName)
+            ?CONNECTOR_NOT_FOUND(Type, Name)
     end.
 
-is_enabled_connector(ConnectorType, ConnectorName) ->
-    try emqx:get_config([connectors, ConnectorType, binary_to_existing_atom(ConnectorName)]) of
-        ConfMap ->
-            maps:get(enable, ConfMap, true)
+is_enabled_connector(Namespace, ConnectorType, ConnectorName) ->
+    try
+        KeyPath = [connectors, ConnectorType, binary_to_existing_atom(ConnectorName), enable],
+        get_config(Namespace, KeyPath, true)
     catch
         error:{config_not_found, _} ->
             throw(not_found);
@@ -542,8 +611,8 @@ is_enabled_connector(ConnectorType, ConnectorName) ->
             throw(not_found)
     end.
 
-operation_func(all, start) -> start_connectors_to_all_nodes;
-operation_func(_Node, start) -> start_connector_to_node.
+operation_func(start) ->
+    {emqx_connector_proto_v2, start}.
 
 enable_func(true) -> enable;
 enable_func(false) -> disable.
@@ -617,6 +686,7 @@ aggregate_status(AllStatus) ->
     end.
 
 format_resource(
+    Namespace,
     #{
         type := Type,
         name := ConnectorName,
@@ -625,7 +695,7 @@ format_resource(
     },
     Node
 ) ->
-    ResourceData = lookup_channels(Type, ConnectorName, ResourceData0),
+    ResourceData = lookup_channels(Namespace, Type, ConnectorName, ResourceData0),
     RawConf = fill_defaults(Type, RawConf0),
     redact(
         maps:merge(
@@ -638,8 +708,8 @@ format_resource(
         )
     ).
 
-lookup_channels(Type, Name, ResourceData0) ->
-    ConnectorResId = emqx_connector_resource:resource_id(Type, Name),
+lookup_channels(Namespace, Type, Name, ResourceData0) ->
+    ConnectorResId = emqx_connector_resource:resource_id(Namespace, Type, Name),
     case emqx_resource:get_channels(ConnectorResId) of
         {ok, Channels} ->
             ResourceData0#{channels => maps:from_list(Channels)};
@@ -655,7 +725,22 @@ format_resource_data(error, undefined, Result) ->
 format_resource_data(error, Error, Result) ->
     Result#{status_reason => emqx_utils:readable_error_msg(Error)};
 format_resource_data(channels, Channels, Result) ->
-    Result#{actions => lists:map(fun format_action/1, maps:keys(Channels))};
+    #{
+        actions := Actions,
+        sources := Sources
+    } = lists:foldl(
+        fun(Id, Acc) ->
+            case emqx_bridge_v2:parse_id(Id) of
+                #{kind := source, name := Name} ->
+                    maps:update_with(sources, fun(Ss) -> [Name | Ss] end, Acc);
+                #{name := Name} ->
+                    maps:update_with(actions, fun(As) -> [Name | As] end, Acc)
+            end
+        end,
+        #{actions => [], sources => []},
+        maps:keys(Channels)
+    ),
+    Result#{actions => lists:sort(Actions), sources => lists:sort(Sources)};
 format_resource_data(K, V, Result) ->
     Result#{K => V}.
 
@@ -673,18 +758,16 @@ unpack_connector_conf(Type, PackedConf) ->
     #{<<"foo">> := RawConf} = maps:get(TypeBin, Bridges),
     RawConf.
 
-format_action(ActionId) ->
-    case emqx_bridge_v2:parse_id(ActionId) of
-        #{name := Name} ->
-            Name
-    end.
-
 is_ok(ok) ->
     ok;
 is_ok(OkResult = {ok, _}) ->
     OkResult;
 is_ok(Error = {error, _}) ->
     Error;
+is_ok(timeout) ->
+    %% Returned by `emqx_resource_manager:start' when the connector fails to reach either
+    %% `?status_connected' or `?status_disconnected' within `start_timeout'.
+    timeout;
 is_ok(ResL) ->
     case
         lists:filter(
@@ -719,10 +802,18 @@ bin(S) when is_atom(S) ->
 bin(S) when is_binary(S) ->
     S.
 
-call_operation(NodeOrAll, OperFunc, Args = [_Nodes, ConnectorType, ConnectorName]) ->
-    case is_ok(do_bpapi_call(NodeOrAll, OperFunc, Args)) of
+call_operation(ProtoMod, OperFunc, Namespace, ConnectorType, ConnectorName, BPAPIArgs) ->
+    case is_ok(do_bpapi_call(ProtoMod, OperFunc, BPAPIArgs)) of
         Ok when Ok =:= ok; is_tuple(Ok), element(1, Ok) =:= ok ->
             ?NO_CONTENT;
+        timeout ->
+            %% Returned by `emqx_resource_manager:start' when the connector fails to reach
+            %% either `?status_connected' or `?status_disconnected' within
+            %% `start_timeout'.
+            ?BAD_REQUEST(<<
+                "Timeout while waiting for connector to reach connected status."
+                " Please try again."
+            >>);
         {error, not_implemented} ->
             ?NOT_IMPLEMENTED;
         {error, timeout} ->
@@ -739,6 +830,7 @@ call_operation(NodeOrAll, OperFunc, Args = [_Nodes, ConnectorType, ConnectorName
                 reason => not_found,
                 type => ConnectorType,
                 name => ConnectorName,
+                namespace => Namespace,
                 connector => ConnectorId
             }),
             ?SERVICE_UNAVAILABLE(<<"Connector not found on remote node: ", ConnectorId/binary>>);
@@ -750,48 +842,28 @@ call_operation(NodeOrAll, OperFunc, Args = [_Nodes, ConnectorType, ConnectorName
             ?BAD_REQUEST(redact(Reason))
     end.
 
-do_bpapi_call(all, Call, Args) ->
-    maybe_unwrap(
-        do_bpapi_call_vsn(emqx_bpapi:supported_version(emqx_connector), Call, Args)
-    );
-do_bpapi_call(Node, Call, Args) ->
-    case lists:member(Node, mria:running_nodes()) of
-        true ->
-            do_bpapi_call_vsn(emqx_bpapi:supported_version(Node, emqx_connector), Call, Args);
-        false ->
-            {error, {node_not_found, Node}}
-    end.
-
-do_bpapi_call_vsn(Version, Call, Args) ->
-    case is_supported_version(Version, Call) of
-        true ->
-            apply(emqx_connector_proto_v1, Call, Args);
-        false ->
-            {error, not_implemented}
-    end.
-
-is_supported_version(Version, Call) ->
-    lists:member(Version, supported_versions(Call)).
-
-supported_versions(_Call) -> [1].
-
-maybe_unwrap({error, not_implemented}) ->
-    {error, not_implemented};
-maybe_unwrap(RpcMulticallResult) ->
-    emqx_rpc:unwrap_erpc(RpcMulticallResult).
+do_bpapi_call(ProtoMod, Fn, Args) ->
+    emqx_rpc:unwrap_erpc(apply(ProtoMod, Fn, Args)).
 
 redact(Term) ->
     emqx_utils:redact(Term).
 
-map_to_json(M0) ->
-    %% When dealing with Hocon validation errors, `value' might contain non-serializable
-    %% values (e.g.: user_lookup_fun), so we try again without that key if serialization
-    %% fails as a best effort.
-    M1 = emqx_utils_maps:jsonable_map(M0, fun(K, V) -> {K, emqx_utils_maps:binary_string(V)} end),
-    try
-        emqx_utils_json:encode(M1)
-    catch
-        error:_ ->
-            M2 = maps:without([value, <<"value">>], M1),
-            emqx_utils_json:encode(M2)
+maybe_focus_on_request_connector(Reason0, Type0, Name0) ->
+    Type = bin(Type0),
+    Name = bin(Name0),
+    case Reason0 of
+        #{value := #{Type := #{Name := Val}}} ->
+            Reason0#{value := Val};
+        _ ->
+            Reason0
     end.
+
+get_raw_config(Namespace, KeyPath, Default) when is_binary(Namespace) ->
+    emqx:get_raw_namespaced_config(Namespace, KeyPath, Default);
+get_raw_config(?global_ns, KeyPath, Default) ->
+    emqx:get_raw_config(KeyPath, Default).
+
+get_config(Namespace, KeyPath, Default) when is_binary(Namespace) ->
+    emqx:get_namespaced_config(Namespace, KeyPath, Default);
+get_config(?global_ns, KeyPath, Default) ->
+    emqx:get_config(KeyPath, Default).

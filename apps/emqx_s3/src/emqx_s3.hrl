@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -define(VIA_GPROC(Id), {via, gproc, {n, l, Id}}).
@@ -11,3 +11,5 @@
         exit:{noproc, _} -> {error, NoProcError}
     end
 ).
+
+-define(DEFAULT_MAX_RETRIES, 2).

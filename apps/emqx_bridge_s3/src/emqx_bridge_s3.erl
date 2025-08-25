@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_s3).
@@ -20,6 +20,10 @@
 
 -export([
     connector_examples/1
+]).
+
+-export([
+    pre_config_update/4
 ]).
 
 %%-------------------------------------------------------------------------------------------------
@@ -44,11 +48,7 @@ fields(s3_connector_config) ->
     emqx_s3_schema:fields(s3_client) ++
         emqx_connector_schema:resource_opts_ref(?MODULE, s3_connector_resource_opts);
 fields(s3_connector_resource_opts) ->
-    CommonOpts = emqx_connector_schema:common_resource_opts_subfields(),
-    lists:filter(
-        fun({N, _}) -> lists:member(N, CommonOpts) end,
-        emqx_connector_schema:resource_opts_fields()
-    ).
+    emqx_connector_schema:resource_opts_fields().
 
 desc("config_connector") ->
     ?DESC(config_connector);
@@ -110,3 +110,16 @@ connector_example(put) ->
             enable_pipelining => 1
         }
     }.
+
+%% Config update
+%% `emqx_connector' API
+
+pre_config_update(Path, _Name, Conf = #{<<"transport_options">> := TransportOpts}, _ConfOld) ->
+    case emqx_connector_ssl:convert_certs(filename:join(Path), TransportOpts) of
+        {ok, NTransportOpts} ->
+            {ok, Conf#{<<"transport_options">> := NTransportOpts}};
+        {error, Error} ->
+            {error, Error}
+    end;
+pre_config_update(_Path, _Name, Conf, _ConfOld) ->
+    {ok, Conf}.

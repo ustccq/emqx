@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_data_backup_SUITE).
@@ -19,13 +8,41 @@
 -compile(nowarn_export_all).
 
 -include_lib("emqx_utils/include/emqx_message.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
+-import(emqx_common_test_helpers, [on_exit/1]).
+
 -define(ROLE_SUPERUSER, <<"administrator">>).
 -define(ROLE_API_SUPERUSER, <<"administrator">>).
 -define(BOOTSTRAP_BACKUP, "emqx-export-test-bootstrap-ce.tar.gz").
+
+-define(CACERT, <<
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIDUTCCAjmgAwIBAgIJAPPYCjTmxdt/MA0GCSqGSIb3DQEBCwUAMD8xCzAJBgNV\n"
+    "BAYTAkNOMREwDwYDVQQIDAhoYW5nemhvdTEMMAoGA1UECgwDRU1RMQ8wDQYDVQQD\n"
+    "DAZSb290Q0EwHhcNMjAwNTA4MDgwNjUyWhcNMzAwNTA2MDgwNjUyWjA/MQswCQYD\n"
+    "VQQGEwJDTjERMA8GA1UECAwIaGFuZ3pob3UxDDAKBgNVBAoMA0VNUTEPMA0GA1UE\n"
+    "AwwGUm9vdENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzcgVLex1\n"
+    "EZ9ON64EX8v+wcSjzOZpiEOsAOuSXOEN3wb8FKUxCdsGrsJYB7a5VM/Jot25Mod2\n"
+    "juS3OBMg6r85k2TWjdxUoUs+HiUB/pP/ARaaW6VntpAEokpij/przWMPgJnBF3Ur\n"
+    "MjtbLayH9hGmpQrI5c2vmHQ2reRZnSFbY+2b8SXZ+3lZZgz9+BaQYWdQWfaUWEHZ\n"
+    "uDaNiViVO0OT8DRjCuiDp3yYDj3iLWbTA/gDL6Tf5XuHuEwcOQUrd+h0hyIphO8D\n"
+    "tsrsHZ14j4AWYLk1CPA6pq1HIUvEl2rANx2lVUNv+nt64K/Mr3RnVQd9s8bK+TXQ\n"
+    "KGHd2Lv/PALYuwIDAQABo1AwTjAdBgNVHQ4EFgQUGBmW+iDzxctWAWxmhgdlE8Pj\n"
+    "EbQwHwYDVR0jBBgwFoAUGBmW+iDzxctWAWxmhgdlE8PjEbQwDAYDVR0TBAUwAwEB\n"
+    "/zANBgkqhkiG9w0BAQsFAAOCAQEAGbhRUjpIred4cFAFJ7bbYD9hKu/yzWPWkMRa\n"
+    "ErlCKHmuYsYk+5d16JQhJaFy6MGXfLgo3KV2itl0d+OWNH0U9ULXcglTxy6+njo5\n"
+    "CFqdUBPwN1jxhzo9yteDMKF4+AHIxbvCAJa17qcwUKR5MKNvv09C6pvQDJLzid7y\n"
+    "E2dkgSuggik3oa0427KvctFf8uhOV94RvEDyqvT5+pgNYZ2Yfga9pD/jjpoHEUlo\n"
+    "88IGU8/wJCx3Ds2yc8+oBg/ynxG8f/HmCC1ET6EHHoe2jlo8FpU/SgGtghS1YL30\n"
+    "IWxNsPrUP+XsZpBJy/mvOhE5QXo6Y35zDqqj8tI7AGmAWu22jg==\n"
+    "-----END CERTIFICATE-----"
+>>).
+-define(GLOBAL_AUTHN_CHAIN, 'mqtt:global').
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
@@ -44,13 +61,13 @@ init_per_testcase(TC = t_import_on_cluster, Config) ->
     meck:expect(
         emqx_mgmt_listeners_conf,
         import_config,
-        1,
+        2,
         {ok, #{changed => [], root_key => listeners}}
     ),
     meck:expect(
         emqx_gateway_conf,
         import_config,
-        1,
+        2,
         {ok, #{changed => [], root_key => gateway}}
     ),
     [{cluster, cluster(TC, Config)} | setup(TC, Config)];
@@ -58,7 +75,7 @@ init_per_testcase(TC = t_verify_imported_mnesia_tab_on_cluster, Config) ->
     [{cluster, cluster(TC, Config)} | setup(TC, Config)];
 init_per_testcase(t_mnesia_bad_tab_schema, Config) ->
     meck:new(emqx_mgmt_data_backup, [passthrough]),
-    meck:expect(TC = emqx_mgmt_data_backup, mnesia_tabs_to_backup, 0, [?MODULE]),
+    meck:expect(TC = emqx_mgmt_data_backup, modules_with_mnesia_tabs_to_backup, 0, [?MODULE]),
     setup(TC, Config);
 init_per_testcase(TC, Config) ->
     setup(TC, Config).
@@ -81,95 +98,242 @@ t_empty_export_import(_Config) ->
     ExpRawConf = emqx:get_raw_config([]),
     {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
     Exp = {ok, #{db_errors => #{}, config_errors => #{}}},
-    ?assertEqual(Exp, emqx_mgmt_data_backup:import(FileName)),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))),
     ?assertEqual(ExpRawConf, emqx:get_raw_config([])),
     %% idempotent update assert
-    ?assertEqual(Exp, emqx_mgmt_data_backup:import(FileName)),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))),
     ?assertEqual(ExpRawConf, emqx:get_raw_config([])).
 
 t_cluster_hocon_import_mqtt_subscribers_retainer_messages(Config) ->
-    case emqx_release:edition() of
-        ce ->
-            ok;
-        ee ->
-            FNameEmqx44 = "emqx-export-4.4.24-retainer-mqttsub.tar.gz",
-            BackupFile = filename:join(?config(data_dir, Config), FNameEmqx44),
-            Exp = {ok, #{db_errors => #{}, config_errors => #{}}},
-            ?assertEqual(Exp, emqx_mgmt_data_backup:import(BackupFile)),
-            RawConfAfterImport = emqx:get_raw_config([]),
-            %% verify that MQTT sources are imported
-            ?assertMatch(
-                #{<<"sources">> := #{<<"mqtt">> := Sources}} when map_size(Sources) > 0,
-                RawConfAfterImport
-            ),
-            %% verify that retainer messages are imported
-            ?assertMatch(
-                {ok, [#message{payload = <<"test-payload">>}]},
-                emqx_retainer:read_message(<<"test-retained-message/1">>)
-            ),
-            %% Export and import again
-            {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
-            ?assertEqual(Exp, emqx_mgmt_data_backup:import(FileName)),
-            ?assertEqual(RawConfAfterImport, emqx:get_raw_config([]))
-    end,
+    FNameEmqx44 = "emqx-export-4.4.24-retainer-mqttsub.tar.gz",
+    BackupFile = filename:join(?config(data_dir, Config), FNameEmqx44),
+    Exp = {ok, #{db_errors => #{}, config_errors => #{}}},
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import_local(BackupFile)),
+    RawConfAfterImport = emqx:get_raw_config([]),
+    %% verify that MQTT sources are imported
+    ?assertMatch(
+        #{<<"sources">> := #{<<"mqtt">> := Sources}} when map_size(Sources) > 0,
+        RawConfAfterImport
+    ),
+    %% verify that retainer messages are imported
+    ?assertMatch(
+        {ok, [#message{payload = <<"test-payload">>}]},
+        emqx_retainer:read_message(<<"test-retained-message/1">>)
+    ),
+    %% Export and import again
+    {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))),
+    ?assertEqual(
+        remove_time_based_fields(RawConfAfterImport),
+        remove_time_based_fields(emqx:get_raw_config([]))
+    ),
+    ok.
+
+t_import_retained_messages(Config) ->
+    FName = "emqx-export-ce-retained-msgs-test.tar.gz",
+    BackupFile = filename:join(?config(data_dir, Config), FName),
+    Exp = {ok, #{db_errors => #{}, config_errors => #{}}},
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import_local(BackupFile)),
+    %% verify that retainer messages are imported
+    ?assertMatch(
+        {ok, [#message{payload = <<"Hi 1!!!">>}]},
+        emqx_retainer:read_message(<<"t/backup-retainer/test1">>)
+    ),
+    ?assertMatch(
+        {ok, [#message{payload = <<"Hi 5!!!">>}]},
+        emqx_retainer:read_message(<<"t/backup-retainer/test5">>)
+    ),
+
+    %% verify that messages are re-indexed
+    ?assertMatch(
+        {ok, _, [
+            #message{payload = <<"Hi 5!!!">>},
+            #message{payload = <<"Hi 4!!!">>},
+            #message{payload = <<"Hi 3!!!">>},
+            #message{payload = <<"Hi 2!!!">>},
+            #message{payload = <<"Hi 1!!!">>}
+        ]},
+        emqx_retainer:page_read(<<"t/backup-retainer/#">>, 1, 5)
+    ),
+    %% Export and import again
+    {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))).
+
+t_export_ram_retained_messages(_Config) ->
+    {ok, _} = emqx_retainer:update_config(
+        #{
+            <<"enable">> => true,
+            <<"backend">> => #{<<"storage_type">> => <<"ram">>}
+        }
+    ),
+    ?assertEqual(ram_copies, mnesia:table_info(emqx_retainer_message, storage_type)),
+    Topic = <<"t/backup_test_export_retained_ram/1">>,
+    Payload = <<"backup_test_retained_ram">>,
+    Msg = emqx_message:make(
+        <<"backup_test">>,
+        ?QOS_0,
+        Topic,
+        Payload,
+        #{retain => true},
+        #{}
+    ),
+    _ = emqx_broker:publish(Msg),
+    {ok, #{filename := BackupFileName}} = emqx_mgmt_data_backup:export(),
+    ok = emqx_retainer:delete(Topic),
+    ?assertEqual({ok, []}, emqx_retainer:read_message(Topic)),
+    ?assertEqual(
+        {ok, #{db_errors => #{}, config_errors => #{}}},
+        emqx_mgmt_data_backup:import(basename(BackupFileName))
+    ),
+    ?assertMatch({ok, [#message{payload = Payload}]}, emqx_retainer:read_message(Topic)).
+
+t_export_cloud_subset(Config) ->
+    setup_t_export_cloud_subset_scenario(),
+    Opts = #{
+        raw_conf_transform => fun(RawConf) ->
+            maps:with(
+                [
+                    <<"connectors">>,
+                    <<"actions">>,
+                    <<"sources">>,
+                    <<"rule_engine">>,
+                    <<"schema_registry">>
+                ],
+                RawConf
+            )
+        end,
+        mnesia_table_filter => fun(TableName) ->
+            lists:member(
+                TableName,
+                [
+                    %% mnesia builtin authn
+                    emqx_authn_mnesia,
+                    emqx_authn_scram_mnesia,
+                    %% mnesia builtin authz
+                    emqx_acl,
+                    %% banned
+                    emqx_banned,
+                    emqx_banned_rules
+                ]
+            )
+        end
+    },
+    {ok, #{filename := BackupFileName}} = emqx_mgmt_data_backup:export(Opts),
+    #{
+        cluster_hocon := RawHocon,
+        mnesia_tables := Tables
+    } = inspect_backup(BackupFileName),
+    {ok, Hocon} = hocon:binary(RawHocon),
+    ?assertEqual(
+        lists:sort([
+            <<"connectors">>,
+            <<"actions">>,
+            <<"sources">>,
+            <<"rule_engine">>,
+            <<"schema_registry">>
+        ]),
+        lists:sort(maps:keys(Hocon))
+    ),
+    ?assertEqual(
+        lists:sort([
+            <<"emqx_authn_mnesia">>,
+            <<"emqx_authn_scram_mnesia">>,
+            <<"emqx_acl">>,
+            <<"emqx_banned">>,
+            <<"emqx_banned_rules">>
+        ]),
+        lists:sort(maps:keys(Tables))
+    ),
+    %% Using a fresh cluster to avoid dirty environment.
+    Nodes = [N1 | _] = cluster(?FUNCTION_NAME, Config),
+    on_exit(fun() -> emqx_cth_cluster:stop(Nodes) end),
+    ?ON(
+        N1,
+        ?assertEqual(
+            {ok, #{db_errors => #{}, config_errors => #{}}},
+            emqx_mgmt_data_backup:import_local(BackupFileName)
+        )
+    ),
     ok.
 
 t_cluster_hocon_export_import(Config) ->
     RawConfBeforeImport = emqx:get_raw_config([]),
     BootstrapFile = filename:join(?config(data_dir, Config), ?BOOTSTRAP_BACKUP),
     Exp = {ok, #{db_errors => #{}, config_errors => #{}}},
-    ?assertEqual(Exp, emqx_mgmt_data_backup:import(BootstrapFile)),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import_local(BootstrapFile)),
     RawConfAfterImport = emqx:get_raw_config([]),
     ?assertNotEqual(RawConfBeforeImport, RawConfAfterImport),
     {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
-    ?assertEqual(Exp, emqx_mgmt_data_backup:import(FileName)),
-    ?assertEqual(RawConfAfterImport, emqx:get_raw_config([])),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))),
+    ?assertEqual(
+        remove_time_based_fields(RawConfAfterImport),
+        remove_time_based_fields(emqx:get_raw_config([]))
+    ),
     %% idempotent update assert
-    ?assertEqual(Exp, emqx_mgmt_data_backup:import(FileName)),
-    ?assertEqual(RawConfAfterImport, emqx:get_raw_config([])),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))),
+    ?assertEqual(
+        remove_time_based_fields(RawConfAfterImport),
+        remove_time_based_fields(emqx:get_raw_config([]))
+    ),
     %% lookup file inside <data_dir>/backup
-    ?assertEqual(Exp, emqx_mgmt_data_backup:import(filename:basename(FileName))),
+    ?assertEqual(Exp, emqx_mgmt_data_backup:import(basename(FileName))),
 
     %% backup data migration test
-    ?assertMatch([_, _, _], ets:tab2list(emqx_app)),
+    ?assertMatch([_, _, _, _], ets:tab2list(emqx_app)),
     ?assertMatch(
         {ok, #{name := <<"key_to_export2">>, role := ?ROLE_API_SUPERUSER}},
         emqx_mgmt_auth:read(<<"key_to_export2">>)
     ),
     ok.
 
-t_ee_to_ce_backup(Config) ->
-    case emqx_release:edition() of
-        ce ->
-            EEBackupFileName = filename:join(?config(priv_dir, Config), "export-backup-ee.tar.gz"),
-            Meta = unicode:characters_to_binary(
-                hocon_pp:do(#{edition => ee, version => emqx_release:version()}, #{})
-            ),
-            ok = erl_tar:create(
-                EEBackupFileName,
-                [
-                    {"export-backup-ee/cluster.hocon", <<>>},
-                    {"export-backup-ee/META.hocon", Meta}
-                ],
-                [compressed]
-            ),
-            ExpReason = ee_to_ce_backup,
-            ?assertEqual(
-                {error, ExpReason}, emqx_mgmt_data_backup:import(EEBackupFileName)
-            ),
-            %% Must be translated to a readable string
-            ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(ExpReason));
-        ee ->
-            %% Don't fail if the test is run with emqx-enterprise profile
-            ok
-    end.
+t_tar_outside_backup_dir(Config) ->
+    BackupFileName = filename:join(?config(priv_dir, Config), "tar_outside_backup_dir.tar.gz"),
+    Meta = unicode:characters_to_binary(
+        hocon_pp:do(#{edition => emqx_release:edition(), version => emqx_release:version()}, #{})
+    ),
+    ok = erl_tar:create(
+        BackupFileName,
+        [
+            {"tar_outside_backup_dir/../../cluster.hocon", <<>>},
+            {"tar_outside_backup_dir/META.hocon", Meta}
+        ],
+        [compressed]
+    ),
+    {error, Message} = emqx_mgmt_data_backup:import_local(BackupFileName),
+    ?assert(
+        string:str(Message, "The path points above the current working directory") > 0
+    ).
+
+t_unsafe_backup_name(Config) ->
+    {ok, #{filename := Filename}} = emqx_mgmt_data_backup:export(),
+    ?assert(filelib:is_regular(Filename)),
+    BackupFileName = filename:join(?config(priv_dir, Config), "...tar.gz"),
+    Meta = unicode:characters_to_binary(
+        hocon_pp:do(#{edition => emqx_release:edition(), version => emqx_release:version()}, #{})
+    ),
+    ok = erl_tar:create(
+        BackupFileName,
+        [
+            {"../cluster.hocon", <<>>},
+            {"../META.hocon", Meta}
+        ],
+        [compressed]
+    ),
+    {ok, BackupFileContent} = file:read_file(BackupFileName),
+    ?assertEqual(
+        {error, unsafe_backup_name},
+        emqx_mgmt_data_backup:upload(filename:basename(BackupFileName), BackupFileContent)
+    ),
+    ?assert(filelib:is_regular(Filename)).
 
 t_no_backup_file(_Config) ->
-    ExpReason = not_found,
+    ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(not_found)),
     ?assertEqual(
         {error, not_found}, emqx_mgmt_data_backup:import("no_such_backup.tar.gz")
     ),
-    ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(ExpReason)).
+    ?assertEqual(
+        {error, not_found}, emqx_mgmt_data_backup:import_local("/no_such_backup.tar.gz")
+    ).
 
 t_bad_backup_file(Config) ->
     BadFileName = filename:join(?config(priv_dir, Config), "export-bad-backup-tar-gz"),
@@ -219,23 +383,23 @@ t_bad_backup_file(Config) ->
     BadArchiveDirReason = bad_archive_dir,
     InvalidEditionReason = invalid_edition,
     InvalidVersionReason = invalid_version,
-    ?assertEqual({error, BadFileNameReason}, emqx_mgmt_data_backup:import(BadFileName)),
+    ?assertEqual({error, BadFileNameReason}, emqx_mgmt_data_backup:import_local(BadFileName)),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(BadFileNameReason)),
-    ?assertEqual({error, NoMetaReason}, emqx_mgmt_data_backup:import(NoMetaFileName)),
+    ?assertEqual({error, NoMetaReason}, emqx_mgmt_data_backup:import_local(NoMetaFileName)),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(NoMetaReason)),
     ?assertEqual(
         {error, BadArchiveDirReason},
-        emqx_mgmt_data_backup:import(BadArchiveDirFileName)
+        emqx_mgmt_data_backup:import_local(BadArchiveDirFileName)
     ),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(BadArchiveDirReason)),
     ?assertEqual(
         {error, InvalidEditionReason},
-        emqx_mgmt_data_backup:import(InvalidEditionFileName)
+        emqx_mgmt_data_backup:import_local(InvalidEditionFileName)
     ),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(InvalidEditionReason)),
     ?assertEqual(
         {error, InvalidVersionReason},
-        emqx_mgmt_data_backup:import(InvalidVersionFileName)
+        emqx_mgmt_data_backup:import_local(InvalidVersionFileName)
     ),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(InvalidVersionReason)).
 
@@ -272,8 +436,8 @@ t_future_version(Config) ->
     ),
     ExpMajorReason = {unsupported_version, FutureMajorVersion},
     ExpMinorReason = {unsupported_version, FutureMinorVersion},
-    ?assertEqual({error, ExpMajorReason}, emqx_mgmt_data_backup:import(MajorFileName)),
-    ?assertEqual({error, ExpMinorReason}, emqx_mgmt_data_backup:import(MinorFileName)),
+    ?assertEqual({error, ExpMajorReason}, emqx_mgmt_data_backup:import_local(MajorFileName)),
+    ?assertEqual({error, ExpMinorReason}, emqx_mgmt_data_backup:import_local(MinorFileName)),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(ExpMajorReason)),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(ExpMinorReason)).
 
@@ -298,15 +462,39 @@ t_bad_config(Config) ->
         ],
         [compressed]
     ),
-    Res = emqx_mgmt_data_backup:import(BadConfigFileName),
+    Res = emqx_mgmt_data_backup:import_local(BadConfigFileName),
     ?assertMatch({error, #{kind := validation_error}}, Res).
+
+t_cluster_links(_Config) ->
+    Link = #{
+        <<"name">> => <<"emqxcl_backup_test">>,
+        <<"server">> => <<"emqx.emqxcl_backup_test.host:41883">>,
+        <<"topics">> => [<<"#">>],
+        <<"ssl">> => #{<<"enable">> => true, <<"cacertfile">> => ?CACERT}
+    },
+    {ok, [RawLink]} = emqx_cluster_link_config:update([Link]),
+    {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
+    {ok, []} = emqx_cluster_link_config:update([]),
+    #{<<"ssl">> := #{<<"cacertfile">> := CertPath}} = RawLink,
+    _ = file:delete(CertPath),
+    ?assertEqual(
+        {ok, #{db_errors => #{}, config_errors => #{}}},
+        emqx_mgmt_data_backup:import(basename(FileName))
+    ),
+    [
+        #{
+            <<"name">> := <<"emqxcl_backup_test">>,
+            <<"ssl">> := #{<<"cacertfile">> := CertPath1}
+        }
+    ] = emqx:get_raw_config([cluster, links]),
+    ?assertEqual({ok, ?CACERT}, file:read_file(CertPath1)).
 
 t_import_on_cluster(Config) ->
     %% Randomly chosen config key to verify import result additionally
     ?assertEqual([], emqx:get_config([authentication])),
     BootstrapFile = filename:join(?config(data_dir, Config), ?BOOTSTRAP_BACKUP),
     ExpImportRes = {ok, #{db_errors => #{}, config_errors => #{}}},
-    ?assertEqual(ExpImportRes, emqx_mgmt_data_backup:import(BootstrapFile)),
+    ?assertEqual(ExpImportRes, emqx_mgmt_data_backup:import_local(BootstrapFile)),
     ImportedAuthnConf = emqx:get_config([authentication]),
     ?assertMatch([_ | _], ImportedAuthnConf),
     {ok, #{filename := FileName}} = emqx_mgmt_data_backup:export(),
@@ -316,13 +504,13 @@ t_import_on_cluster(Config) ->
     ReplImportReason = not_core_node,
     ?assertEqual(
         {error, ReplImportReason},
-        rpc:call(ReplicantNode, emqx_mgmt_data_backup, import, [AbsFilePath])
+        rpc:call(ReplicantNode, emqx_mgmt_data_backup, import_local, [AbsFilePath])
     ),
     ?assertMatch([_ | _], emqx_mgmt_data_backup:format_error(ReplImportReason)),
     [?assertEqual([], rpc:call(N, emqx, get_config, [[authentication]])) || N <- NodesList],
     ?assertEqual(
         ExpImportRes,
-        rpc:call(CoreNode1, emqx_mgmt_data_backup, import, [AbsFilePath])
+        rpc:call(CoreNode1, emqx_mgmt_data_backup, import_local, [AbsFilePath])
     ),
     [
         ?assertEqual(
@@ -349,10 +537,10 @@ t_verify_imported_mnesia_tab_on_cluster(Config) ->
 
     ?assertEqual(
         {ok, #{db_errors => #{}, config_errors => #{}}},
-        rpc:call(CoreNode1, emqx_mgmt_data_backup, import, [AbsFilePath])
+        rpc:call(CoreNode1, emqx_mgmt_data_backup, import_local, [AbsFilePath])
     ),
 
-    [Tab] = emqx_dashboard_admin:backup_tables(),
+    {_Name, [Tab]} = emqx_dashboard_admin:backup_tables(),
     AllUsers = lists:sort(mnesia:dirty_all_keys(Tab) ++ UsersBeforeImport),
     [
         ?assertEqual(
@@ -367,7 +555,7 @@ t_verify_imported_mnesia_tab_on_cluster(Config) ->
     ?assertEqual(AllUsers, lists:sort(rpc:call(ReplicantNode, mnesia, dirty_all_keys, [Tab]))).
 
 backup_tables() ->
-    [data_backup_test].
+    {<<"mocked_test">>, [data_backup_test]}.
 
 t_mnesia_bad_tab_schema(_Config) ->
     OldAttributes = [id, name, description],
@@ -386,7 +574,7 @@ t_mnesia_bad_tab_schema(_Config) ->
                 #{data_backup_test => {error, {"Backup traversal failed", different_table_schema}}},
             config_errors => #{}
         }},
-        emqx_mgmt_data_backup:import(FileName)
+        emqx_mgmt_data_backup:import(basename(FileName))
     ),
     ?assertEqual([NewRec], mnesia:dirty_read(data_backup_test, <<"id">>)),
     ?assertEqual([<<"id">>], mnesia:dirty_all_keys(data_backup_test)).
@@ -424,11 +612,168 @@ t_read_files(_Config) ->
 
 setup(TC, Config) ->
     WorkDir = filename:join(emqx_cth_suite:work_dir(TC, Config), local),
-    Started = emqx_cth_suite:start(apps_to_start(), #{work_dir => WorkDir}),
+    Started = emqx_cth_suite:start(apps_to_start(TC), #{work_dir => WorkDir}),
     [{suite_apps, Started} | Config].
 
 cleanup(Config) ->
+    emqx_common_test_helpers:call_janitor(),
     emqx_cth_suite:stop(?config(suite_apps, Config)).
+
+setup_t_export_cloud_subset_scenario() ->
+    ok = emqx_dashboard:stop_listeners(),
+    {ok, _} = emqx_conf:update(
+        [dashboard, listeners, http, bind],
+        18083,
+        #{override_to => cluster}
+    ),
+    ok = emqx_dashboard:start_listeners(),
+    {ok, _} = emqx_license:update_key(<<"default">>),
+    {ok, _} = emqx_dashboard_admin:add_user(
+        <<"some_admin">>,
+        <<"Adminpass123">>,
+        ?ROLE_SUPERUSER,
+        <<"shouldn't be exported">>
+    ),
+    {ok, _} = emqx_authn_chains:create_authenticator(
+        ?GLOBAL_AUTHN_CHAIN,
+        #{
+            mechanism => password_based,
+            backend => built_in_database,
+            enable => true,
+            user_id_type => username,
+            password_hash_algorithm => #{
+                name => plain,
+                salt_position => suffix
+            }
+        }
+    ),
+    {ok, _} = emqx_authn_chains:add_user(
+        ?GLOBAL_AUTHN_CHAIN,
+        <<"password_based:built_in_database">>,
+        #{
+            user_id => <<"user1">>,
+            password => <<"user1pass">>
+        }
+    ),
+    ok = emqx_authz_mnesia:store_rules(
+        {username, <<"user2">>},
+        [
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"action">> => <<"publish">>,
+                <<"topic">> => <<"t">>
+            },
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"action">> => <<"subscribe">>,
+                <<"topic">> => <<"t/+">>
+            }
+        ]
+    ),
+    ConnectorName1 = <<"source1">>,
+    ConnectorConfig1 = #{
+        <<"enable">> => true,
+        <<"description">> => <<"my connector">>,
+        <<"pool_size">> => 3,
+        <<"proto_ver">> => <<"v5">>,
+        <<"server">> => <<"127.0.0.1:1883">>,
+        <<"resource_opts">> => #{
+            <<"health_check_interval">> => <<"15s">>,
+            <<"start_after_created">> => true,
+            <<"start_timeout">> => <<"5s">>
+        }
+    },
+    {201, _} = emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_connector_api([
+            {connector_type, <<"mqtt">>},
+            {connector_name, ConnectorName1},
+            {connector_config, ConnectorConfig1}
+        ])
+    ),
+    {201, _} = emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_kind_api([
+            {bridge_kind, source},
+            {source_type, <<"mqtt">>},
+            {source_name, <<"source1">>},
+            {source_config, #{
+                <<"enable">> => true,
+                <<"connector">> => ConnectorName1,
+                <<"parameters">> =>
+                    #{
+                        <<"topic">> => <<"remote/topic">>,
+                        <<"qos">> => 2
+                    },
+                <<"resource_opts">> => #{
+                    <<"health_check_interval">> => <<"15s">>,
+                    <<"resume_interval">> => <<"15s">>
+                }
+            }}
+        ])
+    ),
+    ConnectorName2 = <<"action1">>,
+    {201, _} = emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_connector_api([
+            {connector_type, <<"mqtt">>},
+            {connector_name, ConnectorName2},
+            {connector_config, ConnectorConfig1}
+        ])
+    ),
+    {201, _} = emqx_bridge_v2_testlib:simplify_result(
+        emqx_bridge_v2_testlib:create_kind_api([
+            {bridge_kind, action},
+            {action_type, <<"mqtt">>},
+            {action_name, <<"action1">>},
+            {action_config, #{
+                <<"enable">> => true,
+                <<"connector">> => ConnectorName1,
+                <<"parameters">> =>
+                    #{
+                        <<"topic">> => <<"local/topic">>,
+                        <<"qos">> => 2
+                    },
+                <<"resource_opts">> => #{
+                    <<"health_check_interval">> => <<"15s">>,
+                    <<"resume_interval">> => <<"15s">>
+                }
+            }}
+        ])
+    ),
+    {ok, _} = emqx_bridge_v2_testlib:create_rule_api(#{
+        sql => <<"select * from '$bridges/mqtt:source1'">>,
+        actions => []
+    }),
+    {ok, _} = emqx_bridge_v2_testlib:create_rule_api(#{
+        sql => <<"select * from 't/action'">>,
+        actions => [<<"mqtt:action1">>]
+    }),
+    {201, _} = emqx_mgmt_api_test_util:simple_request(
+        post,
+        emqx_mgmt_api_test_util:api_path(["cluster", "links"]),
+        #{
+            <<"name">> => <<"clink1">>,
+            <<"clientid">> => <<"linkclientid">>,
+            <<"password">> => <<"my secret password">>,
+            <<"pool_size">> => 1,
+            <<"server">> => <<"emqxcl_2.nohost:31883">>,
+            <<"topics">> => [<<"t/test-topic">>, <<"t/test/#">>]
+        }
+    ),
+    {201, _} = emqx_mgmt_api_test_util:simple_request(
+        post,
+        emqx_mgmt_api_test_util:api_path(["schema_registry"]),
+        #{
+            <<"name">> => <<"schema1">>,
+            <<"type">> => <<"json">>,
+            <<"source">> => emqx_utils_json:encode(#{
+                properties => #{
+                    foo => #{},
+                    bar => #{}
+                },
+                required => [<<"foo">>]
+            })
+        }
+    ),
+    ok.
 
 users(Prefix) ->
     [
@@ -447,11 +792,14 @@ recompose_version(MajorInt, MinorInt, Patch) ->
 cluster(TC, Config) ->
     Nodes = emqx_cth_cluster:start(
         [
-            {data_backup_core1, #{role => core, apps => apps_to_start()}},
-            {data_backup_core2, #{role => core, apps => apps_to_start()}},
-            {data_backup_replicant, #{role => replicant, apps => apps_to_start()}}
+            {data_backup_core1, #{role => core, apps => apps_to_start(TC)}},
+            {data_backup_core2, #{role => core, apps => apps_to_start(TC)}},
+            {data_backup_replicant, #{role => replicant, apps => apps_to_start(TC)}}
         ],
-        #{work_dir => emqx_cth_suite:work_dir(TC, Config)}
+        #{
+            work_dir => emqx_cth_suite:work_dir(TC, Config),
+            start_apps_timeout => 60_000
+        }
     ),
     Nodes.
 
@@ -471,13 +819,20 @@ create_test_tab(Attributes) ->
     ]),
     ok = mria:wait_for_tables([data_backup_test]).
 
+apps_to_start(t_cluster_links) ->
+    apps_to_start() ++ [emqx_cluster_link];
+apps_to_start(t_export_cloud_subset) ->
+    apps_to_start() ++ [emqx_schema_registry, emqx_cluster_link];
+apps_to_start(_TC) ->
+    apps_to_start().
+
 apps_to_start() ->
     [
         {emqx, #{override_env => [{boot_modules, [broker]}]}},
-        {emqx_conf, #{config => #{dashboard => #{listeners => #{http => #{bind => <<"0">>}}}}}},
+        {emqx_conf, #{config => #{}}},
+        {emqx_license, ""},
         emqx_psk,
         emqx_management,
-        emqx_dashboard,
         emqx_auth,
         emqx_auth_http,
         emqx_auth_jwt,
@@ -492,9 +847,9 @@ apps_to_start() ->
         emqx_modules,
         emqx_gateway,
         emqx_exhook,
-        emqx_bridge_http,
         emqx_bridge,
         emqx_auto_subscribe,
+        emqx_mgmt_api_test_util:emqx_dashboard("dashboard.listeners.http.bind = 0"),
 
         % loaded only
         emqx_gateway_lwm2m,
@@ -503,3 +858,54 @@ apps_to_start() ->
         emqx_gateway_stomp,
         emqx_gateway_mqttsn
     ].
+
+inspect_backup(Filepath) ->
+    {ok, Contents} = erl_tar:extract(Filepath, [compressed, memory]),
+    [{_, Meta}] = filter_matching(Contents, <<"/META.hocon$">>),
+    [{_, ClusterHocon}] = filter_matching(Contents, <<"/cluster.hocon$">>),
+    MnesiaTables0 = filter_matching(Contents, <<"/mnesia/.*$">>),
+    MnesiaTables1 = lists:map(
+        fun({Path, FileContents}) ->
+            {strip_prefix(Path, 2), FileContents}
+        end,
+        MnesiaTables0
+    ),
+    #{
+        meta => Meta,
+        cluster_hocon => ClusterHocon,
+        mnesia_tables => maps:from_list(MnesiaTables1)
+    }.
+
+filter_matching(FileTree, RE) ->
+    lists:filter(
+        fun({Path, _FileContents}) ->
+            match =:= re:run(Path, RE, [{capture, none}])
+        end,
+        FileTree
+    ).
+
+strip_prefix(Path, N) ->
+    Segments = filename:split(Path),
+    iolist_to_binary(filename:join(lists:nthtail(N, Segments))).
+
+remove_time_based_fields(RawConf0) ->
+    %% These fields are dynamically injected when config updates happen.
+    StripBridgeDates =
+        fun(TypeToNameAndConf) ->
+            maps:map(
+                fun(_Type, NameToConf) ->
+                    maps:map(
+                        fun(_Name, Conf) ->
+                            maps:without([<<"created_at">>, <<"last_modified_at">>], Conf)
+                        end,
+                        NameToConf
+                    )
+                end,
+                TypeToNameAndConf
+            )
+        end,
+    RawConf1 = emqx_utils_maps:update_if_present(<<"actions">>, StripBridgeDates, RawConf0),
+    emqx_utils_maps:update_if_present(<<"sources">>, StripBridgeDates, RawConf1).
+
+basename(FilePath) ->
+    filename:basename(FilePath).

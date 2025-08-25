@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_coap_channel).
@@ -32,6 +20,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_timeout/3,
     terminate/2
@@ -85,7 +74,8 @@
 
 -define(INFO_KEYS, [conninfo, conn_state, clientinfo, session]).
 
--define(DEF_IDLE_TIME, timer:seconds(30)).
+-define(DEF_IDLE_SECONDS, 30).
+-define(RAND_CLIENTID_BYTES, 16).
 
 -import(emqx_coap_medium, [reply/2, reply/3, reply/4, iter/3, iter/4]).
 
@@ -120,7 +110,7 @@ stats(#channel{session = Session}) ->
 -spec init(map(), map()) -> channel().
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     #{ctx := Ctx} = Config
@@ -140,8 +130,9 @@ init(
             listener => ListenerId,
             protocol => 'coap',
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
-            clientid => emqx_guid:to_base62(emqx_guid:gen()),
+            clientid => emqx_utils:rand_id(?RAND_CLIENTID_BYTES),
             username => undefined,
             is_bridge => false,
             is_superuser => false,
@@ -149,7 +140,7 @@ init(
             mountpoint => Mountpoint
         }
     ),
-    Heartbeat = maps:get(heartbeat, Config, ?DEF_IDLE_TIME),
+    Heartbeat = maps:get(heartbeat, Config, ?DEF_IDLE_SECONDS),
     #channel{
         ctx = Ctx,
         conninfo = ConnInfo,
@@ -185,6 +176,9 @@ handle_in(Msg, Channel0) ->
         _ ->
             call_session(handle_response, Msg, Channel)
     end.
+
+handle_frame_error(Reason, Channel) ->
+    {shutdown, Reason, Channel}.
 
 %%--------------------------------------------------------------------
 %% Handle Delivers from broker to client
@@ -263,7 +257,7 @@ handle_call(
         [ClientInfo, MountedTopic, NSubOpts]
     ),
     %% modify session state
-    SubReq = {Topic, Token},
+    SubReq = #{topic => Topic, token => Token, subopts => NSubOpts},
     TempMsg = #coap_message{type = non},
     %% FIXME: The subopts is not used for emqx_coap_session
     Result = emqx_coap_session:process_subscribe(
@@ -378,7 +372,7 @@ ensure_keepalive_timer(Channel) ->
     ensure_keepalive_timer(fun ensure_timer/4, Channel).
 
 ensure_keepalive_timer(Fun, #channel{keepalive = KeepAlive} = Channel) ->
-    Heartbeat = emqx_keepalive:info(interval, KeepAlive),
+    Heartbeat = emqx_keepalive:info(check_interval, KeepAlive),
     Fun(keepalive, Heartbeat, keepalive, Channel).
 
 check_auth_state(Msg, #channel{connection_required = false} = Channel) ->
@@ -430,7 +424,6 @@ check_token(
         clientinfo = ClientInfo
     } = Channel
 ) ->
-    IsDeleteConn = is_delete_connection_request(Msg),
     #{clientid := ClientId} = ClientInfo,
     case emqx_coap_message:extract_uri_query(Msg) of
         #{
@@ -438,39 +431,17 @@ check_token(
             <<"token">> := Token
         } ->
             call_session(handle_request, Msg, Channel);
-        #{<<"clientid">> := ReqClientId, <<"token">> := ReqToken} ->
-            case emqx_gateway_cm:call(coap, ReqClientId, {check_token, ReqToken}) of
-                undefined when IsDeleteConn ->
+        _ ->
+            %% This channel is create by this DELETE command, so here can safely close this channel
+            case Token =:= undefined andalso is_delete_connection_request(Msg) of
+                true ->
                     Reply = emqx_coap_message:piggyback({ok, deleted}, Msg),
                     {shutdown, normal, Reply, Channel};
-                undefined ->
-                    ?SLOG(info, #{
-                        msg => "remote_connection_not_found",
-                        clientid => ReqClientId,
-                        token => ReqToken
-                    }),
-                    Reply = emqx_coap_message:reset(Msg),
-                    {shutdown, normal, Reply, Channel};
                 false ->
-                    ?SLOG(info, #{
-                        msg => "request_token_invalid", clientid => ReqClientId, token => ReqToken
-                    }),
-                    Reply = emqx_coap_message:piggyback({error, unauthorized}, Msg),
-                    {shutdown, normal, Reply, Channel};
-                true ->
-                    %% hack: since each message request can spawn a new connection
-                    %% process, we can't rely on the `inc_incoming_stats' call in
-                    %% `emqx_gateway_conn:handle_incoming' to properly keep track of
-                    %% bumping incoming requests for an existing channel.  Since this
-                    %% number is used by keepalive, we have to bump it inside the
-                    %% requested channel/connection pid so heartbeats actually work.
-                    emqx_gateway_cm:cast(coap, ReqClientId, inc_recv_pkt),
-                    call_session(handle_request, Msg, Channel)
-            end;
-        _ ->
-            ErrMsg = <<"Missing token or clientid in connection mode">>,
-            Reply = emqx_coap_message:piggyback({error, bad_request}, ErrMsg, Msg),
-            {shutdown, normal, Reply, Channel}
+                    ErrMsg = <<"Missing token or clientid in connection mode">>,
+                    Reply = emqx_coap_message:piggyback({error, bad_request}, ErrMsg, Msg),
+                    {ok, {outgoing, Reply}, Channel}
+            end
     end.
 
 run_conn_hooks(
@@ -495,13 +466,16 @@ enrich_conninfo(
 ) ->
     case Queries of
         #{<<"clientid">> := ClientId} ->
-            Interval = maps:get(interval, emqx_keepalive:info(KeepAlive)),
+            %% in milliseconds
+            IntervalMs = emqx_keepalive:info(check_interval, KeepAlive),
+            %% in seconds
+            InternalS = floor(IntervalMs / 1000),
             NConnInfo = ConnInfo#{
                 clientid => ClientId,
                 proto_name => <<"CoAP">>,
                 proto_ver => <<"1">>,
                 clean_start => true,
-                keepalive => Interval,
+                keepalive => InternalS,
                 expiry_interval => 0
             },
             {ok, Channel#channel{conninfo = NConnInfo}};
@@ -785,6 +759,7 @@ process_connection(
 ) when
     ConnState == connected
 ->
+    %% TODO should take over the session here
     Queries = emqx_coap_message:extract_uri_query(Req),
     ErrMsg0 =
         case Queries of

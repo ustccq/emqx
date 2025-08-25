@@ -1,11 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_schema_registry).
 
 -behaviour(gen_server).
--behaviour(emqx_config_handler).
--behaviour(emqx_config_backup).
 
 -include("emqx_schema_registry.hrl").
 -include_lib("emqx/include/logger.hrl").
@@ -16,6 +14,9 @@
     start_link/0,
     add_schema/2,
     get_schema/1,
+    get_schema_raw_with_defaults/1,
+    is_existing_type/1,
+    is_existing_type/2,
     delete_schema/1,
     list_schemas/0
 ]).
@@ -29,12 +30,11 @@
     terminate/2
 ]).
 
-%% `emqx_config_handler' API
--export([post_config_update/5]).
-
-%% Data backup
+%% Internal exports for `emqx_schema_registry_config'
 -export([
-    import_config/1
+    async_delete_serdes/1,
+    ensure_serde_absent/1,
+    build_serdes/1
 ]).
 
 %% for testing
@@ -42,16 +42,45 @@
     get_serde/1
 ]).
 
+-export_type([
+    serde_type/0,
+    schema_name/0
+]).
+
+%%-------------------------------------------------------------------------------------------------
+%% Type definitions
+%%-------------------------------------------------------------------------------------------------
+
+-define(BAD_SCHEMA_NAME, <<"bad_schema_name">>).
+
+-type schema_config_req() :: schema() | protobuf_bundle_req().
+
 -type schema() :: #{
     type := serde_type(),
     source := binary(),
     description => binary()
 }.
 
+%% #{
+%%     <<"type">> => <<"protobuf">>,
+%%     <<"source">> => #{
+%%         <<"type">> => <<"bundle">>,
+%%         <<"files">> => [
+%%             #{
+%%                 <<"root">> => true,
+%%                 <<"path">> => <<"some.proto">>,
+%%                 <<"contents">> => <<"message Bah {...">>
+%%             }
+%%         ]
+%%     }
+%% }
+-type protobuf_bundle_req() :: map().
+
 %%-------------------------------------------------------------------------------------------------
 %% API
 %%-------------------------------------------------------------------------------------------------
 
+-spec start_link() -> gen_server:start_ret().
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -64,9 +93,17 @@ get_serde(SchemaName) ->
             {ok, Serde}
     end.
 
+-spec is_existing_type(schema_name()) -> boolean().
+is_existing_type(SchemaName) ->
+    is_existing_type(SchemaName, []).
+
+-spec is_existing_type(schema_name(), [binary()]) -> boolean().
+is_existing_type(SchemaName, Path) ->
+    emqx_schema_registry_serde:is_existing_type(SchemaName, Path).
+
 -spec get_schema(schema_name()) -> {ok, map()} | {error, not_found}.
 get_schema(SchemaName) ->
-    case
+    try
         emqx_config:get(
             [?CONF_KEY_ROOT, schemas, schema_name_bin_to_atom(SchemaName)], undefined
         )
@@ -75,9 +112,37 @@ get_schema(SchemaName) ->
             {error, not_found};
         Config ->
             {ok, Config}
+    catch
+        throw:#{reason := ?BAD_SCHEMA_NAME} ->
+            {error, not_found};
+        throw:not_found ->
+            {error, not_found}
     end.
 
--spec add_schema(schema_name(), schema()) -> ok | {error, term()}.
+get_schema_raw_with_defaults(Name) ->
+    try
+        emqx_config:get_raw(
+            [
+                ?CONF_KEY_ROOT_BIN,
+                <<"schemas">>,
+                schema_name_bin_to_atom(Name)
+            ],
+            undefined
+        )
+    of
+        undefined ->
+            {error, not_found};
+        Raw ->
+            RawConfWithDefaults = fill_schema_defaults(Raw),
+            {ok, RawConfWithDefaults}
+    catch
+        throw:#{reason := ?BAD_SCHEMA_NAME} ->
+            {error, not_found};
+        throw:not_found ->
+            {error, not_found}
+    end.
+
+-spec add_schema(schema_name(), schema_config_req()) -> ok | {error, term()}.
 add_schema(Name, Schema) ->
     RawSchema = emqx_utils_maps:binary_key_map(Schema),
     Res = emqx_conf:update(
@@ -110,79 +175,6 @@ list_schemas() ->
     emqx_config:get([?CONF_KEY_ROOT, schemas], #{}).
 
 %%-------------------------------------------------------------------------------------------------
-%% `emqx_config_handler' API
-%%-------------------------------------------------------------------------------------------------
-%% remove
-post_config_update(
-    [?CONF_KEY_ROOT, schemas, Name],
-    '$remove',
-    _NewSchemas,
-    _OldSchemas,
-    _AppEnvs
-) ->
-    async_delete_serdes([Name]),
-    ok;
-%% add or update
-post_config_update(
-    [?CONF_KEY_ROOT, schemas, NewName],
-    _Cmd,
-    NewSchemas,
-    %% undefined or OldSchemas
-    _,
-    _AppEnvs
-) ->
-    case build_serdes([{NewName, NewSchemas}]) of
-        ok ->
-            {ok, #{NewName => NewSchemas}};
-        {error, Reason, SerdesToRollback} ->
-            lists:foreach(fun ensure_serde_absent/1, SerdesToRollback),
-            {error, Reason}
-    end;
-post_config_update(?CONF_KEY_PATH, _Cmd, NewConf = #{schemas := NewSchemas}, OldConf, _AppEnvs) ->
-    OldSchemas = maps:get(schemas, OldConf, #{}),
-    #{
-        added := Added,
-        changed := Changed0,
-        removed := Removed
-    } = emqx_utils_maps:diff_maps(NewSchemas, OldSchemas),
-    Changed = maps:map(fun(_N, {_Old, New}) -> New end, Changed0),
-    RemovedNames = maps:keys(Removed),
-    case RemovedNames of
-        [] ->
-            ok;
-        _ ->
-            async_delete_serdes(RemovedNames)
-    end,
-    SchemasToBuild = maps:to_list(maps:merge(Changed, Added)),
-    case build_serdes(SchemasToBuild) of
-        ok ->
-            {ok, NewConf};
-        {error, Reason, SerdesToRollback} ->
-            lists:foreach(fun ensure_serde_absent/1, SerdesToRollback),
-            {error, Reason}
-    end;
-post_config_update(_Path, _Cmd, NewConf, _OldConf, _AppEnvs) ->
-    {ok, NewConf}.
-
-%%-------------------------------------------------------------------------------------------------
-%% Data backup
-%%-------------------------------------------------------------------------------------------------
-
-import_config(#{<<"schema_registry">> := #{<<"schemas">> := Schemas} = SchemaRegConf}) ->
-    OldSchemas = emqx:get_raw_config([?CONF_KEY_ROOT, schemas], #{}),
-    SchemaRegConf1 = SchemaRegConf#{<<"schemas">> => maps:merge(OldSchemas, Schemas)},
-    case emqx_conf:update(?CONF_KEY_PATH, SchemaRegConf1, #{override_to => cluster}) of
-        {ok, #{raw_config := #{<<"schemas">> := NewRawSchemas}}} ->
-            Changed = maps:get(changed, emqx_utils_maps:diff_maps(NewRawSchemas, OldSchemas)),
-            ChangedPaths = [[?CONF_KEY_ROOT, schemas, Name] || Name <- maps:keys(Changed)],
-            {ok, #{root_key => ?CONF_KEY_ROOT, changed => ChangedPaths}};
-        Error ->
-            {error, #{root_key => ?CONF_KEY_ROOT, reason => Error}}
-    end;
-import_config(_RawConf) ->
-    {ok, #{root_key => ?CONF_KEY_ROOT, changed => []}}.
-
-%%-------------------------------------------------------------------------------------------------
 %% `gen_server' API
 %%-------------------------------------------------------------------------------------------------
 
@@ -194,7 +186,8 @@ init(_) ->
     {ok, State, {continue, {build_serdes, Schemas}}}.
 
 handle_continue({build_serdes, Schemas}, State) ->
-    do_build_serdes(Schemas),
+    Opts = #{initial_load => true},
+    do_build_serdes(Schemas, Opts),
     {noreply, State}.
 
 handle_call(_Call, _From, State) ->
@@ -233,12 +226,15 @@ create_tables() ->
     ok.
 
 do_build_serdes(Schemas) ->
+    do_build_serdes(Schemas, _Opts = #{}).
+
+do_build_serdes(Schemas, Opts) ->
     %% We build a special serde for the Sparkplug B payload. This serde is used
     %% by the rule engine functions sparkplug_decode/1 and sparkplug_encode/1.
     ok = maybe_build_sparkplug_b_serde(),
     %% TODO: use some kind of mutex to make each core build a
     %% different serde to avoid duplicate work.  Maybe ekka_locker?
-    maps:foreach(fun do_build_serde/2, Schemas),
+    maps:foreach(fun(Name, Serde) -> do_build_serde(Name, Serde, Opts) end, Schemas),
     ?tp(schema_registry_serdes_built, #{}).
 
 maybe_build_sparkplug_b_serde() ->
@@ -287,11 +283,24 @@ build_serdes([{Name, Params} | Rest], Acc0) ->
 build_serdes([], _Acc) ->
     ok.
 
-do_build_serde(Name, Serde) when not is_binary(Name) ->
-    do_build_serde(to_bin(Name), Serde);
-do_build_serde(Name, #{type := Type, source := Source}) ->
+do_build_serde(Name, Serde) ->
+    do_build_serde(Name, Serde, _Opts = #{}).
+
+do_build_serde(Name, Serde, Opts) when not is_binary(Name) ->
+    do_build_serde(to_bin(Name), Serde, Opts);
+do_build_serde(Name, #{type := external_http = Type, parameters := Params0}, Opts) ->
+    Params =
+        case maps:get(initial_load, Opts, false) of
+            true -> Params0#{async_start => true};
+            false -> Params0
+        end,
+    do_build_serde1(Name, Type, Params);
+do_build_serde(Name, #{type := Type, source := Source}, _Opts) ->
+    do_build_serde1(Name, Type, Source).
+
+do_build_serde1(Name, Type, Params) ->
     try
-        Serde = emqx_schema_registry_serde:make_serde(Type, Name, Source),
+        Serde = emqx_schema_registry_serde:make_serde(Type, Name, Params),
         true = ets:insert(?SERDE_TAB, Serde),
         ok
     catch
@@ -317,6 +326,7 @@ ensure_serde_absent(Name) ->
         {ok, Serde} ->
             ok = emqx_schema_registry_serde:destroy(Serde),
             _ = ets:delete(?SERDE_TAB, Name),
+            ?tp("schema_registry_serde_deleted", #{name => Name}),
             ok;
         {error, not_found} ->
             ok
@@ -329,15 +339,36 @@ to_bin(A) when is_atom(A) -> atom_to_binary(A);
 to_bin(B) when is_binary(B) -> B.
 
 schema_name_bin_to_atom(Bin) when size(Bin) > 255 ->
-    erlang:throw(
-        iolist_to_binary(
-            io_lib:format(
-                "Name is is too long."
-                " Please provide a shorter name (<= 255 bytes)."
-                " The name that is too long: \"~s\"",
-                [Bin]
-            )
+    Msg = iolist_to_binary(
+        io_lib:format(
+            "Name is is too long."
+            " Please provide a shorter name (<= 255 bytes)."
+            " The name that is too long: \"~s\"",
+            [Bin]
         )
-    );
+    ),
+    Reason = #{
+        kind => validation_error,
+        reason => ?BAD_SCHEMA_NAME,
+        hint => Msg
+    },
+    throw(Reason);
 schema_name_bin_to_atom(Bin) ->
-    binary_to_atom(Bin, utf8).
+    try
+        binary_to_existing_atom(Bin, utf8)
+    catch
+        error:badarg ->
+            throw(not_found)
+    end.
+
+fill_schema_defaults(RawConf) ->
+    Name = <<"schema_name">>,
+    RootConf = #{?CONF_KEY_ROOT_BIN => #{<<"schemas">> => #{Name => RawConf}}},
+    #{
+        ?CONF_KEY_ROOT_BIN := #{
+            <<"schemas">> := #{
+                Name := RawConfWithDefaults
+            }
+        }
+    } = emqx_config:fill_defaults(emqx_schema_registry_schema, RootConf, #{}),
+    RawConfWithDefaults.

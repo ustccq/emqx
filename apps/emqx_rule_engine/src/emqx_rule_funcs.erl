@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_funcs).
@@ -39,7 +27,11 @@
     contains_topic/3,
     contains_topic_match/2,
     contains_topic_match/3,
-    null/0
+    null/0,
+    coalesce/1,
+    coalesce/2,
+    coalesce_ne/1,
+    coalesce_ne/2
 ]).
 
 %% Arithmetic Funcs
@@ -105,6 +97,7 @@
 -export([
     str/1,
     str_utf8/1,
+    str_utf16_le/1,
     bool/1,
     int/1,
     float/1,
@@ -112,7 +105,10 @@
     float2str/2,
     map/1,
     bin2hexstr/1,
-    hexstr2bin/1
+    bin2hexstr/2,
+    hexstr2bin/1,
+    hexstr2bin/2,
+    sqlserver_bin2hexstr/1
 ]).
 
 %% Data Type Validation Funcs
@@ -127,7 +123,8 @@
     is_float/1,
     is_num/1,
     is_map/1,
-    is_array/1
+    is_array/1,
+    is_empty/1
 ]).
 
 %% String Funcs
@@ -136,6 +133,8 @@
     ltrim/1,
     reverse/1,
     rtrim/1,
+    rtrim/2,
+    rm_prefix/2,
     strlen/1,
     substr/2,
     substr/3,
@@ -155,11 +154,13 @@
     replace/4,
     regex_match/2,
     regex_replace/3,
+    regex_extract/2,
     ascii/1,
     find/2,
     find/3,
     join_to_string/1,
     join_to_string/2,
+    map_to_redis_hset_args/1,
     join_to_sql_values_string/1,
     jq/2,
     jq/3,
@@ -175,7 +176,8 @@
     map_put/3,
     map_keys/1,
     map_values/1,
-    map_to_entries/1
+    map_to_entries/1,
+    map_size/1
 ]).
 
 %% For backward compatibility
@@ -250,9 +252,8 @@
     timezone_to_offset_seconds/1
 ]).
 
-%% See extra_functions_module/0 and set_extra_functions_module/1 in the
-%% emqx_rule_engine module
--callback handle_rule_function(atom(), list()) -> any() | {error, no_match_for_function}.
+%% System functions
+-export([getenv/1]).
 
 %% MongoDB specific date functions. These functions return a date tuple. The
 %% MongoDB bridge converts such date tuples to a MongoDB date type. The
@@ -425,6 +426,27 @@ null() ->
 
 bytesize(IoList) ->
     erlang:iolist_size(IoList).
+
+%% @doc coalesce returns the first non-null value
+coalesce([]) -> null();
+coalesce([undefined | T]) -> coalesce(T);
+coalesce([H | _T]) -> H.
+
+%% @doc This is a short-cut of SQL `CASE WHEN is_null(A) THEN A ELSE B END'
+coalesce(A, B) ->
+    coalesce([A, B]).
+
+%% @doc coalesce_ne returns the first non-empty value.
+%% `undefined', `""', and `<<>>' are considered 'empty'.
+coalesce_ne([]) -> null();
+coalesce_ne([undefined | T]) -> coalesce_ne(T);
+coalesce_ne(["" | T]) -> coalesce_ne(T);
+coalesce_ne([<<>> | T]) -> coalesce_ne(T);
+coalesce_ne([H | _T]) -> H.
+
+%% @doc Same as coalesce/2, but considers a value null when it's empty string.
+coalesce_ne(A, B) ->
+    coalesce_ne([A, B]).
 
 %%------------------------------------------------------------------------------
 %% Arithmetic Funcs
@@ -674,10 +696,15 @@ do_get_subbits(Bits, Sz, Len, <<"bits">>, <<"signed">>, <<"little">>) ->
 str(Data) ->
     emqx_utils_conv:bin(Data).
 
-str_utf8(Data) when is_binary(Data); is_list(Data) ->
+str_utf8(Data) when is_binary(Data) ->
     unicode:characters_to_binary(Data);
 str_utf8(Data) ->
     unicode:characters_to_binary(str(Data)).
+
+str_utf16_le(Data) when is_binary(Data) ->
+    unicode:characters_to_binary(Data, utf8, {utf16, little});
+str_utf16_le(Data) ->
+    unicode:characters_to_binary(str(Data), utf8, {utf16, little}).
 
 bool(Data) ->
     emqx_utils_conv:bool(Data).
@@ -710,10 +737,29 @@ map(Data) ->
     error(badarg, [Data]).
 
 bin2hexstr(Bin) ->
-    emqx_variform_bif:bin2hexstr(Bin).
+    bin2hexstr(Bin, undefined).
+
+bin2hexstr(Bin, undefined) ->
+    emqx_variform_bif:bin2hexstr(Bin);
+bin2hexstr(Bin, Prefix) when is_binary(Prefix) ->
+    <<Prefix/binary, (emqx_variform_bif:bin2hexstr(Bin))/binary>>.
 
 hexstr2bin(Str) ->
-    emqx_variform_bif:hexstr2bin(Str).
+    hexstr2bin(Str, undefined).
+
+hexstr2bin(Str, undefined) ->
+    emqx_variform_bif:hexstr2bin(Str);
+hexstr2bin(Str, Prefix) when is_binary(Prefix) ->
+    Length = size(Prefix),
+    case Str of
+        <<Prefix:Length/binary, Rest/binary>> ->
+            emqx_variform_bif:hexstr2bin(Rest);
+        _ ->
+            error(binary_prefix_unmatch)
+    end.
+
+sqlserver_bin2hexstr(Str) ->
+    bin2hexstr(Str, <<"0x">>).
 
 %%------------------------------------------------------------------------------
 %% NULL Funcs
@@ -753,6 +799,15 @@ is_map(_) -> false.
 is_array(T) when is_list(T) -> true;
 is_array(_) -> false.
 
+is_empty([]) ->
+    true;
+is_empty(<<>>) ->
+    true;
+is_empty(List) when is_list(List) ->
+    false;
+is_empty(Map) ->
+    ?MODULE:map_size(Map) == 0.
+
 %%------------------------------------------------------------------------------
 %% String Funcs
 %%------------------------------------------------------------------------------
@@ -764,6 +819,10 @@ ltrim(S) -> emqx_variform_bif:ltrim(S).
 reverse(S) -> emqx_variform_bif:reverse(S).
 
 rtrim(S) -> emqx_variform_bif:rtrim(S).
+
+rtrim(S, Chars) -> emqx_variform_bif:rtrim(S, Chars).
+
+rm_prefix(S, Prefix) -> emqx_variform_bif:rm_prefix(S, Prefix).
 
 strlen(S) -> emqx_variform_bif:strlen(S).
 
@@ -804,6 +863,8 @@ regex_match(Str, RE) -> emqx_variform_bif:regex_match(Str, RE).
 
 regex_replace(SrcStr, RE, RepStr) -> emqx_variform_bif:regex_replace(SrcStr, RE, RepStr).
 
+regex_extract(SrcStr, RE) -> emqx_variform_bif:regex_extract(SrcStr, RE).
+
 ascii(Char) -> emqx_variform_bif:ascii(Char).
 
 find(S, P) -> emqx_variform_bif:find(S, P).
@@ -814,14 +875,59 @@ join_to_string(Str) -> emqx_variform_bif:join_to_string(Str).
 
 join_to_string(Sep, List) -> emqx_variform_bif:join_to_string(Sep, List).
 
+%% @doc Format map key-value pairs as redis HSET (or HMSET) command fields.
+%% Notes:
+%% - Non-string keys in the input map are dropped
+%% - Keys are not quoted
+%% - String values are always quoted
+%% - No escape sequence for keys and values
+%% - Float point values are formatted with fixed (6) decimal point compact-formatting
+map_to_redis_hset_args(Payload) when erlang:is_binary(Payload) ->
+    try
+        Map = json_decode(Payload),
+        map_to_redis_hset_args(Map)
+    catch
+        _:_ ->
+            %% Discard invalid JSON
+            [map_to_redis_hset_args]
+    end;
+map_to_redis_hset_args(Map) when erlang:is_map(Map) ->
+    Fields = maps:fold(fun redis_hset_acc/3, [], Map),
+    %% Fields can be [], the final template may have other fields for concatenation
+    [map_to_redis_hset_args | Fields];
+map_to_redis_hset_args(_Other) ->
+    [map_to_redis_hset_args].
+
+redis_hset_acc(K, V, IoData) ->
+    try
+        [redis_field_name(K), redis_field_value(V) | IoData]
+    catch
+        _:_ ->
+            IoData
+    end.
+
+redis_field_name(K) when erlang:is_binary(K) ->
+    K;
+redis_field_name(K) ->
+    throw({bad_redis_field_name, K}).
+
+redis_field_value(V) when erlang:is_binary(V) ->
+    V;
+redis_field_value(V) when erlang:is_integer(V) ->
+    integer_to_binary(V);
+redis_field_value(V) when erlang:is_float(V) ->
+    float2str(V, 6);
+redis_field_value(V) when erlang:is_boolean(V) ->
+    atom_to_binary(V).
+
 join_to_sql_values_string(List) ->
     QuotedList =
         [
             case is_list(Item) of
                 true ->
-                    emqx_placeholder:quote_sql(emqx_utils_json:encode(Item));
+                    emqx_placeholder:quote_sql2(emqx_utils_json:encode(Item));
                 false ->
-                    emqx_placeholder:quote_sql(Item)
+                    emqx_placeholder:quote_sql2(Item)
             end
          || Item <- List
         ],
@@ -968,6 +1074,9 @@ map_values(Map) ->
     maps:values(map(Map)).
 map_to_entries(Map) ->
     [#{key => K, value => V} || {K, V} <- maps:to_list(map(Map))].
+
+map_size(Map) ->
+    maps:size(map(Map)).
 
 %%------------------------------------------------------------------------------
 %% Hash Funcs
@@ -1143,16 +1252,11 @@ timezone_to_offset_seconds(TimeZone) ->
 %% (currently this module is emqx_schema_registry_serde in the case of EE but
 %% could be changed to another module in the future).
 '$handle_undefined_function'(FunctionName, Args) ->
-    case emqx_rule_engine:extra_functions_module() of
-        undefined ->
-            throw_sql_function_not_supported(FunctionName, Args);
-        Mod ->
-            case Mod:handle_rule_function(FunctionName, Args) of
-                {error, no_match_for_function} ->
-                    throw_sql_function_not_supported(FunctionName, Args);
-                Result ->
-                    Result
-            end
+    case emqx_rule_engine:get_external_function(FunctionName) of
+        {ok, Module, Function} ->
+            apply(Module, Function, [Args]);
+        {error, not_found} ->
+            throw_sql_function_not_supported(FunctionName, Args)
     end.
 
 -spec throw_sql_function_not_supported(atom(), list()) -> no_return().
@@ -1213,3 +1317,9 @@ convert_timestamp(MillisecondsTimestamp) ->
 
 uuid_str(UUID, DisplayOpt) ->
     uuid:uuid_to_string(UUID, DisplayOpt).
+
+%%------------------------------------------------------------------------------
+%% System Funcs
+%%------------------------------------------------------------------------------
+getenv(Env) ->
+    emqx_variform_bif:getenv(Env).

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ocpp_frame).
@@ -55,7 +43,7 @@ initial_parse_state(_Opts) ->
 
 -spec parse(binary() | list(), parse_state()) -> parse_result().
 parse(Bin, Parser) when is_binary(Bin) ->
-    case emqx_utils_json:safe_decode(Bin, [return_maps]) of
+    case emqx_utils_json:safe_decode(Bin) of
         {ok, Json} ->
             parse(Json, Parser);
         {error, {Position, Reason}} ->
@@ -79,7 +67,7 @@ parse([?OCPP_MSG_TYPE_ID_CALL, Id, Action, Payload], Parser) ->
         ok ->
             {ok, Frame, <<>>, Parser};
         {error, ReasonStr} ->
-            error({validation_faliure, Id, ReasonStr})
+            error({validation_failure, Id, ReasonStr})
     end;
 %% CALLRESULT
 parse([?OCPP_MSG_TYPE_ID_CALLRESULT, Id, Payload], Parser) ->
@@ -93,7 +81,7 @@ parse([?OCPP_MSG_TYPE_ID_CALLRESULT, Id, Payload], Parser) ->
     %%    ok ->
     %%        {ok, Frame, <<>>, Parser};
     %%    {error, ReasonStr} ->
-    %%        error({validation_faliure, Id, ReasonStr})
+    %%        error({validation_failure, Id, ReasonStr})
     %%end;
     {ok, Frame, <<>>, Parser};
 %% CALLERROR

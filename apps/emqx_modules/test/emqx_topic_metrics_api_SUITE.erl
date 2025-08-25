@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_topic_metrics_api_SUITE).
@@ -22,10 +11,6 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
-
--define(BASE_CONF, #{
-    <<"topic_metrics">> => []
-}).
 
 suite() -> [{timetrap, {seconds, 30}}].
 
@@ -40,23 +25,25 @@ init_per_testcase(_, Config) ->
     Config.
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:load_config(emqx_modules_schema, ?BASE_CONF),
-    ok = emqx_mgmt_api_test_util:init_suite(
-        [emqx_conf, emqx_modules]
-    ),
-
-    %% When many tests run in an obscure order, it may occur that
-    %% `gen_rpc` started with its default settings before `emqx_conf`.
+    %% For some unknown reason, this test suite depends on
+    %% `gen_rpc` not starting with its default settings before `emqx_conf`.
     %% `gen_rpc` and `emqx_conf` have different default `port_discovery` modes,
     %% so we reinitialize `gen_rpc` explicitly.
-    ok = application:stop(gen_rpc),
-    ok = application:start(gen_rpc),
+    Apps = emqx_cth_suite:start(
+        [
+            {gen_rpc, #{override_env => [{port_discovery, stateless}]}},
+            {emqx_conf, "rpc.port_discovery = stateless"},
+            emqx_modules,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-    Config.
-
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf, emqx_modules]),
-    application:stop(gen_rpc),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 %%------------------------------------------------------------------------------

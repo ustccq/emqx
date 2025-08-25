@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_greptimedb_connector_SUITE).
@@ -25,11 +25,17 @@ init_per_suite(Config) ->
     Servers = [{GreptimedbTCPHost, GreptimedbTCPPort}],
     case emqx_common_test_helpers:is_all_tcp_servers_available(Servers) of
         true ->
-            ok = emqx_common_test_helpers:start_apps([emqx_conf]),
-            ok = emqx_connector_test_helpers:start_apps([emqx_resource]),
-            {ok, _} = application:ensure_all_started(emqx_connector),
-            {ok, _} = application:ensure_all_started(greptimedb),
+            Apps = emqx_cth_suite:start(
+                [
+                    emqx,
+                    emqx_conf,
+                    emqx_bridge_greptimedb,
+                    emqx_bridge
+                ],
+                #{work_dir => emqx_cth_suite:work_dir(Config)}
+            ),
             [
+                {apps, Apps},
                 {greptimedb_tcp_host, GreptimedbTCPHost},
                 {greptimedb_tcp_port, GreptimedbTCPPort}
                 | Config
@@ -43,11 +49,9 @@ init_per_suite(Config) ->
             end
     end.
 
-end_per_suite(_Config) ->
-    ok = emqx_common_test_helpers:stop_apps([emqx_conf]),
-    ok = emqx_connector_test_helpers:stop_apps([emqx_resource]),
-    _ = application:stop(emqx_connector),
-    _ = application:stop(greptimedb),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_testcase(_, Config) ->
@@ -83,7 +87,7 @@ perform_lifecycle_check(PoolName, InitialConfig) ->
         ?CONNECTOR_RESOURCE_GROUP,
         ?GREPTIMEDB_RESOURCE_MOD,
         FullConfig,
-        #{}
+        #{spawn_buffer_workers => true}
     ),
     ?assertEqual(InitialStatus, connected),
     % Instance should match the state and status of the just started resource

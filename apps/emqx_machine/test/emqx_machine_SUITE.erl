@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_machine_SUITE).
@@ -36,19 +24,40 @@
     emqx_retainer,
     emqx_exhook,
     emqx_auth,
-    emqx_plugin,
-    emqx_opentelemetry
+    emqx_plugin
 ]).
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_common_test_helpers:start_apps([emqx_conf, emqx_opentelemetry]),
-    application:load(emqx_dashboard),
-    Config.
+    Apps = emqx_cth_suite:start(
+        app_specs(),
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_opentelemetry, emqx_conf]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
+
+app_specs() ->
+    [
+        emqx_conf,
+        emqx_prometheus,
+        emqx_modules,
+        emqx_dashboard,
+        emqx_gateway,
+        emqx_resource,
+        emqx_rule_engine,
+        emqx_bridge,
+        emqx_management,
+        emqx_retainer,
+        emqx_exhook,
+        emqx_auth,
+        emqx_plugins,
+        {emqx_license, "license { key = \"default\" }"}
+    ].
 
 init_per_testcase(t_custom_shard_transports, Config) ->
     OldConfig = application:get_env(emqx_machine, custom_shard_transports),
@@ -86,13 +95,29 @@ end_per_testcase(t_open_ports_check, Config) ->
 end_per_testcase(_TestCase, _Config) ->
     ok.
 
-t_shutdown_reboot(_Config) ->
-    emqx_machine_boot:stop_apps(),
-    false = emqx:is_running(node()),
-    emqx_machine_boot:ensure_apps_started(),
-    true = emqx:is_running(node()),
-    ok = emqx_machine_boot:stop_apps(),
-    false = emqx:is_running(node()).
+t_shutdown_reboot(Config) ->
+    [Node] = emqx_cth_cluster:start(
+        [{machine_reboot_SUITE1, #{role => core, apps => app_specs()}}],
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, Config)}
+    ),
+    try
+        erpc:call(Node, fun() ->
+            true = emqx:is_running(node()),
+            emqx_machine_boot:stop_apps(),
+            false = emqx:is_running(node()),
+            %% This is to emulate the presence of `emqx.conf' or `cluster.hocon' files,
+            %% which are not present in the peer.
+            %% This is done by `emqx_cth_suite' initially.
+            ok = emqx_app:set_config_loader(emqx_cth_suite),
+            emqx_machine_boot:ensure_apps_started(),
+            true = emqx:is_running(node()),
+            ok = emqx_machine_boot:stop_apps(),
+            false = emqx:is_running(node()),
+            ok
+        end)
+    after
+        catch emqx_cth_cluster:stop([Node])
+    end.
 
 t_sorted_reboot_apps(_Config) ->
     Apps = emqx_machine_boot:sorted_reboot_apps(),
@@ -119,7 +144,7 @@ t_node_status(_Config) ->
             <<"backend">> := _,
             <<"role">> := <<"core">>
         },
-        jsx:decode(JSON)
+        emqx_utils_json:decode(JSON)
     ).
 
 t_open_ports_check(Config) ->

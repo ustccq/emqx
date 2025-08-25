@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mongodb_schema).
@@ -89,6 +77,7 @@ common_fields() ->
         {password_hash_field, fun password_hash_field/1},
         {salt_field, fun salt_field/1},
         {is_superuser_field, fun is_superuser_field/1},
+        {clientid_override_field, fun clientid_override_field/1},
         {password_hash_algorithm, fun emqx_authn_password_hashing:type_ro/1}
     ] ++ emqx_authn_schema:common_fields().
 
@@ -125,3 +114,9 @@ is_superuser_field(desc) -> ?DESC(?FUNCTION_NAME);
 is_superuser_field(required) -> false;
 is_superuser_field(default) -> <<"is_superuser">>;
 is_superuser_field(_) -> undefined.
+
+clientid_override_field(type) -> binary();
+clientid_override_field(desc) -> ?DESC(?FUNCTION_NAME);
+clientid_override_field(required) -> false;
+clientid_override_field(default) -> <<"clientid_override">>;
+clientid_override_field(_) -> undefined.

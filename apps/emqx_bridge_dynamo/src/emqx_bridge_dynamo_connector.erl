@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_dynamo_connector).
@@ -17,6 +17,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -62,12 +63,14 @@ fields(config) ->
                 }
             )},
         {pool_size, fun emqx_connector_schema_lib:pool_size/1},
-        {auto_reconnect, fun emqx_connector_schema_lib:auto_reconnect/1}
+        {auto_reconnect, fun emqx_connector_schema_lib:auto_reconnect/1},
+        emqx_bridge_v2_schema:undefined_as_null_field()
     ].
 
 %%========================================================================================
 %% `emqx_resource' API
 %%========================================================================================
+resource_type() -> dynamo.
 
 callback_mode() -> always_sync.
 
@@ -193,7 +196,7 @@ on_format_query_result(Result) ->
 health_check_timeout() ->
     2500.
 
-on_get_status(_InstanceId, #{pool_name := Pool} = State) ->
+on_get_status(_InstanceId, #{pool_name := Pool}) ->
     Health = emqx_resource_pool:health_check_workers(
         Pool,
         {emqx_bridge_dynamo_connector_client, is_connected, [
@@ -204,19 +207,19 @@ on_get_status(_InstanceId, #{pool_name := Pool} = State) ->
     ),
     case Health of
         {error, timeout} ->
-            {?status_connecting, State, <<"timeout_while_checking_connection">>};
+            {?status_connecting, <<"timeout_while_checking_connection">>};
         {ok, Results} ->
-            status_result(Results, State)
+            status_result(Results)
     end.
 
-status_result(Results, State) ->
+status_result(Results) ->
     case lists:filter(fun(Res) -> Res =/= true end, Results) of
         [] when Results =:= [] ->
             ?status_connecting;
         [] ->
             ?status_connected;
         [{false, Error} | _] ->
-            {?status_connecting, State, Error}
+            {?status_connecting, Error}
     end.
 
 %%========================================================================================
@@ -251,7 +254,7 @@ do_query(
                 ecpool:pick_and_do(
                     PoolName,
                     {emqx_bridge_dynamo_connector_client, query, [
-                        Table, QueryTuple, Templates, TraceRenderedCTX
+                        Table, QueryTuple, Templates, TraceRenderedCTX, ChannelState
                     ]},
                     no_handover
                 );
@@ -308,8 +311,8 @@ get_query_tuple([{_ChannelId, {_QueryType, _Data}} | _]) ->
         {unrecoverable_error,
             {invalid_request, <<"The only query type that supports batching is insert.">>}}
     );
-get_query_tuple([InsertQuery | _]) ->
-    get_query_tuple(InsertQuery).
+get_query_tuple([_InsertQuery | _] = Reqs) ->
+    lists:map(fun get_query_tuple/1, Reqs).
 
 ensuare_dynamo_keys({_, Data} = Query, State) when is_map(Data) ->
     ensuare_dynamo_keys([Query], State);

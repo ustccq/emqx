@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_telemetry_api_SUITE).
@@ -23,33 +12,26 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(BASE_CONF, #{}).
-
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    ok = emqx_common_test_helpers:load_config(emqx_modules_schema, ?BASE_CONF),
-    ok = emqx_common_test_helpers:load_config(emqx_telemetry_schema, ?BASE_CONF),
-    ok = emqx_mgmt_api_test_util:init_suite(
-        [emqx_conf, emqx_auth, emqx_management, emqx_telemetry],
-        fun set_special_configs/1
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard(),
+            emqx_modules,
+            emqx_telemetry
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
+    [{apps, Apps} | Config].
 
-    Config.
-
-end_per_suite(_Config) ->
-    {ok, _} = emqx:update_config(
-        [authorization],
-        #{
-            <<"no_match">> => <<"allow">>,
-            <<"cache">> => #{<<"enable">> => <<"true">>},
-            <<"sources">> => []
-        }
-    ),
-    emqx_mgmt_api_test_util:end_suite([
-        emqx_conf, emqx_auth, emqx_management, emqx_telemetry
-    ]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_testcase(t_status_non_official, Config) ->
@@ -92,10 +74,12 @@ set_special_configs(_App) ->
 
 %% official's telemetry is enabled by default
 t_status_official(_) ->
+    emqx_telemetry_config:set_default_status(true),
     check_status(true).
 
 %% non official's telemetry is disabled by default
 t_status_non_official(_) ->
+    emqx_telemetry_config:set_default_status(true),
     check_status(false).
 
 check_status(Default) ->

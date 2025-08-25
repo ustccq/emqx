@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_sys).
@@ -71,22 +59,7 @@
     sysdescr :: binary()
 }).
 
--define(APP, emqx).
 -define(SYS, ?MODULE).
-
--define(INFO_KEYS,
-    % Broker version
-    [
-        version,
-        % Broker uptime
-        uptime,
-        % Broker local datetime
-        datetime,
-        % Broker description
-        sysdescr
-    ]
-).
-
 -define(CONF_KEY_PATH, [sys_topics]).
 
 %%--------------------------------------------------------------------
@@ -242,10 +215,15 @@ unload_event_hooks(Event) ->
 
 on_client_connected(ClientInfo, ConnInfo) ->
     Payload0 = common_infos(ClientInfo, ConnInfo),
+    ConnProps = maps:get(conn_props, ConnInfo, #{}),
+    RcvMax = maps:get(receive_maximum, ConnInfo, 0),
     Payload = Payload0#{
+        conn_props => emqx_utils_maps:printable_props(ConnProps),
+        receive_maximum => RcvMax,
         keepalive => maps:get(keepalive, ConnInfo, 0),
         clean_start => maps:get(clean_start, ConnInfo, true),
-        expiry_interval => maps:get(expiry_interval, ConnInfo, 0)
+        expiry_interval => maps:get(expiry_interval, ConnInfo, 0),
+        client_attrs => maps:get(client_attrs, ClientInfo, #{})
     },
     publish(connected, Payload).
 
@@ -256,6 +234,10 @@ on_client_disconnected(
 ) ->
     Payload0 = common_infos(ClientInfo, ConnInfo),
     Payload = Payload0#{
+        disconn_props => emqx_utils_maps:printable_props(
+            maps:get(disconn_props, ConnInfo, #{})
+        ),
+        client_attrs => maps:get(client_attrs, ClientInfo, #{}),
         reason => reason(Reason),
         disconnected_at => DisconnectedAt
     },

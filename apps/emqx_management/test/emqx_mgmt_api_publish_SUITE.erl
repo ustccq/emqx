@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_publish_SUITE).
 
@@ -25,15 +13,45 @@
 -define(TOPIC1, <<"api_topic1">>).
 -define(TOPIC2, <<"api_topic2">>).
 
+-define(OFFLINE_TOPIC, <<"offline_api_topic">>).
+
 all() ->
-    emqx_common_test_helpers:all(?MODULE).
+    [
+        {group, persistence_enabled},
+        {group, persistence_disabled}
+    ].
 
-init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite(),
-    Config.
+groups() ->
+    Tcs = emqx_common_test_helpers:all(?MODULE),
+    [
+        {persistence_enabled, Tcs},
+        {persistence_disabled, Tcs}
+    ].
 
-end_per_suite(_) ->
-    emqx_mgmt_api_test_util:end_suite().
+init_per_group(persistence_disabled, Config) ->
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config];
+init_per_group(persistence_enabled, Config) ->
+    DurableSessionsOpts = #{
+        <<"enable">> => true,
+        <<"checkpoint_interval">> => <<"100ms">>
+    },
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    ExtraApps = [emqx_management, emqx_mgmt_api_test_util:emqx_dashboard()],
+    emqx_common_test_helpers:start_apps_ds(Config, ExtraApps, Opts).
+
+end_per_group(persistence_enabled, Config) ->
+    ok = emqx_common_test_helpers:stop_apps_ds(Config),
+    ok;
+end_per_group(_, Config) ->
+    ok = emqx_cth_suite:stop(?config(apps, Config)).
 
 init_per_testcase(Case, Config) ->
     ?MODULE:Case({init, Config}).
@@ -50,8 +68,8 @@ t_publish_api({init, Config}) ->
         }
     ),
     {ok, _} = emqtt:connect(Client),
-    {ok, _, [0]} = emqtt:subscribe(Client, ?TOPIC1),
-    {ok, _, [0]} = emqtt:subscribe(Client, ?TOPIC2),
+    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(Client, ?TOPIC1, ?QOS_1),
+    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(Client, ?TOPIC2, ?QOS_1),
     [{client, Client} | Config];
 t_publish_api({'end', Config}) ->
     Client = ?config(client, Config),
@@ -337,6 +355,61 @@ t_publish_bulk_dispatch_failure(Config) when is_list(Config) ->
         decode_json(ResponseBody)
     ).
 
+t_publish_offline_api({init, Config}) ->
+    {ok, Client} = emqtt:start_link(
+        #{
+            username => <<"api_username">>,
+            clientid => <<"api_clientid">>,
+            proto_ver => v5,
+            clean_start => false,
+            properties => #{'Session-Expiry-Interval' => 60}
+        }
+    ),
+    {ok, _} = emqtt:connect(Client),
+    {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(Client, ?OFFLINE_TOPIC, ?QOS_1),
+    _ = emqtt:stop(Client),
+    Config;
+t_publish_offline_api({'end', _Config}) ->
+    ok;
+t_publish_offline_api(_) ->
+    Payload = <<"hello">>,
+    Path = emqx_mgmt_api_test_util:api_path(["publish"]),
+    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    UserProperties = #{<<"foo">> => <<"bar">>},
+    Properties =
+        #{
+            <<"payload_format_indicator">> => 0,
+            <<"message_expiry_interval">> => 1000,
+            <<"correlation_data">> => <<"some_correlation_id">>,
+            <<"user_properties">> => UserProperties,
+            <<"content_type">> => <<"application/json">>
+        },
+    Body = #{topic => ?OFFLINE_TOPIC, payload => Payload, properties => Properties},
+    {ok, Response} = emqx_mgmt_api_test_util:request_api(post, Path, "", Auth, Body),
+    ResponseMap = decode_json(Response),
+    ?assertEqual([<<"id">>], lists:sort(maps:keys(ResponseMap))).
+
+%% Checks that we return HTTP response status code 200 for delayed messages, even if there
+%% are no subscribers at the time of publishing.
+t_delayed_message_always_200({init, Config}) ->
+    Config;
+t_delayed_message_always_200({'end', _Config}) ->
+    ok;
+t_delayed_message_always_200(Config) when is_list(Config) ->
+    Request = #{
+        <<"topic">> => <<"$delayed/1/t">>,
+        <<"payload">> => <<"delayed">>
+    },
+    ?assertMatch(
+        {200, #{<<"id">> := _}},
+        emqx_mgmt_api_test_util:simple_request(
+            post,
+            emqx_mgmt_api_test_util:api_path(["publish"]),
+            Request
+        )
+    ),
+    ok.
+
 receive_assert(Topic, Qos, Payload) ->
     receive
         {publish, Message} ->
@@ -352,4 +425,4 @@ receive_assert(Topic, Qos, Payload) ->
     end.
 
 decode_json(In) ->
-    emqx_utils_json:decode(In, [return_maps]).
+    emqx_utils_json:decode(In).

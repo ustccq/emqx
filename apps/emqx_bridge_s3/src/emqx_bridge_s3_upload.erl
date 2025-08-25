@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_s3_upload).
@@ -29,7 +29,10 @@
 ]).
 
 %% Internal exports
--export([convert_actions/2]).
+-export([
+    convert_actions/2,
+    validate_key_template/1
+]).
 
 -define(DEFAULT_AGGREG_BATCH_SIZE, 100).
 -define(DEFAULT_AGGREG_BATCH_TIME, <<"10ms">>).
@@ -63,10 +66,14 @@ fields(action) ->
 fields(?ACTION) ->
     emqx_bridge_v2_schema:make_producer_action_schema(
         hoconsc:mk(
-            mkunion(mode, #{
-                <<"direct">> => ?R_REF(s3_direct_upload_parameters),
-                <<"aggregated">> => ?R_REF(s3_aggregated_upload_parameters)
-            }),
+            emqx_schema:mkunion(
+                mode,
+                #{
+                    <<"direct">> => ?R_REF(s3_direct_upload_parameters),
+                    <<"aggregated">> => ?R_REF(s3_aggregated_upload_parameters)
+                },
+                <<"direct">>
+            ),
             #{
                 required => true,
                 desc => ?DESC(s3_upload),
@@ -87,7 +94,7 @@ fields(s3_direct_upload_parameters) ->
                 hoconsc:mk(
                     direct,
                     #{
-                        required => true,
+                        default => <<"direct">>,
                         desc => ?DESC(s3_direct_upload_mode)
                     }
                 )},
@@ -112,17 +119,9 @@ fields(s3_aggregated_upload_parameters) ->
                         desc => ?DESC(s3_aggregated_upload_mode)
                     }
                 )},
-            {container,
-                hoconsc:mk(
-                    mkunion(type, #{
-                        <<"csv">> => ?REF(s3_aggregated_container_csv)
-                    }),
-                    #{
-                        required => true,
-                        default => #{<<"type">> => <<"csv">>},
-                        desc => ?DESC(s3_aggregated_container)
-                    }
-                )},
+            emqx_connector_aggregator_schema:container(#{
+                meta => #{desc => ?DESC(s3_aggregated_container)}
+            }),
             {aggregation,
                 hoconsc:mk(
                     ?REF(s3_aggregation),
@@ -133,7 +132,10 @@ fields(s3_aggregated_upload_parameters) ->
                 )}
         ],
         emqx_resource_schema:override(emqx_s3_schema:fields(s3_upload), [
-            {key, #{desc => ?DESC(s3_aggregated_upload_key)}}
+            {key, #{
+                desc => ?DESC(s3_aggregated_upload_key),
+                validator => fun ?MODULE:validate_key_template/1
+            }}
         ]),
         emqx_s3_schema:fields(s3_uploader)
     ]);
@@ -186,20 +188,6 @@ fields(s3_upload_resource_opts) ->
         {batch_time, #{default => ?DEFAULT_AGGREG_BATCH_TIME}}
     ]).
 
-mkunion(Field, Schemas) ->
-    hoconsc:union(fun(Arg) -> scunion(Field, Schemas, Arg) end).
-
-scunion(_Field, Schemas, all_union_members) ->
-    maps:values(Schemas);
-scunion(Field, Schemas, {value, Value}) ->
-    Selector = maps:get(emqx_utils_conv:bin(Field), Value, undefined),
-    case Selector == undefined orelse maps:find(emqx_utils_conv:bin(Selector), Schemas) of
-        {ok, Schema} ->
-            [Schema];
-        _Error ->
-            throw(#{field_name => Field, expected => maps:keys(Schemas)})
-    end.
-
 desc(s3) ->
     ?DESC(s3_upload);
 desc(Name) when
@@ -225,21 +213,44 @@ convert_actions(undefined, _) ->
 
 convert_action(Conf = #{<<"parameters">> := Params, <<"resource_opts">> := ResourceOpts}, _) ->
     case Params of
-        #{<<"mode">> := <<"direct">>} ->
+        #{<<"mode">> := <<"aggregated">>} ->
+            Conf;
+        #{} ->
             %% NOTE: Disable batching for direct uploads.
             NResourceOpts = ResourceOpts#{<<"batch_size">> => 1, <<"batch_time">> => 0},
-            Conf#{<<"resource_opts">> := NResourceOpts};
-        #{} ->
-            Conf
+            Conf#{<<"resource_opts">> := NResourceOpts}
+    end.
+
+validate_key_template(Conf) ->
+    Template = emqx_template:parse(Conf),
+    case validate_bindings(emqx_template:placeholders(Template)) of
+        Bindings when is_list(Bindings) ->
+            ok;
+        {error, {disallowed_placeholders, Disallowed}} ->
+            {error, emqx_utils:format("Template placeholders are disallowed: ~p", [Disallowed])}
+    end.
+
+validate_bindings(Bindings) ->
+    Formats = ["rfc3339", "rfc3339utc", "unix"],
+    AllowedBindings = lists:append([
+        ["action", "node", "sequence"],
+        ["datetime." ++ F || F <- Formats],
+        ["datetime_until." ++ F || F <- Formats]
+    ]),
+    case Bindings -- AllowedBindings of
+        [] ->
+            Bindings;
+        Disallowed ->
+            {error, {disallowed_placeholders, Disallowed}}
     end.
 
 %% Interpreting options
 
--spec mk_key_template(_Parameters :: map()) -> emqx_template:str().
-mk_key_template(#{key := Key}) ->
+-spec mk_key_template(unicode:chardata()) ->
+    emqx_template:str().
+mk_key_template(Key) ->
     Template = emqx_template:parse(Key),
-    {_, BindingErrors} = emqx_template:render(Template, #{}),
-    {UsedBindings, _} = lists:unzip(BindingErrors),
+    UsedBindings = emqx_template:placeholders(Template),
     SuffixTemplate = mk_suffix_template(UsedBindings),
     case emqx_template:is_const(SuffixTemplate) of
         true ->
@@ -287,6 +298,8 @@ normalize_headers(Headers) ->
 
 mk_container_headers(#{type := csv}) ->
     #{"content-type" => "text/csv"};
+mk_container_headers(#{type := json_lines}) ->
+    #{"content-type" => "application/jsonl"};
 mk_container_headers(#{}) ->
     #{}.
 

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_tdengine_connector).
@@ -19,6 +19,7 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -34,12 +35,19 @@
 
 -export([connector_examples/1]).
 
--export([connect/1, do_get_status/1, execute/3, do_batch_insert/5]).
+-export([connect/1, do_get_status/1, execute/3, do_batch_insert/6]).
 
 -import(hoconsc, [mk/2, enum/1, ref/2]).
 
+-define(TD_DEFAULT_PORT, 6041).
+
 -define(TD_HOST_OPTIONS, #{
-    default_port => 6041
+    default_port => ?TD_DEFAULT_PORT
+}).
+
+-define(TD_HOST_OPTIONS_CLOUD, #{
+    default_port => 443,
+    supported_schemes => ["https"]
 }).
 
 -define(CONNECTOR_TYPE, tdengine).
@@ -59,6 +67,7 @@ fields(config) ->
 fields("config_connector") ->
     emqx_connector_schema:common_fields() ++
         base_config(false) ++
+        token_field() ++
         emqx_connector_schema:resource_opts_ref(?MODULE, connector_resource_opts);
 fields(connector_resource_opts) ->
     emqx_connector_schema:resource_opts_fields();
@@ -75,6 +84,9 @@ base_config(HasDatabase) ->
         | adjust_fields(emqx_connector_schema_lib:relational_db_fields(), HasDatabase)
     ].
 
+token_field() ->
+    [{token, hoconsc:mk(binary(), #{required => false, desc => ?DESC("token")})}].
+
 desc(config) ->
     ?DESC("desc_config");
 desc(connector_resource_opts) ->
@@ -89,10 +101,8 @@ desc(_) ->
 adjust_fields(Fields, HasDatabase) ->
     lists:filtermap(
         fun
-            ({username, OrigUsernameFn}) ->
-                {true, {username, add_default_fn(OrigUsernameFn, <<"root">>)}};
             ({password, _}) ->
-                {true, {password, emqx_connector_schema_lib:password_field(#{required => true})}};
+                {true, {password, emqx_connector_schema_lib:password_field(#{required => false})}};
             ({database, _}) ->
                 HasDatabase;
             (_Field) ->
@@ -101,15 +111,34 @@ adjust_fields(Fields, HasDatabase) ->
         Fields
     ).
 
-add_default_fn(OrigFn, Default) ->
-    fun
-        (default) -> Default;
-        (Field) -> OrigFn(Field)
+server() ->
+    Meta = #{
+        required => true,
+        desc => ?DESC("server"),
+        converter => fun emqx_schema:convert_servers/2,
+        validator => fun validator_server/1
+    },
+    hoconsc:mk(string(), Meta).
+
+validator_server(Str) ->
+    case emqx_schema:str(Str) of
+        "" ->
+            throw("cannot_be_empty");
+        "undefined" ->
+            throw("cannot_be_empty");
+        _ ->
+            _ = parse_server(Str),
+            ok
     end.
 
-server() ->
-    Meta = #{desc => ?DESC("server")},
-    emqx_schema:servers_sc(Meta, ?TD_HOST_OPTIONS).
+parse_server(Str0) ->
+    Str = emqx_schema:str(Str0),
+    case Str of
+        "https://" ++ _ ->
+            emqx_schema:parse_server(Str, ?TD_HOST_OPTIONS_CLOUD);
+        _ ->
+            emqx_schema:parse_server(Str, ?TD_HOST_OPTIONS)
+    end.
 
 %%=====================================================================
 %% V2 Hocon schema
@@ -140,6 +169,7 @@ connector_example_values() ->
 %%========================================================================================
 %% `emqx_resource' API
 %%========================================================================================
+resource_type() -> tdengine.
 
 callback_mode() -> always_sync.
 
@@ -147,8 +177,6 @@ on_start(
     InstanceId,
     #{
         server := Server,
-        username := Username,
-        password := Password,
         pool_size := PoolSize
     } = Config
 ) ->
@@ -158,16 +186,25 @@ on_start(
         config => emqx_utils:redact(Config)
     }),
 
-    #{hostname := Host, port := Port} = emqx_schema:parse_server(Server, ?TD_HOST_OPTIONS),
+    Server1 = parse_server(Server),
+    Options0 =
+        case maps:get(scheme, Server1, undefined) of
+            "https" ->
+                [{https_enabled, true}];
+            _ ->
+                []
+        end,
+    #{hostname := Host, port := Port} = Server1,
     Options = [
         {host, to_bin(Host)},
         {port, Port},
-        {username, Username},
-        {password, Password},
+        {username, maps:get(username, Config, undefined)},
+        {password, maps:get(password, Config, undefined)},
+        {token, maps:get(token, Config, undefined)},
         {pool_size, PoolSize},
         {pool, InstanceId}
+        | Options0
     ],
-
     State = #{pool_name => InstanceId, channels => #{}},
     case emqx_resource_pool:start(InstanceId, ?MODULE, Options) of
         ok ->
@@ -186,8 +223,8 @@ on_stop(InstanceId, _State) ->
 
 on_query(InstanceId, {ChannelId, Data}, #{channels := Channels} = State) ->
     case maps:find(ChannelId, Channels) of
-        {ok, #{insert := Tokens, opts := Opts}} ->
-            Query = emqx_placeholder:proc_tmpl(Tokens, Data),
+        {ok, #{insert := Tokens, opts := Opts} = ChannelState} ->
+            Query = proc_nullable_tmpl(Tokens, Data, maps:get(channel_conf, ChannelState, #{})),
             emqx_trace:rendered_action_template(ChannelId, #{query => Query}),
             do_query_job(InstanceId, {?MODULE, execute, [Query, Opts]}, State);
         _ ->
@@ -201,18 +238,19 @@ on_batch_query(
     #{channels := Channels} = State
 ) ->
     case maps:find(ChannelId, Channels) of
-        {ok, #{batch := Tokens, opts := Opts}} ->
+        {ok, #{batch := Tokens, opts := Opts} = ChannelState} ->
             TraceRenderedCTX = emqx_trace:make_rendered_action_template_trace_context(ChannelId),
+            ChannelConf = maps:get(channel_conf, ChannelState, #{}),
             do_query_job(
                 InstanceId,
-                {?MODULE, do_batch_insert, [Tokens, BatchReq, Opts, TraceRenderedCTX]},
+                {?MODULE, do_batch_insert, [Tokens, BatchReq, Opts, TraceRenderedCTX, ChannelConf]},
                 State
             );
         _ ->
             {error, {unrecoverable_error, {invalid_channel_id, InstanceId}}}
     end;
-on_batch_query(InstanceId, BatchReq, State) ->
-    LogMeta = #{connector => InstanceId, request => BatchReq, state => State},
+on_batch_query(InstanceId, BatchReq, _State) ->
+    LogMeta = #{connector => InstanceId, request => BatchReq},
     ?SLOG(error, LogMeta#{msg => "invalid_request"}),
     {error, {unrecoverable_error, invalid_request}}.
 
@@ -221,7 +259,7 @@ on_format_query_result({ok, ResultMap}) ->
 on_format_query_result(Result) ->
     Result.
 
-on_get_status(_InstanceId, #{pool_name := PoolName} = State) ->
+on_get_status(_InstanceId, #{pool_name := PoolName}) ->
     case
         emqx_resource_pool:health_check_workers(
             PoolName,
@@ -231,16 +269,16 @@ on_get_status(_InstanceId, #{pool_name := PoolName} = State) ->
         )
     of
         {ok, []} ->
-            {?status_connecting, State, undefined};
+            {?status_connecting, undefined};
         {ok, Values} ->
             case lists:keyfind(error, 1, Values) of
                 false ->
                     ?status_connected;
                 {error, Reason} ->
-                    {?status_connecting, State, enhance_reason(Reason)}
+                    {?status_connecting, enhance_reason(Reason)}
             end;
         {error, Reason} ->
-            {?status_connecting, State, enhance_reason(Reason)}
+            {?status_connecting, enhance_reason(Reason)}
     end.
 
 do_get_status(Conn) ->
@@ -271,7 +309,7 @@ on_add_channel(
     #{channels := Channels} = OldState,
     ChannelId,
     #{
-        parameters := #{database := Database, sql := SQL}
+        parameters := #{database := Database, sql := SQL} = ChannelConf
     }
 ) ->
     case maps:is_key(ChannelId, Channels) of
@@ -281,7 +319,8 @@ on_add_channel(
             case parse_prepare_sql(SQL) of
                 {ok, Result} ->
                     Opts = [{db_name, Database}],
-                    Channels2 = Channels#{ChannelId => Result#{opts => Opts}},
+                    Channel = Result#{opts => Opts, channel_conf => ChannelConf},
+                    Channels2 = Channels#{ChannelId => Channel},
                     {ok, OldState#{channels := Channels2}};
                 Error ->
                     Error
@@ -297,14 +336,9 @@ on_get_channels(InstanceId) ->
 on_get_channel_status(InstanceId, ChannelId, #{channels := Channels} = State) ->
     case maps:is_key(ChannelId, Channels) of
         true ->
-            case on_get_status(InstanceId, State) of
-                {Status, _State, Reason} ->
-                    {Status, Reason};
-                Status ->
-                    Status
-            end;
+            on_get_status(InstanceId, State);
         _ ->
-            {error, not_exists}
+            ?status_disconnected
     end.
 
 %%========================================================================================
@@ -347,8 +381,8 @@ do_query_job(InstanceId, Job, #{pool_name := PoolName} = State) ->
 execute(Conn, Query, Opts) ->
     tdengine:insert(Conn, Query, Opts).
 
-do_batch_insert(Conn, Tokens, BatchReqs, Opts, TraceRenderedCTX) ->
-    SQL = aggregate_query(Tokens, BatchReqs, <<"INSERT INTO">>),
+do_batch_insert(Conn, Tokens, BatchReqs, Opts, TraceRenderedCTX, ChannelConf) ->
+    SQL = aggregate_query(Tokens, BatchReqs, <<"INSERT INTO">>, ChannelConf),
     try
         emqx_trace:rendered_action_template_with_ctx(
             TraceRenderedCTX,
@@ -360,15 +394,20 @@ do_batch_insert(Conn, Tokens, BatchReqs, Opts, TraceRenderedCTX) ->
             {error, Reason}
     end.
 
-aggregate_query(BatchTks, BatchReqs, Acc) ->
+aggregate_query(BatchTks, BatchReqs, Acc, ChannelConf) ->
     lists:foldl(
         fun({_, Data}, InAcc) ->
-            InsertPart = emqx_placeholder:proc_tmpl(BatchTks, Data),
+            InsertPart = proc_nullable_tmpl(BatchTks, Data, ChannelConf),
             <<InAcc/binary, " ", InsertPart/binary>>
         end,
         Acc,
         BatchReqs
     ).
+
+proc_nullable_tmpl(Template, Data, #{undefined_vars_as_null := true}) ->
+    emqx_placeholder:proc_nullable_tmpl(Template, Data);
+proc_nullable_tmpl(Template, Data, _) ->
+    emqx_placeholder:proc_tmpl(Template, Data).
 
 connect(Opts) ->
     %% TODO: teach `tdengine` to accept 0-arity closures as passwords.

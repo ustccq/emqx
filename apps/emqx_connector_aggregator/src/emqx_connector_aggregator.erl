@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% This module manages buffers for aggregating records and offloads them
@@ -17,7 +17,8 @@
     push_records/3,
     tick/2,
     take_error/1,
-    buffer_to_map/1
+    buffer_to_map/1,
+    delivery_exit/3
 ]).
 
 -behaviour(gen_server).
@@ -29,10 +30,16 @@
     terminate/2
 ]).
 
+%% For testing only
+-export([where/1]).
+
 -export_type([
+    container_type/0,
     record/0,
     timestamp/0
 ]).
+
+-type container_type() :: csv.
 
 %% Record.
 -type record() :: #{binary() => _}.
@@ -43,9 +50,15 @@
 %%
 
 -define(VSN, 1).
--define(SRVREF(NAME), {via, gproc, {n, l, {?MODULE, NAME}}}).
+-define(REF(NAME), {n, l, {?MODULE, NAME}}).
+-define(SRVREF(NAME), {via, gproc, ?REF(NAME)}).
+
+-record(delivery_exit, {pid, reason}).
 
 %%
+
+where(Name) ->
+    gproc:where(?REF(Name)).
 
 start_link(Name, Opts) ->
     gen_server:start_link(?SRVREF(Name), ?MODULE, mk_state(Name, Opts), []).
@@ -63,10 +76,12 @@ push_records(_Name, _Timestamp, []) ->
     ok.
 
 tick(Name, Timestamp) ->
+    ?tp("connector_aggregator_tick_enter", #{}),
     case pick_buffer(Name, Timestamp) of
         #buffer{} ->
             ok;
         _Outdated ->
+            ?tp("connector_aggregator_tick_close_buffer_async", #{}),
             send_close_buffer(Name, Timestamp)
     end.
 
@@ -82,31 +97,45 @@ buffer_to_map(#buffer{} = Buffer) ->
         max_records => Buffer#buffer.max_records
     }.
 
+delivery_exit(Name, DeliveryPid, Reason) ->
+    gen_server:cast(?SRVREF(Name), #delivery_exit{pid = DeliveryPid, reason = Reason}).
+
 %%
 
 write_records_limited(Name, Buffer = #buffer{max_records = undefined}, Records) ->
-    write_records(Name, Buffer, Records);
+    write_records(Name, Buffer, Records, _NumWritten = undefined);
 write_records_limited(Name, Buffer = #buffer{max_records = MaxRecords}, Records) ->
     NR = length(Records),
     case inc_num_records(Buffer, NR) of
         NR ->
             %% NOTE: Allow unconditionally if it's the first write.
-            write_records(Name, Buffer, Records);
+            write_records(Name, Buffer, Records, NR);
         NWritten when NWritten > MaxRecords ->
+            ?tp("connector_aggregator_push_records_rotate_buffer", #{}),
             NextBuffer = rotate_buffer(Name, Buffer),
             write_records_limited(Name, NextBuffer, Records);
-        _ ->
-            write_records(Name, Buffer, Records)
+        NWritten ->
+            write_records(Name, Buffer, Records, NWritten)
     end.
 
-write_records(Name, Buffer = #buffer{fd = Writer}, Records) ->
+write_records(Name, Buffer = #buffer{fd = Writer, max_records = MaxRecords}, Records, NumWritten) ->
     case emqx_connector_aggreg_buffer:write(Records, Writer) of
         ok ->
-            ?tp(connector_aggreg_records_written, #{action => Name, records => Records}),
+            ?tp(connector_aggreg_records_written, #{
+                action => Name,
+                records => Records,
+                buffer => Buffer
+            }),
+            case is_number(NumWritten) andalso NumWritten >= MaxRecords of
+                true ->
+                    rotate_buffer_async(Name, Buffer);
+                false ->
+                    ok
+            end,
             ok;
         {error, terminated} ->
             BufferNext = rotate_buffer(Name, Buffer),
-            write_records(Name, BufferNext, Records);
+            write_records_limited(Name, BufferNext, Records);
         {error, _} = Error ->
             Error
     end.
@@ -120,6 +149,9 @@ next_buffer(Name, Timestamp) ->
 rotate_buffer(Name, #buffer{fd = FD}) ->
     gen_server:call(?SRVREF(Name), {rotate_buffer, FD}).
 
+rotate_buffer_async(Name, #buffer{fd = FD}) ->
+    gen_server:cast(?SRVREF(Name), {rotate_buffer, FD}).
+
 send_close_buffer(Name, Timestamp) ->
     gen_server:cast(?SRVREF(Name), {close_buffer, Timestamp}).
 
@@ -130,7 +162,7 @@ send_close_buffer(Name, Timestamp) ->
     tab :: ets:tid() | undefined,
     buffer :: buffer() | undefined,
     queued :: buffer() | undefined,
-    deliveries = #{} :: #{reference() => buffer()},
+    deliveries = #{} :: #{pid() => buffer()},
     errors = queue:new() :: queue:queue(_Error),
     interval :: emqx_schema:duration_s(),
     max_records :: pos_integer(),
@@ -174,23 +206,26 @@ init(St0 = #st{name = Name}) ->
 
 handle_call({next_buffer, Timestamp}, _From, St0) ->
     St = #st{buffer = Buffer} = handle_next_buffer(Timestamp, St0),
-    {reply, Buffer, St, 0};
+    {reply, Buffer, St};
 handle_call({rotate_buffer, FD}, _From, St0) ->
     St = #st{buffer = Buffer} = handle_rotate_buffer(FD, St0),
-    {reply, Buffer, St, 0};
+    {reply, Buffer, St};
 handle_call(take_error, _From, St0) ->
     {MaybeError, St} = handle_take_error(St0),
     {reply, MaybeError, St}.
 
-handle_cast({close_buffer, Timestamp}, St) ->
-    {noreply, handle_close_buffer(Timestamp, St)};
-handle_cast(_Cast, St) ->
-    {noreply, St}.
-
-handle_info(timeout, St) ->
-    {noreply, handle_queued_buffer(St)};
-handle_info({'DOWN', MRef, _, Pid, Reason}, St0 = #st{name = Name, deliveries = Ds0}) ->
-    case maps:take(MRef, Ds0) of
+handle_cast({close_buffer, Timestamp}, St0) ->
+    St = handle_close_buffer(Timestamp, St0),
+    ?tp("connector_aggregator_close_buffer_async_done", #{}),
+    {noreply, St};
+handle_cast({rotate_buffer, FD}, St0) ->
+    ?tp("connector_aggregator_cast_rotate_buffer_received", #{}),
+    St = handle_rotate_buffer(FD, St0),
+    {noreply, St};
+handle_cast(enqueue_delivery, St0) ->
+    {noreply, handle_queued_buffer(St0)};
+handle_cast(#delivery_exit{pid = Pid, reason = Reason}, #st{name = Name, deliveries = Ds0} = St0) ->
+    case maps:take(Pid, Ds0) of
         {Buffer, Ds} ->
             St = St0#st{deliveries = Ds},
             {noreply, handle_delivery_exit(Buffer, Reason, St)};
@@ -203,6 +238,9 @@ handle_info({'DOWN', MRef, _, Pid, Reason}, St0 = #st{name = Name, deliveries = 
             }),
             {noreply, St0}
     end;
+handle_cast(_Cast, St) ->
+    {noreply, St}.
+
 handle_info(_Msg, St) ->
     {noreply, St}.
 
@@ -239,6 +277,7 @@ handle_rotate_buffer(_ClosedFD, St) ->
     St.
 
 enqueue_closed_buffer(Buffer, St = #st{queued = undefined}) ->
+    trigger_enqueue_delivery(),
     St#st{queued = Buffer};
 enqueue_closed_buffer(Buffer, St0) ->
     %% NOTE: Should never really happen unless interval / max records are too tight.
@@ -262,7 +301,7 @@ allocate_buffer(Since, Seq, St = #st{name = Name}) ->
     {ok, FD} = file:open(Filename, [write, binary]),
     Writer = emqx_connector_aggreg_buffer:new_writer(FD, _Meta = []),
     _ = add_counter(Counter),
-    ?tp(connector_aggreg_buffer_allocated, #{action => Name, filename => Filename}),
+    ?tp(connector_aggreg_buffer_allocated, #{action => Name, filename => Filename, buffer => Buffer}),
     Buffer#buffer{fd = Writer}.
 
 recover_buffer(Buffer = #buffer{filename = Filename, cnt_records = Counter}) ->
@@ -340,6 +379,16 @@ handle_close_buffer(
     St = St0#st{buffer = undefined},
     _ = announce_current_buffer(St),
     enqueue_delivery(close_buffer(Buffer), St);
+handle_close_buffer(Timestamp, St = #st{buffer = Until}) when
+    Timestamp < Until
+->
+    %% If, for example, a `tick` operation (which triggers a `close_buffer`) happens
+    %% concurrently with a `push_records` (which triggers a `next_buffer` if buffer is
+    %% outdated), then, by the time the aggregator process handles the `close_buffer`
+    %% event, the `#state.buffer` might have already been rotated and have an
+    %% `#buffer.until > Timestamp`.  Long story short, the buffer has been closed
+    %% concurrently.
+    St;
 handle_close_buffer(_Timestamp, St = #st{buffer = undefined}) ->
     St.
 
@@ -371,24 +420,28 @@ lookup_current_buffer(Name) ->
 
 %%
 
+trigger_enqueue_delivery() ->
+    gen_server:cast(self(), enqueue_delivery).
+
 enqueue_delivery(Buffer, St = #st{name = Name, deliveries = Ds}) ->
-    {ok, Pid} = emqx_connector_aggreg_upload_sup:start_delivery(Name, Buffer),
-    MRef = erlang:monitor(process, Pid),
-    St#st{deliveries = Ds#{MRef => Buffer}}.
+    case emqx_connector_aggreg_upload_sup:start_delivery(Name, Buffer) of
+        {ok, Pid} ->
+            St#st{deliveries = Ds#{Pid => Buffer}};
+        {error, _} = Error ->
+            handle_delivery_exit(Buffer, Error, St)
+    end.
 
 handle_delivery_exit(Buffer, Normal, St = #st{name = Name}) when
     Normal == normal; Normal == noproc
 ->
-    ?SLOG(debug, #{
-        msg => "aggregated_buffer_delivery_completed",
+    ?tp(debug, "aggregated_buffer_delivery_completed", #{
         action => Name,
         buffer => Buffer#buffer.filename
     }),
     ok = discard_buffer(Buffer),
     St;
 handle_delivery_exit(Buffer, {shutdown, {skipped, Reason}}, St = #st{name = Name}) ->
-    ?SLOG(info, #{
-        msg => "aggregated_buffer_delivery_skipped",
+    ?tp(info, "aggregated_buffer_delivery_skipped", #{
         action => Name,
         buffer => {Buffer#buffer.since, Buffer#buffer.seq},
         reason => Reason
@@ -396,8 +449,7 @@ handle_delivery_exit(Buffer, {shutdown, {skipped, Reason}}, St = #st{name = Name
     ok = discard_buffer(Buffer),
     St;
 handle_delivery_exit(Buffer, Error, St = #st{name = Name}) ->
-    ?SLOG(error, #{
-        msg => "aggregated_buffer_delivery_failed",
+    ?tp(error, "aggregated_buffer_delivery_failed", #{
         action => Name,
         buffer => {Buffer#buffer.since, Buffer#buffer.seq},
         filename => Buffer#buffer.filename,
@@ -410,7 +462,12 @@ enqueue_status_error({upload_failed, Error}, St = #st{errors = QErrors}) ->
     %% TODO
     %% This code feels too specific, errors probably need classification.
     St#st{errors = queue:in(Error, QErrors)};
-enqueue_status_error(_AnotherError, St) ->
+enqueue_status_error(_AnotherError, St = #st{name = Name}) ->
+    ?SLOG(debug, #{
+        msg => "aggregated_buffer_error_not_enqueued",
+        error => _AnotherError,
+        action => Name
+    }),
     St.
 
 handle_take_error(St = #st{errors = QErrors0}) ->
@@ -465,6 +522,8 @@ parse_filename(Filename) ->
 
 %%
 
+-define(COUNTER_POS, 2).
+
 add_counter({Tab, Counter}) ->
     add_counter({Tab, Counter}, 0).
 
@@ -472,10 +531,12 @@ add_counter({Tab, Counter}, N) ->
     ets:insert(Tab, {Counter, N}).
 
 inc_counter({Tab, Counter}, Size) ->
-    ets:update_counter(Tab, Counter, {2, Size}).
+    ets:update_counter(Tab, Counter, {?COUNTER_POS, Size}).
 
 del_counter({Tab, Counter}) ->
     ets:delete(Tab, Counter).
+
+-undef(COUNTER_POS).
 
 %%
 

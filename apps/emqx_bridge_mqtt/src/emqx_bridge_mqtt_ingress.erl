@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_mqtt_ingress).
@@ -19,6 +7,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 
 %% management APIs
 -export([
@@ -76,11 +65,15 @@ subscribe_remote_topics(Pid, IngressList, WorkerIdx, PoolSize, Name) ->
     [subscribe_remote_topic(Pid, Ingress, WorkerIdx, PoolSize, Name) || Ingress <- IngressList].
 
 subscribe_remote_topic(
-    Pid, #{remote := #{topic := RemoteTopic, qos := QoS}} = _Remote, WorkerIdx, PoolSize, Name
+    Pid,
+    #{remote := #{topic := RemoteTopic, qos := QoS, no_local := NoLocal}} = _Remote,
+    WorkerIdx,
+    PoolSize,
+    Name
 ) ->
-    case should_subscribe(RemoteTopic, WorkerIdx, PoolSize, Name, _LogWarn = true) of
+    case should_subscribe(RemoteTopic, WorkerIdx, PoolSize, Name, true) of
         true ->
-            emqtt:subscribe(Pid, RemoteTopic, QoS);
+            emqtt:subscribe(Pid, RemoteTopic, [{qos, QoS}, {nl, NoLocal}]);
         false ->
             ok
     end.
@@ -89,22 +82,24 @@ should_subscribe(RemoteTopic, WorkerIdx, PoolSize, Name, LogWarn) ->
     IsFirstWorker = WorkerIdx == 1,
     case emqx_topic:parse(RemoteTopic) of
         {#share{} = _Filter, _SubOpts} ->
-            % NOTE: this is shared subscription, many workers may subscribe
+            %% NOTE: this is shared subscription, many workers may subscribe
             true;
-        {_Filter, #{}} when PoolSize > 1, IsFirstWorker, LogWarn ->
-            % NOTE: this is regular subscription, only one worker should subscribe
-            ?SLOG(warning, #{
-                msg => "mqtt_pool_size_ignored",
-                connector => Name,
-                reason =>
-                    "Remote topic filter is not a shared subscription, "
-                    "only a single connection will be used from the connection pool",
-                config_pool_size => PoolSize,
-                pool_size => PoolSize
-            }),
-            IsFirstWorker;
         {_Filter, #{}} ->
-            % NOTE: this is regular subscription, only one worker should subscribe
+            case PoolSize > 1 orelse IsFirstWorker orelse LogWarn of
+                true ->
+                    ?SLOG(warning, #{
+                        msg => "mqtt_pool_size_ignored",
+                        connector => Name,
+                        reason =>
+                            "Remote topic filter is not a shared subscription, "
+                            "only a single connection will be used from the connection pool",
+                        config_pool_size => PoolSize,
+                        pool_size => PoolSize
+                    });
+                false ->
+                    ok
+            end,
+            %% NOTE: this is regular subscription, only one worker should subscribe
             IsFirstWorker
     end.
 
@@ -154,8 +149,9 @@ unsubscribe_remote_topic(
     ChannelId,
     TopicToHandlerIndex
 ) ->
-    emqx_topic_index:delete(RemoteTopic, ChannelId, TopicToHandlerIndex),
-    case should_subscribe(RemoteTopic, WorkerIdx, PoolSize, Name, _NoWarn = false) of
+    IndexTopic = to_index_topic(RemoteTopic),
+    emqx_topic_index:delete(IndexTopic, ChannelId, TopicToHandlerIndex),
+    case should_subscribe(RemoteTopic, WorkerIdx, PoolSize, Name, false) of
         true ->
             case emqtt:unsubscribe(Pid, RemoteTopic) of
                 {ok, _Properties, _ReasonCodes} ->
@@ -192,14 +188,16 @@ fix_remote_config(#{remote := RC}, BridgeName, TopicToHandlerIndex, Conf) ->
 insert_to_topic_to_handler_index(
     #{remote := #{topic := Topic}} = Conf, TopicToHandlerIndex, BridgeName
 ) ->
-    TopicPattern =
-        case emqx_topic:parse(Topic) of
-            {#share{group = _Group, topic = TP}, _} ->
-                TP;
-            _ ->
-                Topic
-        end,
-    emqx_topic_index:insert(TopicPattern, BridgeName, Conf, TopicToHandlerIndex).
+    IndexTopic = to_index_topic(Topic),
+    emqx_topic_index:insert(IndexTopic, BridgeName, Conf, TopicToHandlerIndex).
+
+to_index_topic(Topic) ->
+    case emqx_topic:parse(Topic) of
+        {#share{group = _Group, topic = TP}, _} ->
+            TP;
+        _ ->
+            Topic
+    end.
 
 parse_remote(#{qos := QoSIn} = Remote, BridgeName) ->
     QoS = downgrade_ingress_qos(QoSIn),
@@ -234,13 +232,13 @@ status(Pid) ->
     try
         case proplists:get_value(socket, info(Pid)) of
             Socket when Socket /= undefined ->
-                connected;
+                ?status_connected;
             undefined ->
-                connecting
+                ?status_connecting
         end
     catch
         exit:{noproc, _} ->
-            disconnected
+            ?status_disconnected
     end.
 
 %%
@@ -274,7 +272,6 @@ handle_match(
     [ChannelConfig] = emqx_topic_index:get_record(Match, TopicToHandlerIndex),
     #{on_message_received := OnMessage} = ChannelConfig,
     Msg = import_msg(MsgIn, ChannelConfig),
-
     maybe_on_message_received(Msg, OnMessage),
     LocalPublish = maps:get(local, ChannelConfig, undefined),
     _ = maybe_publish_local(Msg, LocalPublish, Props),
@@ -312,32 +309,9 @@ import_msg(
         qos => QoS,
         dup => Dup,
         retain => Retain,
-        pub_props => printable_maps(Props),
+        pub_props => emqx_utils_maps:printable_props(Props),
         message_received_at => erlang:system_time(millisecond)
     }.
-
-printable_maps(undefined) ->
-    #{};
-printable_maps(Headers) ->
-    maps:fold(
-        fun
-            ('User-Property', V0, AccIn) when is_list(V0) ->
-                AccIn#{
-                    'User-Property' => maps:from_list(V0),
-                    'User-Property-Pairs' => [
-                        #{
-                            key => Key,
-                            value => Value
-                        }
-                     || {Key, Value} <- V0
-                    ]
-                };
-            (K, V0, AccIn) ->
-                AccIn#{K => V0}
-        end,
-        #{},
-        Headers
-    ).
 
 %% published from remote node over a MQTT connection
 to_broker_msg(Msg, Vars, undefined) ->

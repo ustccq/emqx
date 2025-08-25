@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_lwm2m_channel).
@@ -37,6 +25,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_timeout/3,
     terminate/2
@@ -119,7 +108,7 @@ stats(#channel{session = Session}) ->
 
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     #{ctx := Ctx} = Config
@@ -139,6 +128,7 @@ init(
             listener => ListenerId,
             protocol => lwm2m,
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             username => undefined,
             clientid => undefined,
@@ -177,6 +167,9 @@ send_cmd(Channel, Cmd) ->
 handle_in(Msg, Channle) ->
     NChannel = update_life_timer(Channle),
     call_session(handle_coap_in, Msg, NChannel).
+
+handle_frame_error(Error, Channel) ->
+    {shutdown, Error, Channel}.
 
 %%--------------------------------------------------------------------
 %% Handle Delivers from broker to client

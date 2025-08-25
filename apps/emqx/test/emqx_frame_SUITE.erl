@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_frame_SUITE).
@@ -49,7 +37,8 @@ groups() ->
             t_parse_cont,
             t_parse_frame_too_large,
             t_parse_frame_malformed_variable_byte_integer,
-            t_parse_malformed_utf8_string
+            t_parse_malformed_utf8_string,
+            t_parse_bad_v5_publish_packet
         ]},
         {connect, [parallel], [
             t_serialize_parse_v3_connect,
@@ -63,8 +52,12 @@ groups() ->
             t_parse_malformed_properties,
             t_malformed_connect_header,
             t_malformed_connect_data,
+            t_malformed_connect_data_proto_ver,
             t_reserved_connect_flag,
-            t_invalid_clientid
+            t_invalid_clientid,
+            t_undefined_password,
+            t_invalid_will_retain,
+            t_invalid_will_qos
         ]},
         {connack, [parallel], [
             t_serialize_parse_connack,
@@ -75,6 +68,7 @@ groups() ->
             t_serialize_parse_qos0_publish,
             t_serialize_parse_qos1_publish,
             t_serialize_parse_qos2_publish,
+            t_serialize_parse_with_dup_flag,
             t_serialize_parse_publish_v5
         ]},
         {puback, [parallel], [
@@ -131,11 +125,11 @@ t_parse_cont(_) ->
     Packet = ?CONNECT_PACKET(#mqtt_packet_connect{}),
     ParseState = emqx_frame:initial_parse_state(),
     <<HdrBin:1/binary, LenBin:1/binary, RestBin/binary>> = serialize_to_binary(Packet),
-    {more, ContParse} = emqx_frame:parse(<<>>, ParseState),
-    {more, ContParse1} = emqx_frame:parse(HdrBin, ContParse),
-    {more, ContParse2} = emqx_frame:parse(LenBin, ContParse1),
-    {more, ContParse3} = emqx_frame:parse(<<>>, ContParse2),
-    {ok, Packet, <<>>, _} = emqx_frame:parse(RestBin, ContParse3).
+    {some_more, ContParse} = emqx_frame:parse(<<>>, ParseState),
+    {some_more, ContParse1} = emqx_frame:parse(HdrBin, ContParse),
+    {12, ContParse2} = emqx_frame:parse(LenBin, ContParse1),
+    {12, ContParse3} = emqx_frame:parse(<<>>, ContParse2),
+    {Packet, <<>>, _} = emqx_frame:parse(RestBin, ContParse3).
 
 t_parse_frame_too_large(_) ->
     Packet = ?PUBLISH_PACKET(?QOS_1, <<"t">>, 1, payload(1000)),
@@ -164,6 +158,36 @@ t_parse_malformed_utf8_string(_) ->
     ParseState = emqx_frame:initial_parse_state(#{strict_mode => true}),
     ?ASSERT_FRAME_THROW(utf8_string_invalid, emqx_frame:parse(MalformedPacket, ParseState)).
 
+%% Case found by fuzzying with defensics.
+t_parse_bad_v5_publish_packet(_) ->
+    BadInput = iolist_to_binary([
+        <<48, 57, 0, 6>>,
+        %% Topic: `test/1`
+        <<116, 101, 115, 116, 47, 49>>,
+        %% Wrong variable byte integer length for properties ends up cutting the property
+        %% value out. Parsed length is 9.
+        <<9, 38>>,
+        %% Bad user-property here, due to wrong length above.
+        <<0, 6, 115, 97, 109, 112, 108, 101>>,
+        %% Rest of packet
+        <<0, 18, 84, 104, 105, 115, 32, 105, 115, 32, 97, 110, 32, 101, 120, 97, 109, 112, 108, 101,
+            84, 104, 105, 115, 32, 105, 115, 32, 112, 108, 97, 99, 101, 104, 111, 108, 100, 101,
+            114>>
+    ]),
+    ParseState = emqx_frame:initial_parse_state(#{version => 5}),
+    ?ASSERT_FRAME_THROW(
+        #{
+            cause := malformed_user_property_missing_value,
+            parsed_key_length := 6,
+            parsed_key := <<"sample">>,
+            remaining_bytes_length := 0
+        },
+        emqx_frame:parse(BadInput, ParseState)
+    ),
+    ok.
+
+%% TODO: parse v3 with 0 length clientid
+
 t_serialize_parse_v3_connect(_) ->
     Bin =
         <<16, 37, 0, 6, 77, 81, 73, 115, 100, 112, 3, 2, 0, 60, 0, 23, 109, 111, 115, 113, 112, 117,
@@ -177,8 +201,11 @@ t_serialize_parse_v3_connect(_) ->
             keepalive = 60
         }
     ),
-    {ok, Packet, <<>>, PState} = emqx_frame:parse(Bin),
-    ?assertMatch({none, #{version := ?MQTT_PROTO_V3}}, PState).
+    {Packet, <<>>, PState} = emqx_frame:parse(Bin),
+    ?assertMatch(
+        #{state := clean, proto_ver := ?MQTT_PROTO_V3},
+        emqx_frame:describe_state(PState)
+    ).
 
 t_serialize_parse_v4_connect(_) ->
     Bin =
@@ -194,7 +221,7 @@ t_serialize_parse_v4_connect(_) ->
         }
     ),
     ?assertEqual(Bin, serialize_to_binary(Packet)),
-    ?assertMatch({ok, Packet, <<>>, _}, emqx_frame:parse(Bin)).
+    ?assertMatch({Packet, <<>>, _}, emqx_frame:parse(Bin)).
 
 t_serialize_parse_v5_connect(_) ->
     Props = #{
@@ -250,7 +277,7 @@ t_serialize_parse_connect_without_clientid(_) ->
         keepalive = 60
     }),
     ?assertEqual(Bin, serialize_to_binary(Packet)),
-    ?assertMatch({ok, Packet, <<>>, _}, emqx_frame:parse(Bin)).
+    ?assertMatch({Packet, <<>>, _}, emqx_frame:parse(Bin)).
 
 t_serialize_parse_connect_with_will(_) ->
     Bin =
@@ -276,7 +303,7 @@ t_serialize_parse_connect_with_will(_) ->
         }
     },
     ?assertEqual(Bin, serialize_to_binary(Packet)),
-    ?assertMatch({ok, Packet, <<>>, _}, emqx_frame:parse(Bin)).
+    ?assertMatch({Packet, <<>>, _}, emqx_frame:parse(Bin)).
 
 t_serialize_parse_connect_with_malformed_will(_) ->
     Packet2 = #mqtt_packet{
@@ -321,7 +348,7 @@ t_serialize_parse_bridge_connect(_) ->
         header = #mqtt_packet_header{type = ?CONNECT},
         variable = #mqtt_packet_connect{
             clientid = <<"C_00:0C:29:2B:77:52">>,
-            proto_ver = 16#03,
+            proto_ver = ?MQTT_PROTO_V3,
             proto_name = <<"MQIsdp">>,
             is_bridge = true,
             will_retain = true,
@@ -334,7 +361,7 @@ t_serialize_parse_bridge_connect(_) ->
         }
     },
     ?assertEqual(Bin, serialize_to_binary(Packet)),
-    ?assertMatch({ok, Packet, <<>>, _}, emqx_frame:parse(Bin)),
+    ?assertMatch({Packet, <<>>, _}, emqx_frame:parse(Bin)),
     Packet1 = ?CONNECT_PACKET(#mqtt_packet_connect{is_bridge = true}),
     ?assertEqual(Packet1, parse_serialize(Packet1)).
 
@@ -384,10 +411,10 @@ t_parse_sticky_frames(_) ->
     Size = size(Bin),
     <<H:(Size - 2)/binary, TailTwoBytes/binary>> = Bin,
     %% needs 2 more bytes
-    {more, PState1} = emqx_frame:parse(H),
+    {2, PState1} = emqx_frame:parse(H),
     %% feed 3 bytes as if the next 1 byte belongs to the next packet.
-    {ok, _, <<42>>, PState2} = emqx_frame:parse(iolist_to_binary([TailTwoBytes, 42]), PState1),
-    ?assertMatch({none, _}, PState2).
+    {_, <<42>>, PState2} = emqx_frame:parse(iolist_to_binary([TailTwoBytes, 42]), PState1),
+    ?assertMatch(#{state := clean}, emqx_frame:describe_state(PState2)).
 
 t_serialize_parse_qos0_publish(_) ->
     Bin = <<48, 14, 0, 7, 120, 120, 120, 47, 121, 121, 121, 104, 101, 108, 108, 111>>,
@@ -443,6 +470,39 @@ t_serialize_parse_qos2_publish(_) ->
     ),
     %% strict_mode = false
     _ = parse_serialize(?PUBLISH_PACKET(?QOS_2, <<"Topic">>, 0, <<>>), #{strict_mode => false}).
+
+t_serialize_parse_with_dup_flag(_) ->
+    Packet = fun(Dup, QoS) ->
+        #mqtt_packet{
+            header = #mqtt_packet_header{
+                type = ?PUBLISH,
+                dup = Dup,
+                qos = QoS,
+                retain = false
+            },
+            variable = #mqtt_packet_publish{
+                topic_name = <<"a/b/c">>,
+                packet_id = 1
+            },
+            payload = <<"haha">>
+        }
+    end,
+
+    %% no invalid flag check for serializing now
+    InvalidQoS0Packet = Packet(true, ?QOS_0),
+    ?ASSERT_FRAME_THROW(bad_frame_header, parse_serialize(InvalidQoS0Packet)),
+
+    QoS1_Dup = Packet(true, ?QOS_1),
+    ?assertEqual(QoS1_Dup, parse_serialize(QoS1_Dup)),
+
+    QoS1_NoDup = Packet(false, ?QOS_1),
+    ?assertEqual(QoS1_NoDup, parse_serialize(QoS1_NoDup)),
+
+    QoS2_Dup = Packet(true, ?QOS_2),
+    ?assertEqual(QoS2_Dup, parse_serialize(QoS2_Dup)),
+
+    QoS2_NoDup = Packet(false, ?QOS_2),
+    ?assertEqual(QoS2_NoDup, parse_serialize(QoS2_NoDup)).
 
 t_serialize_parse_publish_v5(_) ->
     Props = #{
@@ -623,7 +683,7 @@ t_serialize_parse_pingresp(_) ->
 
 t_parse_disconnect(_) ->
     Packet = ?DISCONNECT_PACKET(?RC_SUCCESS),
-    ?assertMatch({ok, Packet, <<>>, _}, emqx_frame:parse(<<224, 0>>)).
+    ?assertMatch({Packet, <<>>, _}, emqx_frame:parse(<<224, 0>>)).
 
 t_serialize_parse_disconnect(_) ->
     Packet = ?DISCONNECT_PACKET(?RC_SUCCESS),
@@ -683,15 +743,36 @@ t_malformed_connect_header(_) ->
     ).
 
 t_malformed_connect_data(_) ->
+    ProtoNameWithLen = <<0, 6, "MQIsdp">>,
+    ConnectFlags = <<2#00000000>>,
+    ClientIdwithLen = <<0, 1, "a">>,
+    UnexpectedRestBin = <<0, 1, 2>>,
     ?ASSERT_FRAME_THROW(
-        #{cause := malformed_connect, unexpected_trailing_bytes := _},
-        emqx_frame:parse(<<16, 15, 0, 6, 77, 81, 73, 115, 100, 112, 3, 0, 0, 0, 0, 0, 0>>)
+        #{cause := malformed_connect, unexpected_trailing_bytes := 3},
+        emqx_frame:parse(
+            <<16, 18, ProtoNameWithLen/binary, ?MQTT_PROTO_V3, ConnectFlags/binary, 0, 0,
+                ClientIdwithLen/binary, UnexpectedRestBin/binary>>
+        )
+    ).
+
+t_malformed_connect_data_proto_ver(_) ->
+    Proto3NameWithLen = <<0, 6, "MQIsdp">>,
+    ?ASSERT_FRAME_THROW(
+        #{cause := malformed_connect, header_bytes := <<>>},
+        emqx_frame:parse(<<16, 8, Proto3NameWithLen/binary>>)
+    ),
+    ProtoNameWithLen = <<0, 4, "MQTT">>,
+    ?ASSERT_FRAME_THROW(
+        #{cause := malformed_connect, header_bytes := <<>>},
+        emqx_frame:parse(<<16, 6, ProtoNameWithLen/binary>>)
     ).
 
 t_reserved_connect_flag(_) ->
     ?assertException(
         throw,
-        {frame_parse_error, reserved_connect_flag},
+        {frame_parse_error, #{
+            cause := reserved_connect_flag, proto_ver := ?MQTT_PROTO_V3, proto_name := <<"MQIsdp">>
+        }},
         emqx_frame:parse(<<16, 15, 0, 6, 77, 81, 73, 115, 100, 112, 3, 1, 0, 0, 1, 0, 0>>)
     ).
 
@@ -703,9 +784,15 @@ t_invalid_clientid(_) ->
     ).
 
 %% for regression: `password` must be `undefined`
+%% BUG-FOR-BUG compatible
 t_undefined_password(_) ->
-    Payload = <<16, 19, 0, 4, 77, 81, 84, 84, 4, 130, 0, 60, 0, 2, 97, 49, 0, 3, 97, 97, 97>>,
-    {ok, Packet, <<>>, {none, _}} = emqx_frame:parse(Payload),
+    %% Username Flag = true
+    %% Password Flag = false
+    %% Clean Session = true
+    ConnectFlags = <<2#1000:4, 2#0010:4>>,
+    ConnBin =
+        <<16, 17, 0, 4, 77, 81, 84, 84, 4, ConnectFlags/binary, 0, 60, 0, 2, 97, 49, 0, 1, 97>>,
+    {Packet, <<>>, _} = emqx_frame:parse(ConnBin),
     Password = undefined,
     ?assertEqual(
         #mqtt_packet{
@@ -717,7 +804,7 @@ t_undefined_password(_) ->
             },
             variable = #mqtt_packet_connect{
                 proto_name = <<"MQTT">>,
-                proto_ver = 4,
+                proto_ver = ?MQTT_PROTO_V4,
                 is_bridge = false,
                 clean_start = true,
                 will_flag = false,
@@ -729,12 +816,91 @@ t_undefined_password(_) ->
                 will_props = #{},
                 will_topic = undefined,
                 will_payload = undefined,
-                username = <<"aaa">>,
+                username = <<"a">>,
                 password = Password
             },
             payload = undefined
         },
         Packet
+    ),
+    ok.
+
+t_invalid_password_flag(_) ->
+    %% Username Flag = false
+    %% Password Flag = true
+    %% Clean Session = true
+    ConnectFlags = <<2#0100:4, 2#0010:4>>,
+    ConnectBin =
+        <<16, 17, 0, 4, 77, 81, 84, 84, 4, ConnectFlags/binary, 0, 60, 0, 2, 97, 49, 0, 1, 97>>,
+    ?assertMatch(
+        {_, _, _},
+        emqx_frame:parse(ConnectBin)
+    ),
+
+    StrictModeParseState = emqx_frame:initial_parse_state(#{strict_mode => true}),
+    ?assertException(
+        throw,
+        {frame_parse_error, invalid_password_flag},
+        emqx_frame:parse(ConnectBin, StrictModeParseState)
+    ).
+
+t_invalid_will_retain(_) ->
+    ConnectFlags = <<2#01100000>>,
+    ConnectBin =
+        <<16, 51, 0, 4, 77, 81, 84, 84, 5, ConnectFlags/binary, 174, 157, 24, 38, 0, 14, 98, 55,
+            122, 51, 83, 73, 89, 50, 54, 79, 77, 73, 65, 86, 0, 5, 66, 117, 53, 57, 66, 0, 6, 84,
+            54, 75, 78, 112, 57, 0, 6, 68, 103, 55, 87, 87, 87>>,
+    ?assertException(
+        throw,
+        {frame_parse_error, #{
+            cause := invalid_will_retain, proto_ver := ?MQTT_PROTO_V5, proto_name := <<"MQTT">>
+        }},
+        emqx_frame:parse(ConnectBin)
+    ),
+    ok.
+
+t_invalid_will_qos(_) ->
+    Will_F_WillQoS0 = <<2#010:3, 2#00:2, 2#000:3>>,
+    Will_F_WillQoS1 = <<2#010:3, 2#01:2, 2#000:3>>,
+    Will_F_WillQoS2 = <<2#010:3, 2#10:2, 2#000:3>>,
+    Will_F_WillQoS3 = <<2#010:3, 2#11:2, 2#000:3>>,
+    Will_T_WillQoS3 = <<2#011:3, 2#11:2, 2#000:3>>,
+    ConnectBinFun = fun(ConnectFlags) ->
+        <<16, 51, 0, 4, 77, 81, 84, 84, 5, ConnectFlags/binary, 174, 157, 24, 38, 0, 14, 98, 55,
+            122, 51, 83, 73, 89, 50, 54, 79, 77, 73, 65, 86, 0, 5, 66, 117, 53, 57, 66, 0, 6, 84,
+            54, 75, 78, 112, 57, 0, 6, 68, 103, 55, 87, 87, 87>>
+    end,
+    ?assertMatch(
+        {_, _, _},
+        emqx_frame:parse(ConnectBinFun(Will_F_WillQoS0))
+    ),
+    ?assertException(
+        throw,
+        {frame_parse_error, #{
+            cause := invalid_will_qos, proto_ver := ?MQTT_PROTO_V5, proto_name := <<"MQTT">>
+        }},
+        emqx_frame:parse(ConnectBinFun(Will_F_WillQoS1))
+    ),
+    ?assertException(
+        throw,
+        {frame_parse_error, #{
+            cause := invalid_will_qos, proto_ver := ?MQTT_PROTO_V5, proto_name := <<"MQTT">>
+        }},
+        emqx_frame:parse(ConnectBinFun(Will_F_WillQoS2))
+    ),
+    ?assertException(
+        throw,
+        {frame_parse_error, #{
+            cause := invalid_will_qos, proto_ver := ?MQTT_PROTO_V5, proto_name := <<"MQTT">>
+        }},
+        emqx_frame:parse(ConnectBinFun(Will_F_WillQoS3))
+    ),
+    ?assertException(
+        throw,
+        {frame_parse_error, #{
+            cause := invalid_will_qos, proto_ver := ?MQTT_PROTO_V5, proto_name := <<"MQTT">>
+        }},
+        emqx_frame:parse(ConnectBinFun(Will_T_WillQoS3))
     ),
     ok.
 
@@ -745,7 +911,7 @@ parse_serialize(Packet, Opts) when is_map(Opts) ->
     Ver = maps:get(version, Opts, ?MQTT_PROTO_V4),
     Bin = iolist_to_binary(emqx_frame:serialize(Packet, Ver)),
     ParseState = emqx_frame:initial_parse_state(Opts),
-    {ok, NPacket, <<>>, _} = emqx_frame:parse(Bin, ParseState),
+    {NPacket, <<>>, _} = emqx_frame:parse(Bin, ParseState),
     NPacket.
 
 serialize_to_binary(Packet) ->
@@ -756,7 +922,7 @@ serialize_to_binary(Packet, Ver) ->
 
 parse_to_packet(Bin, Opts) ->
     PState = emqx_frame:initial_parse_state(Opts),
-    {ok, Packet, <<>>, _} = emqx_frame:parse(Bin, PState),
+    {Packet, <<>>, _} = emqx_frame:parse(Bin, PState),
     Packet.
 
 payload(Len) -> iolist_to_binary(lists:duplicate(Len, 1)).

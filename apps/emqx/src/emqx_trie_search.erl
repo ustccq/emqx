@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Topic index for matching topics to topic filters.
@@ -99,7 +87,7 @@
 -module(emqx_trie_search).
 
 -export([make_key/2, make_pat/2, filter/1]).
--export([match/2, matches/3, get_id/1, get_topic/1]).
+-export([match/2, matches/3, get_id/1, get_topic/1, matches_filter/3]).
 -export_type([key/1, word/0, words/0, nextf/0, opts/0]).
 
 -define(END, '$end_of_table').
@@ -179,13 +167,24 @@ match(Topic, NextF) ->
 
 %% @doc Match given topic against the index and return _all_ matches.
 %% If `unique` option is given, return only unique matches by record ID.
--spec matches(emqx_types:topic(), nextf(), opts()) -> [key(_)].
+-spec matches(emqx_types:topic() | [word()], nextf(), opts()) -> [key(_)].
 matches(Topic, NextF, Opts) ->
     search(Topic, NextF, Opts).
 
+%% @doc Match given topic filter against the index and return _all_ matches.
+-spec matches_filter(emqx_types:topic() | [word()], nextf(), opts()) -> [key(_)].
+matches_filter(TopicFilter, NextF, Opts) ->
+    search(TopicFilter, NextF, [topic_filter | Opts]).
+
 %% @doc Entrypoint of the search for a given topic.
 search(Topic, NextF, Opts) ->
-    Words = topic_words(Topic),
+    %% A private opt
+    IsFilter = proplists:get_bool(topic_filter, Opts),
+    Words =
+        case IsFilter of
+            true -> filter_words(Topic);
+            false -> topic_words(Topic)
+        end,
     Base = base_init(Words),
     ORetFirst = proplists:get_bool(return_first, Opts),
     OUnique = proplists:get_bool(unique, Opts),
@@ -200,8 +199,10 @@ search(Topic, NextF, Opts) ->
         end,
     Matches =
         case search_new(Words, Base, NextF, Acc0) of
-            {Cursor, Acc} ->
+            {Cursor, Acc} when not IsFilter ->
                 match_topics(Topic, Cursor, NextF, Acc);
+            {_Cursor, Acc} ->
+                Acc;
             Acc ->
                 Acc
         end,
@@ -275,6 +276,17 @@ compare(['#'], _Words, _) ->
     % Closest possible next entries that we must not miss:
     % * a/+/+/d/# (same topic but a different ID)
     match_full;
+%% Filter search %%
+compare(_Filter, ['#'], _) ->
+    match_full;
+compare([_ | TF], ['+' | TW], Pos) ->
+    case compare(TF, TW, Pos + 1) of
+        lower ->
+            lower;
+        Other ->
+            Other
+    end;
+%% Filter search end %%
 compare(['+' | TF], [HW | TW], Pos) ->
     case compare(TF, TW, Pos + 1) of
         lower ->
@@ -331,7 +343,9 @@ match_add(K, Acc) when is_list(Acc) ->
 match_add(K, first) ->
     throw({first, K}).
 
--spec filter_words(emqx_types:topic()) -> [word()].
+-spec filter_words(emqx_types:topic() | [word()]) -> [word()].
+filter_words(Words) when is_list(Words) ->
+    Words;
 filter_words(Topic) when is_binary(Topic) ->
     % NOTE
     % This is almost identical to `emqx_topic:words/1`, but it doesn't convert empty
@@ -340,6 +354,8 @@ filter_words(Topic) when is_binary(Topic) ->
     [word(W, filter) || W <- emqx_topic:tokens(Topic)].
 
 -spec topic_words(emqx_types:topic()) -> [binary()].
+topic_words(Words) when is_list(Words) ->
+    Words;
 topic_words(Topic) when is_binary(Topic) ->
     [word(W, topic) || W <- emqx_topic:tokens(Topic)].
 

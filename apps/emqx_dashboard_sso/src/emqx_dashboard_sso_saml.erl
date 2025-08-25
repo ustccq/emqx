@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_sso_saml).
@@ -139,7 +139,7 @@ login(
                 Html = esaml_binding:encode_http_post(IDP, SignedXml, <<>>),
                 {200, ?RESPHEADERS, Html};
             false ->
-                {302, ?RESPHEADERS#{<<"location">> => Target}, ?REDIRECT_BODY}
+                {302, maps:merge(?RESPHEADERS, #{<<"location">> => Target}), ?REDIRECT_BODY}
         end,
     {redirect, Redirect}.
 
@@ -162,7 +162,7 @@ convert_certs(
         Conf
 ) ->
     case
-        emqx_tls_lib:ensure_ssl_files(
+        emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(
             Dir, #{enable => true, certfile => Cert, keyfile => Key}, #{}
         )
     of
@@ -226,21 +226,23 @@ do_validate_assertion(SP, DuplicateFun, Body) ->
     SAMLEncoding = proplists:get_value(<<"SAMLEncoding">>, PostVals),
     SAMLResponse = proplists:get_value(<<"SAMLResponse">>, PostVals),
     RelayState = proplists:get_value(<<"RelayState">>, PostVals),
-    case (catch esaml_binding:decode_response(SAMLEncoding, SAMLResponse)) of
-        {'EXIT', Reason} ->
-            {error, {bad_decode, Reason}};
-        Xml ->
-            case esaml_sp:validate_assertion(Xml, DuplicateFun, SP) of
-                {ok, A} -> {ok, A, RelayState};
-                {error, E} -> {error, E}
-            end
+    try
+        Xml = esaml_binding:decode_response(SAMLEncoding, SAMLResponse),
+        case esaml_sp:validate_assertion(Xml, DuplicateFun, SP) of
+            {ok, A} -> {ok, A, RelayState};
+            {error, E} -> {error, E}
+        end
+    catch
+        exit:Reason ->
+            {error, {bad_decode, Reason}}
     end.
 
 gen_redirect_response(DashboardAddr, Username) ->
     case ensure_user_exists(Username) of
         {ok, Role, Token} ->
             Target = login_redirect_target(DashboardAddr, Username, Role, Token),
-            {redirect, {302, ?RESPHEADERS#{<<"location">> => Target}, ?REDIRECT_BODY}};
+            Response = {302, maps:merge(?RESPHEADERS, #{<<"location">> => Target}), ?REDIRECT_BODY},
+            {redirect, Username, Response};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -253,7 +255,8 @@ gen_redirect_response(DashboardAddr, Username) ->
 ensure_user_exists(Username) ->
     case emqx_dashboard_admin:lookup_user(saml, Username) of
         [User] ->
-            emqx_dashboard_token:sign(User, <<>>);
+            {ok, Role, Token, _Namespace} = emqx_dashboard_token:sign(User),
+            {ok, Role, Token};
         [] ->
             case emqx_dashboard_admin:add_sso_user(saml, Username, ?ROLE_VIEWER, <<>>) of
                 {ok, _} ->
@@ -273,7 +276,7 @@ is_msie(Headers) ->
     not (binary:match(UA, <<"MSIE">>) =:= nomatch).
 
 login_redirect_target(DashboardAddr, Username, Role, Token) ->
-    LoginMeta = emqx_dashboard_sso_api:login_meta(Username, Role, Token),
+    LoginMeta = emqx_dashboard_sso_api:login_meta(Username, Role, Token, saml),
     <<DashboardAddr/binary, "/?login_meta=", (base64_login_meta(LoginMeta))/binary>>.
 
 base64_login_meta(LoginMeta) ->

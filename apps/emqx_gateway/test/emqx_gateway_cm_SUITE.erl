@@ -1,22 +1,11 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_cm_SUITE).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 
 -compile(export_all).
 -compile(nowarn_export_all).
@@ -33,19 +22,22 @@
 all() -> emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Conf) ->
-    emqx_config:erase(gateway),
-    emqx_gateway_test_utils:load_all_gateway_apps(),
-    emqx_common_test_helpers:load_config(emqx_gateway_schema, ?CONF_DEFAULT),
-    emqx_common_test_helpers:start_apps([]),
-
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            {emqx_gateway, ?CONF_DEFAULT}
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Conf)}
+    ),
     ok = meck:new(emqx_gateway_metrics, [passthrough, no_history, no_link]),
     ok = meck:expect(emqx_gateway_metrics, inc, fun(_, _) -> ok end),
-    Conf.
+    [{apps, Apps} | Conf].
 
-end_per_suite(_Conf) ->
-    meck:unload(emqx_gateway_metrics),
-    emqx_common_test_helpers:stop_apps([]),
-    emqx_config:delete_override_conf_files().
+end_per_suite(Conf) ->
+    meck:unload(),
+    ok = emqx_cth_suite:stop(?config(apps, Conf)),
+    ok.
 
 init_per_testcase(_TestCase, Conf) ->
     process_flag(trap_exit, true),

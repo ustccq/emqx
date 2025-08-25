@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@
 -export([parse/2]).
 -export([parse_deep/1]).
 -export([parse_deep/2]).
+-export([placeholders/1]).
+-export([placeholders/2]).
 -export([validate/2]).
 -export([is_const/1]).
 -export([unparse/1]).
@@ -143,18 +145,34 @@ parse_accessor(Var) ->
             Name
     end.
 
+%% @doc Extract all used placeholders from a template.
+-spec placeholders(t()) -> [varname()].
+placeholders(Template) when is_list(Template) ->
+    [Name || {var, Name, _} <- Template];
+placeholders({'$tpl', Template}) ->
+    placeholders_deep(Template).
+
+%% @doc Extract all used placeholders from a template
+%% and partition them into allowed and disallowed.
+-spec placeholders([varname() | {var_namespace, varname()}], t()) ->
+    {_UsedAllowed :: [varname()], _UsedDisallowed :: [varname()]}.
+placeholders(Allowed, Template) ->
+    UsedAll = placeholders(Template),
+    UsedUnique = lists:usort(UsedAll),
+    UsedDisallowed = find_disallowed(UsedUnique, Allowed),
+    UsedAllowed = UsedUnique -- UsedDisallowed,
+    {UsedAllowed, UsedDisallowed}.
+
 %% @doc Validate a template against a set of allowed variables.
 %% If the given template contains any variable not in the allowed set, an error
 %% is returned.
 -spec validate([varname() | {var_namespace, varname()}], t()) ->
     ok | {error, [_Error :: {varname(), disallowed}]}.
 validate(Allowed, Template) ->
-    {_, Errors} = render(Template, #{}),
-    {Used, _} = lists:unzip(Errors),
-    case find_disallowed(lists:usort(Used), Allowed) of
-        [] ->
+    case placeholders(Allowed, Template) of
+        {_UsedAllowed, []} ->
             ok;
-        Disallowed ->
+        {_UsedAllowed, Disallowed} ->
             {error, [{Var, disallowed} || Var <- Disallowed]}
     end.
 
@@ -192,10 +210,13 @@ is_allowed(Var, [{var_namespace, VarPrefix} | Allowed]) ->
         false ->
             is_allowed(Var, Allowed)
     end;
-is_allowed(Var, [Var | _Allowed]) ->
+is_allowed(Var, [VarAllowed | Rest]) ->
+    is_same_varname(Var, VarAllowed) orelse is_allowed(Var, Rest).
+
+is_same_varname("", ".") ->
     true;
-is_allowed(Var, [_ | Allowed]) ->
-    is_allowed(Var, Allowed).
+is_same_varname(V1, V2) ->
+    V1 =:= V2.
 
 %% @doc Check if a template is constant with respect to rendering, i.e. does not
 %% contain any placeholders.
@@ -321,6 +342,22 @@ parse_deep_term(Term, Opts) when is_binary(Term) ->
     parse(Term, Opts);
 parse_deep_term(Term, _Opts) ->
     Term.
+
+-spec placeholders_deep(deeptpl()) -> [varname()].
+placeholders_deep(Template) when is_map(Template) ->
+    maps:fold(
+        fun(KT, VT, Acc) -> placeholders_deep(KT) ++ placeholders_deep(VT) ++ Acc end,
+        [],
+        Template
+    );
+placeholders_deep({list, Template}) when is_list(Template) ->
+    lists:flatmap(fun placeholders_deep/1, Template);
+placeholders_deep({tuple, Template}) when is_list(Template) ->
+    lists:flatmap(fun placeholders_deep/1, Template);
+placeholders_deep(Template) when is_list(Template) ->
+    placeholders(Template);
+placeholders_deep(_Term) ->
+    [].
 
 render_deep(Template, Context, Opts) when is_map(Template) ->
     maps:fold(

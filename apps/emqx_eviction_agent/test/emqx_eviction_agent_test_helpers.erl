@@ -1,8 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_eviction_agent_test_helpers).
+
+-include_lib("common_test/include/ct.hrl").
 
 -export([
     emqtt_connect/0,
@@ -96,7 +98,7 @@ start_cluster(Config, NodeNames = [Node1 | _], Apps) ->
     ClusterNodes = emqx_cth_cluster:start(
         Cluster,
         %% Use Node1 to scope the work dirs for all the nodes
-        #{work_dir => emqx_cth_suite:work_dir(Node1, Config)}
+        #{work_dir => emqx_cth_suite:work_dir(?config(tc_name, Config), Config)}
     ),
     nodes_with_mqtt_tcp_ports(ClusterNodes).
 

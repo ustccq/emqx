@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mnesia_schema).
@@ -68,4 +56,26 @@ common_fields() ->
         {mechanism, emqx_authn_schema:mechanism(?AUTHN_MECHANISM_SIMPLE)},
         {backend, emqx_authn_schema:backend(?AUTHN_BACKEND)},
         {user_id_type, fun user_id_type/1}
-    ] ++ emqx_authn_schema:common_fields().
+    ] ++ bootstrap_fields() ++
+        emqx_authn_schema:common_fields().
+
+bootstrap_fields() ->
+    [
+        {bootstrap_file,
+            ?HOCON(
+                binary(),
+                #{
+                    desc => ?DESC(bootstrap_file),
+                    required => false,
+                    default => <<"${EMQX_ETC_DIR}/auth-built-in-db-bootstrap.csv">>
+                }
+            )},
+        {bootstrap_type,
+            ?HOCON(
+                ?ENUM([hash, plain]), #{
+                    desc => ?DESC(bootstrap_type),
+                    required => false,
+                    default => <<"plain">>
+                }
+            )}
+    ].

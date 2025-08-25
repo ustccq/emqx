@@ -1,23 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Start/Stop MQTT listeners.
 -module(emqx_listeners).
 
--include("emqx_mqtt.hrl").
 -include("emqx_schema.hrl").
 -include("logger.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
@@ -34,7 +21,8 @@
     max_conns/2,
     id_example/0,
     default_max_conn/0,
-    shutdown_count/2
+    shutdown_count/2,
+    tcp_opts/1
 ]).
 
 -export([
@@ -44,28 +32,51 @@
     stop_listener/3,
     restart_listener/1,
     restart_listener/3,
-    has_enabled_listener_conf_by_type/1
+    has_enabled_listener_conf_by_type/1,
+    wait_listener_stopped/1
 ]).
 
 -export([
     listener_id/2,
     parse_listener_id/1,
-    ensure_override_limiter_conf/2,
     esockd_access_rules/1
 ]).
+
+-export([is_packet_parser_available/1]).
 
 -export([pre_config_update/3, post_config_update/5]).
 
 -export([format_bind/1]).
 
 -ifdef(TEST).
--export([certs_dir/2, wait_listener_stopped/1]).
+-export([certs_dir/2]).
 -endif.
 
 -export_type([listener_id/0]).
 
+-if(OTP_RELEASE >= 26).
+-dialyzer(
+    {no_unknown, [
+        is_running/3,
+        current_conns/3,
+        do_stop_listener/3,
+        do_start_listener/4,
+        do_update_listener/4,
+        quic_listener_conf_rollback/4
+    ]}
+).
+-endif.
+
 -type listener_id() :: atom() | binary().
 -type listener_type() :: tcp | ssl | ws | wss | quic | dtls.
+
+%% MQTT SockOpts
+-define(MQTT_SOCKOPTS, [
+    binary,
+    {reuseaddr, true},
+    {backlog, 512},
+    {nodelay, true}
+]).
 
 -define(ESOCKD_LISTENER(T), (T == tcp orelse T == ssl)).
 -define(COWBOY_LISTENER(T), (T == ws orelse T == wss)).
@@ -160,8 +171,7 @@ is_running(Type, ListenerId, Conf) when Type =:= tcp; Type =:= ssl ->
     end;
 is_running(Type, ListenerId, _Conf) when Type =:= ws; Type =:= wss ->
     try
-        Info = ranch:info(ListenerId),
-        proplists:get_value(status, Info) =:= running
+        ranch:get_status(ListenerId) =:= running
     catch
         _:_ ->
             false
@@ -174,33 +184,33 @@ is_running(quic, ListenerId, _Conf) ->
             false
     end.
 
-current_conns(ID, ListenOn) ->
-    {ok, #{type := Type, name := Name}} = parse_listener_id(ID),
+current_conns(Id, ListenOn) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
     current_conns(Type, Name, ListenOn).
 
 current_conns(Type, Name, ListenOn) when Type == tcp; Type == ssl ->
     esockd:get_current_connections({listener_id(Type, Name), ListenOn});
 current_conns(Type, Name, _ListenOn) when Type =:= ws; Type =:= wss ->
-    proplists:get_value(all_connections, ranch:info(listener_id(Type, Name)));
+    maps:get(all_connections, ranch:info(listener_id(Type, Name)));
 current_conns(quic, Name, _ListenOn) ->
     {ok, LPid} = quicer:listener(listener_id(quic, Name)),
     quicer_listener:count_conns(LPid);
 current_conns(_, _, _) ->
     {error, not_support}.
 
-max_conns(ID, ListenOn) ->
-    {ok, #{type := Type, name := Name}} = parse_listener_id(ID),
+max_conns(Id, ListenOn) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
     max_conns(Type, Name, ListenOn).
 
 max_conns(Type, Name, ListenOn) when Type == tcp; Type == ssl ->
     esockd:get_max_connections({listener_id(Type, Name), ListenOn});
 max_conns(Type, Name, _ListenOn) when Type =:= ws; Type =:= wss ->
-    proplists:get_value(max_connections, ranch:info(listener_id(Type, Name)));
+    maps:get(max_connections, ranch:info(listener_id(Type, Name)));
 max_conns(_, _, _) ->
     {error, not_support}.
 
-shutdown_count(ID, ListenOn) ->
-    {ok, #{type := Type, name := Name}} = parse_listener_id(ID),
+shutdown_count(Id, ListenOn) ->
+    {ok, #{type := Type, name := Name}} = parse_listener_id(Id),
     shutdown_count(Type, Name, ListenOn).
 
 shutdown_count(Type, Name, ListenOn) when Type == tcp; Type == ssl ->
@@ -228,8 +238,7 @@ start_listener(ListenerId) ->
 -spec start_listener(listener_type(), atom(), map()) -> ok | {error, term()}.
 start_listener(Type, Name, #{bind := Bind, enable := true} = Conf) ->
     ListenerId = listener_id(Type, Name),
-    Limiter = limiter(Conf),
-    ok = add_limiter_bucket(ListenerId, Limiter),
+    ok = emqx_limiter:create_listener_limiters(ListenerId, Conf),
     case do_start_listener(Type, Name, ListenerId, Conf) of
         {ok, {skipped, Reason}} when
             Reason =:= quic_app_missing
@@ -253,8 +262,8 @@ start_listener(Type, Name, #{bind := Bind, enable := true} = Conf) ->
             }),
             {error, {already_started, Pid}};
         {error, Reason} ->
-            ok = del_limiter_bucket(ListenerId, Limiter),
             ?tp(listener_not_started, #{type => Type, bind => Bind, status => {error, Reason}}),
+            ok = emqx_limiter:delete_listener_limiters(ListenerId),
             BindStr = format_bind(Bind),
             ?ELOG(
                 "Failed to start listener ~ts on ~ts: ~0p.~n",
@@ -295,10 +304,9 @@ update_listener(Type, Name, Conf = #{enable := true}, #{enable := false}) ->
 update_listener(Type, Name, #{enable := false}, Conf = #{enable := true}) ->
     start_listener(Type, Name, Conf);
 update_listener(Type, Name, OldConf, NewConf) ->
-    Id = listener_id(Type, Name),
-    ok = update_limiter_bucket(Id, limiter(OldConf), limiter(NewConf)),
     case do_update_listener(Type, Name, OldConf, NewConf) of
         ok ->
+            ok = emqx_limiter:update_listener_limiters(listener_id(Type, Name), NewConf),
             ok = maybe_unregister_ocsp_stapling_refresh(Type, Name, NewConf),
             ok;
         {skip, Error} when Type =:= quic ->
@@ -330,10 +338,10 @@ stop_listener(ListenerId) ->
 
 stop_listener(Type, Name, #{bind := Bind} = Conf) ->
     Id = listener_id(Type, Name),
-    ok = del_limiter_bucket(Id, limiter(Conf)),
     ok = unregister_ocsp_stapling_refresh(Type, Name),
     case do_stop_listener(Type, Id, Conf) of
         ok ->
+            ok = emqx_limiter:delete_listener_limiters(Id),
             console_print(
                 "Listener ~ts on ~ts stopped.~n",
                 [Id, format_bind(Bind)]
@@ -417,15 +425,21 @@ console_print(_Fmt, _Args) -> ok.
 -spec do_start_listener(listener_type(), atom(), listener_id(), map()) ->
     {ok, pid() | {skipped, atom()}} | {error, term()}.
 %% Start MQTT/TCP listener
+do_start_listener(Type = tcp, Name, Id, #{bind := ListenOn, tcp_backend := socket} = Conf) ->
+    esockd:open_tcpsocket(
+        Id,
+        ListenOn,
+        esockd_opts(Id, Type, Name, emqx_socket_connection, Conf)
+    );
 do_start_listener(Type, Name, Id, #{bind := ListenOn} = Opts) when ?ESOCKD_LISTENER(Type) ->
     esockd:open(
         Id,
         ListenOn,
-        merge_default(esockd_opts(Id, Type, Name, Opts))
+        esockd_opts(Id, Type, Name, emqx_connection, Opts)
     );
 %% Start MQTT/WS listener
 do_start_listener(Type, Name, Id, Opts) when ?COWBOY_LISTENER(Type) ->
-    RanchOpts = ranch_opts(Type, Opts),
+    RanchOpts = ranch_opts(Id, Type, Opts),
     WsOpts = ws_opts(Type, Name, Opts),
     case Type of
         ws -> cowboy:start_clear(Id, RanchOpts, WsOpts);
@@ -436,36 +450,44 @@ do_start_listener(quic, Name, Id, #{bind := Bind} = Opts) ->
     ListenOn = quic_listen_on(Bind),
     case [A || {quicer, _, _} = A <- application:which_applications()] of
         [_] ->
-            ListenOpts = to_quicer_listener_opts(Opts),
-            Limiter = limiter(Opts),
-            ConnectionOpts = #{
-                conn_callback => emqx_quic_connection,
-                peer_unidi_stream_count => maps:get(peer_unidi_stream_count, Opts, 1),
-                peer_bidi_stream_count => maps:get(peer_bidi_stream_count, Opts, 10),
-                zone => zone(Opts),
-                listener => {quic, Name},
-                limiter => Limiter
-            },
-            StreamOpts = #{
-                stream_callback => emqx_quic_stream,
-                active => 1
-            },
             quicer:spawn_listener(
                 Id,
                 ListenOn,
-                {ListenOpts, ConnectionOpts, StreamOpts}
+                to_quicer_listener_opts(Name, Opts)
             );
         [] ->
             {ok, {skipped, quic_app_missing}}
     end.
 
+do_update_listener(
+    Type = tcp, Name, OldConf, NewConf = #{bind := ListenOn, tcp_backend := Backend}
+) ->
+    Id = listener_id(tcp, Name),
+    case OldConf of
+        #{bind := ListenOn, tcp_backend := Backend} ->
+            case Backend of
+                gen_tcp -> ConnMod = emqx_connection;
+                socket -> ConnMod = emqx_socket_connection
+            end,
+            esockd:reset_options(
+                {Id, ListenOn},
+                esockd_opts(Id, Type, Name, ConnMod, NewConf)
+            );
+        _Different ->
+            %% TODO
+            %% Again, we're not strictly required to drop live connections in this case.
+            {error, not_supported}
+    end;
 do_update_listener(Type, Name, OldConf, NewConf = #{bind := ListenOn}) when
     ?ESOCKD_LISTENER(Type)
 ->
     Id = listener_id(Type, Name),
-    case maps:get(bind, OldConf) of
-        ListenOn ->
-            esockd:set_options({Id, ListenOn}, esockd_opts(Id, Type, Name, NewConf));
+    case OldConf of
+        #{bind := ListenOn} ->
+            esockd:reset_options(
+                {Id, ListenOn},
+                esockd_opts(Id, Type, Name, emqx_connection, NewConf)
+            );
         _Different ->
             %% TODO
             %% Again, we're not strictly required to drop live connections in this case.
@@ -475,9 +497,9 @@ do_update_listener(Type, Name, OldConf, NewConf) when
     ?COWBOY_LISTENER(Type)
 ->
     Id = listener_id(Type, Name),
-    RanchOpts = ranch_opts(Type, NewConf),
+    RanchOpts = ranch_opts(Id, Type, NewConf),
     WsOpts = ws_opts(Type, Name, NewConf),
-    case ranch_opts(Type, OldConf) of
+    case ranch_opts(Id, Type, OldConf) of
         RanchOpts ->
             %% Transport options did not change, no need to touch the listener.
             ok;
@@ -492,14 +514,21 @@ do_update_listener(Type, Name, OldConf, NewConf) when
 do_update_listener(quic = Type, Name, OldConf, NewConf) ->
     case quicer:listener(listener_id(Type, Name)) of
         {ok, ListenerPid} ->
-            ListenOn = quic_listen_on(maps:get(bind, NewConf)),
-            case quicer_listener:reload(ListenerPid, ListenOn, to_quicer_listener_opts(NewConf)) of
+            ListenOn = quic_listen_on(NewConf),
+            case
+                quicer_listener:reload(
+                    ListenerPid, ListenOn, to_quicer_listener_opts(Name, NewConf)
+                )
+            of
                 ok ->
                     ok;
                 Error ->
                     case
                         quic_listener_conf_rollback(
-                            ListenerPid, to_quicer_listener_opts(OldConf), Error
+                            ListenerPid,
+                            quic_listen_on(OldConf),
+                            to_quicer_listener_opts(Name, OldConf),
+                            Error
                         )
                     of
                         ok ->
@@ -525,9 +554,8 @@ pre_config_update([?ROOT_KEY, _Type, _Name], {update, _Request}, undefined) ->
     {error, not_found};
 pre_config_update([?ROOT_KEY, Type, Name], {update, Request}, RawConf) ->
     RawConf1 = emqx_utils_maps:deep_merge(RawConf, Request),
-    RawConf2 = ensure_override_limiter_conf(RawConf1, Request),
-    ok = assert_zone_exists(RawConf2),
-    {ok, convert_certs(Type, Name, RawConf2)};
+    ok = assert_zone_exists(RawConf1),
+    {ok, convert_certs(Type, Name, RawConf1)};
 pre_config_update([?ROOT_KEY, _Type, _Name], {action, _Action, Updated}, RawConf) ->
     {ok, emqx_utils_maps:deep_merge(RawConf, Updated)};
 pre_config_update([?ROOT_KEY, _Type, _Name], ?MARK_DEL, _RawConf) ->
@@ -577,44 +605,38 @@ perform_listener_change(update, {{Type, Name, ConfOld}, {_, _, ConfNew}}) ->
 perform_listener_change(stop, {Type, Name, Conf}) ->
     stop_listener(Type, Name, Conf).
 
-esockd_opts(ListenerId, Type, Name, Opts0) ->
+esockd_opts(ListenerId, Type, Name, ConnMod, Opts0) ->
+    Zone = zone(Opts0),
+    PacketTcpOpts = choose_packet_opts(Opts0),
+    Limiter = emqx_limiter:create_esockd_limiter_client(Zone, ListenerId),
     Opts1 = maps:with([acceptors, max_connections, proxy_protocol, proxy_protocol_timeout], Opts0),
-    Limiter = limiter(Opts0),
-    Opts2 =
-        case emqx_limiter_utils:extract_with_type(connection, Limiter) of
-            undefined ->
-                Opts1;
-            BucketCfg ->
-                Opts1#{
-                    limiter => emqx_esockd_htb_limiter:new_create_options(
-                        ListenerId, connection, BucketCfg
-                    )
-                }
-        end,
-    Opts3 = Opts2#{
+    Opts2 = Opts1#{
+        limiter => Limiter,
         access_rules => esockd_access_rules(maps:get(access_rules, Opts0, [])),
-        tune_fun => {emqx_olp, backoff_new_conn, [zone(Opts0)]},
+        tune_fun => {emqx_olp, backoff_new_conn, [Zone]},
         connection_mfargs =>
-            {emqx_connection, start_link, [
+            {ConnMod, start_link, [
                 #{
                     listener => {Type, Name},
-                    zone => zone(Opts0),
-                    limiter => Limiter,
+                    zone => Zone,
                     enable_authn => enable_authn(Opts0)
                 }
             ]}
     },
+    TcpOpts = emqx_utils:merge_opts(?MQTT_SOCKOPTS, PacketTcpOpts ++ tcp_opts(Opts0)),
     maps:to_list(
         case Type of
             tcp ->
-                Opts3#{tcp_options => tcp_opts(Opts0)};
+                Opts2#{
+                    tcp_options => TcpOpts
+                };
             ssl ->
-                OptsWithCRL = inject_crl_config(Opts0),
-                OptsWithSNI = inject_sni_fun(ListenerId, OptsWithCRL),
-                OptsWithRootFun = inject_root_fun(OptsWithSNI),
-                OptsWithVerifyFun = inject_verify_fun(OptsWithRootFun),
-                SSLOpts = ssl_opts(OptsWithVerifyFun),
-                Opts3#{ssl_options => SSLOpts, tcp_options => tcp_opts(Opts0)}
+                SSLOpts0 = ssl_opts(Opts0),
+                SSLOpts = inject_sni_fun(ListenerId, Opts0, SSLOpts0),
+                Opts2#{
+                    ssl_options => SSLOpts,
+                    tcp_options => TcpOpts
+                }
         end
     ).
 
@@ -624,7 +646,6 @@ ws_opts(Type, ListenerName, Opts) ->
         {WsPath, emqx_ws_connection, #{
             zone => zone(Opts),
             listener => {Type, ListenerName},
-            limiter => limiter(Opts),
             enable_authn => enable_authn(Opts)
         }}
     ],
@@ -632,9 +653,17 @@ ws_opts(Type, ListenerName, Opts) ->
     ProxyProto = maps:get(proxy_protocol, Opts, false),
     #{env => #{dispatch => Dispatch}, proxy_header => ProxyProto}.
 
-ranch_opts(Type, Opts = #{bind := ListenOn}) ->
+ranch_opts(ListenerId, Type, Opts = #{bind := ListenOn}) ->
+    Zone = zone(Opts),
     NumAcceptors = maps:get(acceptors, Opts, 4),
     MaxConnections = maps:get(max_connections, Opts, 1024),
+    LimiterClient = emqx_limiter:create_listener_limiter_client(Zone, ListenerId),
+    Limiter =
+        {emqx_ranch_limiter, #{
+            listener => ListenerId,
+            rate_limiter => LimiterClient,
+            max_connections => MaxConnections
+        }},
     SocketOpts =
         case Type of
             wss ->
@@ -652,12 +681,39 @@ ranch_opts(Type, Opts = #{bind := ListenOn}) ->
         end,
     #{
         num_acceptors => NumAcceptors,
+        %% Controls both connection rate and max connections limit:
+        limiter => Limiter,
+        %% Same as number of acceptors, for predictable limiter behavior:
+        num_conns_sups => NumAcceptors,
+        %% Essentially only for `max_conns/1` now:
         max_connections => MaxConnections,
         handshake_timeout => maps:get(handshake_timeout, Opts, 15000),
         socket_opts => ip_port(ListenOn) ++
             %% cowboy don't allow us to set 'reuseaddr'
             proplists:delete(reuseaddr, SocketOpts)
     }.
+
+choose_packet_opts(Opts) ->
+    ParseUnit = maps:get(parse_unit, Opts, chunk),
+    HasPacketParser = is_packet_parser_available(mqtt),
+    case ParseUnit of
+        frame when HasPacketParser ->
+            PacketSize = emqx_config:get_zone_conf(zone(Opts), [mqtt, max_packet_size]),
+            [{packet, mqtt}, {packet_size, PacketSize}];
+        frame ->
+            %% NOTE: Silently ignoring the setting if BEAM does not provide `mqtt` parser.
+            [{packet, raw}];
+        chunk ->
+            [{packet, raw}]
+    end.
+
+-spec is_packet_parser_available(atom()) -> boolean().
+is_packet_parser_available(Type) ->
+    try erlang:decode_packet(Type, <<>>, []) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end.
 
 ip_port(Port) when is_integer(Port) ->
     [{port, Port}];
@@ -687,14 +743,6 @@ esockd_access_rules(StrRules) ->
         end
     end,
     lists:foldr(Access, [], StrRules).
-
-merge_default(Options) ->
-    case lists:keytake(tcp_options, 1, Options) of
-        {value, {tcp_options, TcpOpts}, Options1} ->
-            [{tcp_options, emqx_utils:merge_opts(?MQTT_SOCKOPTS, TcpOpts)} | Options1];
-        false ->
-            [{tcp_options, ?MQTT_SOCKOPTS} | Options]
-    end.
 
 -spec format_bind(
     integer() | {tuple(), integer()} | string() | binary()
@@ -747,39 +795,6 @@ parse_listener_id(Id) ->
 zone(Opts) ->
     maps:get(zone, Opts, undefined).
 
-limiter(Opts) ->
-    emqx_limiter_utils:get_listener_opts(Opts).
-
-add_limiter_bucket(_Id, undefined) ->
-    ok;
-add_limiter_bucket(Id, Limiter) ->
-    maps:fold(
-        fun(Type, Cfg, _) ->
-            emqx_limiter_server:add_bucket(Id, Type, Cfg)
-        end,
-        ok,
-        maps:without([client], Limiter)
-    ).
-
-del_limiter_bucket(_Id, undefined) ->
-    ok;
-del_limiter_bucket(Id, Limiter) ->
-    maps:foreach(
-        fun(Type, _) ->
-            emqx_limiter_server:del_bucket(Id, Type)
-        end,
-        Limiter
-    ).
-
-update_limiter_bucket(Id, Limiter, undefined) ->
-    del_limiter_bucket(Id, Limiter);
-update_limiter_bucket(Id, undefined, Limiter) ->
-    add_limiter_bucket(Id, Limiter);
-update_limiter_bucket(Id, OldLimiter, NewLimiter) ->
-    ok = add_limiter_bucket(Id, NewLimiter),
-    Outdated = maps:without(maps:keys(NewLimiter), OldLimiter),
-    del_limiter_bucket(Id, Outdated).
-
 diff_confs(NewConfs, OldConfs) ->
     emqx_utils:diff_lists(
         flatten_confs(NewConfs),
@@ -810,12 +825,30 @@ ssl_opts(Opts) ->
     emqx_tls_lib:to_server_opts(tls, maps:get(ssl_options, Opts, #{})).
 
 tcp_opts(Opts) ->
-    maps:to_list(
-        maps:without(
-            [active_n, keepalive],
-            maps:get(tcp_options, Opts, #{})
-        )
-    ).
+    TcpOpts = maps:to_list(maps:get(tcp_options, Opts, #{})),
+    lists:flatten(lists:map(fun tcp_opt/1, TcpOpts)).
+
+tcp_opt({active_n, _}) ->
+    %% The `active_n' option is ignored for listener socket.
+    %% For accepted sockets, `active_n' is set by socket owner processes.
+    [];
+tcp_opt({keepalive, _String}) ->
+    %% emqx_schema:tcp_keepalive_opts(String);
+    %% esockd only supports key-value paris, NOT options like [{raw, 6, 4, ...}]
+    %% so we ignore it here but set it in emqx_connection process like `active_n'
+    [];
+tcp_opt({nolinger, Bool}) ->
+    case Bool of
+        true ->
+            {linger, {true, 0}};
+        false ->
+            %% cannot return [] here
+            %% because we need to be able to set {true, 0}
+            %% but also be able to revert it on the fly
+            {linger, {false, 0}}
+    end;
+tcp_opt(Opt) ->
+    Opt.
 
 foreach_listeners(Do) ->
     lists:foreach(
@@ -884,7 +917,7 @@ convert_certs(ListenerConf) ->
 
 convert_certs(Type, Name, Conf) ->
     CertsDir = certs_dir(Type, Name),
-    case emqx_tls_lib:ensure_ssl_files(CertsDir, get_ssl_options(Conf)) of
+    case emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(CertsDir, get_ssl_options(Conf)) of
         {ok, undefined} ->
             Conf;
         {ok, SSL} ->
@@ -901,12 +934,6 @@ assert_zone_exists(#{<<"zone">> := Zone}) ->
     emqx_config_zones:assert_zone_exists(Zone);
 assert_zone_exists(_) ->
     ok.
-
-%% limiter config should override, not merge
-ensure_override_limiter_conf(Conf, #{<<"limiter">> := Limiter}) ->
-    Conf#{<<"limiter">> => Limiter};
-ensure_override_limiter_conf(Conf, _) ->
-    Conf.
 
 get_ssl_options(Conf = #{}) ->
     case maps:find(ssl_options, Conf) of
@@ -974,34 +1001,14 @@ quic_listener_optional_settings() ->
         stateless_operation_expiration_ms
     ].
 
-inject_root_fun(#{ssl_options := SslOpts} = Opts) ->
-    Opts#{ssl_options := emqx_tls_lib:opt_partial_chain(SslOpts)};
-inject_root_fun(Opts) ->
-    Opts.
-
-inject_verify_fun(#{ssl_options := SslOpts} = Opts) ->
-    Opts#{ssl_options := emqx_tls_lib:opt_verify_fun(SslOpts)};
-inject_verify_fun(Opts) ->
-    Opts.
-
-inject_sni_fun(ListenerId, Conf = #{ssl_options := #{ocsp := #{enable_ocsp_stapling := true}}}) ->
-    emqx_ocsp_cache:inject_sni_fun(ListenerId, Conf);
-inject_sni_fun(_ListenerId, Conf) ->
-    Conf.
-
-inject_crl_config(
-    Conf = #{ssl_options := #{enable_crl_check := true} = SSLOpts}
+inject_sni_fun(
+    ListenerId,
+    Conf = #{ssl_options := #{ocsp := #{enable_ocsp_stapling := true}}},
+    SSLOpts
 ) ->
-    HTTPTimeout = emqx_config:get([crl_cache, http_timeout], timer:seconds(15)),
-    Conf#{
-        ssl_options := SSLOpts#{
-            %% `crl_check => true' doesn't work
-            crl_check => peer,
-            crl_cache => {emqx_ssl_crl_cache, {internal, [{http, HTTPTimeout}]}}
-        }
-    };
-inject_crl_config(Conf) ->
-    Conf.
+    emqx_ocsp_cache:opt_sni_fun(ListenerId, Conf) ++ SSLOpts;
+inject_sni_fun(_ListenerId, _Conf = #{}, SSLOpts) ->
+    SSLOpts.
 
 maybe_unregister_ocsp_stapling_refresh(
     ssl = Type, Name, #{ssl_options := #{ocsp := #{enable_ocsp_stapling := false}}} = _Conf
@@ -1023,7 +1030,8 @@ ensure_max_conns(<<"infinity">>) -> <<"infinity">>;
 ensure_max_conns(MaxConn) when is_binary(MaxConn) -> binary_to_integer(MaxConn);
 ensure_max_conns(MaxConn) -> MaxConn.
 
--spec quic_listen_on(X :: any()) -> quicer:listen_on().
+quic_listen_on(#{bind := Bind}) ->
+    quic_listen_on(Bind);
 quic_listen_on(Bind) ->
     case Bind of
         {Addr, Port} when tuple_size(Addr) == 4 ->
@@ -1036,8 +1044,8 @@ quic_listen_on(Bind) ->
             Port
     end.
 
--spec to_quicer_listener_opts(map()) -> map().
-to_quicer_listener_opts(Opts) ->
+-spec to_quicer_listener_opts(atom(), map()) -> quicer_listener:listener_opts().
+to_quicer_listener_opts(Name, Opts) ->
     DefAcceptors = erlang:system_info(schedulers_online) * 8,
     SSLOpts = maps:from_list(ssl_opts(Opts)),
     Opts1 = maps:filter(
@@ -1062,15 +1070,32 @@ to_quicer_listener_opts(Opts) ->
         SSLOpts
     ),
     %% @NOTE: Optional options take precedence over required options
-    maps:merge(Opts2, optional_quic_listener_opts(Opts)).
+    ListenOpts = maps:merge(Opts2, optional_quic_listener_opts(Opts)),
+
+    %% Conn Opts
+    HibernateAfterMs = maps:get(hibernate_after, ListenOpts),
+    ConnectionOpts = #{
+        conn_callback => emqx_quic_connection,
+        peer_unidi_stream_count => maps:get(peer_unidi_stream_count, Opts, 1),
+        peer_bidi_stream_count => maps:get(peer_bidi_stream_count, Opts, 10),
+        zone => zone(Opts),
+        listener => {quic, Name},
+        hibernate_after => HibernateAfterMs
+    },
+    StreamOpts = #{
+        stream_callback => emqx_quic_stream,
+        active => 1,
+        hibernate_after => HibernateAfterMs
+    },
+    {ListenOpts, ConnectionOpts, StreamOpts}.
 
 -spec quic_listener_conf_rollback(
     pid(),
-    map(),
+    quicer:listen_on(),
+    quicer_listener:listener_opts(),
     Error :: {error, _, _} | {error, _}
 ) -> ok | {error, any()}.
-quic_listener_conf_rollback(ListenerPid, #{bind := Bind} = Conf, Error) ->
-    ListenOn = quic_listen_on(Bind),
+quic_listener_conf_rollback(ListenerPid, ListenOn, Conf, Error) ->
     case quicer_listener:reload(ListenerPid, ListenOn, Conf) of
         ok ->
             ?ELOG(

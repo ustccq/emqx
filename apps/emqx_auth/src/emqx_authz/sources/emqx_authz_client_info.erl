@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_client_info).
@@ -27,9 +15,8 @@
 
 %% APIs
 -export([
-    description/0,
     create/1,
-    update/1,
+    update/2,
     destroy/1,
     authorize/4
 ]).
@@ -48,21 +35,19 @@
 %% emqx_authz callbacks
 %%--------------------------------------------------------------------
 
-description() ->
-    "AuthZ with ClientInfo".
-
+%% NOTE: No state is needed for this source, just configuration.
 create(Source) ->
-    Source.
+    emqx_authz_utils:init_state(Source, #{}).
 
-update(Source) ->
-    Source.
+update(_State, Source) ->
+    create(Source).
 
 destroy(_Source) -> ok.
 
-%% @doc Authorize based on cllientinfo enriched with `acl' data.
+%% @doc Authorize based on client info enriched with `acl' data.
 %% e.g. From JWT.
 %%
-%% Supproted rules formats are:
+%% Supported rules formats are:
 %%
 %% v1: (always deny when no match)
 %%
@@ -76,6 +61,7 @@ destroy(_Source) -> ok.
 %%
 %%    [{
 %%        Permission :: emqx_authz_rule:permission_resolution(),
+%%        Who :: emqx_authz_rule:who_condition(),
 %%        Action :: emqx_authz_rule:action_condition(),
 %%        Topics :: emqx_authz_rule:topic_condition()
 %%     }]
@@ -101,13 +87,16 @@ destroy(_Source) -> ok.
 %%
 %%            %% true | false | all | 0 | 1 | <<"true">> | ...
 %%            %% only for pub action
-%%            <<"retain">> => true
+%%            <<"retain">> => true,
+%%
+%%            ....
+%%            %% See `emqx_authz_rule_raw' for more fields
 %%        },
 %%        ...
 %%    ]
 %%
 authorize(#{acl := Acl} = Client, PubSub, Topic, _Source) ->
-    case check(Acl) of
+    case check(Client, Acl) of
         {ok, Rules} when ?IS_V2(Rules) ->
             authorize_v2(Client, PubSub, Topic, Rules);
         {ok, Rules} when ?IS_V1(Rules) ->
@@ -116,24 +105,24 @@ authorize(#{acl := Acl} = Client, PubSub, Topic, _Source) ->
             MatchResult
     end;
 authorize(_Client, _PubSub, _Topic, _Source) ->
-    nomatch.
+    ignore.
 
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
 
-check(#{expire := Expire, rules := Rules}) ->
-    Now = erlang:system_time(second),
+check(Client, #{expire := Expire, rules := Rules}) ->
+    Now = now(Client),
     case Expire of
-        N when is_integer(N) andalso N > Now -> {ok, Rules};
+        N when is_integer(N) andalso N >= Now -> {ok, Rules};
         undefined -> {ok, Rules};
         _ -> {error, {matched, deny}}
     end;
 %% no expire
-check(#{rules := Rules}) ->
+check(_Client, #{rules := Rules}) ->
     {ok, Rules};
 %% no rules — no match
-check(#{}) ->
+check(_Client, #{}) ->
     {error, nomatch}.
 
 authorize_v1(Client, PubSub, Topic, AclRules) ->
@@ -165,3 +154,8 @@ get_topic_filters_v1([Key | Keys], Rules, Default) ->
 
 authorize_v2(Client, PubSub, Topic, Rules) ->
     emqx_authz_rule:matches(Client, PubSub, Topic, Rules).
+
+now(#{now_time := Now}) ->
+    erlang:convert_time_unit(Now, millisecond, second);
+now(_Client) ->
+    erlang:system_time(second).

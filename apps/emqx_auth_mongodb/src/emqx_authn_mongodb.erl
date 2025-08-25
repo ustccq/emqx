@@ -1,23 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mongodb).
 
--include_lib("emqx_auth/include/emqx_authn.hrl").
--include_lib("emqx/include/logger.hrl").
+-behaviour(emqx_authn_provider).
 
 -export([
     create/2,
@@ -25,6 +12,9 @@
     authenticate/2,
     destroy/1
 ]).
+
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include("emqx_auth_mongodb.hrl").
 
 %%------------------------------------------------------------------------------
 %% APIs
@@ -34,22 +24,32 @@ create(_AuthenticatorID, Config) ->
     create(Config).
 
 create(Config0) ->
-    ResourceId = emqx_authn_utils:make_resource_id(?MODULE),
-    {Config, State} = parse_config(Config0),
-    {ok, _Data} = emqx_authn_utils:create_resource(
-        ResourceId,
-        emqx_mongodb,
-        Config
-    ),
-    {ok, State#{resource_id => ResourceId}}.
+    maybe
+        ResourceId = emqx_authn_utils:make_resource_id(?AUTHN_BACKEND_BIN),
+        {ok, ResourceConfig, State} ?= create_state(ResourceId, Config0),
+        ok ?=
+            emqx_authn_utils:create_resource(
+                emqx_mongodb,
+                ResourceConfig,
+                State,
+                ?AUTHN_MECHANISM_BIN,
+                ?AUTHN_BACKEND_BIN
+            ),
+        {ok, State}
+    end.
 
 update(Config0, #{resource_id := ResourceId} = _State) ->
-    {Config, NState} = parse_config(Config0),
-    case emqx_authn_utils:update_resource(emqx_mongodb, Config, ResourceId) of
-        {error, Reason} ->
-            error({load_config_error, Reason});
-        {ok, _} ->
-            {ok, NState#{resource_id => ResourceId}}
+    maybe
+        {ok, ResourceConfig, State} ?= create_state(ResourceId, Config0),
+        ok ?=
+            emqx_authn_utils:update_resource(
+                emqx_mongodb,
+                ResourceConfig,
+                State,
+                ?AUTHN_MECHANISM_BIN,
+                ?AUTHN_BACKEND_BIN
+            ),
+        {ok, State}
     end.
 
 destroy(#{resource_id := ResourceId}) ->
@@ -63,7 +63,7 @@ authenticate(#{password := undefined}, _) ->
 authenticate(
     Credential, #{filter_template := FilterTemplate} = State
 ) ->
-    try emqx_auth_utils:render_deep_for_json(FilterTemplate, Credential) of
+    try emqx_auth_template:render_deep_for_json(FilterTemplate, Credential) of
         Filter ->
             authenticate_with_filter(Filter, Credential, State)
     catch
@@ -76,13 +76,20 @@ authenticate(
 
 authenticate_with_filter(
     Filter,
-    #{password := Password},
+    #{password := Password} = Credential,
     #{
         collection := Collection,
-        resource_id := ResourceId
+        resource_id := ResourceId,
+        cache_key_template := CacheKeyTemplate
     } = State
 ) ->
-    case emqx_resource:simple_sync_query(ResourceId, {find_one, Collection, Filter, #{}}) of
+    CacheKey = emqx_auth_template:cache_key(Credential, CacheKeyTemplate),
+    Result = emqx_authn_utils:cached_simple_sync_query(
+        CacheKey,
+        ResourceId,
+        {find_one, Collection, Filter}
+    ),
+    case Result of
         {ok, undefined} ->
             ignore;
         {error, Reason} ->
@@ -96,7 +103,7 @@ authenticate_with_filter(
         {ok, Doc} ->
             case check_password(Password, Doc, State) of
                 ok ->
-                    {ok, is_superuser(Doc, State)};
+                    {ok, authn_result(Doc, State)};
                 {error, {cannot_find_password_hash_field, PasswordHashField}} ->
                     ?TRACE_AUTHN_PROVIDER(error, "cannot_find_password_hash_field", #{
                         resource => ResourceId,
@@ -115,9 +122,31 @@ authenticate_with_filter(
 %% Internal functions
 %%------------------------------------------------------------------------------
 
-parse_config(#{filter := Filter} = Config) ->
-    FilterTemplate = emqx_authn_utils:parse_deep(Filter),
-    State = maps:with(
+create_state(ResourceId, #{filter := Filter} = Config) ->
+    {Vars, FilterTemplate} = emqx_authn_utils:parse_deep(emqx_utils_maps:binary_key_map(Filter)),
+    CacheKeyTemplate = emqx_auth_template:cache_key_template(Vars),
+    State0 = emqx_authn_utils:init_state(
+        Config,
+        maps:with(
+            [
+                collection,
+                password_hash_field,
+                salt_field,
+                is_superuser_field,
+                clientid_override_field,
+                password_hash_algorithm,
+                salt_position
+            ],
+            Config
+        )
+    ),
+    State = State0#{
+        filter_template => FilterTemplate,
+        cache_key_template => CacheKeyTemplate,
+        resource_id => ResourceId
+    },
+    ok = emqx_authn_password_hashing:init(maps:get(password_hash_algorithm, State)),
+    ResourceConfig = emqx_authn_utils:cleanup_resource_config(
         [
             collection,
             password_hash_field,
@@ -128,8 +157,7 @@ parse_config(#{filter := Filter} = Config) ->
         ],
         Config
     ),
-    ok = emqx_authn_password_hashing:init(maps:get(password_hash_algorithm, State)),
-    {Config, State#{filter_template => FilterTemplate}}.
+    {ok, ResourceConfig, State}.
 
 check_password(undefined, _Selected, _State) ->
     {error, bad_username_or_password};
@@ -161,3 +189,14 @@ is_superuser(Doc, #{is_superuser_field := IsSuperuserField}) ->
     emqx_authn_utils:is_superuser(#{<<"is_superuser">> => IsSuperuser});
 is_superuser(_, _) ->
     emqx_authn_utils:is_superuser(#{<<"is_superuser">> => false}).
+
+clientid_override(Doc, #{clientid_override_field := ClientIdOverrideField}) ->
+    ClientIdOverride = maps:get(ClientIdOverrideField, Doc, undefined),
+    emqx_authn_utils:clientid_override(#{<<"clientid_override">> => ClientIdOverride});
+clientid_override(_Doc, _State) ->
+    #{}.
+
+authn_result(Doc, State) ->
+    Res0 = is_superuser(Doc, State),
+    Res1 = clientid_override(Doc, State),
+    maps:merge(Res0, Res1).

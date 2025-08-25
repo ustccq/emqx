@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_utils).
@@ -21,62 +9,96 @@
 -include_lib("snabbkaffe/include/trace.hrl").
 
 -export([
-    create_resource/3,
-    update_resource/3,
+    create_resource/5,
+    update_resource/5,
+    init_state/2,
+    cleanup_resource_config/2,
     check_password_from_selected_map/3,
     parse_deep/1,
     parse_str/1,
     parse_sql/2,
     is_superuser/1,
     client_attrs/1,
+    clientid_override/1,
     bin/1,
     ensure_apps_started/1,
     cleanup_resources/0,
     make_resource_id/1,
     without_password/1,
     to_bool/1,
-    convert_headers/1,
-    convert_headers_no_content_type/1,
-    default_headers/0,
-    default_headers_no_content_type/0
+    cached_simple_sync_query/3
 ]).
 
--define(DEFAULT_RESOURCE_OPTS, #{
-    start_after_created => false
+-define(DEFAULT_RESOURCE_OPTS(OWNER_ID), #{
+    start_after_created => false,
+    spawn_buffer_workers => false,
+    owner_id => OWNER_ID
 }).
 
 %%--------------------------------------------------------------------
 %% APIs
 %%--------------------------------------------------------------------
 
-create_resource(ResourceId, Module, Config) ->
-    Result = emqx_resource:create_local(
-        ResourceId,
-        ?AUTHN_RESOURCE_GROUP,
-        Module,
-        Config,
-        ?DEFAULT_RESOURCE_OPTS
-    ),
-    start_resource_if_enabled(Result, ResourceId, Config).
+create_resource(Module, ResourceConfig, #{resource_id := ResourceId} = State, Mechanism, Backend) ->
+    maybe
+        OwnerId = owner_id(Mechanism, Backend),
+        {ok, _} ?=
+            emqx_resource:create_local(
+                ResourceId,
+                ?AUTHN_RESOURCE_GROUP,
+                Module,
+                ResourceConfig,
+                ?DEFAULT_RESOURCE_OPTS(OwnerId)
+            ),
+        ok = start_resource_if_enabled(State, Mechanism, Backend)
+    end.
 
-update_resource(Module, Config, ResourceId) ->
-    Result = emqx_resource:recreate_local(
-        ResourceId, Module, Config, ?DEFAULT_RESOURCE_OPTS
-    ),
-    start_resource_if_enabled(Result, ResourceId, Config).
+update_resource(Module, ResourceConfig, #{resource_id := ResourceId} = State, Mechanism, Backend) ->
+    maybe
+        OwnerId = owner_id(Mechanism, Backend),
+        {ok, _} ?=
+            emqx_resource:recreate_local(
+                ResourceId, Module, ResourceConfig, ?DEFAULT_RESOURCE_OPTS(OwnerId)
+            ),
+        start_resource_if_enabled(State, Mechanism, Backend)
+    end.
 
-start_resource_if_enabled({ok, _} = Result, ResourceId, #{enable := true}) ->
-    _ = emqx_resource:start(ResourceId),
-    Result;
-start_resource_if_enabled(Result, _ResourceId, _Config) ->
-    Result.
+start_resource_if_enabled(#{resource_id := ResourceId, enable := true}, Mechanism, Backend) ->
+    case emqx_resource:start(ResourceId) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            %% NOTE
+            %% we allow creation of resources that cannot be started
+            ?SLOG(warning, #{
+                msg => "failed_to_start_authn_resource",
+                resource_id => ResourceId,
+                reason => Reason,
+                mechanism => Mechanism,
+                backend => Backend
+            }),
+            ok
+    end;
+start_resource_if_enabled(#{resource_id := _ResourceId, enable := false}, _Mechanism, _Backend) ->
+    ok.
 
-parse_deep(Template) -> emqx_auth_utils:parse_deep(Template, ?AUTHN_DEFAULT_ALLOWED_VARS).
+init_state(#{enable := Enable} = _Source, Values) ->
+    maps:merge(
+        #{
+            enable => Enable
+        },
+        Values
+    ).
 
-parse_str(Template) -> emqx_auth_utils:parse_str(Template, ?AUTHN_DEFAULT_ALLOWED_VARS).
+cleanup_resource_config(WithoutFields, Config) ->
+    maps:without([enable] ++ WithoutFields, Config).
+
+parse_deep(Template) -> emqx_auth_template:parse_deep(Template, ?AUTHN_DEFAULT_ALLOWED_VARS).
+
+parse_str(Template) -> emqx_auth_template:parse_str(Template, ?AUTHN_DEFAULT_ALLOWED_VARS).
 
 parse_sql(Template, ReplaceWith) ->
-    emqx_auth_utils:parse_sql(Template, ReplaceWith, ?AUTHN_DEFAULT_ALLOWED_VARS).
+    emqx_auth_template:parse_sql(Template, ReplaceWith, ?AUTHN_DEFAULT_ALLOWED_VARS).
 
 check_password_from_selected_map(_Algorithm, _Selected, undefined) ->
     {error, bad_username_or_password};
@@ -111,6 +133,13 @@ client_attrs(#{<<"client_attrs">> := Attrs}) ->
 client_attrs(_) ->
     #{client_attrs => #{}}.
 
+clientid_override(#{<<"clientid_override">> := Value}) when
+    is_binary(Value) andalso Value /= <<"">>
+->
+    #{clientid_override => Value};
+clientid_override(_) ->
+    #{}.
+
 drop_invalid_attr(Map) when is_map(Map) ->
     maps:from_list(do_drop_invalid_attr(maps:to_list(Map))).
 
@@ -134,8 +163,8 @@ ensure_apps_started(_) ->
     ok.
 
 bin(A) when is_atom(A) -> atom_to_binary(A, utf8);
-bin(L) when is_list(L) -> list_to_binary(L);
-bin(X) -> X.
+bin(L) when is_list(L) -> iolist_to_binary(L);
+bin(X) when is_binary(X) -> X.
 
 cleanup_resources() ->
     lists:foreach(
@@ -144,7 +173,7 @@ cleanup_resources() ->
     ).
 
 make_resource_id(Name) ->
-    NameBin = bin(Name),
+    NameBin = bin([<<"authn:">>, bin(Name)]),
     emqx_resource:generate_id(NameBin).
 
 without_password(Credential) ->
@@ -184,29 +213,8 @@ to_bool(MaybeBinInt) when is_binary(MaybeBinInt) ->
 to_bool(_) ->
     false.
 
-convert_headers(Headers) ->
-    transform_header_name(Headers).
-
-convert_headers_no_content_type(Headers) ->
-    maps:without(
-        [<<"content-type">>],
-        transform_header_name(Headers)
-    ).
-
-default_headers() ->
-    maps:put(
-        <<"content-type">>,
-        <<"application/json">>,
-        default_headers_no_content_type()
-    ).
-
-default_headers_no_content_type() ->
-    #{
-        <<"accept">> => <<"application/json">>,
-        <<"cache-control">> => <<"no-cache">>,
-        <<"connection">> => <<"keep-alive">>,
-        <<"keep-alive">> => <<"timeout=30, max=1000">>
-    }.
+cached_simple_sync_query(CacheKey, ResourceID, Query) ->
+    emqx_auth_utils:cached_simple_sync_query(?AUTHN_CACHE, CacheKey, ResourceID, Query).
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -222,19 +230,5 @@ without_password(Credential, [Name | Rest]) ->
             without_password(Credential, Rest)
     end.
 
-transform_header_name(Headers) ->
-    maps:fold(
-        fun(K0, V, Acc) ->
-            K = list_to_binary(string:to_lower(to_list(K0))),
-            maps:put(K, V, Acc)
-        end,
-        #{},
-        Headers
-    ).
-
-to_list(A) when is_atom(A) ->
-    atom_to_list(A);
-to_list(B) when is_binary(B) ->
-    binary_to_list(B);
-to_list(L) when is_list(L) ->
-    L.
+owner_id(Mechanism, Backend) ->
+    bin([bin(Mechanism), ":", bin(Backend)]).

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_conf_schema_tests).
@@ -32,7 +20,6 @@
                 name = emqxcl
                 discovery_strategy = static
                 static.seeds = ~p
-                core_nodes = ~p
              }
     ").
 
@@ -41,7 +28,7 @@ array_nodes_test() ->
     ExpectNodes = ['emqx1@127.0.0.1', 'emqx2@127.0.0.1'],
     lists:foreach(
         fun(Nodes) ->
-            ConfFile = to_bin(?BASE_CONF, [Nodes, Nodes]),
+            ConfFile = to_bin(?BASE_CONF, [Nodes]),
             {ok, Conf} = hocon:binary(ConfFile, #{format => richmap}),
             ConfList = hocon_tconf:generate(emqx_conf_schema, Conf),
             VMArgs = proplists:get_value(vm_args, ConfList),
@@ -56,11 +43,6 @@ array_nodes_test() ->
             ?assertEqual(
                 {static, [{seeds, ExpectNodes}]},
                 ClusterDiscovery,
-                Nodes
-            ),
-            ?assertEqual(
-                ExpectNodes,
-                proplists:get_value(core_nodes, proplists:get_value(mria, ConfList)),
                 Nodes
             )
         end,
@@ -133,30 +115,36 @@ log.file_handlers {
         single_line => true,
         template => ["[", level, "] ", msg, "\n"],
         time_offset => TimeOffset,
-        timestamp_format => auto
+        timestamp_format => auto,
+        with_mfa => false,
+        payload_encode => text
     }}
 ).
 
 -define(FILTERS, [{drop_progress_reports, {fun logger_filters:progress/2, stop}}]).
--define(LOG_CONFIG, #{
-    burst_limit_enable => true,
-    burst_limit_max_count => 10000,
-    burst_limit_window_time => 1000,
-    drop_mode_qlen => 3000,
-    flush_qlen => 8000,
-    overload_kill_enable => true,
-    overload_kill_mem_size => 31457280,
-    overload_kill_qlen => 20000,
-    overload_kill_restart_after => 5000,
-    sync_mode_qlen => 100
-}).
+-define(LOG_CONFIG,
+    (begin
+        #{
+            burst_limit_enable => true,
+            burst_limit_max_count => 10000,
+            burst_limit_window_time => 1000,
+            drop_mode_qlen => 3000,
+            flush_qlen => 8000,
+            overload_kill_enable => true,
+            overload_kill_mem_size => 31457280,
+            overload_kill_qlen => 20000,
+            overload_kill_restart_after => 5000,
+            sync_mode_qlen => 100
+        }
+    end)
+).
 
 outdated_log_test() ->
     validate_log(?OUTDATED_LOG_CONF).
 
 validate_log(Conf) ->
     ensure_acl_conf(),
-    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1", "emqx1@127.0.0.1"]),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
     Conf0 = <<BaseConf/binary, (list_to_binary(Conf))/binary>>,
     {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
     ConfList = hocon_tconf:generate(emqx_conf_schema, ConfMap0),
@@ -212,7 +200,7 @@ validate_log(Conf) ->
 
 file_log_infinity_rotation_size_test_() ->
     ensure_acl_conf(),
-    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1", "emqx1@127.0.0.1"]),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
     Gen = fun(#{count := Count, size := Size}) ->
         Conf0 = to_bin(?FILE_LOG_BASE_CONF, [Count, Size]),
         Conf1 = [BaseConf, Conf0],
@@ -290,7 +278,7 @@ log_rotation_count_limit_test() ->
     rotation_size = \"1024MB\"
     }
     ",
-    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1", "emqx1@127.0.0.1"]),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
     lists:foreach(fun({Conf, Count}) ->
         Conf0 = <<BaseConf/binary, Conf/binary>>,
         {ok, ConfMap0} = hocon:binary(Conf0, #{format => richmap}),
@@ -350,7 +338,7 @@ log_rotation_count_limit_test() ->
 
 authn_validations_test() ->
     ensure_acl_conf(),
-    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1", "emqx1@127.0.0.1"]),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
 
     OKHttps = to_bin(?BASE_AUTHN_ARRAY, [post, true, <<"https://127.0.0.1:8080">>]),
     Conf0 = <<BaseConf/binary, OKHttps/binary>>,
@@ -408,7 +396,7 @@ authn_validations_test() ->
 
 listeners_test() ->
     ensure_acl_conf(),
-    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1", "emqx1@127.0.0.1"]),
+    BaseConf = to_bin(?BASE_CONF, ["emqx1@127.0.0.1"]),
 
     Conf = <<BaseConf/binary, ?LISTENERS>>,
     {ok, ConfMap0} = hocon:binary(Conf, #{format => richmap}),
@@ -513,10 +501,8 @@ log_path_test_() ->
     end,
 
     [
-        {"default-values", fun() -> Assert(default, "log/emqx.log", check(#{})) end},
+        {"default-values", fun() -> Assert(default, "${EMQX_LOG_DIR}/emqx.log", check(#{})) end},
         {"file path with space", fun() -> Assert(name1, "a /b", check(Fh(<<"a /b">>))) end},
-        {"windows", fun() -> Assert(name1, "c:\\a\\ b\\", check(Fh(<<"c:\\a\\ b\\">>))) end},
-        {"unicoded", fun() -> Assert(name1, "路 径", check(Fh(<<"路 径"/utf8>>))) end},
         {"bad utf8", fun() ->
             ?assertThrow(
                 {emqx_conf_schema, [
@@ -689,3 +675,66 @@ dns_srv_record_is_ok_test() ->
         Value when is_map(Value),
         hocon_tconf:check_plain(emqx_conf_schema, ConfMap, #{required => false}, [node, cluster])
     ).
+
+invalid_role_test() ->
+    Conf = node_role_conf(dummy),
+    ?assertThrow(
+        {emqx_conf_schema, [#{reason := "Invalid node role: dummy"}]},
+        hocon_tconf:check_plain(emqx_conf_schema, Conf, #{required => false}, [node])
+    ).
+
+unsupported_role_test() ->
+    test_unsupported_role(emqx_release:edition()).
+
+test_unsupported_role(ee) ->
+    %% all roles are supported in ee
+    ok;
+test_unsupported_role(ce) ->
+    %% replicant role is not allowed for ce since 5.8.0
+    Conf = node_role_conf(replicant),
+    ?assertThrow(
+        {emqx_conf_schema, [
+            #{reason := "Node role 'replicant' is only allowed in Enterprise edition since 5.8.0"}
+        ]},
+        hocon_tconf:check_plain(emqx_conf_schema, Conf, #{required => false}, [node])
+    ).
+
+node_role_conf(Role0) ->
+    Role = atom_to_binary(Role0),
+    Hocon = <<"node { role =", Role/binary, ", cookie = \"cookie\", data_dir = \".\" }">>,
+    {ok, ConfMap} = hocon:binary(Hocon, #{format => map}),
+    ConfMap.
+
+fix_log_dir_path_test() ->
+    ?assertEqual(
+        "/opt/emqx/log/a.log",
+        emqx_conf_schema:fix_bad_log_path("/opt/emqx/log/a.log")
+    ),
+    ?assertEqual(
+        "/var/log/emqx/a.log",
+        emqx_conf_schema:fix_bad_log_path("/var/log/emqx/a.log")
+    ),
+    ?assertEqual(
+        "${SOMEDIR}/a.log",
+        emqx_conf_schema:fix_bad_log_path("${SOMEDIR}/a.log")
+    ),
+    ?assertEqual(
+        <<"${SOMEDIR}/a.log">>,
+        emqx_conf_schema:fix_bad_log_path(<<"${SOMEDIR}/a.log">>)
+    ),
+    try
+        os:putenv("EMQX_LOG_DIR", "foobar"),
+        %% assumption: the two hard coded paths below do not exist in CT test runner
+        ?assertEqual(
+            "${EMQX_LOG_DIR}/a.log",
+            emqx_conf_schema:fix_bad_log_path("/nosuchdir/a.log")
+        ),
+        %% binary in binary out
+        ?assertEqual(
+            <<"${EMQX_LOG_DIR}/a.log">>,
+            emqx_conf_schema:fix_bad_log_path(<<"/nosuchdir/a.log">>)
+        )
+    after
+        os:unsetenv("EMQX_LOG_DIR")
+    end,
+    ok.

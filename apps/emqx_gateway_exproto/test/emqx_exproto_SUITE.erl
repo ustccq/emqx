@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_exproto_SUITE).
@@ -69,13 +57,20 @@ all() ->
         {group, udp_listener},
         {group, dtls_listener},
         {group, https_grpc_server},
-        {group, streaming_connection_handler}
+        {group, streaming_connection_handler},
+        {group, hostname_grpc_server}
     ].
 
 suite() ->
     [{timetrap, {seconds, 30}}].
 
 groups() ->
+    UpdateCases = [
+        t_update_not_restart_listener
+    ],
+    DtlsUpdateCases = [
+        t_update_dtls_listener_have_to_restart
+    ],
     MainCases = [
         t_keepalive_timeout,
         t_mountpoint_echo,
@@ -88,12 +83,13 @@ groups() ->
         t_hook_message_delivered
     ],
     [
-        {tcp_listener, [sequence], MainCases},
-        {ssl_listener, [sequence], MainCases},
-        {udp_listener, [sequence], MainCases},
-        {dtls_listener, [sequence], MainCases},
+        {tcp_listener, [sequence], MainCases ++ UpdateCases},
+        {ssl_listener, [sequence], MainCases ++ UpdateCases},
+        {udp_listener, [sequence], MainCases ++ UpdateCases},
+        {dtls_listener, [sequence], MainCases ++ DtlsUpdateCases},
         {streaming_connection_handler, [sequence], MainCases},
-        {https_grpc_server, [sequence], MainCases}
+        {https_grpc_server, [sequence], MainCases},
+        {hostname_grpc_server, [sequence], MainCases}
     ].
 
 init_per_group(GrpName, Cfg) when
@@ -109,17 +105,27 @@ init_per_group(GrpName, Cfg) when
             udp_listener -> udp;
             dtls_listener -> dtls
         end,
-    init_per_group(LisType, 'ConnectionUnaryHandler', http, Cfg);
-init_per_group(https_grpc_server, Cfg) ->
-    init_per_group(tcp, 'ConnectionUnaryHandler', https, Cfg);
-init_per_group(streaming_connection_handler, Cfg) ->
-    init_per_group(tcp, 'ConnectionHandler', http, Cfg);
-init_per_group(_, Cfg) ->
-    init_per_group(tcp, 'ConnectionUnaryHandler', http, Cfg).
+    init_per_group(GrpName, LisType, 'ConnectionUnaryHandler', http, Cfg);
+init_per_group(https_grpc_server = GrpName, Cfg) ->
+    init_per_group(GrpName, tcp, 'ConnectionUnaryHandler', https, Cfg);
+init_per_group(streaming_connection_handler = GrpName, Cfg) ->
+    init_per_group(GrpName, tcp, 'ConnectionHandler', http, Cfg);
+init_per_group(GrpName, Cfg) ->
+    init_per_group(GrpName, tcp, 'ConnectionUnaryHandler', http, Cfg).
 
-init_per_group(LisType, ServiceName, Scheme, Cfg) ->
+init_per_group(GrpName, LisType, ServiceName, Scheme, Cfg) ->
     Svrs = emqx_exproto_echo_svr:start(Scheme),
-    Addrs = lists:flatten(io_lib:format("~s://127.0.0.1:9001", [Scheme])),
+    Addrs = lists:flatten(
+        io_lib:format("~s://~s:9001", [
+            Scheme,
+            case GrpName of
+                hostname_grpc_server ->
+                    "localhost";
+                _ ->
+                    "127.0.0.1"
+            end
+        ])
+    ),
     GWConfig = #{
         server => #{bind => 9100},
         idle_timeout => 5000,
@@ -153,6 +159,7 @@ init_per_group(LisType, ServiceName, Scheme, Cfg) ->
     ].
 
 end_per_group(_, Cfg) ->
+    emqx_gateway:unload(exproto),
     ok = emqx_cth_suite:stop(proplists:get_value(apps, Cfg)),
     emqx_exproto_echo_svr:stop(proplists:get_value(servers, Cfg)).
 
@@ -182,6 +189,13 @@ listener_confs(Type) ->
 
 default_config() ->
     ?CONF_DEFAULT.
+
+update_exproto_with_idle_timeout(IdleTimeout) ->
+    Conf = emqx:get_raw_config([gateway, exproto]),
+    emqx_gateway_conf:update_gateway(
+        exproto,
+        Conf#{<<"idle_timeout">> => IdleTimeout}
+    ).
 
 %%--------------------------------------------------------------------
 %% Tests cases
@@ -230,6 +244,55 @@ t_mountpoint_echo(Cfg) ->
         error(echo_not_running)
     end,
     close(Sock).
+
+t_update_not_restart_listener(Cfg) ->
+    SockType = proplists:get_value(listener_type, Cfg),
+    Sock = open(SockType),
+
+    Client = #{
+        proto_name => <<"demo">>,
+        proto_ver => <<"v0.1">>,
+        clientid => <<"test_client_1">>
+    },
+    Password = <<"123456">>,
+
+    ConnBin = frame_connect(Client, Password),
+    ConnAckBin = frame_connack(0),
+
+    send(Sock, ConnBin),
+    {ok, ConnAckBin} = recv(Sock, 5000),
+
+    update_exproto_with_idle_timeout(<<"20s">>),
+
+    SubBin = frame_subscribe(<<"t/dn">>, 1),
+    SubAckBin = frame_suback(0),
+
+    send(Sock, SubBin),
+    {ok, SubAckBin} = recv(Sock, 5000),
+
+    close(Sock).
+
+t_update_dtls_listener_have_to_restart(Cfg) ->
+    SockType = proplists:get_value(listener_type, Cfg),
+    Sock = open(SockType),
+
+    Client = #{
+        proto_name => <<"demo">>,
+        proto_ver => <<"v0.1">>,
+        clientid => <<"test_client_1">>
+    },
+    Password = <<"123456">>,
+
+    ConnBin = frame_connect(Client, Password),
+    ConnAckBin = frame_connack(0),
+
+    send(Sock, ConnBin),
+    {ok, ConnAckBin} = recv(Sock, 5000),
+
+    update_exproto_with_idle_timeout(<<"20s">>),
+
+    {error, closed} = recv(Sock, 5000),
+    ok.
 
 t_raw_publish(Cfg) ->
     SockType = proplists:get_value(listener_type, Cfg),
@@ -440,11 +503,18 @@ t_hook_connected_disconnected(Cfg) ->
     ConnAckBin = frame_connack(0),
 
     Parent = self(),
+    emqx_hooks:add('client.connect', {?MODULE, hook_fun0, [Parent]}, 1000),
     emqx_hooks:add('client.connected', {?MODULE, hook_fun1, [Parent]}, 1000),
     emqx_hooks:add('client.disconnected', {?MODULE, hook_fun2, [Parent]}, 1000),
 
     send(Sock, ConnBin),
     {ok, ConnAckBin} = recv(Sock, 5000),
+
+    receive
+        connect -> ok
+    after 1000 ->
+        error(hook_is_not_running)
+    end,
 
     receive
         connected -> ok
@@ -465,6 +535,7 @@ t_hook_connected_disconnected(Cfg) ->
         begin
             {error, closed} = recv(Sock, 5000)
         end,
+    emqx_hooks:del('client.connect', {?MODULE, hook_fun0}),
     emqx_hooks:del('client.connected', {?MODULE, hook_fun1}),
     emqx_hooks:del('client.disconnected', {?MODULE, hook_fun2}).
 
@@ -593,6 +664,10 @@ t_idle_timeout(Cfg) ->
 
 %%--------------------------------------------------------------------
 %% Utils
+
+hook_fun0(_, _, Parent) ->
+    Parent ! connect,
+    ok.
 
 hook_fun1(_, _, Parent) ->
     Parent ! connected,

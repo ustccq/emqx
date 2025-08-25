@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_license_checker_SUITE).
@@ -7,6 +7,7 @@
 -compile(nowarn_export_all).
 -compile(export_all).
 
+-include("emqx_license.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
@@ -67,20 +68,23 @@ t_dump(_Config) ->
 
     #{} = emqx_license_checker:update(License),
 
-    ?assertEqual(
-        [
-            {customer, <<"Foo">>},
-            {email, <<"contact@foo.com">>},
-            {deployment, <<"bar">>},
-            {max_connections, 10},
-            {start_at, <<"2022-01-11">>},
-            {expiry_at, <<"2295-10-27">>},
-            {type, <<"trial">>},
-            {customer_type, 10},
-            {expiry, false}
-        ],
-        emqx_license_checker:dump()
+    ?assertMatch(
+        #{
+            customer := <<"Foo">>,
+            email := <<"contact@foo.com">>,
+            deployment := <<"bar">>,
+            max_sessions := 10,
+            start_at := <<"2022-01-11">>,
+            expiry_at := <<"2295-10-27">>,
+            type := <<"trial">>,
+            customer_type := 10,
+            expiry := false
+        },
+        license_info()
     ).
+
+license_info() ->
+    maps:from_list(emqx_license_checker:dump()).
 
 t_update(_Config) ->
     License = mk_license(
@@ -99,7 +103,7 @@ t_update(_Config) ->
     #{} = emqx_license_checker:update(License),
 
     ?assertMatch(
-        {ok, #{max_connections := 123}},
+        {ok, #{max_sessions := 123}},
         emqx_license_checker:limits()
     ).
 
@@ -144,9 +148,36 @@ t_expired_trial(_Config) ->
     #{} = emqx_license_checker:update(License),
 
     ?assertMatch(
-        {ok, #{max_connections := expired}},
+        {ok, #{max_sessions := ?ERR_EXPIRED}},
         emqx_license_checker:limits()
     ).
+
+t_max_uptime_reached(_Config) ->
+    License = mk_license(
+        [
+            "220111",
+            "0",
+            "10",
+            "Foo",
+            "contact@foo.com",
+            "bar",
+            "20991231",
+            "1",
+            "123"
+        ]
+    ),
+
+    meck:new(emqx_license_parser_v20220101, [passthrough, no_history]),
+    meck:expect(emqx_license_parser_v20220101, max_uptime_seconds, fun(_) -> 0 end),
+
+    #{} = emqx_license_checker:update(License),
+
+    ?assertMatch(
+        {ok, #{max_sessions := ?ERR_MAX_UPTIME}},
+        emqx_license_checker:limits()
+    ),
+
+    meck:unload(emqx_license_parser_v20220101).
 
 t_overexpired_small_client(_Config) ->
     {NowDate, _} = calendar:universal_time(),
@@ -170,7 +201,7 @@ t_overexpired_small_client(_Config) ->
     #{} = emqx_license_checker:update(License),
 
     ?assertMatch(
-        {ok, #{max_connections := expired}},
+        {ok, #{max_sessions := expired}},
         emqx_license_checker:limits()
     ).
 
@@ -196,7 +227,7 @@ t_overexpired_medium_client(_Config) ->
     #{} = emqx_license_checker:update(License),
 
     ?assertMatch(
-        {ok, #{max_connections := 123}},
+        {ok, #{max_sessions := 123}},
         emqx_license_checker:limits()
     ).
 
@@ -222,7 +253,7 @@ t_recently_expired_small_client(_Config) ->
     #{} = emqx_license_checker:update(License),
 
     ?assertMatch(
-        {ok, #{max_connections := 123}},
+        {ok, #{max_sessions := 123}},
         emqx_license_checker:limits()
     ).
 

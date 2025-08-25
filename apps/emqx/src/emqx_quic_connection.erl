@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc impl. the quic connection owner process.
@@ -47,6 +35,12 @@
     handle_info/2
 ]).
 
+%% Connection scope shared counter
+-export([step_cnt/3]).
+-export([read_cnt/2]).
+
+-define(MAX_CNTS, 8).
+
 -export_type([cb_state/0, cb_ret/0]).
 
 -type cb_state() :: #{
@@ -62,7 +56,9 @@
     streams := [{pid(), quicer:stream_handle()}],
     %% New stream opts
     stream_opts := map(),
-    %% If conneciton is resumed from session ticket
+    %% Connection Scope Counters, shared by streams for MQTT layer
+    cnts_ref := counters:counters_ref(),
+    %% If connection is resumed from session ticket
     is_resumed => boolean(),
     %% mqtt message serializer config
     serialize => undefined,
@@ -70,17 +66,18 @@
 }.
 -type cb_ret() :: quicer_lib:cb_ret().
 
-%% @doc  Data streams initializions are started in parallel with control streams, data streams are blocked
-%%       for the activation from control stream after it is accepted as a legit conneciton.
+%% @doc  Data streams initializations are started in parallel with control streams, data streams are blocked
+%%       for the activation from control stream after it is accepted as a legit connection.
 %%       For security, the initial number of allowed data streams from client should be limited by
 %%       'peer_bidi_stream_count` & 'peer_unidi_stream_count`
--spec activate_data_streams(pid(), {
-    emqx_frame:parse_state(), emqx_frame:serialize_opts(), emqx_channel:channel()
-}) -> ok.
+-spec activate_data_streams(
+    pid(),
+    {emqx_frame:parse_state(), emqx_frame:serialize_opts(), emqx_channel:channel()}
+) -> ok.
 activate_data_streams(ConnOwner, {PS, Serialize, Channel}) ->
     gen_server:call(ConnOwner, {activate_data_streams, {PS, Serialize, Channel}}, infinity).
 
-%% @doc conneciton owner init callback
+%% @doc connection owner init callback
 -spec init(map()) -> {ok, cb_state()}.
 init(#{stream_opts := SOpts} = S) when is_list(SOpts) ->
     init(S#{stream_opts := maps:from_list(SOpts)});
@@ -102,7 +99,7 @@ new_conn(
     #{zone := Zone, conn := undefined, ctrl_pid := undefined} = S
 ) ->
     process_flag(trap_exit, true),
-    ?SLOG(debug, ConnInfo),
+    ?SLOG(debug, ConnInfo#{conn => Conn}),
     case emqx_olp:is_overloaded() andalso is_zone_olp_enabled(Zone) of
         false ->
             %% Start control stream process
@@ -114,7 +111,8 @@ new_conn(
             ),
             receive
                 {CtrlPid, stream_acceptor_ready} ->
-                    ok = quicer:async_handshake(Conn),
+                    %% Apply latest config during handshake
+                    ok = quicer:async_handshake(Conn, S),
                     {ok, S#{conn := Conn, ctrl_pid := CtrlPid}};
                 {'EXIT', _Pid, _Reason} ->
                     {stop, stream_accept_error, S}
@@ -157,29 +155,30 @@ new_stream(
         streams := Streams,
         stream_opts := SOpts,
         zone := Zone,
-        limiter := Limiter,
         parse_state := PS,
         channel := Channel,
-        serialize := Serialize
+        serialize := Serialize,
+        hibernate_after := HibernateAfterMs,
+        conn_shared_state := SS
     } = S
 ) ->
     %% Cherry pick options for data streams
     SOpts1 = SOpts#{
         is_local => false,
         zone => Zone,
-        % unused
-        limiter => Limiter,
         parse_state => PS,
         channel => Channel,
         serialize => Serialize,
-        quic_event_mask => ?QUICER_STREAM_EVENT_MASK_START_COMPLETE
+        quic_event_mask => ?QUICER_STREAM_EVENT_MASK_START_COMPLETE,
+        conn_shared_state => SS
     },
     {ok, NewStreamOwner} = quicer_stream:start_link(
         emqx_quic_data_stream,
         Stream,
         Conn,
         SOpts1,
-        Props
+        Props,
+        [{hibernate_after, HibernateAfterMs}]
     ),
     case quicer:handoff_stream(Stream, NewStreamOwner, {PS, Serialize, Channel}) of
         ok ->
@@ -235,7 +234,7 @@ streams_available(_C, {BidirCnt, UnidirCnt}, S) ->
     cb_ret().
 peer_needs_streams(_C, _StreamType, S) ->
     ?SLOG(info, #{
-        msg => "ignore_peer_needs_more_streams", info => maps:with([conn_pid, ctrl_pid], S)
+        msg => "ignore_peer_needs_more_streams", info => maps:with([conn_shared_state, ctrl_pid], S)
     }),
     {ok, S}.
 
@@ -251,7 +250,13 @@ handle_call(
         %% we dont care about the return val here.
         %% note, this is only used after control stream pass the validation. The data streams
         %%       that are called here are assured to be inactived (data processing hasn't been started).
-        catch emqx_quic_data_stream:activate_data(OwnerPid, ActivateData)
+        try emqx_quic_data_stream:activate_data(OwnerPid, ActivateData) of
+            _ ->
+                ok
+        catch
+            _:_ ->
+                ok
+        end
      || {OwnerPid, _Stream} <- Streams
     ],
     {reply, ok, S#{
@@ -288,6 +293,17 @@ handle_info({'EXIT', Pid, Reason}, #{streams := Streams} = S) ->
             {stop, unknown_pid_down, S}
     end.
 
+-spec step_cnt(counters:counters_ref(), control_packet, integer()) -> ok.
+step_cnt(CounterRef, Name, Incr) when is_atom(Name) ->
+    counters:add(CounterRef, cnt_id(Name), Incr).
+
+-spec read_cnt(counters:counters_ref(), control_packet) -> integer().
+read_cnt(CounterRef, Name) ->
+    counters:get(CounterRef, cnt_id(Name)).
+
+cnt_id(control_packet) ->
+    1.
+
 %%%
 %%%  Internals
 %%%
@@ -302,15 +318,19 @@ is_zone_olp_enabled(Zone) ->
 
 -spec init_cb_state(map()) -> cb_state().
 init_cb_state(#{zone := _Zone} = Map) ->
+    SS = #{
+        cnts_ref => counters:new(?MAX_CNTS, [write_concurrency]),
+        conn_pid => self()
+    },
     Map#{
-        conn_pid => self(),
         ctrl_pid => undefined,
         conn => undefined,
         streams => [],
         parse_state => undefined,
         channel => undefined,
         serialize => undefined,
-        is_resumed => false
+        is_resumed => false,
+        conn_shared_state => SS
     }.
 
 %% BUILD_WITHOUT_QUIC

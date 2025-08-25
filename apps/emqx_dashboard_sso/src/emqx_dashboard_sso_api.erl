@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_sso_api).
@@ -33,7 +33,7 @@
     backend/2
 ]).
 
--export([sso_parameters/1, login_meta/3]).
+-export([sso_parameters/1, login_meta/4]).
 
 -define(REDIRECT, 'REDIRECT').
 -define(BAD_USERNAME_OR_PWD, 'BAD_USERNAME_OR_PWD').
@@ -157,31 +157,38 @@ running(get, _Request) ->
     {200, emqx_dashboard_sso_manager:running()}.
 
 login(post, #{bindings := #{backend := Backend}, body := Body} = Request) ->
+    minirest_handler:update_log_meta(#{log_from => dashboard, log_source => Backend}),
     case emqx_dashboard_sso_manager:lookup_state(Backend) of
         undefined ->
             {404, #{code => ?BACKEND_NOT_FOUND, message => <<"Backend not found">>}};
         State ->
             case emqx_dashboard_sso:login(provider(Backend), Request, State) of
-                {ok, Role, Token} ->
+                {ok, Role, Token, _Namespace} ->
                     ?SLOG(info, #{
                         msg => "dashboard_sso_login_successful",
                         request => emqx_utils:redact(Request)
                     }),
                     Username = maps:get(<<"username">>, Body),
-                    {200, login_meta(Username, Role, Token)};
+                    minirest_handler:update_log_meta(#{log_source => Username}),
+                    {200, login_meta(Username, Role, Token, Backend)};
                 {redirect, Redirect} ->
                     ?SLOG(info, #{
                         msg => "dashboard_sso_login_redirect",
                         request => emqx_utils:redact(Request)
                     }),
                     Redirect;
-                {error, Reason} ->
+                {error, Reason0} ->
+                    Reason = emqx_utils:redact(Reason0),
                     ?SLOG(info, #{
                         msg => "dashboard_sso_login_failed",
                         request => emqx_utils:redact(Request),
-                        reason => emqx_utils:redact(Reason)
+                        reason => Reason
                     }),
-                    {401, #{code => ?BAD_USERNAME_OR_PWD, message => <<"Auth failed">>}}
+                    {401, #{
+                        code => ?BAD_USERNAME_OR_PWD,
+                        message => <<"Auth failed">>,
+                        reason => Reason
+                    }}
             end
     end.
 
@@ -286,11 +293,12 @@ to_redacted_json(Data) ->
         end
     ).
 
-login_meta(Username, Role, Token) ->
+login_meta(Username, Role, Token, Backend) ->
     #{
         username => Username,
         role => Role,
         token => Token,
         version => iolist_to_binary(proplists:get_value(version, emqx_sys:info())),
-        license => #{edition => emqx_release:edition()}
+        license => #{edition => emqx_release:edition()},
+        backend => Backend
     }.

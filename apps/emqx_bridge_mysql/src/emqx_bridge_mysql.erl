@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_mysql).
 
@@ -146,9 +146,10 @@ fields(action_parameters) ->
     [
         {sql,
             mk(
-                binary(),
+                emqx_schema:template(),
                 #{desc => ?DESC("sql_template"), default => ?DEFAULT_SQL, format => <<"sql">>}
-            )}
+            )},
+        emqx_bridge_v2_schema:undefined_as_null_field()
     ];
 fields("config_connector") ->
     emqx_connector_schema:common_fields() ++

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_ldap_schema).
@@ -32,7 +20,7 @@
 namespace() -> "authn".
 
 refs() ->
-    [?R_REF(ldap), ?R_REF(ldap_deprecated)].
+    [?R_REF(ldap)].
 
 select_union_member(#{<<"mechanism">> := ?AUTHN_MECHANISM_BIN, <<"backend">> := ?AUTHN_BACKEND_BIN}) ->
     refs();
@@ -44,12 +32,6 @@ select_union_member(#{<<"backend">> := ?AUTHN_BACKEND_BIN}) ->
 select_union_member(_) ->
     undefined.
 
-fields(ldap_deprecated) ->
-    common_fields() ++
-        [
-            {password_attribute, password_attribute()},
-            {is_superuser_attribute, is_superuser_attribute()}
-        ];
 fields(ldap) ->
     common_fields() ++
         [
@@ -63,10 +45,26 @@ fields(hash_method) ->
     [
         {type, method_type(hash)},
         {password_attribute, password_attribute()},
-        {is_superuser_attribute, is_superuser_attribute()}
+        {is_superuser_attribute, is_superuser_attribute()},
+        {clientid_override_attribute, clientid_override_attribute()}
     ];
 fields(bind_method) ->
-    [{type, method_type(bind)}] ++ emqx_ldap:fields(bind_opts).
+    [
+        {type, method_type(bind)},
+        {is_superuser_attribute, is_superuser_attribute()},
+        {clientid_override_attribute, clientid_override_attribute()},
+        {bind_password,
+            ?HOCON(
+                binary(),
+                #{
+                    desc => ?DESC(bind_password),
+                    default => <<"${password}">>,
+                    example => <<"${password}">>,
+                    sensitive => true,
+                    validator => fun emqx_schema:non_empty_string/1
+                }
+            )}
+    ].
 
 common_fields() ->
     [
@@ -74,13 +72,13 @@ common_fields() ->
         {backend, emqx_authn_schema:backend(?AUTHN_BACKEND)},
         {query_timeout, fun query_timeout/1}
     ] ++
+        acl_fields() ++
+        emqx_ldap:fields(search_options) ++
         emqx_authn_schema:common_fields() ++
         emqx_ldap:fields(config).
 
 desc(ldap) ->
     ?DESC(ldap);
-desc(ldap_deprecated) ->
-    ?DESC(ldap_deprecated);
 desc(hash_method) ->
     ?DESC(hash_method);
 desc(bind_method) ->
@@ -120,12 +118,55 @@ password_attribute() ->
         }
     ).
 
+acl_fields() ->
+    [
+        {acl_ttl_attribute,
+            ?HOCON(string(), #{
+                desc => ?DESC(acl_ttl_attribute),
+                example => <<"mqttAclTtl">>,
+                required => false
+            })},
+        {publish_attribute,
+            ?HOCON(string(), #{
+                desc => ?DESC(emqx_authz_ldap_schema, publish_attribute),
+                example => <<"mqttPublishTopic">>,
+                required => false
+            })},
+        {subscribe_attribute,
+            ?HOCON(string(), #{
+                desc => ?DESC(emqx_authz_ldap_schema, subscribe_attribute),
+                example => <<"mqttSubscriptionTopic">>,
+                required => false
+            })},
+        {all_attribute,
+            ?HOCON(string(), #{
+                desc => ?DESC(emqx_authz_ldap_schema, all_attribute),
+                example => <<"mqttPubSubTopic">>,
+                required => false
+            })},
+        {acl_rule_attribute,
+            ?HOCON(string(), #{
+                desc => ?DESC(emqx_authz_ldap_schema, acl_rule_attribute),
+                example => <<"mqttAclRule">>,
+                required => false
+            })}
+    ].
+
 is_superuser_attribute() ->
     ?HOCON(
         string(),
         #{
             desc => ?DESC(?FUNCTION_NAME),
             default => <<"isSuperuser">>
+        }
+    ).
+
+clientid_override_attribute() ->
+    ?HOCON(
+        string(),
+        #{
+            desc => ?DESC(?FUNCTION_NAME),
+            default => <<"clientIdOverride">>
         }
     ).
 

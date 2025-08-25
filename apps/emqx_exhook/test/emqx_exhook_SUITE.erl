@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_exhook_SUITE).
@@ -28,26 +16,26 @@
 
 -define(OTHER_CLUSTER_NAME_STRING, "test_emqx_cluster").
 
--define(CONF_DEFAULT, <<
-    "exhook {\n"
-    "  servers = [\n"
-    "    { name = default,\n"
-    "      url = \"http://127.0.0.1:9000\"\n"
-    "    },\n"
-    "    { name = enable,\n"
-    "      enable = false,\n"
-    "      url = \"http://127.0.0.1:9000\"\n"
-    "    },\n"
-    "    { name = error,\n"
-    "      url = \"http://127.0.0.1:9001\"\n"
-    "    },\n"
-    "    { name = not_reconnect,\n"
-    "      auto_reconnect = false,\n"
-    "      url = \"http://127.0.0.1:9001\"\n"
-    "    }\n"
-    "  ]\n"
-    "}\n"
->>).
+-define(CONF_DEFAULT, <<"""
+    exhook {
+      servers = [
+        { name = default,
+          url = "http://127.0.0.1:9000"
+        },
+        { name = enable,
+          enable = false,
+          url = "http://127.0.0.1:9000"
+        },
+        { name = error,
+          url = "http://127.0.0.1:9001"
+        },
+        { name = not_reconnect,
+          auto_reconnect = false,
+          url = "http://127.0.0.1:9001"
+        }
+      ]
+    }
+""">>).
 
 %%--------------------------------------------------------------------
 %% Setups
@@ -55,14 +43,31 @@
 
 all() -> emqx_common_test_helpers:all(?MODULE).
 
-init_per_suite(Cfg) ->
-    _ = emqx_exhook_demo_svr:start(),
-    Cfg.
+init_per_suite(Config) ->
+    {ok, Apps} = application:ensure_all_started(grpc),
+    [{suite_apps, Apps} | Config].
 
-end_per_suite(_Cfg) ->
-    emqx_exhook_demo_svr:stop().
+end_per_suite(Config) ->
+    ok = emqx_cth_suite:stop(?config(suite_apps, Config)).
 
+init_per_testcase(t_health_check = TC, Config) ->
+    common_init(TC, Config);
 init_per_testcase(TC, Config) ->
+    _ = emqx_exhook_demo_svr:start(),
+    common_init(TC, Config).
+
+end_per_testcase(t_health_check, Config) ->
+    common_stop(Config);
+end_per_testcase(_, Config) ->
+    common_stop(Config),
+    ok = emqx_exhook_demo_svr:stop().
+
+emqx_conf(t_cluster_name) ->
+    io_lib:format("cluster.name = ~p", [?OTHER_CLUSTER_NAME_STRING]);
+emqx_conf(_) ->
+    #{}.
+
+common_init(TC, Config) ->
     Apps = emqx_cth_suite:start(
         [
             emqx,
@@ -71,30 +76,27 @@ init_per_testcase(TC, Config) ->
         ],
         #{work_dir => emqx_cth_suite:work_dir(TC, Config)}
     ),
-    [{tc_apps, Apps} | Config].
+    emqx_common_test_helpers:init_per_testcase(?MODULE, TC, [{tc_apps, Apps} | Config]).
 
-end_per_testcase(_, Config) ->
+common_stop(Config) ->
     ok = emqx_cth_suite:stop(?config(tc_apps, Config)).
-
-emqx_conf(t_cluster_name) ->
-    io_lib:format("cluster.name = ~p", [?OTHER_CLUSTER_NAME_STRING]);
-emqx_conf(_) ->
-    #{}.
 
 %%--------------------------------------------------------------------
 %% Test cases
 %%--------------------------------------------------------------------
 
-t_access_failed_if_no_server_running(Config) ->
-    meck:expect(emqx_metrics_worker, inc, fun(_, _, _) -> ok end),
-    meck:expect(emqx_metrics, inc, fun(_) -> ok end),
-    emqx_hooks:add('client.authorize', {emqx_authz, authorize, [[]]}, ?HP_AUTHZ),
+t_access_failed_if_no_server_running('init', Config) ->
+    ok = emqx_hooks:add('client.authorize', {emqx_authz, authorize, [[]]}, ?HP_AUTHZ),
+    Config;
+t_access_failed_if_no_server_running('end', _Config) ->
+    emqx_hooks:del('client.authorize', {emqx_authz, authorize}).
 
+t_access_failed_if_no_server_running(Config) ->
     ClientInfo = #{
         clientid => <<"user-id-1">>,
         username => <<"usera">>,
+        peername => {{127, 0, 0, 1}, 3456},
         peerhost => {127, 0, 0, 1},
-        peerport => 3456,
         sockport => 1883,
         protocol => mqtt,
         mountpoint => undefined
@@ -136,7 +138,6 @@ t_access_failed_if_no_server_running(Config) ->
         emqx_exhook_handler:on_message_publish(Message)
     ),
     emqx_exhook_mgr:enable(<<"default">>),
-    emqx_hooks:del('client.authorize', {emqx_authz, authorize}),
     assert_get_basic_usage_info(Config).
 
 t_lookup(_) ->
@@ -167,6 +168,75 @@ t_timer(_) ->
     _ = erlang:send(Pid, {timeout, undefined, {reload, <<"default">>}}),
     _ = erlang:send(Pid, {timeout, undefined, {reload, <<"not_found">>}}),
     _ = erlang:send(Pid, {timeout, undefined, {reload, <<"error">>}}),
+    ok.
+
+t_health_check('init', Config) ->
+    %% health_check and auto_reconnect logic:
+    %% assume auto_reconnect = 7.5s
+    %% It takes too much time to perform health checks manually.
+    %%
+    %% Status:
+    %% C: Connected
+    %% R: (re)Connecting
+    %% D: Disconnected
+    %%
+    %% Time (s) 0.0   2.5   5.0   7.5  10.0  12.5  15.0  17.5  20.0  22.5  25.0
+    %%          |-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+    %%      Stop Server  ^                      Start Server ^
+    %% Health Check timer:
+    %%          |           |           |           |           |           |
+    %%          C1          C2         C3          C4          C5          C6
+    %%          |---------->|---------->|---------->|---------->|---------->|
+    %%          |           |           |           |           |           |
+    %% Status:  |---- C ----|---- R ----|- D -|- R -|---- D ----|---- C ----|
+    %%          |           |           |           |           |           |
+    %% Reconnect Interval:  |           |           |           |           |
+    %%                      |---- 7.5s ------>|---- 7.5s ------>| Cancaled
+
+    emqx_exhook_mgr:disable(<<"default">>),
+    _ = emqx_exhook_demo_svr:start(),
+    Config;
+t_health_check('end', _Config) ->
+    ok.
+
+t_health_check(_Config) ->
+    %% before time C1
+    Name = <<"default">>,
+    ?assertMatch(#{status := disabled}, emqx_exhook_mgr:lookup(Name)),
+
+    emqx_exhook_mgr:enable(Name),
+
+    timer:sleep(200),
+    %% will be `connecting` and then changed to `connected` very soon
+    %% disabled -> connected
+    ?assertMatch(#{status := connected}, emqx_exhook_mgr:lookup(Name)),
+
+    %% stop server
+    _ = emqx_exhook_demo_svr:stop(),
+
+    %% manually perform health_check
+    %% health_check found it unhealthy and then start a reload timer,
+    %% the reload timer marked it `connecting`
+    %% connected -> connecting
+    erlang:send(erlang:whereis(emqx_exhook_mgr), refresh_tick),
+    ?assertMatch(#{status := connecting}, emqx_exhook_mgr:lookup(Name)),
+
+    %% still unhealthy after next health_check, then mark `disconnected` (reload timer still working)
+    %% connecting -> disconnected
+    erlang:send(erlang:whereis(emqx_exhook_mgr), refresh_tick),
+    ?assertMatch(#{status := disconnected}, emqx_exhook_mgr:lookup(Name)),
+
+    emqx_exhook_mgr:disable(Name),
+    emqx_exhook_mgr:enable(Name),
+
+    %% re-enable, will be `connecting` if server is not started
+    ?assertMatch(#{status := connecting}, emqx_exhook_mgr:lookup(Name)),
+
+    %% still unhealthy after next health_check
+    %% connecting -> disconnected
+    erlang:send(erlang:whereis(emqx_exhook_mgr), refresh_tick),
+    ?assertMatch(#{status := disconnected}, emqx_exhook_mgr:lookup(Name)),
+
     ok.
 
 t_error_update_conf(_) ->
@@ -237,15 +307,39 @@ t_metrics(_) ->
     ?assertMatch(#{'client.connect' := #{succeed := _}}, HooksMetrics),
     ok.
 
-t_handler(_) ->
+t_handler_tcp(_) ->
+    t_handler(fun emqtt:connect/1, 1883, <<"exhook_tcp">>).
+
+t_handler_ws(_) ->
+    t_handler(fun emqtt:ws_connect/1, 8083, <<"exhook_ws">>).
+
+t_handler(ConnFun, Port, CId) ->
+    ?assertMatch(
+        [{on_provider_loaded, #{broker := _Broker}}],
+        emqx_exhook_demo_svr:flush()
+    ),
+
     %% connect
     {ok, C} = emqtt:start_link([
         {host, "localhost"},
-        {port, 1883},
+        {port, Port},
         {username, <<"gooduser">>},
-        {clientid, <<"exhook_gooduser">>}
+        {clientid, CId}
     ]),
-    {ok, _} = emqtt:connect(C),
+    {ok, _} = ConnFun(C),
+
+    ?assertMatch(
+        [
+            {on_client_connect, #{conninfo := #{sockport := Port}}},
+            {on_client_authenticate, #{
+                clientinfo := #{sockport := Port, peerport := _, clientid := CId}
+            }},
+            {on_session_created, #{clientinfo := #{clientid := CId}}},
+            {on_client_connected, #{clientinfo := #{clientid := CId}}},
+            {on_client_connack, #{conninfo := #{}}}
+        ],
+        emqx_exhook_demo_svr:flush()
+    ),
 
     %% pub/sub
     {ok, _, _} = emqtt:subscribe(C, <<"/exhook">>, qos0),
@@ -254,6 +348,50 @@ t_handler(_) ->
     ok = emqtt:publish(C, <<"/ignore">>, <<>>, qos0),
     timer:sleep(100),
     {ok, _, _} = emqtt:unsubscribe(C, <<"/exhook">>),
+
+    Events1 = emqx_exhook_demo_svr:flush(),
+    ?assertMatch(
+        [
+            {on_client_authorize, #{type := 'SUBSCRIBE', clientinfo := #{clientid := CId}}},
+            {on_client_subscribe, #{
+                topic_filters := [#{name := <<"/exhook">>}],
+                clientinfo := #{clientid := CId}
+            }},
+            {on_session_subscribed, #{
+                topic := <<"/exhook">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_client_authorize, #{
+                type := 'PUBLISH',
+                topic := <<"/exhook">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_message_publish, #{message := #{topic := <<"/exhook">>, qos := 0}}},
+            {on_client_authorize, #{
+                type := 'PUBLISH',
+                topic := <<"/ignore">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_message_publish, #{message := #{topic := <<"/ignore">>, qos := 0}}},
+            {on_client_unsubscribe, #{
+                topic_filters := [#{name := <<"/exhook">>}],
+                clientinfo := #{clientid := CId}
+            }},
+            {on_session_unsubscribed, #{
+                topic := <<"/exhook">>,
+                clientinfo := #{clientid := CId}
+            }}
+        ],
+        [E || {ET, _} = E <- Events1, ET /= on_message_dropped, ET /= on_message_delivered]
+    ),
+    ?assertMatch(
+        [{on_message_delivered, #{message := #{topic := <<"/exhook">>, qos := 0}}}],
+        [E || {ET, _} = E <- Events1, ET == on_message_delivered]
+    ),
+    ?assertMatch(
+        [{on_message_dropped, #{message := #{topic := <<"/ignore">>, qos := 0}}}],
+        [E || {ET, _} = E <- Events1, ET == on_message_dropped]
+    ),
 
     %% sys pub/sub
     ok = emqtt:publish(C, <<"$SYS">>, <<>>, qos0),
@@ -264,6 +402,47 @@ t_handler(_) ->
     timer:sleep(100),
     {ok, _, _} = emqtt:unsubscribe(C, <<"$SYS/systest">>),
 
+    ?assertMatch(
+        [
+            {on_client_authorize, #{
+                type := 'PUBLISH',
+                topic := <<"$SYS">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_message_publish, #{message := #{topic := <<"$SYS">>, qos := 0}}},
+            {on_message_dropped, #{message := #{topic := <<"$SYS">>, qos := 0}}},
+            {on_client_authorize, #{type := 'SUBSCRIBE', clientinfo := #{clientid := CId}}},
+            {on_client_subscribe, #{
+                topic_filters := [#{name := <<"$SYS/systest">>}],
+                clientinfo := #{clientid := CId}
+            }},
+            {on_session_subscribed, #{
+                topic := <<"$SYS/systest">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_client_authorize, #{
+                type := 'PUBLISH',
+                topic := <<"$SYS/systest">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_client_authorize, #{
+                type := 'PUBLISH',
+                topic := <<"$SYS/ignore">>,
+                clientinfo := #{clientid := CId}
+            }},
+            %% No publishes.
+            {on_client_unsubscribe, #{
+                topic_filters := [#{name := <<"$SYS/systest">>}],
+                clientinfo := #{clientid := CId}
+            }},
+            {on_session_unsubscribed, #{
+                topic := <<"$SYS/systest">>,
+                clientinfo := #{clientid := CId}
+            }}
+        ],
+        emqx_exhook_demo_svr:flush()
+    ),
+
     %% ack
     {ok, _, _} = emqtt:subscribe(C, <<"/exhook1">>, qos1),
     timer:sleep(100),
@@ -271,14 +450,41 @@ t_handler(_) ->
     timer:sleep(100),
     emqtt:stop(C),
     timer:sleep(100),
-    ok.
+
+    ?assertMatch(
+        [
+            {on_client_authorize, #{type := 'SUBSCRIBE', clientinfo := #{clientid := CId}}},
+            {on_client_subscribe, #{
+                topic_filters := [#{name := <<"/exhook1">>}],
+                clientinfo := #{clientid := CId}
+            }},
+            {on_session_subscribed, #{
+                topic := <<"/exhook1">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_client_authorize, #{
+                type := 'PUBLISH',
+                topic := <<"/exhook1">>,
+                clientinfo := #{clientid := CId}
+            }},
+            {on_message_publish, #{message := #{topic := <<"/exhook1">>, qos := 1}}},
+            {on_message_delivered, #{message := #{topic := <<"/exhook1">>, qos := 1}}},
+            {on_message_acked, #{
+                message := #{topic := <<"/exhook1">>, qos := 1},
+                clientinfo := #{clientid := CId}
+            }},
+            {on_client_disconnected, #{clientinfo := #{clientid := CId}}},
+            {on_session_terminated, #{clientinfo := #{clientid := CId}}}
+        ],
+        emqx_exhook_demo_svr:flush()
+    ).
 
 t_simulated_handler(_) ->
     ClientInfo = #{
         clientid => <<"user-id-1">>,
         username => <<"usera">>,
+        peername => {{127, 0, 0, 1}, 3456},
         peerhost => {127, 0, 0, 1},
-        peerport => 3456,
         sockport => 1883,
         protocol => mqtt,
         mountpoint => undefined
@@ -309,9 +515,17 @@ t_cluster_name(_) ->
     ),
     emqx_exhook_mgr:disable(<<"default">>).
 
+t_stop_timeout('init', Config) ->
+    ok = snabbkaffe:start_trace(),
+    ok = meck:new(emqx_exhook_demo_svr, [passthrough, no_history]),
+    Config;
+t_stop_timeout('end', _Config) ->
+    %% ensure started for other tests
+    {ok, _} = application:ensure_all_started(emqx_exhook),
+    ok = snabbkaffe:stop(),
+    ok = meck:unload(emqx_exhook_demo_svr).
+
 t_stop_timeout(_) ->
-    snabbkaffe:start_trace(),
-    meck:new(emqx_exhook_demo_svr, [passthrough, no_history]),
     meck:expect(
         emqx_exhook_demo_svr,
         on_provider_unloaded,
@@ -327,21 +541,14 @@ t_stop_timeout(_) ->
     ?block_until(#{?snk_kind := exhook_mgr_terminated}, 20000),
 
     %% all exhook hooked point should be unloaded
-    Mods = lists:flatten(
-        lists:map(
-            fun({hook, _, Cbs}) ->
-                lists:map(fun({callback, {M, _, _}, _, _}) -> M end, Cbs)
-            end,
-            ets:tab2list(emqx_hooks)
-        )
+    Hooks = lists:flatmap(
+        fun emqx_hooks:lookup/1,
+        maps:keys(emqx_hookpoints:registered_hookpoints())
     ),
-    ?assertEqual(false, lists:any(fun(M) -> M == emqx_exhook_handler end, Mods)),
-
-    %% ensure started for other tests
-    {ok, _} = application:ensure_all_started(emqx_exhook),
-
-    snabbkaffe:stop(),
-    meck:unload(emqx_exhook_demo_svr).
+    ?assertEqual(
+        [],
+        [H || H = {callback, {emqx_exhook_handler, _, _}, _, _} <- Hooks]
+    ).
 
 t_ssl_clear(_) ->
     SvrName = <<"ssl_test">>,
@@ -390,6 +597,106 @@ t_ssl_clear(_) ->
     ?assertMatch({error, enoent}, list_pem_dir(SvrName)),
     ok.
 
+t_format_props(_) ->
+    ?assertMatch(
+        [{on_provider_loaded, #{broker := _Broker}}],
+        emqx_exhook_demo_svr:flush()
+    ),
+
+    %% connect
+    ClientId = <<"exhook_format_props">>,
+    {ok, C} = emqtt:start_link([
+        {host, "localhost"},
+        {port, 1883},
+        {username, <<"gooduser">>},
+        {clientid, ClientId},
+        {proto_ver, v5},
+        {properties, #{
+            'User-Property' => [{<<"k1">>, <<"v1">>}],
+            'Session-Expiry-Interval' => 100
+        }}
+    ]),
+    %% assert the connect/connack props
+    {ok, _} = emqtt:connect(C),
+    Events1 = get_props_from_events(
+        [on_client_connect, on_client_connack],
+        emqx_exhook_demo_svr:flush()
+    ),
+    ?assertMatch(
+        [
+            %% assert the requested props
+            {on_client_connect, #{
+                props := [#{name := <<"Session-Expiry-Interval">>, value := <<"100">>}],
+                user_props := [#{name := <<"k1">>, value := <<"v1">>}]
+            }},
+            %% broker will modify/add some props
+            {on_client_connack, #{props := _, user_props := []}}
+        ],
+        Events1
+    ),
+    %% assert the subscribe props
+    SubReqProps = #{
+        'Subscription-Identifier' => 1,
+        'User-Property' => [{<<"k2">>, <<"v2">>}]
+    },
+    {ok, _, _} = emqtt:subscribe(C, SubReqProps, <<"t/a">>, qos0),
+    Events2 = get_props_from_events(
+        [on_client_subscribe],
+        emqx_exhook_demo_svr:flush()
+    ),
+    ?assertMatch(
+        [
+            {on_client_subscribe, #{
+                props := [#{name := <<"Subscription-Identifier">>, value := <<"1">>}],
+                user_props := [#{name := <<"k2">>, value := <<"v2">>}]
+            }}
+        ],
+        Events2
+    ),
+    %% assert the unsubscribe props
+    UnsubReqProps = #{
+        'Subscription-Identifier' => 1,
+        'User-Property' => [{<<"k3">>, <<"v3">>}]
+    },
+    {ok, _, _} = emqtt:unsubscribe(C, UnsubReqProps, <<"t/a">>),
+    Events3 = get_props_from_events(
+        [on_client_unsubscribe],
+        emqx_exhook_demo_svr:flush()
+    ),
+    ?assertMatch(
+        [
+            {on_client_unsubscribe, #{
+                props := [#{name := <<"Subscription-Identifier">>, value := <<"1">>}],
+                user_props := [#{name := <<"k3">>, value := <<"v3">>}]
+            }}
+        ],
+        Events3
+    ),
+    %% assert the publish props
+    PubReqProps = #{
+        'Message-Expiry-Interval' => 300,
+        'User-Property' => [{<<"k4">>, <<"v4">>}]
+    },
+    ok = emqtt:publish(C, <<"t/a">>, PubReqProps, <<"payload">>, []),
+    timer:sleep(500),
+    Events4 = get_props_from_events(
+        [on_message_publish],
+        emqx_exhook_demo_svr:flush()
+    ),
+    ?assertMatch(
+        [
+            {on_message_publish, #{
+                props := [#{name := <<"Message-Expiry-Interval">>, value := <<"300">>}],
+                user_props := [#{name := <<"k4">>, value := <<"v4">>}]
+            }}
+        ],
+        Events4
+    ),
+    timer:sleep(100),
+    emqtt:stop(C),
+    timer:sleep(100),
+    ok.
+
 %%--------------------------------------------------------------------
 %% Cases Helpers
 %%--------------------------------------------------------------------
@@ -432,38 +739,13 @@ assert_get_basic_usage_info(_Config) ->
 %% Utils
 %%--------------------------------------------------------------------
 
-meck_print() ->
-    meck:new(emqx_ctl, [passthrough, no_history, no_link]),
-    meck:expect(emqx_ctl, print, fun(_) -> ok end),
-    meck:expect(emqx_ctl, print, fun(_, Args) -> Args end).
-
-unmeck_print() ->
-    meck:unload(emqx_ctl).
-
-loaded_exhook_hookpoints() ->
-    lists:filtermap(
-        fun(E) ->
-            Name = element(2, E),
-            Callbacks = element(3, E),
-            case lists:any(fun is_exhook_callback/1, Callbacks) of
-                true -> {true, Name};
-                _ -> false
-            end
-        end,
-        ets:tab2list(emqx_hooks)
-    ).
-
-is_exhook_callback(Cb) ->
-    Action = element(2, Cb),
-    emqx_exhook_handler == element(1, Action).
-
 list_pem_dir(Name) ->
     Dir = filename:join([emqx:mutable_certs_dir(), "exhook", Name]),
     file:list_dir(Dir).
 
 data_file(Name) ->
-    Dir = code:lib_dir(emqx_exhook, test),
-    {ok, Bin} = file:read_file(filename:join([Dir, "data", Name])),
+    Dir = code:lib_dir(emqx_exhook),
+    {ok, Bin} = file:read_file(filename:join([Dir, "test", "data", Name])),
     Bin.
 
 cert_file(Name) ->
@@ -472,3 +754,16 @@ cert_file(Name) ->
 shuffle(List) ->
     Sorted = lists:sort(lists:map(fun(L) -> {rand:uniform(), L} end, List)),
     lists:map(fun({_, L}) -> L end, Sorted).
+
+get_props_from_events(Names, Events) ->
+    lists:filtermap(
+        fun({Name, Req}) ->
+            case lists:member(Name, Names) of
+                true ->
+                    {true, {Name, maps:with([props, user_props], Req)}};
+                false ->
+                    false
+            end
+        end,
+        Events
+    ).

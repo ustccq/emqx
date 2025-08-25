@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Common Test Helper / Running test suites
@@ -64,6 +52,7 @@
 
 -export([work_dir/1]).
 -export([work_dir/2]).
+-export([clean_work_dir/1]).
 
 -export([load_apps/1]).
 -export([start_apps/2]).
@@ -71,8 +60,11 @@
 -export([start_app/3]).
 -export([stop_apps/1]).
 
+-export([default_config/2]).
 -export([merge_appspec/2]).
 -export([merge_config/2]).
+
+-export([inhibit_config_loader/2]).
 
 %% "Unofficial" `emqx_config_handler' and `emqx_conf' APIs
 -export([schema_module/0, upgrade_raw_conf/1]).
@@ -108,21 +100,21 @@
     | fun((appname(), appspec_opts()) -> R).
 
 -type appspec_opts() :: #{
-    %% 1. Enable loading application config
+    %% 1. Perform anything right before starting the application
+    %% If not defined or set to `false`, this step will be skipped.
+    %% Merging amounts to redefining.
+    before_start => hookfun(_) | false,
+
+    %% 2. Enable loading application config
     %% If not defined or set to `false`, this step will be skipped.
     %% If application is missing a schema module, this step will fail.
     %% Merging amounts to appending, unless `false` is used, then merge result is also `false`.
     config => iodata() | config() | emqx_config:raw_config() | false,
 
-    %% 2. Override the application environment
+    %% 3. Override the application environment
     %% If not defined or set to `false`, this step will be skipped.
     %% Merging amounts to appending, unless `false` is used, then merge result is `[]`.
     override_env => [{atom(), term()}] | false,
-
-    %% 3. Perform anything right before starting the application
-    %% If not defined or set to `false`, this step will be skipped.
-    %% Merging amounts to redefining.
-    before_start => hookfun(_) | false,
 
     %% 4. Starting the application
     %% If not defined or set to `true`, `application:ensure_all_started/1` is used.
@@ -161,6 +153,7 @@ start(Apps, SuiteOpts = #{work_dir := WorkDir}) ->
     % 4. Setup isolated mnesia directory
     ok = emqx_common_test_helpers:load(mnesia),
     ok = application:set_env(mnesia, dir, filename:join([WorkDir, mnesia])),
+    ok = application:set_env(emqx_durable_storage, db_data_dir, filename:join([WorkDir, ds])),
     % 5. Start ekka separately.
     % For some reason it's designed to be started in non-regular way, so we have to track
     % applications started in the process manually.
@@ -216,9 +209,9 @@ init_spec(Config) when is_list(Config); is_binary(Config) ->
 
 start_appspec(App, StartOpts) ->
     _ = log_appspec(App, StartOpts),
+    _ = maybe_before_start(App, StartOpts),
     _ = maybe_configure_app(App, StartOpts),
     _ = maybe_override_env(App, StartOpts),
-    _ = maybe_before_start(App, StartOpts),
     case maybe_start(App, StartOpts) of
         {ok, Started} ->
             ?PAL(?STD_IMPORTANCE, "Started applications: ~0p", [Started]),
@@ -243,6 +236,7 @@ log_appspec(App, #{}) ->
 
 spec_fmt(fc, config) -> "~n~ts";
 spec_fmt(fc, _) -> "~p";
+spec_fmt(ffun, {config, false}) -> "false (don't inhibit config loader)";
 spec_fmt(ffun, {config, C}) -> render_config(C);
 spec_fmt(ffun, {_, X}) -> X.
 
@@ -262,6 +256,7 @@ maybe_configure_app(_App, #{}) ->
     ok.
 
 configure_app(SchemaModule, Config) ->
+    _ = emqx_config:create_tables(),
     ok = emqx_config:init_load(SchemaModule, render_config(Config)),
     ok.
 
@@ -333,14 +328,6 @@ default_appspec(emqx, SuiteOpts) ->
         % overwrite everything with a default configuration.
         before_start => fun inhibit_config_loader/2
     };
-default_appspec(emqx_auth, _SuiteOpts) ->
-    #{
-        config => #{
-            % NOTE
-            % Disable default authorization sources (i.e. acl.conf file rules).
-            authorization => #{sources => []}
-        }
-    };
 default_appspec(emqx_conf, SuiteOpts) ->
     Config = #{
         node => #{
@@ -357,10 +344,7 @@ default_appspec(emqx_conf, SuiteOpts) ->
             emqx_utils_maps:deep_merge(Acc, default_config(App, SuiteOpts))
         end,
         Config,
-        [
-            emqx,
-            emqx_auth
-        ]
+        [emqx]
     ),
     #{
         config => SharedConfig,
@@ -375,16 +359,14 @@ default_appspec(emqx_conf, SuiteOpts) ->
             ok = emqx_common_test_helpers:copy_acl_conf()
         end
     };
-default_appspec(emqx_dashboard, _SuiteOpts) ->
-    #{
-        after_start => fun() ->
-            true = emqx_dashboard_listener:is_ready(infinity)
-        end
-    };
-default_appspec(emqx_schema_registry, _SuiteOpts) ->
-    #{schema_mod => emqx_schema_registry_schema, config => #{}};
-default_appspec(emqx_schema_validation, _SuiteOpts) ->
-    #{schema_mod => emqx_schema_validation_schema, config => #{}};
+default_appspec(App, _SuiteOpts) when
+    App == emqx_schema_registry;
+    App == emqx_schema_validation;
+    App == emqx_message_transformation;
+    App == emqx_ds_shared_sub
+->
+    %% NOTE: Start those apps with default configuration.
+    #{config => #{}};
 default_appspec(_, _) ->
     #{}.
 
@@ -430,6 +412,16 @@ work_dir(TCName, CTConfig) ->
     WorkDir = work_dir(CTConfig),
     filename:join(WorkDir, TCName).
 
+%% @doc Delete contents of the workdir.
+clean_work_dir(WorkDir) ->
+    ct:pal("Cleaning workdir ~p", [WorkDir]),
+    case re:run(WorkDir, "_build/.*test/logs/") of
+        {match, _} ->
+            file:del_dir_r(WorkDir);
+        nomatch ->
+            error({unsafe_workdir, WorkDir})
+    end.
+
 %%
 
 start_ekka() ->
@@ -457,8 +449,9 @@ stop_apps(Apps) ->
 
 %%
 
-verify_clean_suite_state(#{boot_type := restart}) ->
-    %% when testing node restart, we do not need to verify clean state
+verify_clean_suite_state(#{work_dir_dirty := true}) ->
+    %% Used by `emqx_cth_cluster:restart/1` that implies the work dir is dirty.
+    %% Use with care.
     ok;
 verify_clean_suite_state(#{work_dir := WorkDir}) ->
     {ok, []} = file:list_dir(WorkDir),
@@ -499,9 +492,4 @@ schema_module() ->
 
 %% "Unofficial" `emqx_conf' API
 upgrade_raw_conf(Conf) ->
-    case emqx_release:edition() of
-        ee ->
-            emqx_enterprise_schema:upgrade_raw_conf(Conf);
-        ce ->
-            emqx_conf_schema:upgrade_raw_conf(Conf)
-    end.
+    emqx_enterprise_schema:upgrade_raw_conf(Conf).

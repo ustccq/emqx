@@ -1,23 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_mysql).
 
--include_lib("emqx_auth/include/emqx_authn.hrl").
--include_lib("emqx/include/logger.hrl").
 -behaviour(emqx_authn_provider).
 
 -define(PREPARE_KEY, ?MODULE).
@@ -29,6 +15,9 @@
     destroy/1
 ]).
 
+-include_lib("emqx_auth/include/emqx_authn.hrl").
+-include("emqx_auth_mysql.hrl").
+
 %%------------------------------------------------------------------------------
 %% APIs
 %%------------------------------------------------------------------------------
@@ -37,18 +26,32 @@ create(_AuthenticatorID, Config) ->
     create(Config).
 
 create(Config0) ->
-    ResourceId = emqx_authn_utils:make_resource_id(?MODULE),
-    {Config, State} = parse_config(Config0),
-    {ok, _Data} = emqx_authn_utils:create_resource(ResourceId, emqx_mysql, Config),
-    {ok, State#{resource_id => ResourceId}}.
+    maybe
+        ResourceId = emqx_authn_utils:make_resource_id(?AUTHN_BACKEND_BIN),
+        {ok, ResourceConfig, State} ?= create_state(ResourceId, Config0),
+        ok ?=
+            emqx_authn_utils:create_resource(
+                emqx_mysql,
+                ResourceConfig,
+                State,
+                ?AUTHN_MECHANISM_BIN,
+                ?AUTHN_BACKEND_BIN
+            ),
+        {ok, State}
+    end.
 
 update(Config0, #{resource_id := ResourceId} = _State) ->
-    {Config, NState} = parse_config(Config0),
-    case emqx_authn_utils:update_resource(emqx_mysql, Config, ResourceId) of
-        {error, Reason} ->
-            error({load_config_error, Reason});
-        {ok, _} ->
-            {ok, NState#{resource_id => ResourceId}}
+    maybe
+        {ok, ResourceConfig, State} ?= create_state(ResourceId, Config0),
+        ok ?=
+            emqx_authn_utils:update_resource(
+                emqx_mysql,
+                ResourceConfig,
+                State,
+                ?AUTHN_MECHANISM_BIN,
+                ?AUTHN_BACKEND_BIN
+            ),
+        {ok, State}
     end.
 
 destroy(#{resource_id := ResourceId}) ->
@@ -65,13 +68,16 @@ authenticate(
         tmpl_token := TmplToken,
         query_timeout := Timeout,
         resource_id := ResourceId,
-        password_hash_algorithm := Algorithm
+        password_hash_algorithm := Algorithm,
+        cache_key_template := CacheKeyTemplate
     }
 ) ->
-    Params = emqx_auth_utils:render_sql_params(TmplToken, Credential),
-    case
-        emqx_resource:simple_sync_query(ResourceId, {prepared_query, ?PREPARE_KEY, Params, Timeout})
-    of
+    Params = emqx_auth_template:render_sql_params(TmplToken, Credential),
+    CacheKey = emqx_auth_template:cache_key(Credential, CacheKeyTemplate),
+    Result = emqx_authn_utils:cached_simple_sync_query(
+        CacheKey, ResourceId, {prepared_query, ?PREPARE_KEY, Params, Timeout}
+    ),
+    case Result of
         {ok, _Columns, []} ->
             ignore;
         {ok, Columns, [Row | _]} ->
@@ -82,7 +88,7 @@ authenticate(
                 )
             of
                 ok ->
-                    {ok, emqx_authn_utils:is_superuser(Selected)};
+                    {ok, authn_result(Selected)};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -97,7 +103,8 @@ authenticate(
             ignore
     end.
 
-parse_config(
+create_state(
+    ResourceId,
     #{
         password_hash_algorithm := Algorithm,
         query := Query0,
@@ -105,10 +112,25 @@ parse_config(
     } = Config
 ) ->
     ok = emqx_authn_password_hashing:init(Algorithm),
-    {PrepareSql, TmplToken} = emqx_authn_utils:parse_sql(Query0, '?'),
-    State = #{
+    {Vars, PrepareSql, TmplToken} = emqx_authn_utils:parse_sql(Query0, '?'),
+    CacheKeyTemplate = emqx_auth_template:cache_key_template(Vars),
+    State = emqx_authn_utils:init_state(Config, #{
         password_hash_algorithm => Algorithm,
         tmpl_token => TmplToken,
-        query_timeout => QueryTimeout
-    },
-    {Config#{prepare_statement => #{?PREPARE_KEY => PrepareSql}}, State}.
+        query_timeout => QueryTimeout,
+        cache_key_template => CacheKeyTemplate,
+        resource_id => ResourceId
+    }),
+    ResourceConfig = emqx_authn_utils:cleanup_resource_config(
+        [query, query_timeout, password_hash_algorithm], Config
+    ),
+    {ok, ResourceConfig#{prepare_statement => #{?PREPARE_KEY => PrepareSql}}, State}.
+
+%%------------------------------------------------------------------------------
+%% Internal functions
+%%------------------------------------------------------------------------------
+
+authn_result(Selected) ->
+    Res0 = emqx_authn_utils:is_superuser(Selected),
+    Res1 = emqx_authn_utils:clientid_override(Selected),
+    maps:merge(Res0, Res1).

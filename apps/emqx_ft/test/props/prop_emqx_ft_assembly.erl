@@ -1,24 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(prop_emqx_ft_assembly).
 
 -include_lib("proper/include/proper.hrl").
 
--import(emqx_proper_types, [scaled/2, fixedmap/1, typegen/0, generate/2]).
+-import(emqx_proper_types, [scaled/2, logscaled/2, fixedmap/1, typegen/0, generate/2]).
 
 -define(COVERAGE_TIMEOUT, 10000).
 
@@ -177,10 +165,10 @@ nsegs(Filesize, [BaseSegsize | _]) ->
     Filesize div max(1, BaseSegsize) + 1.
 
 segments_t(Filesize, Segsizes) ->
-    scaled(nsegs(Filesize, Segsizes), list({node_t(), segment_t(Filesize, Segsizes)})).
+    logscaled(nsegs(Filesize, Segsizes), list({node_t(), segment_t(Filesize, Segsizes)})).
 
 segments_t(Filesize, Segsizes, Hole) ->
-    scaled(nsegs(Filesize, Segsizes), list({node_t(), segment_t(Filesize, Segsizes, Hole)})).
+    logscaled(nsegs(Filesize, Segsizes), list({node_t(), segment_t(Filesize, Segsizes, Hole)})).
 
 segment_t(Filesize, Segsizes, Hole) ->
     ?SUCHTHATMAYBE(

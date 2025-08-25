@@ -1,25 +1,17 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_api_data_backup).
+
+-feature(maybe_expr, enable).
 
 -behaviour(minirest_api).
 
 -include_lib("emqx/include/logger.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -export([api_spec/0, paths/0, schema/1, fields/1, namespace/0]).
 
@@ -31,22 +23,7 @@
 ]).
 
 -define(TAGS, [<<"Data Backup">>]).
-
--define(BAD_REQUEST, 'BAD_REQUEST').
--define(NOT_FOUND, 'NOT_FOUND').
-
--define(node_field(IsRequired), ?node_field(IsRequired, #{})).
--define(node_field(IsRequired, Meta),
-    {node, ?HOCON(binary(), Meta#{desc => "Node name", required => IsRequired})}
-).
--define(filename_field(IsRequired), ?filename_field(IsRequired, #{})).
--define(filename_field(IsRequired, Meta),
-    {filename,
-        ?HOCON(binary(), Meta#{
-            desc => "Data backup file name",
-            required => IsRequired
-        })}
-).
+-define(BPAPI_NAME, emqx_mgmt_data_backup).
 
 namespace() -> undefined.
 
@@ -67,12 +44,22 @@ schema("/data/export") ->
         post => #{
             tags => ?TAGS,
             desc => <<"Export a data backup file">>,
+            'requestBody' => emqx_dashboard_swagger:schema_with_example(
+                ?R_REF(export_request_body),
+                export_request_example()
+            ),
             responses => #{
                 200 =>
                     emqx_dashboard_swagger:schema_with_example(
                         ?R_REF(backup_file_info),
                         backup_file_info_example()
-                    )
+                    ),
+                400 => emqx_dashboard_swagger:error_codes(
+                    [?BAD_REQUEST], <<"Invalid table sets: bar, foo">>
+                ),
+                500 => emqx_dashboard_swagger:error_codes(
+                    [?BAD_REQUEST], <<"Error processing export: ...">>
+                )
             }
         }
     };
@@ -132,8 +119,8 @@ schema("/data/files/:filename") ->
             tags => ?TAGS,
             desc => <<"Download a data backup file">>,
             parameters => [
-                ?filename_field(true, #{in => path}),
-                ?node_field(false, #{in => query})
+                field_filename(true, #{in => path}),
+                field_node(false, #{in => query})
             ],
             responses => #{
                 200 => ?HOCON(binary),
@@ -149,8 +136,8 @@ schema("/data/files/:filename") ->
             tags => ?TAGS,
             desc => <<"Delete a data backup file">>,
             parameters => [
-                ?filename_field(true, #{in => path}),
-                ?node_field(false, #{in => query})
+                field_filename(true, #{in => path}),
+                field_node(false, #{in => query})
             ],
             responses => #{
                 204 => <<"No Content">>,
@@ -171,19 +158,46 @@ fields(files_response) ->
     ];
 fields(backup_file_info) ->
     [
-        ?node_field(true),
-        ?filename_field(true),
+        field_node(true),
+        field_filename(true),
         {created_at,
             ?HOCON(binary(), #{
                 desc => "Data backup file creation date and time",
                 required => true
             })}
     ];
+fields(export_request_body) ->
+    AllTableSetNames = emqx_mgmt_data_backup:all_table_set_names(),
+    TableSetsDesc = iolist_to_binary([
+        [
+            <<"Sets of tables to export. Exports all if omitted.">>,
+            <<" Valid values:\n\n">>
+        ]
+        | lists:map(fun(Name) -> ["- ", Name, $\n] end, AllTableSetNames)
+    ]),
+    [
+        {table_sets,
+            hoconsc:mk(
+                hoconsc:array(binary()),
+                #{
+                    required => false,
+                    desc => TableSetsDesc
+                }
+            )},
+        {root_keys,
+            hoconsc:mk(
+                hoconsc:array(binary()),
+                #{
+                    required => false,
+                    desc => <<"Sets of root configuration keys to export. Exports all if omitted.">>
+                }
+            )}
+    ];
 fields(import_request_body) ->
-    [?node_field(false), ?filename_field(true)];
+    [field_node(false), field_filename(true)];
 fields(data_backup_file) ->
     [
-        ?filename_field(true),
+        field_filename(true),
         {file,
             ?HOCON(binary(), #{
                 desc => "Data backup file content",
@@ -191,28 +205,104 @@ fields(data_backup_file) ->
             })}
     ].
 
+field_node(IsRequired) ->
+    field_node(IsRequired, #{}).
+
+field_node(IsRequired, Meta) ->
+    {node, ?HOCON(binary(), Meta#{desc => "Node name", required => IsRequired})}.
+
+field_filename(IsRequired) ->
+    field_filename(IsRequired, #{}).
+
+field_filename(IsRequired, Meta) ->
+    {filename,
+        ?HOCON(binary(), Meta#{
+            desc => "Data backup file name",
+            required => IsRequired
+        })}.
+
 %%------------------------------------------------------------------------------
 %% HTTP API Callbacks
 %%------------------------------------------------------------------------------
 
-data_export(post, _Request) ->
-    case emqx_mgmt_data_backup:export() of
-        {ok, #{filename := FileName} = File} ->
-            {200, File#{filename => filename:basename(FileName)}};
-        Error ->
-            Error
+data_export(post, #{body := Params0} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    Params = emqx_utils_maps:put_if(Params0, <<"namespace">>, Namespace, is_binary(Namespace)),
+    maybe
+        ok ?= emqx_mgmt_data_backup:validate_export_root_keys(Params),
+        {ok, Opts} ?= emqx_mgmt_data_backup:parse_export_request(Params),
+        {ok, #{filename := Filename} = File} ?= emqx_mgmt_data_backup:export(Opts),
+        {200, File#{filename => filename:basename(Filename)}}
+    else
+        {error, {unknown_root_keys, UnknownKeys}} ->
+            Msg = iolist_to_binary([
+                <<"Invalid root keys: ">>,
+                lists:join(<<", ">>, UnknownKeys)
+            ]),
+            {400, #{code => ?BAD_REQUEST, message => Msg}};
+        {error, {bad_table_sets, InvalidSetNames}} ->
+            Msg = iolist_to_binary([
+                <<"Invalid table sets: ">>,
+                lists:join(<<", ">>, InvalidSetNames)
+            ]),
+            {400, #{code => ?BAD_REQUEST, message => Msg}};
+        {error, Reason} ->
+            Msg = iolist_to_binary([
+                <<"Error processing export: ">>,
+                emqx_utils_conv:bin(Reason)
+            ]),
+            {500, #{code => 'INTERNAL_ERROR', message => Msg}}
     end.
 
-data_import(post, #{body := #{<<"filename">> := FileName} = Body}) ->
-    case safe_parse_node(Body) of
+data_import(post, #{body := #{<<"filename">> := Filename} = Body} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    Nodes = emqx_bpapi:nodes_supporting_bpapi_version(?BPAPI_NAME, 2),
+    case safe_parse_node(Body, Nodes) of
         {error, Msg} ->
             {400, #{code => ?BAD_REQUEST, message => Msg}};
         FileNode ->
             CoreNode = core_node(FileNode),
-            response(
-                emqx_mgmt_data_backup_proto_v1:import_file(CoreNode, FileNode, FileName, infinity)
-            )
+            Opts = emqx_utils_maps:put_if(#{}, namespace, Namespace, is_binary(Namespace)),
+            Res = emqx_mgmt_data_backup_proto_v2:import_file(
+                CoreNode,
+                FileNode,
+                Filename,
+                Opts,
+                infinity
+            ),
+            case Res of
+                {ok, #{db_errors := DbErrs, config_errors := ConfErrs}} ->
+                    case DbErrs =:= #{} andalso ConfErrs =:= #{} of
+                        true ->
+                            {204};
+                        false ->
+                            Msg = format_import_errors(DbErrs, ConfErrs),
+                            {400, #{code => ?BAD_REQUEST, message => Msg}}
+                    end;
+                {badrpc, Reason} ->
+                    {500, #{
+                        code => ?SERVICE_UNAVAILABLE(Reason),
+                        message => emqx_mgmt_data_backup:format_error(Reason)
+                    }};
+                {error, Reason} ->
+                    {400, #{
+                        code => ?BAD_REQUEST, message => emqx_mgmt_data_backup:format_error(Reason)
+                    }}
+            end
     end.
+
+format_import_errors(DbErrs, ConfErrs) ->
+    DbErrs1 = emqx_mgmt_data_backup:format_db_errors(DbErrs),
+    ConfErrs1 = emqx_mgmt_data_backup:format_conf_errors(ConfErrs),
+    GlobalConfErrs = maps:get(?global_ns, ConfErrs1, <<"">>),
+    Msg0 = ConfErrs1#{
+        ?global_ns => [
+            DbErrs1,
+            GlobalConfErrs
+        ]
+    },
+    Msg1 = maps:map(fun(_Ns, IOData) -> iolist_to_binary(IOData) end, Msg0),
+    maps:filter(fun(_Ns, Text) -> Text /= <<"">> end, Msg1).
 
 core_node(FileNode) ->
     case mria_rlog:role(FileNode) of
@@ -228,8 +318,8 @@ core_node(FileNode) ->
     end.
 
 data_files(post, #{body := #{<<"filename">> := #{type := _} = File}}) ->
-    [{FileName, FileContent} | _] = maps:to_list(maps:without([type], File)),
-    case emqx_mgmt_data_backup:upload(FileName, FileContent) of
+    [{Filename, FileContent} | _] = maps:to_list(maps:without([type], File)),
+    case emqx_mgmt_data_backup:upload(Filename, FileContent) of
         ok ->
             {204};
         {error, Reason} ->
@@ -256,8 +346,19 @@ data_file_by_name(Method, #{bindings := #{filename := Filename}, query_string :=
                     {404, #{
                         code => ?NOT_FOUND, message => emqx_mgmt_data_backup:format_error(not_found)
                     }};
-                Other ->
-                    response(Other)
+                ok ->
+                    ?NO_CONTENT;
+                {ok, BinContents} ->
+                    {200, #{<<"content-type">> => <<"application/octet-stream">>}, BinContents};
+                {error, Reason} ->
+                    {400, #{
+                        code => ?BAD_REQUEST, message => emqx_mgmt_data_backup:format_error(Reason)
+                    }};
+                {badrpc, Reason} ->
+                    {500, #{
+                        code => ?SERVICE_UNAVAILABLE(Reason),
+                        message => emqx_mgmt_data_backup:format_error(Reason)
+                    }}
             end
     end.
 
@@ -270,31 +371,18 @@ get_or_delete_file(get, Filename, Node) ->
 get_or_delete_file(delete, Filename, Node) ->
     emqx_mgmt_data_backup_proto_v1:delete_file(Node, Filename, infinity).
 
-safe_parse_node(#{<<"node">> := NodeBin}) ->
-    NodesBin = [erlang:atom_to_binary(N, utf8) || N <- emqx:running_nodes()],
+safe_parse_node(BodyParams) ->
+    Nodes = emqx:running_nodes(),
+    safe_parse_node(BodyParams, Nodes).
+
+safe_parse_node(#{<<"node">> := NodeBin}, Nodes) ->
+    NodesBin = [erlang:atom_to_binary(N, utf8) || N <- Nodes],
     case lists:member(NodeBin, NodesBin) of
         true -> erlang:binary_to_atom(NodeBin, utf8);
         false -> {error, io_lib:format("Unknown node: ~s", [NodeBin])}
     end;
-safe_parse_node(_) ->
+safe_parse_node(_, _) ->
     node().
-
-response({ok, #{db_errors := DbErrs, config_errors := ConfErrs}}) ->
-    case DbErrs =:= #{} andalso ConfErrs =:= #{} of
-        true ->
-            {204};
-        false ->
-            DbErrs1 = emqx_mgmt_data_backup:format_db_errors(DbErrs),
-            ConfErrs1 = emqx_mgmt_data_backup:format_conf_errors(ConfErrs),
-            Msg = unicode:characters_to_binary(io_lib:format("~s", [DbErrs1 ++ ConfErrs1])),
-            {400, #{code => ?BAD_REQUEST, message => Msg}}
-    end;
-response({ok, Res}) ->
-    {200, Res};
-response(ok) ->
-    {204};
-response({error, Reason}) ->
-    {400, #{code => ?BAD_REQUEST, message => emqx_mgmt_data_backup:format_error(Reason)}}.
 
 list_backup_files(Page, Limit) ->
     Start = Page * Limit - Limit + 1,
@@ -341,6 +429,22 @@ backup_file_info_example() ->
         filename => <<"emqx-export-2023-11-23-19-13-19.043.tar.gz">>,
         node => 'emqx@127.0.0.1',
         size => 22740
+    }.
+
+export_request_example() ->
+    #{
+        table_sets => [
+            <<"banned">>,
+            <<"builtin_authn">>,
+            <<"builtin_authz">>
+        ],
+        root_keys => [
+            <<"connectors">>,
+            <<"actions">>,
+            <<"sources">>,
+            <<"rule_engine">>,
+            <<"schema_registry">>
+        ]
     }.
 
 files_response_example() ->

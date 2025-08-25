@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_ds_test_helpers).
 
@@ -20,11 +8,29 @@
 
 -include_lib("emqx_utils/include/emqx_message.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
--include_lib("stdlib/include/assert.hrl").
+-include_lib("common_test/include/ct.hrl").
 
--define(ON(NODE, BODY),
-    erpc:call(NODE, erlang, apply, [fun() -> BODY end, []])
-).
+-spec on([node()] | node(), fun(() -> A)) -> A | [A].
+on(Node, Fun) when is_atom(Node) ->
+    [Ret] = on([Node], Fun),
+    Ret;
+on(Nodes, Fun) ->
+    Results = erpc:multicall(Nodes, erlang, apply, [Fun, []]),
+    lists:map(
+        fun
+            ({_Node, {ok, Result}}) ->
+                Result;
+            ({Node, Error}) ->
+                ct:pal("Error on node ~p", [Node]),
+                case Error of
+                    {error, {exception, Reason, Stack}} ->
+                        erlang:raise(error, Reason, Stack);
+                    _ ->
+                        error(Error)
+                end
+        end,
+        lists:zip(Nodes, Results)
+    ).
 
 %% RPC mocking
 
@@ -65,9 +71,6 @@ mock_rpc_result(gen_rpc, ExpectFun) ->
         end
     end).
 
-%% Consume data from the DS storage on a given node as a stream:
--type ds_stream() :: emqx_utils_stream:stream({emqx_ds:message_key(), emqx_types:message()}).
-
 %% @doc Create an infinite list of messages from a given client:
 interleaved_topic_messages(TestCase, NClients, NMsgs) ->
     %% List of fake client IDs:
@@ -89,6 +92,7 @@ topic_messages(TestCase, ClientId, N) ->
     fun() ->
         NBin = integer_to_binary(N),
         Msg = #message{
+            id = <<N:128>>,
             from = ClientId,
             topic = client_topic(TestCase, ClientId),
             timestamp = N * 100,
@@ -102,181 +106,82 @@ client_topic(TestCase, ClientId) when is_atom(TestCase) ->
 client_topic(TestCase, ClientId) when is_binary(TestCase) ->
     <<TestCase/binary, "/", ClientId/binary>>.
 
-ds_topic_generation_stream(DB, Node, Shard, Topic, Stream) ->
-    {ok, Iterator} = ?ON(
-        Node,
-        emqx_ds_storage_layer:make_iterator(Shard, Stream, Topic, 0)
-    ),
-    do_ds_topic_generation_stream(DB, Node, Shard, Iterator).
+%% Message comparison
 
-do_ds_topic_generation_stream(DB, Node, Shard, It0) ->
-    fun() ->
-        case
-            ?ON(
-                Node,
-                begin
-                    Now = emqx_ds_replication_layer:current_timestamp(DB, Shard),
-                    emqx_ds_storage_layer:next(Shard, It0, 1, Now)
-                end
-            )
-        of
-            {ok, _It, []} ->
-                [];
-            {ok, end_of_stream} ->
-                [];
-            {ok, It, [KeyMsg]} ->
-                [KeyMsg | do_ds_topic_generation_stream(DB, Node, Shard, It)]
-        end
+%% Try to eliminate any ambiguity in the message representation.
+message_canonical_form(Msg0 = #message{}) ->
+    message_canonical_form(emqx_message:to_map(Msg0));
+message_canonical_form(#{flags := Flags0, headers := _Headers0, payload := Payload0} = Msg) ->
+    %% Remove flags that are false:
+    Flags = maps:filter(
+        fun(_Key, Val) -> Val end,
+        Flags0
+    ),
+    Msg#{flags := Flags, payload := iolist_to_binary(Payload0)}.
+
+sublist(L) ->
+    PrintMax = 20,
+    case length(L) of
+        0 ->
+            [];
+        N when N > PrintMax ->
+            lists:sublist(L, 1, PrintMax) ++ ['...', N - PrintMax, 'more'];
+        _ ->
+            L
     end.
 
-%% Payload generation:
+message_set(L) ->
+    ordsets:from_list([message_canonical_form(I) || I <- L]).
 
-apply_stream(DB, Nodes, Stream) ->
-    apply_stream(
-        DB,
-        emqx_utils_stream:repeat(emqx_utils_stream:list(Nodes)),
-        Stream,
-        0
-    ).
+message_set_subtract(A, B) ->
+    ordsets:subtract(message_set(A), message_set(B)).
 
-apply_stream(DB, NodeStream0, Stream0, N) ->
-    case emqx_utils_stream:next(Stream0) of
-        [] ->
-            ?tp(all_done, #{});
-        [Msg = #message{} | Stream] ->
-            [Node | NodeStream] = emqx_utils_stream:next(NodeStream0),
-            ?tp(
-                test_push_message,
-                maps:merge(
-                    emqx_message:to_map(Msg),
-                    #{n => N}
-                )
-            ),
-            ?ON(Node, emqx_ds:store_batch(DB, [Msg], #{sync => true})),
-            apply_stream(DB, NodeStream, Stream, N + 1);
-        [add_generation | Stream] ->
-            %% FIXME:
-            [Node | NodeStream] = emqx_utils_stream:next(NodeStream0),
-            ?ON(Node, emqx_ds:add_generation(DB)),
-            apply_stream(DB, NodeStream, Stream, N);
-        [{Node, Operation, Arg} | Stream] when
-            Operation =:= join_db_site; Operation =:= leave_db_site; Operation =:= assign_db_sites
-        ->
-            ?tp(notice, test_apply_operation, #{node => Node, operation => Operation, arg => Arg}),
-            %% Apply the transition.
-            ?assertMatch(
-                {ok, _},
-                ?ON(
-                    Node,
-                    emqx_ds_replication_layer_meta:Operation(DB, Arg)
-                )
-            ),
-            %% Give some time for at least one transition to complete.
-            Transitions = transitions(Node, DB),
-            ct:pal("Transitions after ~p: ~p", [Operation, Transitions]),
-            ?retry(200, 10, ?assertNotEqual(Transitions, transitions(Node, DB))),
-            apply_stream(DB, NodeStream0, Stream, N);
-        [Fun | Stream] when is_function(Fun) ->
-            Fun(),
-            apply_stream(DB, NodeStream0, Stream, N)
+assert_same_set(Expected, Got) ->
+    assert_same_set(Expected, Got, #{}).
+
+assert_same_set(Expected, Got, Comment) ->
+    SE = message_set(Expected),
+    SG = message_set(Got),
+    case {ordsets:subtract(SE, SG), ordsets:subtract(SG, SE)} of
+        {[], []} ->
+            ok;
+        {Missing, Unexpected} ->
+            error(Comment#{
+                matching => sublist(ordsets:intersection(SE, SG)),
+                missing => sublist(Missing),
+                unexpected => sublist(Unexpected)
+            })
     end.
 
-transitions(Node, DB) ->
-    ?ON(
-        Node,
-        begin
-            Shards = emqx_ds_replication_layer_meta:shards(DB),
-            [
-                {S, T}
-             || S <- Shards, T <- emqx_ds_replication_layer_meta:replica_set_transitions(DB, S)
-            ]
-        end
-    ).
+message_eq(Fields, {_Key, Msg1 = #message{}}, Msg2) ->
+    message_eq(Fields, Msg1, Msg2);
+message_eq(Fields, Msg1, {_Key, Msg2 = #message{}}) ->
+    message_eq(Fields, Msg1, Msg2);
+message_eq(Fields, Msg1 = #message{}, Msg2 = #message{}) ->
+    maps:with(Fields, message_canonical_form(Msg1)) =:=
+        maps:with(Fields, message_canonical_form(Msg2)).
 
-%% Stream comparison
+diff_messages(Expected, Got) ->
+    Fields = [id, qos, from, flags, headers, topic, payload, extra],
+    diff_messages(Fields, Expected, Got).
 
-message_eq(Msg1, {_Key, Msg2}) ->
-    %% Timestamps can be modified by the replication layer, ignore them:
-    Msg1#message{timestamp = 0} =:= Msg2#message{timestamp = 0}.
+diff_messages(Fields, Expected, Got) ->
+    snabbkaffe_diff:assert_lists_eq(Expected, Got, message_diff_options(Fields)).
 
-%% Consuming streams and iterators
+message_diff_options(Fields) ->
+    #{
+        context => 20,
+        window => 1000,
+        compare_fun => fun(M1, M2) -> message_eq(Fields, M1, M2) end
+    }.
 
--spec verify_stream_effects(atom(), binary(), [node()], [{emqx_types:clientid(), ds_stream()}]) ->
-    ok.
-verify_stream_effects(DB, TestCase, Nodes0, L) ->
-    Checked = lists:flatmap(
-        fun({ClientId, Stream}) ->
-            Nodes = nodes_of_clientid(DB, ClientId, Nodes0),
-            ct:pal("Nodes allocated for client ~p: ~p", [ClientId, Nodes]),
-            ?defer_assert(
-                ?assertMatch([_ | _], Nodes, ["No nodes have been allocated for ", ClientId])
-            ),
-            [verify_stream_effects(DB, TestCase, Node, ClientId, Stream) || Node <- Nodes]
-        end,
-        L
-    ),
-    ?defer_assert(?assertMatch([_ | _], Checked, "Some messages have been verified")).
-
--spec verify_stream_effects(atom(), binary(), node(), emqx_types:clientid(), ds_stream()) -> ok.
-verify_stream_effects(DB, TestCase, Node, ClientId, ExpectedStream) ->
-    ct:pal("Checking consistency of effects for ~p on ~p", [ClientId, Node]),
-    DiffOpts = #{context => 20, window => 1000, compare_fun => fun message_eq/2},
-    ?defer_assert(
-        begin
-            snabbkaffe_diff:assert_lists_eq(
-                ExpectedStream,
-                ds_topic_stream(DB, ClientId, client_topic(TestCase, ClientId), Node),
-                DiffOpts
-            ),
-            ct:pal("Data for client ~p on ~p is consistent.", [ClientId, Node])
-        end
-    ).
-
-%% Create a stream from the topic (wildcards are NOT supported for a
-%% good reason: order of messages is implementation-dependent!).
-%%
-%% Note: stream produces messages with keys
--spec ds_topic_stream(atom(), binary(), binary(), node()) -> ds_stream().
-ds_topic_stream(DB, ClientId, TopicBin, Node) ->
-    Topic = emqx_topic:words(TopicBin),
-    Shard = shard_of_clientid(DB, Node, ClientId),
-    {ShardId, DSStreams} =
-        ?ON(
-            Node,
-            begin
-                DBShard = {DB, Shard},
-                {DBShard, emqx_ds_storage_layer:get_streams(DBShard, Topic, 0)}
-            end
-        ),
-    %% Sort streams by their rank Y, and chain them together:
-    emqx_utils_stream:chain([
-        ds_topic_generation_stream(DB, Node, ShardId, Topic, S)
-     || {_RankY, S} <- lists:sort(DSStreams)
-    ]).
-
-%% Find which nodes from the list contain the shards for the given
-%% client ID:
-nodes_of_clientid(DB, ClientId, Nodes = [N0 | _]) ->
-    Shard = shard_of_clientid(DB, N0, ClientId),
-    SiteNodes = ?ON(
-        N0,
-        begin
-            Sites = emqx_ds_replication_layer_meta:replica_set(DB, Shard),
-            lists:map(fun emqx_ds_replication_layer_meta:node/1, Sites)
-        end
-    ),
-    lists:filter(
-        fun(N) ->
-            lists:member(N, SiteNodes)
-        end,
-        Nodes
-    ).
-
-shard_of_clientid(DB, Node, ClientId) ->
-    ?ON(
-        Node,
-        emqx_ds_replication_layer:shard_of_message(DB, #message{from = ClientId}, clientid)
-    ).
+%% @doc Group list of maps by value associated with a given key.
+%% Groups appear in the order of the value of the grouping key, relative order
+%% inside each group is preserved.
+-spec group_maps_by(K, [#{K := V}]) -> #{K := [V]}.
+group_maps_by(K, Maps) ->
+    Values = lists:usort([maps:get(K, M) || M <- Maps]),
+    [M || V <- Values, M <- Maps, map_get(K, M) =:= V].
 
 %% Consume eagerly:
 
@@ -319,7 +224,7 @@ storage_consume(ShardId, TopicFilter) ->
     storage_consume(ShardId, TopicFilter, 0).
 
 storage_consume(ShardId, TopicFilter, StartTime) ->
-    Streams = emqx_ds_storage_layer:get_streams(ShardId, TopicFilter, StartTime),
+    Streams = emqx_ds_storage_layer:get_streams(ShardId, TopicFilter, StartTime, 0),
     lists:flatmap(
         fun({_Rank, Stream}) ->
             storage_consume_stream(ShardId, Stream, TopicFilter, StartTime)
@@ -338,7 +243,7 @@ storage_consume_iter(ShardId, It) ->
 storage_consume_iter(ShardId, It0, Opts) ->
     consume_iter_with(
         fun(It, BatchSize) ->
-            emqx_ds_storage_layer:next(ShardId, It, BatchSize, emqx_ds:timestamp_us())
+            emqx_ds_storage_layer:next(ShardId, It, BatchSize, emqx_ds:timestamp_us(), false)
         end,
         It0,
         Opts
@@ -351,7 +256,7 @@ consume_iter_with(NextFun, It0, Opts) ->
             {ok, It, []};
         {ok, It1, Batch} ->
             {ok, It, Msgs} = consume_iter_with(NextFun, It1, Opts),
-            {ok, It, [Msg || {_DSKey, Msg} <- Batch] ++ Msgs};
+            {ok, It, Batch ++ Msgs};
         {ok, Eos = end_of_stream} ->
             {ok, Eos, []};
         {error, Class, Reason} ->

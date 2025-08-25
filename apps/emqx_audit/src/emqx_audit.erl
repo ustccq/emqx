@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_audit).
@@ -27,7 +27,7 @@
     code_change/3
 ]).
 
--define(FILTER_REQ, [cert, host_info, has_sent_resp, pid, path_info, peer, ref, sock, streamid]).
+-define(CHARS_LIMIT_IN_DB, 1024).
 
 -ifdef(TEST).
 -define(INTERVAL, 100).
@@ -50,7 +50,24 @@ to_audit(#{from := cli, cmd := Cmd, args := Args, duration_ms := DurationMs}) ->
         http_method = <<"">>,
         http_request = <<"">>
     };
-to_audit(#{from := From} = Log) when From =:= dashboard orelse From =:= rest_api ->
+to_audit(#{from := erlang_console, function := F, args := Args}) ->
+    #?AUDIT{
+        from = erlang_console,
+        source = <<"">>,
+        source_ip = <<"">>,
+        %% operation info
+        operation_id = <<"">>,
+        operation_type = <<"">>,
+        operation_result = <<"">>,
+        failure = <<"">>,
+        %% request detail
+        http_status_code = <<"">>,
+        http_method = <<"">>,
+        http_request = <<"">>,
+        duration_ms = 0,
+        args = iolist_to_binary(io_lib:format("~p: ~ts", [F, Args]))
+    };
+to_audit(#{from := From} = Log) when is_atom(From) ->
     #{
         source := Source,
         source_ip := SourceIp,
@@ -76,26 +93,9 @@ to_audit(#{from := From} = Log) when From =:= dashboard orelse From =:= rest_api
         %% request detail
         http_status_code = StatusCode,
         http_method = Method,
-        http_request = Request,
+        http_request = truncate_http_body(Request),
         duration_ms = DurationMs,
         args = <<"">>
-    };
-to_audit(#{from := erlang_console, function := F, args := Args}) ->
-    #?AUDIT{
-        from = erlang_console,
-        source = <<"">>,
-        source_ip = <<"">>,
-        %% operation info
-        operation_id = <<"">>,
-        operation_type = <<"">>,
-        operation_result = <<"">>,
-        failure = <<"">>,
-        %% request detail
-        http_status_code = <<"">>,
-        http_method = <<"">>,
-        http_request = <<"">>,
-        duration_ms = 0,
-        args = iolist_to_binary(io_lib:format("~p: ~ts", [F, Args]))
     }.
 
 log(_Level, undefined, _Handler) ->
@@ -243,3 +243,11 @@ log_to_file(Level, Meta, #{module := Module} = Handler) ->
                     )
             end
     end.
+
+truncate_http_body(Req = #{body := Body}) ->
+    Req#{body => truncate_large_term(Body)};
+truncate_http_body(Req) ->
+    Req.
+
+truncate_large_term(Req) ->
+    unicode:characters_to_binary(io_lib:format("~0p", [Req], [{chars_limit, ?CHARS_LIMIT_IN_DB}])).

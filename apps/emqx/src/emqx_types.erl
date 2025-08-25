@@ -1,20 +1,10 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2018-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2018-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_types).
+
+-elvis([{elvis_style, private_data_types, disable}]).
 
 -include("emqx.hrl").
 -include("emqx_mqtt.hrl").
@@ -49,6 +39,7 @@
     sockstate/0,
     conninfo/0,
     clientinfo/0,
+    tns/0,
     clientid/0,
     username/0,
     password/0,
@@ -144,8 +135,7 @@
 
 -type subid() :: binary() | atom().
 
-%% '_' for match spec
--type group() :: binary() | '_'.
+-type group() :: binary().
 -type topic() :: binary().
 -type word() :: '' | '+' | '#' | binary().
 -type words() :: list(word()).
@@ -153,7 +143,7 @@
 -type share() :: #share{}.
 
 -type socktype() :: tcp | udp | ssl | proxy | atom().
--type sockstate() :: idle | running | blocked | closed.
+-type sockstate() :: idle | running | blocked | closed | read_aborted.
 -type conninfo() :: #{
     socktype := socktype(),
     sockname := peername(),
@@ -196,6 +186,7 @@
     atom() => term()
 }.
 -type client_attrs() :: #{binary() => binary()}.
+-type tns() :: binary().
 -type clientid() :: binary() | atom().
 -type username() :: option(binary()).
 -type password() :: option(binary()).
@@ -239,17 +230,9 @@
 -type subscriber() :: {pid(), subid()}.
 -type payload() :: binary() | iodata().
 -type message() :: #message{}.
--type flag() :: sys | dup | retain | atom().
--type flags() :: #{flag() := boolean()}.
--type headers() :: #{
-    proto_ver => proto_ver(),
-    protocol => protocol(),
-    username => username(),
-    peerhost => peerhost(),
-    properties => properties(),
-    allow_publish => boolean(),
-    atom() => term()
-}.
+-type flag() :: emqx_utils_types:flag().
+-type flags() :: emqx_utils_types:flags().
+-type headers() :: emqx_utils_types:headers().
 
 -type banned() :: #banned{}.
 -type banned_who() ::
@@ -267,9 +250,13 @@
     [
         {node(), topic(), deliver_result()}
         | {share, topic(), deliver_result()}
+        | {emqx_external_broker:dest(), topic(), deliver_result()}
         | persisted
     ]
-    | disconnect.
+    %% If schema validation failure action is set to `disconnect'.
+    | disconnect
+    %% If caller specifies `hook_prohibition_as_error => true'.
+    | {blocked, message()}.
 -type route() :: #route{}.
 -type route_entry() :: {topic(), node()} | {topic, group()}.
 -type command() :: #command{}.

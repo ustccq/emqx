@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_http_schema).
@@ -26,6 +14,8 @@
     select_union_member/1,
     namespace/0
 ]).
+
+-export([url/1, headers/1, headers_no_content_type/1, request_timeout/1]).
 
 -include("emqx_auth_http.hrl").
 -include_lib("emqx_auth/include/emqx_authn.hrl").
@@ -61,12 +51,6 @@ select_union_member(
                 got => Else
             })
     end;
-select_union_member(#{<<"backend">> := ?AUTHN_BACKEND_BIN}) ->
-    throw(#{
-        reason => "unknown_mechanism",
-        expected => "password_based",
-        got => undefined
-    });
 select_union_member(_Value) ->
     undefined.
 
@@ -125,9 +109,9 @@ headers(type) ->
 headers(desc) ->
     ?DESC(?FUNCTION_NAME);
 headers(converter) ->
-    fun emqx_authn_utils:convert_headers/1;
+    fun emqx_auth_http_utils:convert_headers/1;
 headers(default) ->
-    emqx_authn_utils:default_headers();
+    emqx_auth_http_utils:default_headers();
 headers(_) ->
     undefined.
 
@@ -136,9 +120,9 @@ headers_no_content_type(type) ->
 headers_no_content_type(desc) ->
     ?DESC(?FUNCTION_NAME);
 headers_no_content_type(converter) ->
-    fun emqx_authn_utils:convert_headers_no_content_type/1;
+    fun emqx_auth_http_utils:convert_headers_no_content_type/1;
 headers_no_content_type(default) ->
-    emqx_authn_utils:default_headers_no_content_type();
+    emqx_auth_http_utils:default_headers_no_content_type();
 headers_no_content_type(_) ->
     undefined.
 

@@ -1,19 +1,6 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
-
 -module(emqx_otel_metrics).
 -include_lib("emqx/include/logger.hrl").
 
@@ -25,7 +12,7 @@
 -define(SUPERVISOR, emqx_otel_sup).
 
 start_otel(Conf) ->
-    Spec = emqx_otel_sup:worker_spec(?MODULE, Conf),
+    Spec = ?SUPERVISOR:worker_spec(?MODULE, Conf),
     assert_started(supervisor:start_child(?SUPERVISOR, Spec)).
 
 stop_otel() ->
@@ -126,10 +113,9 @@ filter_olp_metrics(Metrics) ->
         true ->
             Metrics;
         false ->
-            OlpMetrics = emqx_metrics:olp_metrics(),
             lists:filter(
                 fun({K, _}) ->
-                    not lists:member(K, OlpMetrics)
+                    not emqx_metrics:is_olp_metric(K)
                 end,
                 Metrics
             )
@@ -163,7 +149,6 @@ bytes_metrics() ->
         'packets.publish.inuse',
         'packets.publish.error',
         'packets.publish.auth_error',
-        'packets.publish.dropped',
         'packets.puback.received',
         'packets.puback.sent',
         'packets.puback.inuse',
@@ -264,6 +249,10 @@ normalize_name(cpu_idle) ->
     'cpu.idle';
 normalize_name(run_queue) ->
     'run.queue';
+normalize_name(mnesia_tm_mailbox_size) ->
+    'mnesia.tm.mailbox.size';
+normalize_name(broker_pool_max_mailbox_size) ->
+    'broker.pool.max.mailbox.size';
 normalize_name(total_memory) ->
     'total.memory';
 normalize_name(used_memory) ->

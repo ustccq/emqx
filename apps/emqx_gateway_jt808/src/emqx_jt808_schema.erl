@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_jt808_schema).
@@ -60,7 +60,12 @@ fields(jt808_proto) ->
                 #{desc => ?DESC(jt808_auth)}
             )},
         {up_topic, fun up_topic/1},
-        {dn_topic, fun dn_topic/1}
+        {dn_topic, fun dn_topic/1},
+        {ignore_unsupported_frames,
+            sc(
+                boolean(),
+                #{desc => ?DESC(ignore_unsupported_frames), default => true}
+            )}
     ];
 fields(anonymous_true) ->
     [

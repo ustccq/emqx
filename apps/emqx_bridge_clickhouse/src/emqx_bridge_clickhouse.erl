@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_clickhouse).
 
@@ -84,7 +84,7 @@ values(_Method, Type) ->
         enable => true,
         type => Type,
         name => <<"foo">>,
-        server => <<"127.0.0.1:8123">>,
+        url => <<"http://127.0.0.1:8123">>,
         database => <<"mqtt">>,
         pool_size => 8,
         username => <<"default">>,
@@ -129,6 +129,7 @@ fields(clickhouse_action) ->
 fields(action_parameters) ->
     [
         sql_field(),
+        emqx_bridge_v2_schema:undefined_as_null_field(),
         batch_value_separator_field()
     ];
 fields(connector_resource_opts) ->

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_conf_app).
@@ -23,11 +11,17 @@
 -export([sync_data_from_node/0]).
 -export([unset_config_loaded/0]).
 
+-ifdef(TEST).
+-export([sync_cluster_conf/0]).
+-endif.
+
 -include_lib("emqx/include/logger.hrl").
 -include("emqx_conf.hrl").
 
 start(_StartType, _StartArgs) ->
     ok = mria:wait_for_tables(emqx_cluster_rpc:create_tables()),
+    _ = emqx_config:create_tables(),
+    ensure_allowed_namespaced_root_keys(),
     try
         ok = init_conf()
     catch
@@ -40,6 +34,7 @@ start(_StartType, _StartArgs) ->
     emqx_conf_sup:start_link().
 
 stop(_State) ->
+    emqx_config:clear_all_invalid_namespaced_configs(),
     ok.
 
 %% @doc emqx_conf relies on this flag to synchronize configuration between nodes.
@@ -81,22 +76,30 @@ get_override_config_file() ->
             end
     end.
 
--define(DATA_DIRS, ["authz", "certs"]).
+-define(DATA_DIRS, ["authz", "certs", "schemas"]).
 
 sync_data_from_node() ->
-    Dir = emqx:data_dir(),
-    TargetDirs = lists:filter(
-        fun(Type) -> filelib:is_dir(filename:join(Dir, Type)) end, ?DATA_DIRS
-    ),
+    DataDir = emqx:data_dir(),
     Name = "data.zip",
-    case zip:zip(Name, TargetDirs, [memory, {cwd, Dir}]) of
-        {ok, {Name, Bin}} -> {ok, Bin};
-        {error, Reason} -> {error, Reason}
+    Files = traverse_and_collect_files(DataDir),
+    case zip:zip(Name, Files, [memory, {cwd, DataDir}]) of
+        {ok, {Name, Bin}} ->
+            {ok, Bin};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% ------------------------------------------------------------------------------
 %% Internal functions
 %% ------------------------------------------------------------------------------
+
+ensure_allowed_namespaced_root_keys() ->
+    emqx_config:add_allowed_namespaced_config_root([
+        <<"actions">>,
+        <<"connectors">>,
+        <<"rule_engine">>,
+        <<"sources">>
+    ]).
 
 init_load(TnxId) ->
     case emqx_app:get_config_loader() of
@@ -139,7 +142,7 @@ sync_cluster_conf() ->
 
 %% @private Some core nodes are running, try to sync the cluster config from them.
 sync_cluster_conf2(Nodes) ->
-    {Results, Failed} = emqx_conf_proto_v3:get_override_config_file(Nodes),
+    {Results, Failed} = emqx_conf_proto_v5:get_override_config_file(Nodes),
     {Ready, NotReady} = lists:partition(fun(Res) -> element(1, Res) =:= ok end, Results),
     LogData = #{peer_nodes => Nodes, self_node => node()},
     case Failed ++ NotReady of
@@ -300,7 +303,7 @@ conf_sort({ok, _}, {ok, _}) ->
     false.
 
 sync_data_from_node(Node) ->
-    case emqx_conf_proto_v3:sync_data_from_node(Node) of
+    case emqx_conf_proto_v4:sync_data_from_node(Node) of
         {ok, DataBin} ->
             case zip:unzip(DataBin, [{cwd, emqx:data_dir()}]) of
                 {ok, []} ->
@@ -326,4 +329,37 @@ has_deprecated_file(#{conf := Conf} = Info) ->
             %% The old version don't have emqx_config:has_deprecated_file/0
             %% Conf is not empty if deprecated file is found.
             Conf =/= #{}
+    end.
+
+traverse_and_collect_files(DataDir) ->
+    SubDirs = lists:map(fun(D) -> filename:join(DataDir, D) end, ?DATA_DIRS),
+    Prefix = ensure_trailing_slash(DataDir),
+    do_traverse_and_collect_files(SubDirs, Prefix, _Acc = []).
+
+do_traverse_and_collect_files([] = _SubDirs, _Prefix, Acc) ->
+    Acc;
+do_traverse_and_collect_files([SubDir | Rest], Prefix, Acc0) ->
+    %% This function already drops any non-regular file, including symlinks.
+    Acc = filelib:fold_files(
+        SubDir,
+        _Regex = "",
+        _Recursive = true,
+        fun(Path0, Acc) ->
+            Path = to_data_dir_relative_path(Path0, Prefix),
+            [Path | Acc]
+        end,
+        Acc0
+    ),
+    do_traverse_and_collect_files(Rest, Prefix, Acc).
+
+%% Note: `Prefix' must end in `/'.
+to_data_dir_relative_path(Path, Prefix) ->
+    lists:flatten(string:replace(Path, Prefix, "", leading)).
+
+ensure_trailing_slash(DataDir) ->
+    case lists:suffix("/", DataDir) of
+        true ->
+            DataDir;
+        false ->
+            DataDir ++ "/"
     end.

@@ -1,0 +1,22 @@
+services:
+  azurite:
+    container_name: azurite
+    image: mcr.microsoft.com/azure-storage/azurite:3.30.0
+    restart: always
+    expose:
+      - "10000"
+    # ports:
+    #   - "10000:10000"
+    networks:
+      - emqx_bridge
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "127.0.0.1", "10000"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+    command:
+      - azurite-blob
+      - "--blobHost"
+      - 0.0.0.0
+      - "-d"
+      - debug.log

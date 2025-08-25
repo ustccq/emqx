@@ -1,7 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_iotdb_connector).
+
+-feature(maybe_expr, enable).
 
 -behaviour(emqx_connector_examples).
 
@@ -15,7 +17,9 @@
 
 %% `emqx_resource' API
 -export([
+    resource_type/0,
     callback_mode/0,
+    callback_mode/1,
     on_start/2,
     on_stop/2,
     on_get_status/2,
@@ -29,6 +33,8 @@
     on_get_channel_status/3,
     on_format_query_result/1
 ]).
+
+-export([connect/1, do_get_status/1]).
 
 -export([
     namespace/0,
@@ -44,7 +50,8 @@
 
 -type config() ::
     #{
-        request_base := #{
+        driver := driver(),
+        request_base => #{
             scheme := http | https,
             host := iolist(),
             port := inet:port_number()
@@ -52,18 +59,17 @@
         connect_timeout := pos_integer(),
         pool_type := random | hash,
         pool_size := pos_integer(),
-        iotdb_version := atom(),
+        iotdb_version => atom(),
+        protocol_version => atom(),
         request => undefined | map(),
         atom() => _
     }.
 
 -type state() ::
     #{
-        connect_timeout := pos_integer(),
-        pool_type := random | hash,
+        driver := driver(),
         channels := map(),
         iotdb_version := atom(),
-        request => undefined | map(),
         atom() => _
     }.
 
@@ -71,6 +77,9 @@
 
 -define(CONNECTOR_TYPE, iotdb).
 -define(IOTDB_PING_PATH, <<"ping">>).
+
+%% timer:seconds(10)).
+-define(DEFAULT_THRIFT_TIMEOUT, 10000).
 
 -import(hoconsc, [mk/2, enum/1, ref/2]).
 
@@ -114,13 +123,13 @@ connector_example_values() ->
 namespace() -> "iotdb".
 
 roots() ->
-    [{config, #{type => hoconsc:ref(?MODULE, config)}}].
+    [].
 
-fields(config) ->
+fields("config_restapi") ->
     proplists_without(
         [url, request, retry_interval, headers],
         emqx_bridge_http_schema:fields("config_connector")
-    ) ++
+    ) ++ common_fields(restapi) ++
         fields("connection_fields");
 fields("connection_fields") ->
     [
@@ -142,38 +151,104 @@ fields("connection_fields") ->
             )},
         {authentication,
             mk(
-                hoconsc:union([ref(?MODULE, auth_basic)]),
+                hoconsc:union([ref(?MODULE, authentication)]),
                 #{
                     default => auth_basic, desc => ?DESC("config_authentication")
                 }
             )}
     ];
-fields(auth_basic) ->
+fields(authentication) ->
     [
-        {username, mk(binary(), #{required => true, desc => ?DESC("config_auth_basic_username")})},
+        {username, mk(binary(), #{required => true, desc => ?DESC("config_auth_username")})},
         {password,
             emqx_schema_secret:mk(#{
                 required => true,
-                desc => ?DESC("config_auth_basic_password")
+                desc => ?DESC("config_auth_password")
             })}
     ];
-fields("post") ->
-    emqx_connector_schema:type_and_name_fields(enum([iotdb])) ++ fields(config);
-fields("put") ->
-    fields(config);
-fields("get") ->
-    emqx_bridge_schema:status_fields() ++ fields("post").
+fields("config_thrift") ->
+    Meta = #{desc => ?DESC("server")},
+    emqx_connector_schema:common_fields() ++
+        common_fields(thrift) ++
+        [
+            {server, emqx_schema:servers_sc(Meta, ?THRIFT_HOST_OPTIONS)},
+            {protocol_version,
+                mk(
+                    hoconsc:enum([?PROTOCOL_V1, ?PROTOCOL_V2, ?PROTOCOL_V3]),
+                    #{
+                        desc => ?DESC("config_protocol_version"),
+                        default => ?PROTOCOL_V3
+                    }
+                )},
+            {'zoneId',
+                mk(
+                    binary(),
+                    #{default => <<"Asia/Shanghai">>, desc => ?DESC("config_zoneId")}
+                )},
+            {pool_size,
+                mk(
+                    pos_integer(),
+                    #{
+                        default => 8,
+                        desc => ?DESC("pool_size")
+                    }
+                )},
+            {connect_timeout,
+                mk(
+                    emqx_schema:timeout_duration_ms(),
+                    #{
+                        default => <<"10s">>,
+                        desc => ?DESC("connect_timeout")
+                    }
+                )},
+            {recv_timeout,
+                mk(
+                    emqx_schema:timeout_duration_ms(),
+                    #{
+                        default => <<"10s">>,
+                        desc => ?DESC("recv_timeout")
+                    }
+                )}
+        ] ++ fields(authentication) ++ emqx_connector_schema_lib:ssl_fields() ++
+        emqx_connector_schema:resource_opts_ref(?MODULE, connector_resource_opts);
+fields(connector_resource_opts) ->
+    emqx_connector_schema:resource_opts_fields();
+fields("post_" ++ Driver) ->
+    emqx_connector_schema:type_and_name_fields(enum([iotdb])) ++ fields("config_" ++ Driver);
+fields("put_" ++ Driver) ->
+    fields("config_" ++ Driver);
+fields("get_" ++ Driver) ->
+    emqx_bridge_schema:status_fields() ++ fields("post_" ++ Driver).
 
-desc(config) ->
-    ?DESC("desc_config");
-desc(auth_basic) ->
-    "Basic Authentication";
-desc(Method) when Method =:= "get"; Method =:= "put"; Method =:= "post" ->
-    ["Configuration for IoTDB using `", string:to_upper(Method), "` method."];
+common_fields(Driver) ->
+    [
+        {driver,
+            mk(
+                hoconsc:enum([Driver]),
+                #{
+                    desc => ?DESC("config_driver"),
+                    default => <<"restapi">>
+                }
+            )}
+    ].
+
+desc(authentication) ->
+    ?DESC("config_authentication");
+desc(connector_resource_opts) ->
+    "Connector resource options";
+desc(Struct) when is_list(Struct) ->
+    case string:split(Struct, "_") of
+        ["config", _] ->
+            ?DESC("desc_config");
+        [Method, _] when Method =:= "get"; Method =:= "put"; Method =:= "post" ->
+            ["Configuration for IoTDB using `", string:to_upper(Method), "` method."];
+        _ ->
+            undefined
+    end;
 desc(_) ->
     undefined.
 
-connector_config(Conf, #{name := Name, parse_confs := ParseConfs}) ->
+connector_config(#{driver := restapi} = Conf, #{name := Name, parse_confs := ParseConfs}) ->
     #{
         base_url := BaseUrl,
         authentication :=
@@ -198,7 +273,9 @@ connector_config(Conf, #{name := Name, parse_confs := ParseConfs}) ->
         <<"http">>,
         Name,
         WebhookConfig
-    ).
+    );
+connector_config(Conf, _) ->
+    Conf.
 
 proplists_without(Keys, List) ->
     [El || El = {K, _} <- List, not lists:member(K, Keys)].
@@ -206,10 +283,17 @@ proplists_without(Keys, List) ->
 %%-------------------------------------------------------------------------------------
 %% `emqx_resource' API
 %%-------------------------------------------------------------------------------------
+resource_type() -> iotdb.
+
 callback_mode() -> async_if_possible.
 
+callback_mode(#{driver := restapi}) ->
+    async_if_possible;
+callback_mode(#{driver := thrift}) ->
+    always_sync.
+
 -spec on_start(manager_id(), config()) -> {ok, state()} | no_return().
-on_start(InstanceId, #{iotdb_version := Version} = Config) ->
+on_start(InstanceId, #{driver := restapi, iotdb_version := Version} = Config) ->
     %% [FIXME] The configuration passed in here is pre-processed and transformed
     %% in emqx_bridge_resource:parse_confs/2.
     case emqx_bridge_http_connector:on_start(InstanceId, Config) of
@@ -219,8 +303,85 @@ on_start(InstanceId, #{iotdb_version := Version} = Config) ->
                 instance_id => InstanceId,
                 request => emqx_utils:redact(maps:get(request, State, <<>>))
             }),
-            ?tp(iotdb_bridge_started, #{instance_id => InstanceId}),
-            {ok, State#{iotdb_version => Version, channels => #{}}};
+            ?tp(iotdb_bridge_started, #{driver => restapi, instance_id => InstanceId}),
+            {ok, State#{driver => restapi, iotdb_version => Version, channels => #{}}};
+        {error, Reason} ->
+            ?SLOG(error, #{
+                msg => "failed_to_start_iotdb_bridge",
+                instance_id => InstanceId,
+                request => emqx_utils:redact(maps:get(request, Config, <<>>)),
+                reason => Reason
+            }),
+            throw(failed_to_start_iotdb_bridge)
+    end;
+on_start(
+    InstanceId,
+    #{
+        driver := thrift,
+        protocol_version := ProtocolVsn,
+        server := Server,
+        pool_size := PoolSize,
+        ssl := SSL
+    } = Config
+) ->
+    IoTDBOpts0 = maps:with(['zoneId', username, password], Config),
+
+    Version =
+        case ProtocolVsn of
+            ?PROTOCOL_V1 ->
+                0;
+            ?PROTOCOL_V2 ->
+                1;
+            ?PROTOCOL_V3 ->
+                2
+        end,
+
+    Addresses = emqx_schema:parse_servers(Server, ?THRIFT_HOST_OPTIONS),
+
+    DriverOpts = maps:merge(
+        #{
+            connect_timeout => ?DEFAULT_THRIFT_TIMEOUT,
+            recv_timeout => ?DEFAULT_THRIFT_TIMEOUT
+        },
+        normalize_thrift_timeout(maps:with([connect_timeout, recv_timeout], Config))
+    ),
+
+    DriverOpts1 =
+        case maps:get(enable, SSL) of
+            true ->
+                DriverOpts#{
+                    ssltransport => true,
+                    ssloptions => emqx_tls_lib:to_client_opts(SSL)
+                };
+            false ->
+                DriverOpts
+        end,
+
+    IoTDBOpts = IoTDBOpts0#{
+        version => Version,
+        addresses => Addresses,
+        options => DriverOpts1
+    },
+
+    Options = [
+        {pool_size, PoolSize},
+        {iotdb_options, IoTDBOpts}
+    ],
+
+    case emqx_resource_pool:start(InstanceId, ?MODULE, Options) of
+        ok ->
+            ?SLOG(info, #{
+                msg => "iotdb_bridge_started",
+                instance_id => InstanceId
+            }),
+
+            ?tp(iotdb_bridge_started, #{driver => thrift, instance_id => InstanceId}),
+
+            {ok, #{
+                driver => thrift,
+                iotdb_version => ProtocolVsn,
+                channels => #{}
+            }};
         {error, Reason} ->
             ?SLOG(error, #{
                 msg => "failed_to_start_iotdb_bridge",
@@ -232,18 +393,26 @@ on_start(InstanceId, #{iotdb_version := Version} = Config) ->
     end.
 
 -spec on_stop(manager_id(), state()) -> ok | {error, term()}.
-on_stop(InstanceId, State) ->
+on_stop(InstanceId, #{driver := restapi} = State) ->
     ?SLOG(info, #{
         msg => "stopping_iotdb_bridge",
         connector => InstanceId
     }),
     Res = emqx_bridge_http_connector:on_stop(InstanceId, State),
     ?tp(iotdb_bridge_stopped, #{instance_id => InstanceId}),
-    Res.
+    Res;
+on_stop(InstanceId, #{driver := thrift} = _State) ->
+    ?SLOG(info, #{
+        msg => "stopping_iotdb_bridge",
+        connector => InstanceId
+    }),
+
+    ?tp(iotdb_bridge_stopped, #{instance_id => InstanceId}),
+    emqx_resource_pool:stop(InstanceId).
 
 -spec on_get_status(manager_id(), state()) ->
     connected | connecting | {disconnected, state(), term()}.
-on_get_status(InstanceId, State) ->
+on_get_status(InstanceId, #{driver := restapi} = State) ->
     Func = fun(Worker, Timeout) ->
         Request = {?IOTDB_PING_PATH, [], undefined},
         NRequest = emqx_bridge_http_connector:formalize_request(get, Request),
@@ -262,7 +431,27 @@ on_get_status(InstanceId, State) ->
                 {error, {unexpected_ping_result, Result}}
         end
     end,
-    emqx_bridge_http_connector:on_get_status(InstanceId, State, Func).
+    emqx_bridge_http_connector:on_get_status(InstanceId, State, Func);
+on_get_status(InstanceId, #{driver := thrift} = _State) ->
+    case emqx_resource_pool:health_check_workers(InstanceId, fun ?MODULE:do_get_status/1) of
+        true ->
+            ?status_connected;
+        false ->
+            ?status_disconnected
+    end.
+
+do_get_status(Conn) ->
+    case iotdb:ping(Conn) of
+        {ok, _} ->
+            true;
+        {error, _} ->
+            false
+    end.
+
+connect(Opts) ->
+    {iotdb_options, #{password := Password} = IoTDBOpts0} = lists:keyfind(iotdb_options, 1, Opts),
+    IoTDBOpts = IoTDBOpts0#{password := emqx_secret:unwrap(Password)},
+    iotdb:start_link(IoTDBOpts).
 
 -spec on_query(manager_id(), {send_message, map()}, state()) ->
     {ok, pos_integer(), [term()], term()}
@@ -271,7 +460,7 @@ on_get_status(InstanceId, State) ->
 on_query(
     InstanceId,
     {ChannelId, _Message} = Req,
-    #{iotdb_version := IoTDBVsn, channels := Channels} = State
+    State
 ) ->
     ?tp(iotdb_bridge_on_query, #{instance_id => InstanceId}),
     ?SLOG(debug, #{
@@ -281,12 +470,10 @@ on_query(
         state => emqx_utils:redact(State)
     }),
 
-    case try_render_messages([Req], IoTDBVsn, Channels) of
-        {ok, [IoTDBPayload]} ->
+    case try_render_records([Req], State) of
+        {ok, Records} ->
             handle_response(
-                emqx_bridge_http_connector:on_query(
-                    InstanceId, {ChannelId, IoTDBPayload}, State
-                )
+                do_on_query(InstanceId, ChannelId, Records, State)
             );
         Error ->
             Error
@@ -298,7 +485,7 @@ on_query_async(
     InstanceId,
     {ChannelId, _Message} = Req,
     ReplyFunAndArgs0,
-    #{iotdb_version := IoTDBVsn, channels := Channels} = State
+    #{driver := restapi} = State
 ) ->
     ?tp(iotdb_bridge_on_query_async, #{instance_id => InstanceId}),
     ?SLOG(debug, #{
@@ -307,8 +494,8 @@ on_query_async(
         send_message => Req,
         state => emqx_utils:redact(State)
     }),
-    case try_render_messages([Req], IoTDBVsn, Channels) of
-        {ok, [IoTDBPayload]} ->
+    case try_render_records([Req], State) of
+        {ok, Records} ->
             ReplyFunAndArgs =
                 {
                     fun(Result) ->
@@ -318,17 +505,30 @@ on_query_async(
                     []
                 },
             emqx_bridge_http_connector:on_query_async(
-                InstanceId, {ChannelId, IoTDBPayload}, ReplyFunAndArgs, State
+                InstanceId, {ChannelId, Records}, ReplyFunAndArgs, State
             );
         Error ->
             Error
-    end.
+    end;
+on_query_async(
+    InstanceId,
+    Req,
+    _ReplyFunAndArgs0,
+    #{driver := thrift}
+) ->
+    ?SLOG(error, #{
+        msg => "iotdb_bridge_async_query_failed",
+        instance_id => InstanceId,
+        send_message => Req,
+        reason => ?THRIFT_NOT_SUPPORT_ASYNC_MSG
+    }),
+    {error, not_support}.
 
 on_batch_query_async(
     InstId,
     Requests,
     Callback,
-    #{iotdb_version := IoTDBVsn, channels := Channels} = State
+    #{driver := restapi} = State
 ) ->
     ?tp(iotdb_bridge_on_batch_query_async, #{instance_id => InstId}),
     [{ChannelId, _Message} | _] = Requests,
@@ -338,8 +538,8 @@ on_batch_query_async(
         send_message => Requests,
         state => emqx_utils:redact(State)
     }),
-    case try_render_messages(Requests, IoTDBVsn, Channels) of
-        {ok, IoTDBPayloads} ->
+    case try_render_records(Requests, State) of
+        {ok, Records} ->
             ReplyFunAndArgs =
                 {
                     fun(Result) ->
@@ -348,22 +548,32 @@ on_batch_query_async(
                     end,
                     []
                 },
-            lists:map(
-                fun(IoTDBPayload) ->
-                    emqx_bridge_http_connector:on_query_async(
-                        InstId, {ChannelId, IoTDBPayload}, ReplyFunAndArgs, State
-                    )
-                end,
-                IoTDBPayloads
+            handle_response(
+                emqx_bridge_http_connector:on_query_async(
+                    InstId, {ChannelId, Records}, ReplyFunAndArgs, State
+                )
             );
         Error ->
             Error
-    end.
+    end;
+on_batch_query_async(
+    InstanceId,
+    Req,
+    _ReplyFunAndArgs0,
+    #{driver := thrift}
+) ->
+    ?SLOG(error, #{
+        msg => "iotdb_bridge_async_query_failed",
+        instance_id => InstanceId,
+        send_message => Req,
+        reason => ?THRIFT_NOT_SUPPORT_ASYNC_MSG
+    }),
+    {error, not_support}.
 
 on_batch_query(
     InstId,
-    [{ChannelId, _Message}] = Requests,
-    #{iotdb_version := IoTDBVsn, channels := Channels} = State
+    [{ChannelId, _Message} | _] = Requests,
+    State
 ) ->
     ?tp(iotdb_bridge_on_batch_query, #{instance_id => InstId}),
     ?SLOG(debug, #{
@@ -373,17 +583,10 @@ on_batch_query(
         state => emqx_utils:redact(State)
     }),
 
-    case try_render_messages(Requests, IoTDBVsn, Channels) of
-        {ok, IoTDBPayloads} ->
-            lists:map(
-                fun(IoTDBPayload) ->
-                    handle_response(
-                        emqx_bridge_http_connector:on_query(
-                            InstId, {ChannelId, IoTDBPayload}, State
-                        )
-                    )
-                end,
-                IoTDBPayloads
+    case try_render_records(Requests, State) of
+        {ok, Records} ->
+            handle_response(
+                do_on_query(InstId, ChannelId, Records, State)
             );
         Error ->
             Error
@@ -393,8 +596,17 @@ on_format_query_result(Result) ->
     emqx_bridge_http_connector:on_format_query_result(Result).
 
 on_add_channel(
+    _InstanceId,
+    _State0,
+    _ChannelId,
+    #{
+        parameters := #{data := []} = _Parameter
+    }
+) ->
+    {error, <<"The data template cannot be empty">>};
+on_add_channel(
     InstanceId,
-    #{iotdb_version := Version, channels := Channels} = OldState0,
+    #{driver := restapi, iotdb_version := Version, channels := Channels} = OldState0,
     ChannelId,
     #{
         parameters := #{data := Data} = Parameter
@@ -405,39 +617,70 @@ on_add_channel(
             {error, already_exists};
         _ ->
             %% update HTTP channel
-            InsertTabletPathV1 = <<"rest/v1/insertTablet">>,
-            InsertTabletPathV2 = <<"rest/v2/insertTablet">>,
+            case Version of
+                ?VSN_1_3_X ->
+                    Path = <<"rest/v2/insertRecords">>,
+                    HTTPReq = #{
+                        parameters => Parameter#{
+                            path => Path,
+                            method => <<"post">>
+                        }
+                    },
 
-            Path =
-                case Version of
-                    ?VSN_1_1_X -> InsertTabletPathV2;
-                    ?VSN_1_3_X -> InsertTabletPathV2;
-                    _ -> InsertTabletPathV1
-                end,
+                    {ok, OldState} = emqx_bridge_http_connector:on_add_channel(
+                        InstanceId, OldState0, ChannelId, HTTPReq
+                    ),
 
-            HTTPReq = #{
-                parameters => Parameter#{
-                    path => Path,
-                    method => <<"post">>
-                }
-            },
-
-            {ok, OldState} = emqx_bridge_http_connector:on_add_channel(
-                InstanceId, OldState0, ChannelId, HTTPReq
-            ),
-
+                    %% update IoTDB channel
+                    DeviceId = maps:get(device_id, Parameter, <<>>),
+                    Channel = Parameter#{
+                        device_id => emqx_placeholder:preproc_tmpl(DeviceId),
+                        data := preproc_data_template(Data)
+                    },
+                    Channels2 = Channels#{ChannelId => Channel},
+                    {ok, OldState#{channels := Channels2}};
+                _ ->
+                    {error, <<"REST API only supports IoTDB 1.3.x and later">>}
+            end
+    end;
+on_add_channel(
+    _InstanceId,
+    #{driver := thrift},
+    _ChannelId,
+    #{
+        resource_opts := #{query_mode := async}
+    }
+) ->
+    {error, <<"Thrift does not support async mode">>};
+on_add_channel(
+    _InstanceId,
+    #{driver := thrift, channels := Channels} = OldState,
+    ChannelId,
+    #{
+        parameters := #{data := Data} = Parameter
+    }
+) ->
+    case maps:is_key(ChannelId, Channels) of
+        true ->
+            {error, already_exists};
+        _ ->
             %% update IoTDB channel
             DeviceId = maps:get(device_id, Parameter, <<>>),
             Channel = Parameter#{
                 device_id => emqx_placeholder:preproc_tmpl(DeviceId),
-                data := preproc_data_template(Data)
+                %% The template process will reverse the order of the values
+                %% so we can reverse the template here to reduce some runtime cost                                 %%
+                data := lists:reverse(preproc_data_template(Data))
             },
             Channels2 = Channels#{ChannelId => Channel},
             {ok, OldState#{channels := Channels2}}
     end.
 
-on_remove_channel(InstanceId, #{channels := Channels} = OldState0, ChannelId) ->
+on_remove_channel(InstanceId, #{driver := restapi, channels := Channels} = OldState0, ChannelId) ->
     {ok, OldState} = emqx_bridge_http_connector:on_remove_channel(InstanceId, OldState0, ChannelId),
+    Channels2 = maps:remove(ChannelId, Channels),
+    {ok, OldState#{channels => Channels2}};
+on_remove_channel(_InstanceId, #{driver := thrift, channels := Channels} = OldState, ChannelId) ->
     Channels2 = maps:remove(ChannelId, Channels),
     {ok, OldState#{channels => Channels2}}.
 
@@ -464,121 +707,41 @@ get_payload(Payload) ->
     Payload.
 
 parse_payload(ParsedPayload) when is_map(ParsedPayload) ->
-    ParsedPayload;
+    {ok, ParsedPayload};
 parse_payload(UnparsedPayload) when is_binary(UnparsedPayload) ->
-    emqx_utils_json:decode(UnparsedPayload);
-parse_payload(UnparsedPayloads) when is_list(UnparsedPayloads) ->
-    lists:map(fun parse_payload/1, UnparsedPayloads).
-
-preproc_data_list(DataList) ->
-    lists:foldl(
-        fun preproc_data/2,
-        [],
-        DataList
-    ).
-
-preproc_data(
-    #{
-        <<"measurement">> := Measurement,
-        <<"data_type">> := DataType,
-        <<"value">> := Value
-    } = Data,
-    Acc
-) ->
-    [
-        #{
-            timestamp => maybe_preproc_tmpl(
-                maps:get(<<"timestamp">>, Data, <<"now">>)
-            ),
-            measurement => emqx_placeholder:preproc_tmpl(Measurement),
-            data_type => emqx_placeholder:preproc_tmpl(DataType),
-            value => maybe_preproc_tmpl(Value)
-        }
-        | Acc
-    ];
-preproc_data(_NoMatch, Acc) ->
-    ?SLOG(
-        warning,
-        #{
-            msg => "iotdb_bridge_preproc_data_failed",
-            required_fields => ['measurement', 'data_type', 'value'],
-            received => _NoMatch
-        }
-    ),
-    Acc.
-
-maybe_preproc_tmpl(Value) when is_binary(Value) ->
-    emqx_placeholder:preproc_tmpl(Value);
-maybe_preproc_tmpl(Value) ->
-    Value.
-
-proc_data(PreProcessedData, Msg, IoTDBVsn) ->
-    NowNS = erlang:system_time(nanosecond),
-    Nows = #{
-        now_ms => erlang:convert_time_unit(NowNS, nanosecond, millisecond),
-        now_us => erlang:convert_time_unit(NowNS, nanosecond, microsecond),
-        now_ns => NowNS
-    },
-    proc_data(PreProcessedData, Msg, Nows, IoTDBVsn, []).
-
-proc_data(
-    [
-        #{
-            timestamp := TimestampTkn,
-            measurement := Measurement,
-            data_type := DataType0,
-            value := ValueTkn
-        }
-        | T
-    ],
-    Msg,
-    Nows,
-    IotDbVsn,
-    Acc
-) ->
-    DataType = list_to_binary(
-        string:uppercase(binary_to_list(emqx_placeholder:proc_tmpl(DataType0, Msg)))
-    ),
-    try
-        proc_data(T, Msg, Nows, IotDbVsn, [
-            #{
-                timestamp => iot_timestamp(IotDbVsn, TimestampTkn, Msg, Nows),
-                measurement => emqx_placeholder:proc_tmpl(Measurement, Msg),
-                data_type => DataType,
-                value => proc_value(DataType, ValueTkn, Msg)
-            }
-            | Acc
-        ])
+    try emqx_utils_json:decode(UnparsedPayload) of
+        Term when is_map(Term) -> {ok, Term};
+        _ ->
+            %% a plain text will be returned as it is, but here we hope it is a map
+            {error, {invalid_data, <<"The payload is not a JSON data">>}}
     catch
-        throw:Reason ->
-            {error, Reason};
-        Error:Reason:Stacktrace ->
-            ?SLOG(debug, #{exception => Error, reason => Reason, stacktrace => Stacktrace}),
-            {error, invalid_data}
-    end;
-proc_data([], _Msg, _Nows, _IotDbVsn, Acc) ->
-    {ok, lists:reverse(Acc)}.
+        _:_ ->
+            {error, {invalid_data, <<"The payload is not a valid JSON data">>}}
+    end.
 
-iot_timestamp(_IotDbVsn, Timestamp, _, _) when is_integer(Timestamp) ->
-    Timestamp;
-iot_timestamp(IotDbVsn, TimestampTkn, Msg, Nows) ->
-    iot_timestamp(IotDbVsn, emqx_placeholder:proc_tmpl(TimestampTkn, Msg), Nows).
+iot_timestamp(Timestamp, _, _) when is_integer(Timestamp) ->
+    {ok, Timestamp};
+iot_timestamp(TimestampTkn, Msg, Nows) ->
+    iot_timestamp(emqx_placeholder:proc_tmpl(TimestampTkn, Msg), Nows).
 
-%% > v1.3.0 don't allow write nanoseconds nor microseconds
-iot_timestamp(?VSN_1_3_X, <<"now_us">>, #{now_ms := NowMs}) ->
-    NowMs;
-iot_timestamp(?VSN_1_3_X, <<"now_ns">>, #{now_ms := NowMs}) ->
-    NowMs;
-iot_timestamp(_IotDbVsn, <<"now_us">>, #{now_us := NowUs}) ->
-    NowUs;
-iot_timestamp(_IotDbVsn, <<"now_ns">>, #{now_ns := NowNs}) ->
-    NowNs;
-iot_timestamp(_IotDbVsn, Timestamp, #{now_ms := NowMs}) when
+%% IoTDB allows us/ms/ns,
+%% but an instance only supports one time unit,
+%% and the time unit cannot be changed after the database is started.
+iot_timestamp(<<"now_us">>, #{now_us := NowUs}) ->
+    {ok, NowUs};
+iot_timestamp(<<"now_ns">>, #{now_ns := NowNs}) ->
+    {ok, NowNs};
+iot_timestamp(Timestamp, #{now_ms := NowMs}) when
     Timestamp =:= <<"now">>; Timestamp =:= <<"now_ms">>; Timestamp =:= <<>>
 ->
-    NowMs;
-iot_timestamp(_IotDbVsn, Timestamp, _) when is_binary(Timestamp) ->
-    binary_to_integer(Timestamp).
+    {ok, NowMs};
+iot_timestamp(Timestamp, _) when is_binary(Timestamp) ->
+    case string:to_integer(Timestamp) of
+        {Timestamp1, <<>>} ->
+            {ok, Timestamp1};
+        _ ->
+            {error, {invalid_data, <<"Timestamp is undefined or not a integer">>}}
+    end.
 
 proc_value(<<"TEXT">>, ValueTkn, Msg) ->
     case emqx_placeholder:proc_tmpl(ValueTkn, Msg) of
@@ -642,105 +805,11 @@ convert_float(null) ->
 convert_float(undefined) ->
     null.
 
-make_iotdb_insert_request(DataList, IsAligned, DeviceId, IoTDBVsn) ->
-    InitAcc = #{timestamps => [], measurements => [], dtypes => [], values => []},
-    Rows = replace_dtypes(aggregate_rows(DataList, InitAcc), IoTDBVsn),
-    maps:merge(Rows, #{
-        iotdb_field_key(is_aligned, IoTDBVsn) => IsAligned,
-        iotdb_field_key(device_id, IoTDBVsn) => DeviceId
-    }).
-
-replace_dtypes(Rows0, IoTDBVsn) ->
-    {Types, Rows} = maps:take(dtypes, Rows0),
-    Rows#{iotdb_field_key(data_types, IoTDBVsn) => Types}.
-
-aggregate_rows(DataList, InitAcc) ->
-    lists:foldr(
-        fun(
-            #{
-                timestamp := Timestamp,
-                measurement := Measurement,
-                data_type := DataType,
-                value := Data
-            },
-            #{
-                timestamps := AccTs,
-                measurements := AccM,
-                dtypes := AccDt,
-                values := AccV
-            } = Acc
-        ) ->
-            Timestamps = [Timestamp | AccTs],
-            case index_of(Measurement, AccM) of
-                0 ->
-                    Acc#{
-                        timestamps => Timestamps,
-                        values => [pad_value(Data, length(AccTs)) | pad_existing_values(AccV)],
-                        measurements => [Measurement | AccM],
-                        dtypes => [DataType | AccDt]
-                    };
-                Index ->
-                    Acc#{
-                        timestamps => Timestamps,
-                        values => insert_value(Index, Data, AccV),
-                        measurements => AccM,
-                        dtypes => AccDt
-                    }
-            end
-        end,
-        InitAcc,
-        DataList
-    ).
-
-pad_value(Data, N) ->
-    [Data | lists:duplicate(N, null)].
-
-pad_existing_values(Values) ->
-    [[null | Value] || Value <- Values].
-
-index_of(E, List) ->
-    string:str(List, [E]).
-
-insert_value(_Index, _Data, []) ->
-    [];
-insert_value(1, Data, [Value | Values]) ->
-    [[Data | Value] | insert_value(0, Data, Values)];
-insert_value(Index, Data, [Value | Values]) ->
-    [[null | Value] | insert_value(Index - 1, Data, Values)].
-
-iotdb_field_key(is_aligned, ?VSN_1_3_X) ->
-    <<"is_aligned">>;
-iotdb_field_key(is_aligned, ?VSN_1_1_X) ->
-    <<"is_aligned">>;
-iotdb_field_key(is_aligned, ?VSN_1_0_X) ->
-    <<"is_aligned">>;
-iotdb_field_key(is_aligned, ?VSN_0_13_X) ->
-    <<"isAligned">>;
-iotdb_field_key(device_id, ?VSN_1_3_X) ->
-    <<"device">>;
-iotdb_field_key(device_id, ?VSN_1_1_X) ->
-    <<"device">>;
-iotdb_field_key(device_id, ?VSN_1_0_X) ->
-    <<"device">>;
-iotdb_field_key(device_id, ?VSN_0_13_X) ->
-    <<"deviceId">>;
-iotdb_field_key(data_types, ?VSN_1_3_X) ->
-    <<"data_types">>;
-iotdb_field_key(data_types, ?VSN_1_1_X) ->
-    <<"data_types">>;
-iotdb_field_key(data_types, ?VSN_1_0_X) ->
-    <<"data_types">>;
-iotdb_field_key(data_types, ?VSN_0_13_X) ->
-    <<"dataTypes">>.
-
-to_list(List) when is_list(List) -> List;
-to_list(Data) -> [Data].
-
 %% If device_id is missing from the channel data, try to find it from the payload
-device_id(Message, Payloads, Channel) ->
+device_id(Message, Payload, Channel) ->
     case maps:get(device_id, Channel, []) of
         [] ->
-            maps:get(<<"device_id">>, hd(Payloads), undefined);
+            maps:get(<<"device_id">>, Payload, <<"undefined">>);
         DeviceIdTkn ->
             emqx_placeholder:proc_tmpl(DeviceIdTkn, Message)
     end.
@@ -753,6 +822,8 @@ handle_response({ok, Code, _Headers, Body}) ->
     {error, #{code => Code, body => Body}};
 handle_response({ok, Code, Body}) ->
     {error, #{code => Code, body => Body}};
+handle_response({ok, _} = Resp) ->
+    Resp;
 handle_response({error, _} = Error) ->
     Error.
 
@@ -781,68 +852,163 @@ preproc_data_template(DataList) ->
             #{
                 timestamp => emqx_placeholder:preproc_tmpl(Atom2Bin(Timestamp)),
                 measurement => emqx_placeholder:preproc_tmpl(Measurement),
-                data_type => emqx_placeholder:preproc_tmpl(Atom2Bin(DataType)),
+                data_type => string:uppercase(Atom2Bin(DataType)),
                 value => emqx_placeholder:preproc_tmpl(Value)
             }
         end,
         DataList
     ).
 
-try_render_messages([{ChannelId, _} | _] = Msgs, IoTDBVsn, Channels) ->
+do_on_query(InstanceId, ChannelId, Data, #{driver := restapi} = State) ->
+    %% HTTP connector already calls `emqx_trace:rendered_action_template`.
+    emqx_bridge_http_connector:on_query(InstanceId, {ChannelId, Data}, State);
+do_on_query(InstanceId, ChannelId, Data, #{driver := thrift} = _State) ->
+    emqx_trace:rendered_action_template(ChannelId, #{records => Data}),
+    ecpool:pick_and_do(InstanceId, {iotdb, insert_records, [Data]}, no_handover).
+
+%% 1. The default timeout in Thrift is `infinity`, but it may cause stuck
+%% 2. The schema of `timeout` accepts a zero value, but the Thrift driver not
+%% 3. If the timeout is too small, the driver may not work properly
+normalize_thrift_timeout(Timeouts) ->
+    maps:map(
+        fun
+            (_K, V) when V >= ?DEFAULT_THRIFT_TIMEOUT ->
+                V;
+            (K, V) ->
+                ?SLOG(warning, #{
+                    msg => "iotdb_thrift_timeout_normalized",
+                    reason => "The timeout is too small for the Thrift driver to work",
+                    timeout => K,
+                    from => V,
+                    to => ?DEFAULT_THRIFT_TIMEOUT,
+                    unit => millisecond
+                }),
+                ?DEFAULT_THRIFT_TIMEOUT
+        end,
+        Timeouts
+    ).
+
+%%-------------------------------------------------------------------------------------
+%% batch
+%%-------------------------------------------------------------------------------------
+try_render_records([{ChannelId, _} | _] = Msgs, #{driver := Driver, channels := Channels}) ->
     case maps:find(ChannelId, Channels) of
-        {ok, Channel} ->
-            case do_render_message(Msgs, Channel, IoTDBVsn, #{}) of
-                RenderMsgs when is_map(RenderMsgs) ->
-                    {ok,
-                        lists:map(
-                            fun({{DeviceId, IsAligned}, DataList}) ->
-                                make_iotdb_insert_request(DataList, IsAligned, DeviceId, IoTDBVsn)
-                            end,
-                            maps:to_list(RenderMsgs)
-                        )};
-                Error ->
-                    Error
-            end;
+        {ok, #{is_aligned := IsAligned} = Channel} ->
+            EmptyRecords = #{
+                timestamps => [],
+                measurements_list => [],
+                data_types_list => [],
+                values_list => [],
+                devices => [],
+                is_aligned_name(Driver) => IsAligned
+            },
+            do_render_record(Msgs, Channel, EmptyRecords);
         _ ->
             {error, {unrecoverable_error, {invalid_channel_id, ChannelId}}}
     end.
 
-do_render_message([], _Channel, _IoTDBVsn, Acc) ->
-    Acc;
-do_render_message([{_, Msg} | Msgs], Channel, IoTDBVsn, Acc) ->
-    case render_channel_message(Channel, IoTDBVsn, Msg) of
-        {ok, NewDataList, DeviceId, IsAligned} ->
-            Fun = fun(V) -> NewDataList ++ V end,
-            Acc1 = maps:update_with({DeviceId, IsAligned}, Fun, NewDataList, Acc),
-            do_render_message(Msgs, Channel, IoTDBVsn, Acc1);
+do_render_record([], _Channel, Acc) ->
+    {ok, Acc};
+do_render_record([{_, Msg} | Msgs], Channel, Acc) ->
+    case render_channel_record(Channel, Msg) of
+        {ok, Record} ->
+            do_render_record(Msgs, Channel, append_record(Record, Acc));
         Error ->
             Error
     end.
 
-render_channel_message(#{is_aligned := IsAligned} = Channel, IoTDBVsn, Message) ->
-    Payloads = to_list(parse_payload(get_payload(Message))),
-    case device_id(Message, Payloads, Channel) of
-        undefined ->
-            {error, device_id_missing};
-        DeviceId ->
-            case get_data_template(Channel, Payloads) of
-                [] ->
-                    {error, invalid_template};
-                DataTemplate ->
-                    case proc_data(DataTemplate, Message, IoTDBVsn) of
-                        {ok, DataList} ->
-                            {ok, DataList, DeviceId, IsAligned};
-                        Error ->
-                            Error
-                    end
-            end
+render_channel_record(#{data := DataTemplate} = Channel, Msg) ->
+    maybe
+        {ok, Payload} ?= parse_payload(get_payload(Msg)),
+        DeviceId = device_id(Msg, Payload, Channel),
+        true ?= (<<"undefined">> =/= DeviceId),
+        #{timestamp := TimestampTkn} = hd(DataTemplate),
+        NowNs = erlang:system_time(nanosecond),
+        Nows = #{
+            now_ms => erlang:convert_time_unit(NowNs, nanosecond, millisecond),
+            now_us => erlang:convert_time_unit(NowNs, nanosecond, microsecond),
+            now_ns => NowNs
+        },
+        {ok, MeasurementAcc, TypeAcc, ValueAcc} ?=
+            proc_record_data(
+                DataTemplate,
+                Msg,
+                [],
+                [],
+                []
+            ),
+        {ok, Timestamp} ?= iot_timestamp(TimestampTkn, Msg, Nows),
+        {ok, #{
+            timestamp => Timestamp,
+            measurements => MeasurementAcc,
+            data_types => TypeAcc,
+            values => ValueAcc,
+            device_id => DeviceId
+        }}
+    else
+        false ->
+            {error, {invalid_data, <<"Can not find the device ID">>}};
+        Error ->
+            Error
     end.
 
-%% Get the message template.
-%% In order to be compatible with 4.4, the template version has higher priority
-%% This is a template, using it
-get_data_template(#{data := Data}, _Payloads) when Data =/= [] ->
-    Data;
-%% This is a self-describing message
-get_data_template(#{data := []}, Payloads) ->
-    preproc_data_list(Payloads).
+proc_record_data(
+    [
+        #{
+            measurement := Measurement,
+            data_type := DataType,
+            value := ValueTkn
+        }
+        | T
+    ],
+    Msg,
+    MeasurementAcc,
+    TypeAcc,
+    ValueAcc
+) ->
+    try
+        proc_record_data(
+            T,
+            Msg,
+            [emqx_placeholder:proc_tmpl(Measurement, Msg) | MeasurementAcc],
+            [DataType | TypeAcc],
+            [proc_value(DataType, ValueTkn, Msg) | ValueAcc]
+        )
+    catch
+        throw:Reason ->
+            {error, Reason};
+        Error:Reason ->
+            ?SLOG(debug, #{exception => Error, reason => Reason}),
+            {error, {invalid_data, Reason}}
+    end;
+proc_record_data([], _Msg, MeasurementAcc, TypeAcc, ValueAcc) ->
+    {ok, MeasurementAcc, TypeAcc, ValueAcc}.
+
+append_record(
+    #{
+        timestamp := Ts,
+        measurements := Measurements,
+        data_types := DataTypes,
+        values := Vals,
+        device_id := DeviceId
+    },
+    #{
+        timestamps := TsL,
+        measurements_list := MeasL,
+        data_types_list := DtL,
+        values_list := ValL,
+        devices := DevL
+    } = Records
+) ->
+    Records#{
+        timestamps := [Ts | TsL],
+        measurements_list := [Measurements | MeasL],
+        data_types_list := [DataTypes | DtL],
+        values_list := [Vals | ValL],
+        devices := [DeviceId | DevL]
+    }.
+
+is_aligned_name(restapi) ->
+    is_aligned;
+is_aligned_name(thrift) ->
+    'isAligned'.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,7 +31,8 @@
     to_epoch_millisecond/1,
     to_epoch_microsecond/1,
     to_epoch_second/1,
-    human_readable_duration_string/1
+    human_readable_duration_string/1,
+    now_time/1
 ]).
 -export([
     epoch_to_rfc3339/1,
@@ -133,6 +134,23 @@ human_readable_duration_string(Milliseconds) ->
     L1 = lists:dropwhile(fun({K, _}) -> K =:= 0 end, L0),
     L2 = lists:map(fun({Time, Unit}) -> [integer_to_list(Time), Unit] end, L1),
     lists:flatten(lists:join(", ", L2)).
+
+%% This is the same human-readable timestamp format as
+%% hocon-cli generated app.<time>.config file name.
+-spec now_time(millisecond | second) -> string().
+now_time(Unit) ->
+    Ts = os:system_time(Unit),
+    {{Y, M, D}, {HH, MM, SS}} = calendar:system_time_to_local_time(Ts, Unit),
+    {Fmt, Args} =
+        case Unit of
+            millisecond ->
+                {"~0p.~2..0b.~2..0b.~2..0b.~2..0b.~2..0b.~3..0b", [
+                    Y, M, D, HH, MM, SS, Ts rem 1000
+                ]};
+            second ->
+                {"~0p.~2..0b.~2..0b.~2..0b.~2..0b.~2..0b", [Y, M, D, HH, MM, SS]}
+        end,
+    lists:flatten(io_lib:format(Fmt, Args)).
 
 validate_epoch(Epoch, _Unit) when Epoch < 0 ->
     {error, bad_epoch};

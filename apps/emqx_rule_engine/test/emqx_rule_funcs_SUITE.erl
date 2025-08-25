@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_funcs_SUITE).
@@ -19,6 +7,7 @@
 -compile(export_all).
 -compile(nowarn_export_all).
 
+-include_lib("emqx/include/asserts.hrl").
 -include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -106,24 +95,62 @@ t_payload(_) ->
 t_str(_) ->
     ?assertEqual(<<"abc">>, emqx_rule_funcs:str("abc")),
     ?assertEqual(<<"abc">>, emqx_rule_funcs:str(abc)),
+    ?assertEqual(<<"👋"/utf8>>, emqx_rule_funcs:str("👋")),
+    ?assertEqual(<<"你好🐸"/utf8>>, emqx_rule_funcs:str("你好🐸")),
     ?assertEqual(<<"{\"a\":1}">>, emqx_rule_funcs:str(#{a => 1})),
     ?assertEqual(<<"[{\"a\":1},{\"b\":1}]">>, emqx_rule_funcs:str([#{a => 1}, #{b => 1}])),
     ?assertEqual(<<"1">>, emqx_rule_funcs:str(1)),
     ?assertEqual(<<"2.0">>, emqx_rule_funcs:str(2.0)),
     ?assertEqual(<<"true">>, emqx_rule_funcs:str(true)),
-    ?assertError(_, emqx_rule_funcs:str({a, v})),
+    ?assertError(_, emqx_rule_funcs:str({a, v})).
 
+t_str_utf8(_) ->
     ?assertEqual(<<"abc">>, emqx_rule_funcs:str_utf8("abc")),
     ?assertEqual(<<"abc 你好"/utf8>>, emqx_rule_funcs:str_utf8("abc 你好")),
+    ?assertEqual(<<"👋"/utf8>>, emqx_rule_funcs:str_utf8("👋")),
+    ?assertEqual(<<"你好🐸"/utf8>>, emqx_rule_funcs:str_utf8("你好🐸")),
     ?assertEqual(<<"abc 你好"/utf8>>, emqx_rule_funcs:str_utf8(<<"abc 你好"/utf8>>)),
     ?assertEqual(<<"abc">>, emqx_rule_funcs:str_utf8(abc)),
     ?assertEqual(
-        <<"{\"a\":\"abc 你好\"}"/utf8>>, emqx_rule_funcs:str_utf8(#{a => <<"abc 你好"/utf8>>})
+        <<"{\"a\":\"abc 你好\"}"/utf8>>,
+        emqx_rule_funcs:str_utf8(#{a => <<"abc 你好"/utf8>>})
+    ),
+    ?assertEqual(
+        <<"[{\"a\":1},{\"你好👋\":1}]"/utf8>>,
+        emqx_rule_funcs:str_utf8([#{a => 1}, #{<<"你好👋"/utf8>> => 1}])
     ),
     ?assertEqual(<<"1">>, emqx_rule_funcs:str_utf8(1)),
     ?assertEqual(<<"2.0">>, emqx_rule_funcs:str_utf8(2.0)),
     ?assertEqual(<<"true">>, emqx_rule_funcs:str_utf8(true)),
     ?assertError(_, emqx_rule_funcs:str_utf8({a, v})).
+
+t_str_utf16_le(_) ->
+    ?assertEqual(<<"abc"/utf16-little>>, emqx_rule_funcs:str_utf16_le("abc")),
+    ?assertEqual(<<"abc"/utf16-little>>, emqx_rule_funcs:str_utf16_le(abc)),
+    ?assertEqual(<<"{\"a\":1}"/utf16-little>>, emqx_rule_funcs:str_utf16_le(#{a => 1})),
+    ?assertEqual(<<"1"/utf16-little>>, emqx_rule_funcs:str_utf16_le(1)),
+    ?assertEqual(<<"2.0"/utf16-little>>, emqx_rule_funcs:str_utf16_le(2.0)),
+    ?assertEqual(<<"true"/utf16-little>>, emqx_rule_funcs:str_utf16_le(true)),
+    ?assertError(_, emqx_rule_funcs:str_utf16_le({a, v})),
+
+    ?assertEqual(<<"abc"/utf16-little>>, emqx_rule_funcs:str_utf16_le("abc")),
+    ?assertEqual(<<"abc 你好"/utf16-little>>, emqx_rule_funcs:str_utf16_le("abc 你好")),
+    ?assertEqual(<<"👋"/utf16-little>>, emqx_rule_funcs:str_utf16_le("👋")),
+    ?assertEqual(<<"你好🐸"/utf16-little>>, emqx_rule_funcs:str_utf16_le("你好🐸")),
+    ?assertEqual(<<"abc 你好"/utf16-little>>, emqx_rule_funcs:str_utf16_le(<<"abc 你好"/utf8>>)),
+    ?assertEqual(<<"abc"/utf16-little>>, emqx_rule_funcs:str_utf16_le(abc)),
+    ?assertEqual(
+        <<"{\"a\":\"abc 你好\"}"/utf16-little>>,
+        emqx_rule_funcs:str_utf16_le(#{a => <<"abc 你好"/utf8>>})
+    ),
+    ?assertEqual(
+        <<"[{\"a\":1},{\"你好👋\":1}]"/utf16-little>>,
+        emqx_rule_funcs:str_utf16_le([#{a => 1}, #{<<"你好👋"/utf8>> => 1}])
+    ),
+    ?assertEqual(<<"1"/utf16-little>>, emqx_rule_funcs:str_utf16_le(1)),
+    ?assertEqual(<<"2.0"/utf16-little>>, emqx_rule_funcs:str_utf16_le(2.0)),
+    ?assertEqual(<<"true"/utf16-little>>, emqx_rule_funcs:str_utf16_le(true)),
+    ?assertError(_, emqx_rule_funcs:str_utf16_le({a, v})).
 
 t_int(_) ->
     ?assertEqual(1, emqx_rule_funcs:int("1")),
@@ -201,9 +228,37 @@ t_hexstr2bin(_) ->
     ?assertEqual(<<1, 2>>, emqx_rule_funcs:hexstr2bin(<<"0102">>)),
     ?assertEqual(<<17, 33>>, emqx_rule_funcs:hexstr2bin(<<"1121">>)).
 
+t_hexstr2bin_with_prefix(_) ->
+    ?assertEqual(<<6, 54, 79>>, emqx_rule_funcs:hexstr2bin(<<"0x6364f">>, <<"0x">>)),
+    ?assertEqual(<<10>>, emqx_rule_funcs:hexstr2bin(<<"0Xa">>, <<"0X">>)),
+    ?assertEqual(<<15>>, emqx_rule_funcs:hexstr2bin(<<"0bf">>, <<"0b">>)),
+    ?assertEqual(<<5>>, emqx_rule_funcs:hexstr2bin(<<"0B5">>, <<"0B">>)),
+    ?assertEqual(<<1, 2>>, emqx_rule_funcs:hexstr2bin(<<"0x0102">>, <<"0x">>)),
+    ?assertEqual(<<17, 33>>, emqx_rule_funcs:hexstr2bin(<<"0X1121">>, <<"0X">>)).
+
+t_hexstr2bin_with_invalid_prefix(_) ->
+    [
+        begin
+            ?assertError(binary_prefix_unmatch, emqx_rule_funcs:hexstr2bin(HexStr, Prefix))
+        end
+     || {HexStr, Prefix} <- [
+            {<<"0x6364f">>, <<"ab">>},
+            {<<"0Xa">>, <<"ef">>},
+            {<<"0bf">>, <<"你好👋"/utf8>>},
+            {<<"0B5">>, <<"🐸"/utf8>>}
+        ]
+    ].
+
 t_bin2hexstr(_) ->
     ?assertEqual(<<"0102">>, emqx_rule_funcs:bin2hexstr(<<1, 2>>)),
     ?assertEqual(<<"1121">>, emqx_rule_funcs:bin2hexstr(<<17, 33>>)).
+
+t_bin2hexstr_with_prefix(_) ->
+    ?assertEqual(<<"0x0102">>, emqx_rule_funcs:bin2hexstr(<<1, 2>>, <<"0x">>)),
+    ?assertEqual(<<"0X0102">>, emqx_rule_funcs:bin2hexstr(<<1, 2>>, <<"0X">>)),
+    ?assertEqual(<<"0b1121">>, emqx_rule_funcs:bin2hexstr(<<17, 33>>, <<"0b">>)),
+    ?assertEqual(<<"0B1121">>, emqx_rule_funcs:bin2hexstr(<<17, 33>>, <<"0B">>)),
+    ?assertEqual(<<"🧠0102"/utf8>>, emqx_rule_funcs:bin2hexstr(<<1, 2>>, <<"🧠"/utf8>>)).
 
 t_bin2hexstr_not_even_bytes(_) ->
     ?assertEqual(<<"0102">>, emqx_rule_funcs:bin2hexstr(<<1:5, 2>>)),
@@ -217,6 +272,21 @@ t_bin2hexstr_not_even_bytes(_) ->
     ?assertEqual(<<"2">>, emqx_rule_funcs:bin2hexstr(<<2:2>>)),
     ?assertEqual(<<"1121">>, emqx_rule_funcs:bin2hexstr(<<17, 33>>)),
     ?assertEqual(<<"01121">>, emqx_rule_funcs:bin2hexstr(<<17:9, 33>>)).
+
+t_sqlserver_bin2hexstr(_) ->
+    ?assertEqual(<<"0x0102">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<1, 2>>)),
+    ?assertEqual(<<"0x1121">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<17, 33>>)),
+    ?assertEqual(<<"0x0102">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<1:5, 2>>)),
+    ?assertEqual(<<"0x1002">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<16:5, 2>>)),
+    ?assertEqual(<<"0x1002">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<16:8, 2>>)),
+    ?assertEqual(<<"0x102">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<1:4, 2>>)),
+    ?assertEqual(<<"0x102">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<1:3, 2>>)),
+    ?assertEqual(<<"0x102">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<1:1, 2>>)),
+    ?assertEqual(<<"0x002">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<2:1, 2>>)),
+    ?assertEqual(<<"0x02">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<2>>)),
+    ?assertEqual(<<"0x2">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<2:2>>)),
+    ?assertEqual(<<"0x1121">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<17, 33>>)),
+    ?assertEqual(<<"0x01121">>, emqx_rule_funcs:sqlserver_bin2hexstr(<<17:9, 33>>)).
 
 t_hex_convert(_) ->
     ?PROPTEST(hex_convert).
@@ -332,6 +402,36 @@ t_is_array(_) ->
         ?assertEqual(false, emqx_rule_funcs:is_array(T))
      || T <- [<<>>, a]
     ].
+
+t_is_empty(_) ->
+    [
+        ?assertEqual(true, emqx_rule_funcs:is_empty(T))
+     || T <- [[], #{}, <<"{}">>]
+    ],
+    [
+        ?assertEqual(false, emqx_rule_funcs:is_empty(T))
+     || T <- [[1], #{a => b}, <<"{\"a\" : \"b\"}">>]
+    ].
+
+t_coalesce(_) ->
+    ?assertEqual(undefined, emqx_rule_funcs:coalesce([])),
+    ?assertEqual(undefined, emqx_rule_funcs:coalesce([undefined, undefined, undefined])),
+    ?assertEqual(42, emqx_rule_funcs:coalesce([undefined, 42, undefined])),
+    ?assertEqual(hello, emqx_rule_funcs:coalesce([hello, undefined])),
+    ?assertEqual(world, emqx_rule_funcs:coalesce([world])),
+    ?assertEqual(hello, emqx_rule_funcs:coalesce(hello, world)),
+    ?assertEqual(world, emqx_rule_funcs:coalesce(undefined, world)),
+    ok.
+
+t_coalesce_ne(_) ->
+    ?assertEqual(undefined, emqx_rule_funcs:coalesce_ne([])),
+    ?assertEqual(undefined, emqx_rule_funcs:coalesce_ne([<<>>, undefined, ""])),
+    ?assertEqual(42, emqx_rule_funcs:coalesce_ne(["", 42, undefined])),
+    ?assertEqual(hello, emqx_rule_funcs:coalesce_ne([hello, <<>>])),
+    ?assertEqual(world, emqx_rule_funcs:coalesce_ne([world])),
+    ?assertEqual(hello, emqx_rule_funcs:coalesce_ne(hello, world)),
+    ?assertEqual(world, emqx_rule_funcs:coalesce_ne("", world)),
+    ok.
 
 %%------------------------------------------------------------------------------
 %% Test cases for arith op
@@ -911,20 +1011,28 @@ t_map_to_entries(_) ->
     ?assertEqual([], apply_func(map_to_entries, [#{}])),
     M = #{a => 1, b => <<"b">>},
     J = <<"{\"a\":1,\"b\":\"b\"}">>,
-    ?assertEqual(
+    ?assertSameSet(
         [
             #{key => a, value => 1},
             #{key => b, value => <<"b">>}
         ],
         apply_func(map_to_entries, [M])
     ),
-    ?assertEqual(
+    ?assertSameSet(
         [
             #{key => <<"a">>, value => 1},
             #{key => <<"b">>, value => <<"b">>}
         ],
         apply_func(map_to_entries, [J])
     ).
+
+t_map_size(_) ->
+    ?assertEqual(0, apply_func(map_size, [#{}])),
+    ?assertEqual(1, apply_func(map_size, [#{a => b}])),
+    ?assertEqual(0, apply_func(map_size, [[]])),
+    ?assertEqual(1, apply_func(map_size, [[{a, b}]])),
+    ?assertEqual(0, apply_func(map_size, [<<"{}">>])),
+    ?assertEqual(1, apply_func(map_size, [<<"{\"a\" : \"b\"}">>])).
 
 t_bitsize(_) ->
     ?assertEqual(8, apply_func(bitsize, [<<"a">>])),
@@ -1374,6 +1482,29 @@ t_parse_date_errors(_) ->
         )
     ),
 
+    ok.
+
+t_map_to_redis_hset_args(_Config) ->
+    Do = fun(Map) -> tl(emqx_rule_funcs:map_to_redis_hset_args(Map)) end,
+    ?assertEqual([], Do(#{})),
+    ?assertEqual([], Do(#{1 => 2})),
+    ?assertEqual([<<"a">>, <<"1">>], Do(#{<<"a">> => 1, 3 => 4})),
+    ?assertEqual([<<"a">>, <<"1.1">>], Do(#{<<"a">> => 1.1})),
+    ?assertEqual([<<"a">>, <<"true">>], Do(#{<<"a">> => true})),
+    ?assertEqual([<<"a">>, <<"false">>], Do(#{<<"a">> => false})),
+    ?assertEqual([<<"a">>, <<"">>], Do(#{<<"a">> => <<"">>})),
+    ?assertEqual([<<"a">>, <<"i j">>], Do(#{<<"a">> => <<"i j">>})),
+    %% no determined ordering
+    ?assert(
+        case Do(#{<<"a">> => 1, <<"b">> => 2}) of
+            [<<"a">>, <<"1">>, <<"b">>, <<"2">>] ->
+                true;
+            [<<"b">>, <<"2">>, <<"a">>, <<"1">>] ->
+                true
+        end
+    ),
+    ?assertEqual([], Do(<<"not json">>)),
+    ?assertEqual([], Do([<<"not map">>, <<"not json either">>])),
     ok.
 
 %%------------------------------------------------------------------------------

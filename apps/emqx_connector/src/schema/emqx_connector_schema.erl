@@ -1,19 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_connector_schema).
+
+-behaviour(emqx_schema_hooks).
 
 -include_lib("typerefl/include/types.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
@@ -50,13 +40,19 @@
 -export([
     common_resource_opts_subfields/0,
     common_resource_opts_subfields_bin/0,
+    resource_opts/0,
     resource_opts_fields/0,
     resource_opts_fields/1,
     resource_opts_ref/2,
     resource_opts_ref/3
 ]).
 
+-export([ehttpc_max_inactive_sc/0]).
+
 -export([examples/1]).
+
+-type http_method() :: get | post | put.
+-type schema_example_map() :: #{atom() => term()}.
 
 api_ref(Module, Type, Method) ->
     {Type, ref(Module, Method)}.
@@ -283,6 +279,26 @@ generate_connector_name(ConnectorsMap, BridgeName, Attempt) ->
     end.
 
 transform_old_style_bridges_to_connector_and_actions_of_type(
+    {ConnectorType, #{type := ?MAP(_Name, ?UNION(UnionFun))}},
+    RawConfig
+) when is_function(UnionFun, 1) ->
+    AllMembers = UnionFun(all_union_members),
+    lists:foldl(
+        fun(
+            ?R_REF(ConnectorConfSchemaMod, ConnectorConfSchemaName),
+            RawConfigSoFar
+        ) ->
+            transform_old_style_bridges_to_connector_and_actions_of_type(
+                {ConnectorType, #{
+                    type => ?MAP(name, ?R_REF(ConnectorConfSchemaMod, ConnectorConfSchemaName))
+                }},
+                RawConfigSoFar
+            )
+        end,
+        RawConfig,
+        AllMembers
+    );
+transform_old_style_bridges_to_connector_and_actions_of_type(
     {ConnectorType, #{type := ?MAP(_Name, ?R_REF(ConnectorConfSchemaMod, ConnectorConfSchemaName))}},
     RawConfig
 ) ->
@@ -351,16 +367,20 @@ transform_old_style_bridges_to_connector_and_actions_of_type(
         end,
         RawConfig,
         ActionConnectorTuples
-    ).
+    );
+transform_old_style_bridges_to_connector_and_actions_of_type(
+    {_ConnectorType, #{type := ?MAP(_Name, _)}},
+    RawConfig
+) ->
+    RawConfig.
 
 transform_bridges_v1_to_connectors_and_bridges_v2(RawConfig) ->
     ConnectorFields = ?MODULE:fields(connectors),
-    NewRawConf = lists:foldl(
+    lists:foldl(
         fun transform_old_style_bridges_to_connector_and_actions_of_type/2,
         RawConfig,
         ConnectorFields
-    ),
-    NewRawConf.
+    ).
 
 %%======================================================================================
 %% HOCON Schema Callbacks
@@ -419,18 +439,37 @@ tags() ->
 -dialyzer({nowarn_function, roots/0}).
 
 roots() ->
+    %% TODO: drop this clause and check
     case fields(connectors) of
         [] ->
+            %% TODO: drop this clause and check
             [
                 {connectors,
-                    ?HOCON(hoconsc:map(name, typerefl:map()), #{importance => ?IMPORTANCE_LOW})}
+                    ?HOCON(
+                        hoconsc:map(name, typerefl:map()),
+                        #{
+                            importance => ?IMPORTANCE_LOW,
+                            validator => fun validator/1
+                        }
+                    )}
             ];
         _ ->
-            [{connectors, ?HOCON(?R_REF(connectors), #{importance => ?IMPORTANCE_LOW})}]
+            [
+                {connectors,
+                    ?HOCON(
+                        ?R_REF(connectors),
+                        #{
+                            importance => ?IMPORTANCE_LOW,
+                            validator => fun validator/1
+                        }
+                    )}
+            ]
     end.
 
 fields(connectors) ->
     connector_info_fields_connectors();
+fields(resource_opts) ->
+    resource_opts_fields();
 fields("node_status") ->
     [
         node_name(),
@@ -454,6 +493,8 @@ desc(connectors) ->
     ?DESC("desc_connectors");
 desc("node_status") ->
     ?DESC("desc_node_status");
+desc(resource_opts) ->
+    ?DESC(emqx_resource_schema, "creation_opts");
 desc(_) ->
     undefined.
 
@@ -484,7 +525,12 @@ api_fields("put_connector", _Type, Fields) ->
 
 common_fields() ->
     [
-        {enable, mk(boolean(), #{desc => ?DESC("config_enable"), default => true})},
+        {enable,
+            mk(boolean(), #{
+                desc => ?DESC("config_enable"),
+                importance => ?IMPORTANCE_NO_DOC,
+                default => true
+            })},
         {tags, emqx_schema:tags_schema()},
         {description, emqx_schema:description_schema()}
     ].
@@ -541,12 +587,16 @@ resource_opts_ref(Module, RefName, ConverterFun) ->
 common_resource_opts_subfields() ->
     [
         health_check_interval,
+        health_check_timeout,
         start_after_created,
         start_timeout
     ].
 
 common_resource_opts_subfields_bin() ->
     lists:map(fun atom_to_binary/1, common_resource_opts_subfields()).
+
+resource_opts() ->
+    resource_opts_ref(?MODULE, resource_opts).
 
 resource_opts_fields() ->
     resource_opts_fields(_Overrides = []).
@@ -560,8 +610,15 @@ resource_opts_fields(Overrides) ->
         emqx_resource_schema:create_opts(Overrides)
     ).
 
--type http_method() :: get | post | put.
--type schema_example_map() :: #{atom() => term()}.
+ehttpc_max_inactive_sc() ->
+    {max_inactive,
+        mk(
+            emqx_schema:timeout_duration_ms(),
+            #{
+                default => <<"10s">>,
+                desc => ?DESC("ehttpc_max_inactive")
+            }
+        )}.
 
 -spec connector_values(http_method(), atom(), schema_example_map()) -> schema_example_map().
 connector_values(Method, Type, ConnectorValues) ->
@@ -619,14 +676,32 @@ node_name() ->
 status() ->
     hoconsc:enum([connected, disconnected, connecting, inconsistent]).
 
+validator(ConnectorsRoot) ->
+    ValidatorFns = emqx_schema_hooks:list_injection_point('connectors.validators', []),
+    emqx_utils:foldl_while(
+        fun(Fn, _Acc) ->
+            case Fn(ConnectorsRoot) of
+                ok ->
+                    {cont, ok};
+                true ->
+                    {cont, ok};
+                Error ->
+                    {halt, Error}
+            end
+        end,
+        ok,
+        ValidatorFns
+    ).
+
 -ifdef(TEST).
 -include_lib("hocon/include/hocon_types.hrl").
 schema_homogeneous_test() ->
     case
-        lists:filtermap(
-            fun({_Name, Schema}) ->
-                is_bad_schema(Schema)
+        lists:foldl(
+            fun({_Name, Schema}, Bads) ->
+                is_bad_schema(Schema, Bads)
             end,
+            [],
             fields(connectors)
         )
     of
@@ -636,7 +711,32 @@ schema_homogeneous_test() ->
             throw(List)
     end.
 
-is_bad_schema(#{type := ?MAP(_, ?R_REF(Module, TypeName))}) ->
+is_bad_schema(#{type := ?MAP(_, ?R_REF(Module, TypeName))}, Bads) ->
+    is_bad_schema_type(Module, TypeName, Bads);
+is_bad_schema(#{type := ?MAP(_, ?UNION(Types))}, Bads) when is_list(Types) ->
+    is_bad_schema_types(Types, Bads);
+is_bad_schema(#{type := ?MAP(_, ?UNION(Func))}, Bads) when is_function(Func, 1) ->
+    Types = Func(all_union_members),
+    is_bad_schema_types(Types, Bads).
+
+is_bad_schema_types(Types, Bads) ->
+    lists:foldl(
+        fun
+            (?R_REF(Module, TypeName), Acc) ->
+                is_bad_schema_type(Module, TypeName, Acc);
+            (Type, Acc) ->
+                [
+                    #{
+                        type => Type
+                    }
+                    | Acc
+                ]
+        end,
+        Bads,
+        Types
+    ).
+
+is_bad_schema_type(Module, TypeName, Bads) ->
     Fields = Module:fields(TypeName),
     ExpectedFieldNames = common_field_names(),
     MissingFields = lists:filter(
@@ -644,13 +744,16 @@ is_bad_schema(#{type := ?MAP(_, ?R_REF(Module, TypeName))}) ->
     ),
     case MissingFields of
         [] ->
-            false;
+            Bads;
         _ ->
-            {true, #{
-                schema_module => Module,
-                type_name => TypeName,
-                missing_fields => MissingFields
-            }}
+            [
+                #{
+                    schema_module => Module,
+                    type_name => TypeName,
+                    missing_fields => MissingFields
+                }
+                | Bads
+            ]
     end.
 
 common_field_names() ->

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc The gateway configuration management module
@@ -67,7 +55,7 @@
 
 %% Data backup
 -export([
-    import_config/1
+    import_config/2
 ]).
 
 -include_lib("emqx/include/logger.hrl").
@@ -79,7 +67,6 @@
 -type map_or_err() :: {ok, map()} | {error, term()}.
 -type listener_ref() :: {ListenerType :: atom_or_bin(), ListenerName :: atom_or_bin()}.
 
--define(IS_SSL(T), (T == <<"ssl_options">> orelse T == <<"dtls_options">>)).
 -define(IGNORE_KEYS, [<<"listeners">>, ?AUTHN_BIN]).
 
 %%----------------------------------------------------------------------------------------
@@ -208,7 +195,7 @@ listeners(GwName0) ->
     ),
     Listeners = emqx_utils_maps:jsonable_map(
         emqx_utils_maps:deep_get(
-            [<<"gateway">>, GwName, <<"listeners">>], RawConf
+            [<<"gateway">>, GwName, <<"listeners">>], RawConf, #{}
         )
     ),
     convert_listeners(GwName, Listeners).
@@ -375,7 +362,7 @@ ret_listener_or_err(_, _, Err) ->
 %% Data backup
 %%----------------------------------------------------------------------------------------
 
-import_config(RawConf) ->
+import_config(_Namespace, RawConf) ->
     GatewayConf = maps:get(<<"gateway">>, RawConf, #{}),
     OldGatewayConf = emqx:get_raw_config([<<"gateway">>], #{}),
     MergedConf = maps:merge(OldGatewayConf, GatewayConf),
@@ -678,9 +665,9 @@ pre_load_authentications(NewConf, OldConf) ->
                     case maps:get(?AUTHN_BIN, NewGwConf, undefined) of
                         undefined ->
                             NewGwConf;
-                        AuthN ->
+                        Authn ->
                             {ok, #{GwName := #{?AUTHN_BIN := NAuthN}}} =
-                                pre_config_update(?GATEWAY, {add_authn, GwName, AuthN}, OldConf),
+                                pre_config_update(?GATEWAY, {add_authn, GwName, Authn}, OldConf),
                             maps:put(?AUTHN_BIN, NAuthN, NewGwConf)
                     end;
                 OldAuthN ->
@@ -887,7 +874,7 @@ convert_certs(SubDir, Conf) ->
 
 convert_certs(Type, SubDir, Conf) ->
     SSL = maps:get(Type, Conf, undefined),
-    case is_map(SSL) andalso emqx_tls_lib:ensure_ssl_files(SubDir, SSL) of
+    case is_map(SSL) andalso emqx_tls_lib:ensure_ssl_files_in_mutable_certs_dir(SubDir, SSL) of
         false ->
             Conf;
         {ok, NSSL = #{}} ->

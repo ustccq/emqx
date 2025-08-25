@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_conf_cli_SUITE).
 
@@ -19,23 +7,42 @@
 -compile(export_all).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
--include("emqx_conf.hrl").
+
 -import(emqx_config_SUITE, [prepare_conf_file/3]).
+
+-define(READONLY_ROOT_KEYS, [rpc, node]).
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_auth, emqx_auth_redis]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_auth_redis,
+            emqx_auth,
+            emqx_management
+        ],
+        #{
+            work_dir => emqx_cth_suite:work_dir(Config)
+        }
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_mgmt_api_test_util:end_suite([emqx_conf, emqx_auth, emqx_auth_redis]).
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
+    ok.
 
 t_load_config(Config) ->
     Authz = authorization,
     Conf = emqx_conf:get_raw([Authz]),
+    ?assertEqual(
+        [emqx_authz_schema:default_authz()],
+        maps:get(<<"sources">>, Conf)
+    ),
     %% set sources to []
     ConfBin = hocon_pp:do(#{<<"authorization">> => #{<<"sources">> => []}}, #{}),
     ConfFile = prepare_conf_file(?FUNCTION_NAME, ConfBin, Config),
@@ -61,66 +68,81 @@ t_load_config(Config) ->
         Conf#{<<"sources">> => [emqx_authz_schema:default_authz()]},
         emqx_conf:get_raw([Authz])
     ),
-    ?assertEqual({error, empty_hocon_file}, emqx_conf_cli:conf(["load", "non-exist-file"])),
+    ?assertMatch({error, #{cause := not_a_file}}, emqx_conf_cli:conf(["load", "non-exist-file"])),
+    EmptyFile = "empty_file.conf",
+    ok = file:write_file(EmptyFile, <<>>),
+    ?assertMatch({error, #{cause := empty_hocon_file}}, emqx_conf_cli:conf(["load", EmptyFile])),
+    ok = file:delete(EmptyFile),
+    ok.
+
+t_remove_config(Config) ->
+    Conf0 = #{
+        <<"zones">> => #{<<"my-zone">> => #{<<"mqtt">> => #{<<"keepalive_multiplier">> => 10}}}
+    },
+    ConfBin0 = hocon_pp:do(Conf0, #{}),
+    ConfFile0 = prepare_conf_file(?FUNCTION_NAME, ConfBin0, Config),
+    ok = emqx_conf_cli:conf(["load", "--replace", ConfFile0]),
+    %% Sanity check
+    ?assertMatch(
+        #{<<"mqtt">> := #{<<"keepalive_multiplier">> := 10}},
+        emqx_conf:get_raw([<<"zones">>, <<"my-zone">>])
+    ),
+    ?assertMatch(ok, emqx_conf_cli:conf(["remove", "zones.my-zone"])),
+    ?assertMatch(not_found, emqx_conf:get_raw([<<"zones">>, <<"my-zone">>], not_found)),
     ok.
 
 t_conflict_mix_conf(Config) ->
-    case emqx_release:edition() of
-        ce ->
-            %% Don't fail if the test is run with emqx profile
-            ok;
-        ee ->
-            AuthNInit = emqx_conf:get_raw([authentication]),
-            Redis = #{
-                <<"backend">> => <<"redis">>,
-                <<"database">> => 0,
-                <<"password_hash_algorithm">> =>
-                    #{<<"name">> => <<"sha256">>, <<"salt_position">> => <<"prefix">>},
-                <<"pool_size">> => 8,
-                <<"cmd">> => <<"HMGET mqtt_user:${username} password_hash salt">>,
-                <<"enable">> => false,
-                <<"mechanism">> => <<"password_based">>,
-                %% password_hash_algorithm {name = sha256, salt_position = suffix}
-                <<"redis_type">> => <<"single">>,
-                <<"server">> => <<"127.0.0.1:6379">>
-            },
-            AuthN = #{<<"authentication">> => [Redis]},
-            ConfBin = hocon_pp:do(AuthN, #{}),
-            ConfFile = prepare_conf_file(?FUNCTION_NAME, ConfBin, Config),
-            %% init with redis sources
-            ok = emqx_conf_cli:conf(["load", "--replace", ConfFile]),
-            [RedisRaw] = emqx_conf:get_raw([authentication]),
-            ?assertEqual(
-                maps:to_list(Redis),
-                maps:to_list(maps:remove(<<"ssl">>, RedisRaw)),
-                {Redis, RedisRaw}
-            ),
-            %% change redis type from single to cluster
-            %% the server field will become servers field
-            RedisCluster = maps:without([<<"server">>, <<"database">>], Redis#{
-                <<"redis_type">> => cluster,
-                <<"servers">> => [<<"127.0.0.1:6379">>]
-            }),
-            AuthN1 = AuthN#{<<"authentication">> => [RedisCluster]},
-            ConfBin1 = hocon_pp:do(AuthN1, #{}),
-            ConfFile1 = prepare_conf_file(?FUNCTION_NAME, ConfBin1, Config),
-            {error, Reason} = emqx_conf_cli:conf(["load", "--merge", ConfFile1]),
-            ?assertNotEqual(
-                nomatch,
-                binary:match(
-                    Reason,
-                    [<<"Tips: There may be some conflicts in the new configuration under">>]
-                ),
-                Reason
-            ),
-            %% use replace to change redis type from single to cluster
-            ?assertMatch(ok, emqx_conf_cli:conf(["load", "--replace", ConfFile1])),
-            %% clean up
-            ConfBinInit = hocon_pp:do(#{<<"authentication">> => AuthNInit}, #{}),
-            ConfFileInit = prepare_conf_file(?FUNCTION_NAME, ConfBinInit, Config),
-            ok = emqx_conf_cli:conf(["load", "--replace", ConfFileInit]),
-            ok
-    end.
+    AuthNInit = emqx_conf:get_raw([authentication]),
+    Redis = #{
+        <<"backend">> => <<"redis">>,
+        <<"database">> => 0,
+        <<"password_hash_algorithm">> =>
+            #{<<"name">> => <<"sha256">>, <<"salt_position">> => <<"prefix">>},
+        <<"pool_size">> => 8,
+        <<"cmd">> => <<"HMGET mqtt_user:${username} password_hash salt">>,
+        <<"enable">> => false,
+        <<"mechanism">> => <<"password_based">>,
+        %% password_hash_algorithm {name = sha256, salt_position = suffix}
+        <<"redis_type">> => <<"single">>,
+        <<"server">> => <<"127.0.0.1:6379">>,
+        <<"precondition">> => <<>>
+    },
+    AuthN = #{<<"authentication">> => [Redis]},
+    ConfBin = hocon_pp:do(AuthN, #{}),
+    ConfFile = prepare_conf_file(?FUNCTION_NAME, ConfBin, Config),
+    %% init with redis sources
+    ok = emqx_conf_cli:conf(["load", "--replace", ConfFile]),
+    [RedisRaw] = emqx_conf:get_raw([authentication]),
+    ?assertEqual(
+        lists:sort(maps:to_list(Redis)),
+        lists:sort(maps:to_list(maps:remove(<<"ssl">>, RedisRaw))),
+        {Redis, RedisRaw}
+    ),
+    %% change redis type from single to cluster
+    %% the server field will become servers field
+    RedisCluster = maps:without([<<"server">>, <<"database">>], Redis#{
+        <<"redis_type">> => cluster,
+        <<"servers">> => [<<"127.0.0.1:6379">>]
+    }),
+    AuthN1 = AuthN#{<<"authentication">> => [RedisCluster]},
+    ConfBin1 = hocon_pp:do(AuthN1, #{}),
+    ConfFile1 = prepare_conf_file(?FUNCTION_NAME, ConfBin1, Config),
+    {error, Reason} = emqx_conf_cli:conf(["load", "--merge", ConfFile1]),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(
+            Reason,
+            [<<"Tips: There may be some conflicts in the new configuration under">>]
+        ),
+        Reason
+    ),
+    %% use replace to change redis type from single to cluster
+    ?assertMatch(ok, emqx_conf_cli:conf(["load", "--replace", ConfFile1])),
+    %% clean up
+    ConfBinInit = hocon_pp:do(#{<<"authentication">> => AuthNInit}, #{}),
+    ConfFileInit = prepare_conf_file(?FUNCTION_NAME, ConfBinInit, Config),
+    ok = emqx_conf_cli:conf(["load", "--replace", ConfFileInit]),
+    ok.
 
 t_config_handler_hook_failed(Config) ->
     Listeners =
@@ -183,7 +205,7 @@ t_load_readonly(Config) ->
             %% Don't update readonly key
             ?assertEqual(Conf, emqx_conf:get_raw([Key]))
         end,
-        ?READONLY_KEYS
+        ?READONLY_ROOT_KEYS
     ),
     ok.
 

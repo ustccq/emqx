@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_retainer).
@@ -22,38 +10,40 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("emqx/include/emqx_hooks.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -export([start_link/0]).
 
 -export([
-    on_session_subscribed/4,
-    on_message_publish/2
-]).
-
--export([
-    delete_message/2,
-    store_retained/2
-]).
-
--export([
     get_expiry_time/1,
-    update_config/1,
     clean/0,
     delete/1,
     read_message/1,
     page_read/3,
-    post_config_update/5,
-    stats_fun/0,
+    page_read/4,
     retained_count/0,
+    is_enabled/0,
+    is_started/0
+]).
+
+%% Hooks
+-export([
+    on_session_subscribed/3,
+    on_message_publish/1,
+    post_config_update/5,
+    on_config_zones_updated/2
+]).
+
+%% Internal APIs
+-export([
+    update_config/1,
+    stats_fun/0,
     backend_module/0,
     backend_module/1,
     backend_state/1,
-    enabled/0
-]).
-
-%% For testing only
--export([
-    context/0
+    context/0,
+    with_backend/1,
+    with_backend/2
 ]).
 
 %% gen_server callbacks
@@ -66,6 +56,7 @@
 ]).
 
 -export_type([
+    deadline/0,
     cursor/0,
     context/0
 ]).
@@ -74,51 +65,56 @@
 -export([get_basic_usage_info/0]).
 
 -type state() :: #{
-    enable := boolean(),
-    context := undefined | context(),
+    is_started := boolean(),
     clear_timer := undefined | reference()
 }.
 
 -type backend_state() :: term().
 
--type context() :: #{
-    module := module(),
-    state := backend_state()
-}.
+-type context() ::
+    #{
+        module := module(),
+        state := backend_state()
+    }
+    | undefined.
 
 -type topic() :: emqx_types:topic().
 -type message() :: emqx_types:message().
+-type deadline() :: emqx_utils_calendar:epoch_millisecond().
 -type cursor() :: undefined | term().
 -type has_next() :: boolean().
 
--define(DEF_MAX_PAYLOAD_SIZE, (1024 * 1024)).
--define(DEF_EXPIRY_INTERVAL, 0).
--define(MAX_PAYLOAD_SIZE_CONFIG_PATH, [retainer, max_payload_size]).
+-define(CONTEXT_KEY, {?MODULE, context}).
 
 -callback create(hocon:config()) -> backend_state().
 -callback update(backend_state(), hocon:config()) -> ok | need_recreate.
 -callback close(backend_state()) -> ok.
 -callback delete_message(backend_state(), topic()) -> ok.
 -callback store_retained(backend_state(), message()) -> ok.
--callback read_message(backend_state(), topic()) -> {ok, list(message())}.
--callback page_read(backend_state(), emqx_maybe:t(topic()), non_neg_integer(), non_neg_integer()) ->
+-callback page_read(
+    backend_state(),
+    emqx_maybe:t(topic()),
+    deadline(),
+    non_neg_integer(),
+    non_neg_integer()
+) ->
     {ok, has_next(), list(message())}.
+-callback read_message(backend_state(), topic()) -> {ok, list(message())}.
 -callback match_messages(backend_state(), topic(), cursor()) -> {ok, list(message()), cursor()}.
 -callback delete_cursor(backend_state(), cursor()) -> ok.
--callback clear_expired(backend_state()) -> ok.
 -callback clean(backend_state()) -> ok.
 -callback size(backend_state()) -> non_neg_integer().
 
 %%------------------------------------------------------------------------------
 %% Hook API
 %%------------------------------------------------------------------------------
--spec on_session_subscribed(_, _, emqx_types:subopts(), _) -> any().
-on_session_subscribed(_, #share{} = _Topic, _SubOpts, _) ->
+-spec on_session_subscribed(_, _, emqx_types:subopts()) -> any().
+on_session_subscribed(_, #share{} = _Topic, _SubOpts) ->
     ok;
-on_session_subscribed(_, Topic, #{rh := Rh} = Opts, Context) ->
+on_session_subscribed(_, Topic, #{rh := Rh} = Opts) ->
     IsNew = maps:get(is_new, Opts, true),
     case Rh =:= 0 orelse (Rh =:= 1 andalso IsNew) of
-        true -> dispatch(Context, Topic);
+        true -> emqx_retainer_dispatcher:dispatch(Topic);
         _ -> ok
     end.
 
@@ -128,29 +124,34 @@ on_message_publish(
         flags = #{retain := true},
         topic = Topic,
         payload = <<>>
-    },
-    Context
+    }
 ) ->
-    delete_message(Context, Topic),
+    emqx_retainer_publisher:delete_message(Topic),
     case get_stop_publish_clear_msg() of
         true ->
             {ok, emqx_message:set_header(allow_publish, false, Msg)};
         _ ->
             {ok, Msg}
     end;
-on_message_publish(Msg = #message{flags = #{retain := true}}, Context) ->
+on_message_publish(Msg = #message{flags = #{retain := true}}) ->
     Msg1 = emqx_message:set_header(retained, true, Msg),
-    store_retained(Context, Msg1),
+    emqx_retainer_publisher:store_retained(Msg1),
     {ok, Msg};
-on_message_publish(Msg, _) ->
+on_message_publish(Msg) ->
     {ok, Msg}.
 
 %%------------------------------------------------------------------------------
 %% Config API
 %%------------------------------------------------------------------------------
 
-post_config_update(_, _UpdateReq, NewConf, OldConf, _AppEnvs) ->
-    call({update_config, NewConf, OldConf}).
+post_config_update([retainer], _UpdateReq, NewConf, OldConf, _AppEnvs) ->
+    ok = call({update_config, NewConf, OldConf}).
+
+on_config_zones_updated(_OldZones, NewZones) ->
+    case is_enabled(NewZones) of
+        true -> call(start);
+        false -> call(stop)
+    end.
 
 %%------------------------------------------------------------------------------
 %% APIs
@@ -170,7 +171,7 @@ get_expiry_time(#message{
 }) ->
     Ts + Interval * 1000;
 get_expiry_time(#message{timestamp = Ts}) ->
-    Interval = emqx_conf:get([retainer, msg_expiry_interval], ?DEF_EXPIRY_INTERVAL),
+    Interval = emqx_conf:get([retainer, msg_expiry_interval]),
     case Interval of
         0 -> 0;
         _ -> Ts + Interval
@@ -182,39 +183,59 @@ update_config(Conf) ->
 
 -spec clean() -> ok.
 clean() ->
-    call(?FUNCTION_NAME).
+    with_backend(fun(Mod, BackendState) -> Mod:clean(BackendState) end).
 
 -spec delete(topic()) -> ok.
 delete(Topic) ->
-    call({?FUNCTION_NAME, Topic}).
+    with_backend(fun(Mod, BackendState) -> Mod:delete_message(BackendState, Topic) end).
 
 -spec retained_count() -> non_neg_integer().
 retained_count() ->
-    call(?FUNCTION_NAME).
+    with_backend(fun(Mod, BackendState) -> Mod:size(BackendState) end, 0).
 
 -spec read_message(topic()) -> {ok, list(message())}.
 read_message(Topic) ->
-    call({?FUNCTION_NAME, Topic}).
+    with_backend(
+        fun(Mod, BackendState) -> Mod:read_message(BackendState, Topic) end,
+        {ok, []}
+    ).
 
 -spec page_read(emqx_maybe:t(topic()), non_neg_integer(), non_neg_integer()) ->
     {ok, has_next(), list(message())}.
 page_read(Topic, Page, Limit) ->
-    call({?FUNCTION_NAME, Topic, Page, Limit}).
+    page_read(Topic, erlang:system_time(millisecond), Page, Limit).
 
--spec enabled() -> boolean().
-enabled() ->
-    call(?FUNCTION_NAME).
+-spec page_read(emqx_maybe:t(topic()), deadline(), non_neg_integer(), non_neg_integer()) ->
+    {ok, has_next(), list(message())}.
+page_read(Topic, Deadline, Page, Limit) ->
+    with_backend(
+        fun(Mod, BackendState) -> Mod:page_read(BackendState, Topic, Deadline, Page, Limit) end,
+        {ok, false, []}
+    ).
 
--spec context() -> ok.
+-spec context() -> context().
 context() ->
+    persistent_term:get(?CONTEXT_KEY, undefined).
+
+-spec is_started() -> boolean().
+is_started() ->
     call(?FUNCTION_NAME).
+
+-spec is_enabled() -> boolean().
+is_enabled() ->
+    Zones = emqx_config:get([zones], #{}),
+    is_enabled(Zones).
+
+-spec is_enabled(emqx_config:config()) -> boolean().
+is_enabled(Zones) ->
+    lists:any(fun is_enabled_for_zone/1, maps:values(Zones)).
 
 %%------------------------------------------------------------------------------
 %% Internal APIs
 %%------------------------------------------------------------------------------
 
 stats_fun() ->
-    gen_server:cast(?MODULE, ?FUNCTION_NAME).
+    emqx_stats:setstat('retained.count', 'retained.max', retained_count()).
 
 -spec get_basic_usage_info() -> #{retained_messages => non_neg_integer()}.
 get_basic_usage_info() ->
@@ -225,6 +246,19 @@ get_basic_usage_info() ->
             #{retained_messages => 0}
     end.
 
+with_backend(Fun, Default) ->
+    Context = context(),
+    case backend_module(Context) of
+        undefined ->
+            Default;
+        Mod ->
+            BackendState = backend_state(Context),
+            Fun(Mod, BackendState)
+    end.
+
+with_backend(Fun) ->
+    with_backend(Fun, ok).
+
 %%------------------------------------------------------------------------------
 %% gen_server callbacks
 %%------------------------------------------------------------------------------
@@ -232,59 +266,54 @@ get_basic_usage_info() ->
 init([]) ->
     erlang:process_flag(trap_exit, true),
     emqx_conf:add_handler([retainer], ?MODULE),
+    ok = emqx_hooks:add('config.zones_updated', {?MODULE, on_config_zones_updated, []}, ?HP_LOWEST),
     State = new_state(),
     RetainerConfig = emqx:get_config([retainer]),
     {ok,
-        case maps:get(enable, RetainerConfig) of
+        case is_enabled() of
             false ->
-                State;
+                %% Cleanup in case of previous crash
+                stop_retainer(State);
             true ->
                 BackendConfig = enabled_backend_config(RetainerConfig),
-                enable_retainer(State, RetainerConfig, BackendConfig)
+                start_retainer(State, RetainerConfig, BackendConfig)
         end}.
 
-handle_call({update_config, NewConf, OldConf}, _, State) ->
+handle_call({update_config, _NewConf, _OldConf}, _From, #{is_started := false} = State) ->
+    {reply, ok, State};
+handle_call({update_config, NewConf, OldConf}, _From, #{is_started := true} = State) ->
     State2 = update_config(State, NewConf, OldConf),
-    emqx_retainer_dispatcher:refresh_limiter(NewConf),
+    ok = emqx_retainer_limiter:update(),
     {reply, ok, State2};
-handle_call(clean, _, #{context := Context} = State) ->
-    _ = clean(Context),
+handle_call(start, _From, #{is_started := IsStarted} = State0) ->
+    State = update_status(State0, IsStarted, true),
     {reply, ok, State};
-handle_call({delete, Topic}, _, #{context := Context} = State) ->
-    _ = delete_message(Context, Topic),
+handle_call(stop, _From, #{is_started := IsStarted} = State0) ->
+    State = update_status(State0, IsStarted, false),
     {reply, ok, State};
-handle_call({read_message, Topic}, _, #{context := Context} = State) ->
-    {reply, read_message(Context, Topic), State};
-handle_call({page_read, Topic, Page, Limit}, _, #{context := Context} = State) ->
-    {reply, page_read(Context, Topic, Page, Limit), State};
-handle_call(retained_count, _From, State = #{context := Context}) ->
-    {reply, count(Context), State};
-handle_call(enabled, _From, State = #{enable := Enable}) ->
-    {reply, Enable, State};
-handle_call(context, _From, State = #{context := Context}) ->
-    {reply, Context, State};
+handle_call(is_started, _From, State = #{is_started := IsStarted}) ->
+    {reply, IsStarted, State};
 handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", call => Req}),
     {reply, ignored, State}.
-
-handle_cast(stats_fun, #{context := Context} = State) ->
-    emqx_stats:setstat('retained.count', 'retained.max', count(Context)),
-    {noreply, State};
 handle_cast(Msg, State) ->
     ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
     {noreply, State}.
 
-handle_info(clear_expired, #{context := Context} = State) ->
-    ok = clear_expired(Context),
-    Interval = emqx_conf:get([retainer, msg_clear_interval], ?DEF_EXPIRY_INTERVAL),
-    {noreply, State#{clear_timer := add_timer(Interval, clear_expired)}, hibernate};
+handle_info(
+    {timeout, TRef, clear_expired}, #{clear_timer := TRef, is_started := IsStarted} = State
+) ->
+    IsStarted andalso start_clear_expired(),
+    ClearInterval = emqx_conf:get([retainer, msg_clear_interval]),
+    {noreply, State#{clear_timer := maybe_start_timer(ClearInterval, clear_expired)}};
 handle_info(Info, State) ->
     ?SLOG(error, #{msg => "unexpected_info", info => Info}),
     {noreply, State}.
 
-terminate(_Reason, #{clear_timer := ClearTimer}) ->
+terminate(_Reason, #{is_started := IsStarted} = State) ->
     emqx_conf:remove_handler([retainer]),
-    _ = stop_timer(ClearTimer),
+    emqx_hooks:del('config.zones_updated', {?MODULE, on_config_zones_updated}),
+    IsStarted andalso stop_retainer(State),
     ok.
 
 %%------------------------------------------------------------------------------
@@ -300,92 +329,25 @@ get_stop_publish_clear_msg() ->
 -spec new_state() -> state().
 new_state() ->
     #{
-        enable => false,
-        context => undefined,
+        is_started => false,
         clear_timer => undefined
     }.
 
-payload_size_limit() ->
-    emqx_conf:get(?MAX_PAYLOAD_SIZE_CONFIG_PATH, ?DEF_MAX_PAYLOAD_SIZE).
+is_enabled_for_zone(ZoneConfig) ->
+    emqx_utils_maps:deep_get([mqtt, retain_available], ZoneConfig, false).
 
-%% @private
-dispatch(Context, Topic) ->
-    emqx_retainer_dispatcher:dispatch(Context, Topic).
-
--spec delete_message(context(), topic()) -> ok.
-delete_message(Context, Topic) ->
-    Mod = backend_module(Context),
-    BackendState = backend_state(Context),
-    Mod:delete_message(BackendState, Topic).
-
--spec read_message(context(), topic()) -> {ok, list(message())}.
-read_message(Context, Topic) ->
-    Mod = backend_module(Context),
-    BackendState = backend_state(Context),
-    Mod:read_message(BackendState, Topic).
-
--spec page_read(context(), emqx_maybe:t(topic()), non_neg_integer(), non_neg_integer()) ->
-    {ok, has_next(), list(message())}.
-page_read(Context, Topic, Page, Limit) ->
-    Mod = backend_module(Context),
-    BackendState = backend_state(Context),
-    Mod:page_read(BackendState, Topic, Page, Limit).
-
--spec count(context()) -> non_neg_integer().
-count(Context) ->
-    Mod = backend_module(Context),
-    BackendState = backend_state(Context),
-    Mod:size(BackendState).
-
--spec clear_expired(context()) -> ok.
-clear_expired(Context) ->
-    Mod = backend_module(Context),
-    BackendState = backend_state(Context),
-    ok = Mod:clear_expired(BackendState).
-
--spec store_retained(context(), message()) -> ok.
-store_retained(Context, #message{topic = Topic, payload = Payload} = Msg) ->
-    Size = iolist_size(Payload),
-    case payload_size_limit() of
-        Limit when Limit > 0 andalso Limit < Size ->
-            ?SLOG(error, #{
-                msg => "retain_failed_for_payload_size_exceeded_limit",
-                topic => Topic,
-                config => emqx_hocon:format_path(?MAX_PAYLOAD_SIZE_CONFIG_PATH),
-                size => Size,
-                limit => Limit
-            });
-        _ ->
-            Mod = backend_module(Context),
-            BackendState = backend_state(Context),
-            Mod:store_retained(BackendState, Msg)
-    end.
-
--spec clean(context()) -> ok.
-clean(Context) ->
-    Mod = backend_module(Context),
-    BackendState = backend_state(Context),
-    Mod:clean(BackendState).
+-spec start_clear_expired() -> ok.
+start_clear_expired() ->
+    Opts = #{
+        deadline => erlang:system_time(millisecond),
+        limit => emqx_conf:get([retainer, msg_clear_limit], all)
+    },
+    _Result = emqx_retainer_sup:start_gc(context(), Opts),
+    ok.
 
 -spec update_config(state(), hocon:config(), hocon:config()) -> state().
-update_config(State, NewConfig, OldConfig) ->
-    update_config(
-        maps:get(enable, NewConfig),
-        maps:get(enable, OldConfig),
-        State,
-        NewConfig,
-        OldConfig
-    ).
-
--spec update_config(boolean(), boolean(), state(), hocon:config(), hocon:config()) -> state().
-update_config(false, _, State, _, _) ->
-    disable_retainer(State);
-update_config(true, false, State, NewConfig, _) ->
-    enable_retainer(State, NewConfig, enabled_backend_config(NewConfig));
 update_config(
-    true,
-    true,
-    #{clear_timer := ClearTimer, context := Context} = State,
+    #{clear_timer := ClearTimer} = State,
     NewConfig,
     OldConfig
 ) ->
@@ -396,45 +358,64 @@ update_config(
     NewMod = config_backend_module(NewBackendConfig),
 
     SameBackendType = NewMod =:= OldMod,
-    case SameBackendType andalso ok =:= OldMod:update(Context, NewBackendConfig) of
+    case SameBackendType andalso ok =:= OldMod:update(context(), NewBackendConfig) of
         true ->
             State#{
-                clear_timer := check_timer(
+                clear_timer := update_timer(
                     ClearTimer,
                     ClearInterval,
                     clear_expired
                 )
             };
         false ->
-            State2 = disable_retainer(State),
-            enable_retainer(State2, NewConfig, NewBackendConfig)
+            State2 = stop_retainer(State),
+            start_retainer(State2, NewConfig, NewBackendConfig)
     end.
 
--spec enable_retainer(state(), hocon:config(), hocon:config()) -> state().
-enable_retainer(
+-spec update_status(state(), boolean(), boolean()) -> state().
+update_status(State0, From, To) ->
+    State = do_update_status(State0, From, To),
+    ?tp(retainer_status_updated, #{from => From, to => To}),
+    State.
+
+do_update_status(State, Status, Status) ->
+    State;
+do_update_status(State, false, true) ->
+    start_retainer(State);
+do_update_status(State, true, false) ->
+    stop_retainer(State).
+
+-spec start_retainer(state()) -> state().
+start_retainer(State) ->
+    RetainerConfig = emqx:get_config([retainer]),
+    BackendConfig = enabled_backend_config(RetainerConfig),
+    start_retainer(State, RetainerConfig, BackendConfig).
+
+-spec start_retainer(state(), hocon:config(), hocon:config()) -> state().
+start_retainer(
     State,
     #{msg_clear_interval := ClearInterval} = _RetainerConfig,
     BackendConfig
 ) ->
-    Context = create(BackendConfig),
-    ok = load(Context),
+    ok = create_context(BackendConfig),
+    ok = emqx_retainer_sup:start_workers(),
+    ok = load_hooks(),
     State#{
-        enable := true,
-        context := Context,
-        clear_timer := add_timer(ClearInterval, clear_expired)
+        is_started := true,
+        clear_timer := maybe_start_timer(ClearInterval, clear_expired)
     }.
 
--spec disable_retainer(state()) -> state().
-disable_retainer(
+-spec stop_retainer(state()) -> state().
+stop_retainer(
     #{
-        clear_timer := ClearTimer,
-        context := Context
+        clear_timer := ClearTimer
     } = State
 ) ->
-    ok = unload(),
-    ok = close(Context),
+    ok = unload_hooks(),
+    ok = emqx_retainer_sup:stop_workers(),
+    ok = close_context(),
     State#{
-        enable := false,
+        is_started := false,
         clear_timer := stop_timer(ClearTimer)
     }.
 
@@ -442,23 +423,26 @@ disable_retainer(
 stop_timer(undefined) ->
     undefined;
 stop_timer(TimerRef) ->
-    _ = erlang:cancel_timer(TimerRef),
+    _ = emqx_utils:cancel_timer(TimerRef),
     undefined.
 
-add_timer(0, _) ->
+maybe_start_timer(0, _) ->
     undefined;
-add_timer(undefined, _) ->
+maybe_start_timer(undefined, _) ->
     undefined;
-add_timer(Ms, Content) ->
-    erlang:send_after(Ms, self(), Content).
+maybe_start_timer(Ms, Content) ->
+    start_timer(Ms, Content).
 
-check_timer(undefined, Ms, Context) ->
-    add_timer(Ms, Context);
-check_timer(Timer, 0, _) ->
+start_timer(Ms, Content) ->
+    emqx_utils:start_timer(Ms, self(), Content).
+
+update_timer(undefined, Ms, Context) ->
+    maybe_start_timer(Ms, Context);
+update_timer(Timer, 0, _) ->
     stop_timer(Timer);
-check_timer(Timer, undefined, _) ->
+update_timer(Timer, undefined, _) ->
     stop_timer(Timer);
-check_timer(Timer, _, _) ->
+update_timer(Timer, _, _) ->
     Timer.
 
 -spec enabled_backend_config(hocon:config()) -> hocon:config() | no_return().
@@ -476,8 +460,9 @@ config_backend_module(Config) ->
         #{module := Module} -> Module
     end.
 
--spec backend_module(context()) -> module().
-backend_module(#{module := Module}) -> Module.
+-spec backend_module(context()) -> module() | undefined.
+backend_module(#{module := Module}) -> Module;
+backend_module(undefined) -> undefined.
 
 -spec backend_state(context()) -> backend_state().
 backend_state(#{state := State}) -> State.
@@ -487,29 +472,35 @@ backend_module() ->
     Config = enabled_backend_config(emqx:get_config([retainer])),
     config_backend_module(Config).
 
--spec create(hocon:config()) -> context().
-create(Cfg) ->
+-spec create_context(hocon:config()) -> ok.
+create_context(Cfg) ->
     Mod = config_backend_module(Cfg),
-    #{
+    Context = #{
         module => Mod,
         state => Mod:create(Cfg)
-    }.
+    },
+    _ = persistent_term:put(?CONTEXT_KEY, Context),
+    ok.
 
--spec close(context()) -> ok | {error, term()}.
-close(Context) ->
-    Mod = backend_module(Context),
-    Mod:close(Context).
+-spec close_context() -> ok | {error, term()}.
+close_context() ->
+    try
+        with_backend(fun(Mod, BackendState) -> Mod:close(BackendState) end)
+    after
+        persistent_term:erase(?CONTEXT_KEY)
+    end.
 
--spec load(context()) -> ok.
-load(Context) ->
+-spec load_hooks() -> ok.
+load_hooks() ->
     ok = emqx_hooks:put(
-        'session.subscribed', {?MODULE, on_session_subscribed, [Context]}, ?HP_RETAINER
+        'session.subscribed', {?MODULE, on_session_subscribed, []}, ?HP_RETAINER
     ),
-    ok = emqx_hooks:put('message.publish', {?MODULE, on_message_publish, [Context]}, ?HP_RETAINER),
+    ok = emqx_hooks:put('message.publish', {?MODULE, on_message_publish, []}, ?HP_RETAINER),
     emqx_stats:update_interval(emqx_retainer_stats, fun ?MODULE:stats_fun/0),
     ok.
 
-unload() ->
+-spec unload_hooks() -> ok.
+unload_hooks() ->
     ok = emqx_hooks:del('message.publish', {?MODULE, on_message_publish}),
     ok = emqx_hooks:del('session.subscribed', {?MODULE, on_session_subscribed}),
     emqx_stats:cancel_update(emqx_retainer_stats),

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_bridge_syskeeper_SUITE).
@@ -10,6 +10,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 
 -define(HOST, "127.0.0.1").
 -define(PORT, 9092).
@@ -92,14 +93,15 @@ init_per_testcase(_Testcase, Config) ->
 
 end_per_testcase(_Testcase, _Config) ->
     ok = snabbkaffe:stop(),
-    delete_bridge(syskeeper_forwarder, ?SYSKEEPER_NAME),
-    delete_connectors(syskeeper_forwarder, ?SYSKEEPER_NAME),
-    delete_connectors(syskeeper_proxy, ?SYSKEEPER_PROXY_NAME),
+    emqx_bridge_v2_testlib:delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_bridges_and_connectors(),
+    emqx_common_test_helpers:call_janitor(),
     ok.
 
 %%------------------------------------------------------------------------------
 %% Helper fns
 %%------------------------------------------------------------------------------
+
 syskeeper_config(Config) ->
     BatchSize =
         case proplists:get_value(enable_batch, Config, false) of
@@ -187,10 +189,12 @@ parse_connectors_and_check(ConfigString, ConnectorType, Name) ->
     emqx_utils_maps:safe_atom_key_map(Config).
 
 create_bridge(Type, Name, Conf) ->
-    emqx_bridge_v2:create(Type, Name, Conf).
-
-delete_bridge(Type, Name) ->
-    emqx_bridge_v2:remove(Type, Name).
+    emqx_bridge_v2_testlib:create_kind_api([
+        {bridge_kind, action},
+        {action_type, Type},
+        {action_name, Name},
+        {action_config, Conf}
+    ]).
 
 create_both_bridges(Config) ->
     {ProxyName, ProxyConf} = syskeeper_proxy_config(Config),
@@ -219,20 +223,21 @@ call_create_http(Root, Params) ->
     Path = emqx_mgmt_api_test_util:api_path([Root]),
     AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     case emqx_mgmt_api_test_util:request_api(post, Path, "", AuthHeader, Params) of
-        {ok, Res} -> {ok, emqx_utils_json:decode(Res, [return_maps])};
+        {ok, Res} -> {ok, emqx_utils_json:decode(Res)};
         Error -> Error
     end.
 
 create_connectors(Type, Name, Conf) ->
-    emqx_connector:create(Type, Name, Conf).
+    emqx_connector:create(?global_ns, Type, Name, Conf).
 
 delete_connectors(Type, Name) ->
-    emqx_connector:remove(Type, Name).
+    emqx_connector:remove(?global_ns, Type, Name).
 
+%% todo: messages should be sent via rules in tests...
 send_message(_Config, Payload) ->
     Name = ?SYSKEEPER_NAME,
     BridgeType = syskeeper_forwarder,
-    emqx_bridge_v2:send_message(BridgeType, Name, Payload, #{}).
+    emqx_bridge_v2:send_message(?global_ns, BridgeType, Name, Payload, #{}).
 
 to_bin(List) when is_list(List) ->
     unicode:characters_to_binary(List, utf8);
@@ -262,9 +267,18 @@ receive_msg() ->
         {error, no_message}
     end.
 
+health_check(Type, Name) ->
+    emqx_bridge_v2_testlib:force_health_check(#{
+        type => Type,
+        name => Name,
+        resource_namespace => ?global_ns,
+        kind => action
+    }).
+
 %%------------------------------------------------------------------------------
 %% Testcases
 %%------------------------------------------------------------------------------
+
 t_setup_proxy_via_config(Config) ->
     {Name, Conf} = syskeeper_proxy_config(Config),
     ?assertMatch(
@@ -340,7 +354,7 @@ t_setup_forwarder_via_http_api(Config) ->
 t_get_status(Config) ->
     create_both_bridges(Config),
     ?assertMatch(
-        #{status := connected}, emqx_bridge_v2:health_check(syskeeper_forwarder, ?SYSKEEPER_NAME)
+        #{status := connected}, health_check(syskeeper_forwarder, ?SYSKEEPER_NAME)
     ),
     delete_connectors(syskeeper_proxy, ?SYSKEEPER_PROXY_NAME),
     ?retry(
@@ -348,7 +362,7 @@ t_get_status(Config) ->
         _Attempts = 10,
         ?assertMatch(
             #{status := disconnected},
-            emqx_bridge_v2:health_check(syskeeper_forwarder, ?SYSKEEPER_NAME)
+            health_check(syskeeper_forwarder, ?SYSKEEPER_NAME)
         )
     ).
 
@@ -431,3 +445,29 @@ t_list_v1_bridges_forwarder(Config) ->
         []
     ),
     ok.
+
+%% Apparently, `proxy` connector does not have any associated action type.
+t_rule_test_trace_forwarder(Config) ->
+    {ProxyName, ProxyConf} = syskeeper_proxy_config(Config),
+    {ok, _} = create_connectors(syskeeper_proxy, ProxyName, ProxyConf),
+    {ConnectorName, ConnectorConfig} = syskeeper_connector_config(Config),
+    {ActionName, ActionConfig0} = syskeeper_config(Config),
+    ActionConfig = emqx_utils_maps:deep_merge(
+        ActionConfig0,
+        #{<<"parameters">> => #{<<"target_topic">> => <<"/dev/null">>}}
+    ),
+    PayloadFn = fun() -> emqx_utils_json:encode(make_message()) end,
+    Opts = #{payload_fn => PayloadFn},
+    emqx_bridge_v2_testlib:t_rule_test_trace(
+        [
+            {bridge_kind, action},
+            {connector_type, syskeeper_forwarder},
+            {connector_name, ConnectorName},
+            {connector_config, ConnectorConfig},
+            {action_type, syskeeper_forwarder},
+            {action_name, ActionName},
+            {action_config, ActionConfig}
+            | Config
+        ],
+        Opts
+    ).

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_metrics).
@@ -59,7 +47,7 @@ inc(GwName, Name) ->
 
 -spec inc(gateway_name(), atom(), integer()) -> ok.
 inc(GwName, Name, Oct) ->
-    ets:update_counter(tabname(GwName), Name, {2, Oct}, {Name, 0}),
+    _ = ets:update_counter(tabname(GwName), Name, {2, Oct}, {Name, 0}),
     ok.
 
 -spec dec(gateway_name(), atom()) -> ok.

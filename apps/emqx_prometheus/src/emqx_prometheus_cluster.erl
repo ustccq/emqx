@@ -1,20 +1,9 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_prometheus_cluster).
 
+-include_lib("emqx/include/logger.hrl").
 -include("emqx_prometheus.hrl").
 -include_lib("emqx_resource/include/emqx_resource.hrl").
 
@@ -39,21 +28,23 @@
 -callback logic_sum_metrics() -> list().
 
 -define(MG(K, MAP), maps:get(K, MAP)).
--define(PG0(K, PROPLISTS), proplists:get_value(K, PROPLISTS, 0)).
 
 raw_data(Module, undefined) ->
     %% TODO: for push gateway, the format mode should be configurable
     raw_data(Module, ?PROM_DATA_MODE__NODE);
 raw_data(Module, ?PROM_DATA_MODE__ALL_NODES_AGGREGATED = Mode) ->
     AllNodesMetrics = aggre_cluster(Module, Mode),
+    %% TODO: fix this typo
     Cluster = Module:fetch_cluster_consistented_data(),
     maps:merge(AllNodesMetrics, Cluster);
 raw_data(Module, ?PROM_DATA_MODE__ALL_NODES_UNAGGREGATED = Mode) ->
     AllNodesMetrics = zip_cluster_data(Module, Mode),
+    %% TODO: fix this typo
     Cluster = Module:fetch_cluster_consistented_data(),
     maps:merge(AllNodesMetrics, Cluster);
 raw_data(Module, ?PROM_DATA_MODE__NODE = Mode) ->
     {_Node, LocalNodeMetrics} = Module:fetch_from_local_node(Mode),
+    %% TODO: fix this typo
     Cluster = Module:fetch_cluster_consistented_data(),
     maps:merge(LocalNodeMetrics, Cluster).
 
@@ -133,8 +124,36 @@ do_sum(K, LogicSumKs, Metric, MetricAcc) ->
         true ->
             logic_sum(Metric, MetricAcc);
         false ->
-            Metric + MetricAcc
+            deep_sum(Metric, MetricAcc)
     end.
+
+deep_sum(Metric, MetricAcc) when is_number(Metric) andalso is_number(MetricAcc) ->
+    Metric + MetricAcc;
+deep_sum(Metric, MetricAcc) when is_map(Metric) andalso is_map(MetricAcc) ->
+    maps:merge_with(
+        fun(_K, V1, V2) ->
+            deep_sum(V1, V2)
+        end,
+        Metric,
+        MetricAcc
+    );
+deep_sum(Metric, MetricAcc) when
+    is_list(Metric) andalso is_list(MetricAcc) andalso length(Metric) == length(MetricAcc)
+->
+    lists:zipwith(
+        fun(V1, V2) ->
+            deep_sum(V1, V2)
+        end,
+        Metric,
+        MetricAcc
+    );
+deep_sum(Metric, MetricAcc) when
+    is_tuple(Metric) andalso is_tuple(MetricAcc) andalso tuple_size(Metric) == tuple_size(MetricAcc) andalso
+        tuple_size(Metric) > 0 andalso element(1, Metric) == element(1, MetricAcc)
+->
+    [Head | Tail0] = tuple_to_list(Metric),
+    [Head | Tail1] = tuple_to_list(MetricAcc),
+    list_to_tuple([Head | deep_sum(Tail0, Tail1)]).
 
 zip_cluster_data(Module, Mode) ->
     zip_cluster(
@@ -172,9 +191,9 @@ do_zip_cluster(NodeMetrics, AccIn0) ->
     ).
 
 point_to_map_fun(Key) ->
-    fun({Lables, Metric}, AccIn2) ->
-        LablesKVMap = maps:from_list(Lables),
-        [maps:merge(LablesKVMap, #{Key => Metric}) | AccIn2]
+    fun({Labels, Metric}, AccIn2) ->
+        LabelsKVMap = maps:from_list(Labels),
+        [maps:merge(LabelsKVMap, #{Key => Metric}) | AccIn2]
     end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Utils funcs for emqx-gateway
@@ -28,7 +16,8 @@
     emqx_gateway_lwm2m,
     emqx_gateway_mqttsn,
     emqx_gateway_ocpp,
-    emqx_gateway_stomp
+    emqx_gateway_stomp,
+    emqx_gateway_nats
 ]).
 
 -export([
@@ -43,7 +32,9 @@
     start_listeners/4,
     start_listener/4,
     stop_listeners/2,
-    stop_listener/2
+    stop_listener/2,
+    update_listeners/5,
+    update_gateway/5
 ]).
 
 -export([
@@ -85,7 +76,7 @@
 
 -import(emqx_listeners, [esockd_access_rules/1]).
 
--define(ACTIVE_N, 100).
+-define(ACTIVE_N, 10).
 -define(DEFAULT_IDLE_TIMEOUT, 30000).
 -define(DEFAULT_GC_OPTS, #{count => 1000, bytes => 1024 * 1024}).
 -define(DEFAULT_OOM_POLICY, #{
@@ -151,7 +142,12 @@ find_sup_child(Sup, ChildId) ->
     {ok, [pid()]}
     | {error, term()}
 when
-    ModCfg :: #{frame_mod := atom(), chann_mod := atom(), connection_mod => atom()}.
+    ModCfg :: #{
+        frame_mod := atom(),
+        chann_mod := atom(),
+        connection_mod => atom(),
+        esockd_proxy_opts => map()
+    }.
 start_listeners(Listeners, GwName, Ctx, ModCfg) ->
     start_listeners(Listeners, GwName, Ctx, ModCfg, []).
 
@@ -332,17 +328,10 @@ stop_listener(GwName, {Type, LisName, ListenOn, Cfg}) ->
     end,
     StopRet.
 
-stop_listener(GwName, Type, LisName, ListenOn, _Cfg) when
-    Type == tcp;
-    Type == ssl;
-    Type == udp;
-    Type == dtls
-->
+stop_listener(GwName, Type, LisName, ListenOn, _Cfg) when ?IS_ESOCKD_LISTENER(Type) ->
     Name = emqx_gateway_utils:listener_id(GwName, Type, LisName),
     esockd:close(Name, ListenOn);
-stop_listener(GwName, Type, LisName, ListenOn, _Cfg) when
-    Type == ws; Type == wss
-->
+stop_listener(GwName, Type, LisName, ListenOn, _Cfg) when ?IS_COWBOY_LISTENER(Type) ->
     Name = emqx_gateway_utils:listener_id(GwName, Type, LisName),
     case cowboy:stop_listener(Name) of
         ok ->
@@ -374,6 +363,153 @@ wait_listener_stopped(ListenOn) ->
             %% concurrently binds to the same port.
             gen_tcp:close(Socket)
     end.
+
+-spec update_gateway(
+    NewConfig :: map(),
+    OldConfig :: map(),
+    GwName :: atom(),
+    Ctx :: emqx_gateway_ctx:context(),
+    ModCfg :: map()
+) ->
+    {ok, [pid()]}
+    | {error, term()}.
+update_gateway(NewConfig, OldConfig, GwName, Ctx, ModCfg) ->
+    NewListeners = normalize_config(NewConfig),
+    OldListeners = normalize_config(OldConfig),
+    Res = update_listeners(NewListeners, OldListeners, GwName, Ctx, ModCfg),
+    NewPids = lists:map(fun({_, Pid}) -> Pid end, maps:get(added, Res, [])),
+    ?SLOG(info, #{
+        msg => "update_gateway_result",
+        gateway => GwName,
+        result => Res
+    }),
+    {ok, NewPids}.
+
+-spec update_listeners(
+    NewListeners :: list(),
+    OldListeners :: list(),
+    GwName :: atom(),
+    Ctx :: emqx_gateway_ctx:context(),
+    ModCfg :: map()
+) ->
+    #{
+        removed := [tuple()],
+        added := [tuple()],
+        updated := [tuple()]
+    }.
+update_listeners(NewListeners, OldListeners, GwName, Ctx, ModCfg) ->
+    #{
+        remove := Removes,
+        add := Adds,
+        update := Update
+    } = diff_listeners(NewListeners, OldListeners),
+
+    RemoveListeners = lists:map(
+        fun({Type, LisName, ListenOn, Cfg}) ->
+            ok = stop_listener(GwName, Type, LisName, ListenOn, Cfg),
+            {Type, LisName, ListenOn}
+        end,
+        Removes
+    ),
+
+    AddListeners = lists:map(
+        fun({Type, LisName, ListenOn, Cfg}) ->
+            {ok, Pid} = start_listener(GwName, Ctx, Type, LisName, ListenOn, Cfg, ModCfg),
+            {{Type, LisName, ListenOn}, Pid}
+        end,
+        Adds
+    ),
+
+    UpdateListeners = lists:map(
+        fun({Type, LisName, ListenOn, Cfg}) ->
+            ok = update_listener(GwName, Type, LisName, ListenOn, Cfg, Ctx, ModCfg),
+            {Type, LisName, ListenOn}
+        end,
+        Update
+    ),
+
+    #{
+        removed => RemoveListeners,
+        added => AddListeners,
+        updated => UpdateListeners
+    }.
+
+update_listener(GwName, Type, LisName, ListenOn, Cfg, Ctx, ModCfg) when ?IS_ESOCKD_LISTENER(Type) ->
+    Name = emqx_gateway_utils:listener_id(GwName, Type, LisName),
+    SocketOpts = merge_default(Type, esockd_opts(Type, Cfg)),
+    HighLevelCfgs0 = filter_out_low_level_opts(Type, Cfg),
+    HighLevelCfgs = maps:merge(
+        HighLevelCfgs0,
+        ModCfg#{
+            ctx => Ctx,
+            listener => {GwName, Type, LisName}
+        }
+    ),
+    ConnMod = maps:get(connection_mod, ModCfg, emqx_gateway_conn),
+    NewOptions = [{connection_mfargs, {ConnMod, start_link, [HighLevelCfgs]}} | SocketOpts],
+    esockd:set_options({Name, ListenOn}, NewOptions);
+update_listener(GwName, Type, LisName, ListenOn, Cfg, Ctx, ModCfg) when ?IS_COWBOY_LISTENER(Type) ->
+    Name = emqx_gateway_utils:listener_id(GwName, Type, LisName),
+    RanchOpts = ranch_opts(Type, ListenOn, Cfg),
+    HighLevelCfgs0 = filter_out_low_level_opts(Type, Cfg),
+    HighLevelCfgs = maps:merge(
+        HighLevelCfgs0,
+        ModCfg#{
+            ctx => Ctx,
+            listener => {GwName, Type, LisName}
+        }
+    ),
+    WsOpts = ws_opts(Cfg, HighLevelCfgs),
+
+    ok = ranch:suspend_listener(Name),
+    ok = ranch:set_transport_options(Name, RanchOpts),
+    ok = ranch:set_protocol_options(Name, WsOpts),
+    %% NOTE: ranch:suspend_listener/1 will close the listening socket,
+    %% so we need to wait for the listener to be stopped.
+    ok = emqx_listeners:wait_listener_stopped(ListenOn),
+    ranch:resume_listener(Name).
+
+diff_listeners(NewListeners, OldListeners) ->
+    Init = #{
+        add => [],
+        remove => [],
+        update => []
+    },
+    {Removes, Diff1} = lists:foldl(
+        fun(L = {Type, LisName, ListenOn, Cfg}, {Old, Result}) ->
+            case take_listener_in_list(Type, LisName, Old) of
+                {ok, {dtls, _, _, _}, _} ->
+                    %% XXX: dtls have to restart to update the options due to the limitation of esockd
+                    Add = maps:get(add, Result, []),
+                    {Old, Result#{add => [L | Add]}};
+                {ok, {Type, LisName, ListenOn, Cfg}, Remaining} ->
+                    NoChange = maps:get(no_change, Result, []),
+                    {Remaining, Result#{no_change => [L | NoChange]}};
+                {ok, {Type, LisName, ListenOn, _OldCfg}, Remaining} ->
+                    Update = maps:get(update, Result, []),
+                    {Remaining, Result#{update => [L | Update]}};
+                {ok, {Type, LisName, _OldListenOn, _}, _Remaining} ->
+                    Add = maps:get(add, Result, []),
+                    {Old, Result#{add => [L | Add]}};
+                error ->
+                    Add = maps:get(add, Result, []),
+                    {Old, Result#{add => [L | Add]}}
+            end
+        end,
+        {OldListeners, Init},
+        NewListeners
+    ),
+    Diff1#{remove => Removes}.
+
+take_listener_in_list(Type, LisName, Listeners) ->
+    take_listener_in_list(Type, LisName, Listeners, []).
+
+take_listener_in_list(_, _, [], _) ->
+    error;
+take_listener_in_list(Type, LisName, [{Type, LisName, ListenOn, Conf} | T], Remaining) ->
+    {ok, {Type, LisName, ListenOn, Conf}, lists:reverse(Remaining) ++ T};
+take_listener_in_list(Type, LisName, [H | T], Remaining) ->
+    take_listener_in_list(Type, LisName, T, [H | Remaining]).
 
 -ifndef(TEST).
 console_print(Fmt, Args) -> ?ULOG(Fmt, Args).
@@ -519,7 +655,8 @@ esockd_opts(Type, Opts0) when ?IS_ESOCKD_LISTENER(Type) ->
             max_connections,
             max_conn_rate,
             proxy_protocol,
-            proxy_protocol_timeout
+            proxy_protocol_timeout,
+            health_check
         ],
         Opts0
     ),
@@ -527,16 +664,16 @@ esockd_opts(Type, Opts0) when ?IS_ESOCKD_LISTENER(Type) ->
     maps:to_list(
         case Type of
             tcp ->
-                Opts2#{tcp_options => sock_opts(tcp_options, Opts0)};
+                Opts2#{tcp_options => tcp_opts(Opts0)};
             ssl ->
                 Opts2#{
-                    tcp_options => sock_opts(tcp_options, Opts0),
+                    tcp_options => tcp_opts(Opts0),
                     ssl_options => ssl_opts(ssl_options, Opts0)
                 };
             udp ->
-                Opts2#{udp_options => sock_opts(udp_options, Opts0)};
+                Opts2#{udp_options => udp_opts(Opts0)};
             dtls ->
-                UDPOpts = sock_opts(udp_options, Opts0),
+                UDPOpts = udp_opts(Opts0),
                 DTLSOpts = ssl_opts(dtls_options, Opts0),
                 Opts2#{
                     udp_options => UDPOpts,
@@ -545,54 +682,31 @@ esockd_opts(Type, Opts0) when ?IS_ESOCKD_LISTENER(Type) ->
         end
     ).
 
-sock_opts(Name, Opts) ->
+tcp_opts(Opts) ->
+    emqx_listeners:tcp_opts(Opts).
+
+udp_opts(Opts) ->
     maps:to_list(
         maps:without(
-            [active_n, keepalive],
-            maps:get(Name, Opts, #{})
+            [active_n],
+            maps:get(udp_options, Opts, #{})
         )
     ).
 
 ssl_opts(Name, Opts) ->
-    SSLOpts = maps:get(Name, Opts, #{}),
-    emqx_utils:run_fold(
-        [
-            fun ssl_opts_crl_config/2,
-            fun ssl_opts_drop_unsupported/2,
-            fun ssl_partial_chain/2,
-            fun ssl_verify_fun/2,
-            fun ssl_server_opts/2
-        ],
-        SSLOpts,
-        Name
-    ).
+    SSLConf = maps:get(Name, Opts, #{}),
+    SSLOpts = ssl_server_opts(Name, SSLConf),
+    ensure_dtls_protocol(Name, SSLOpts).
 
-ssl_opts_crl_config(#{enable_crl_check := true} = SSLOpts, _Name) ->
-    HTTPTimeout = emqx_config:get([crl_cache, http_timeout], timer:seconds(15)),
-    NSSLOpts = maps:remove(enable_crl_check, SSLOpts),
-    NSSLOpts#{
-        %% `crl_check => true' doesn't work
-        crl_check => peer,
-        crl_cache => {emqx_ssl_crl_cache, {internal, [{http, HTTPTimeout}]}}
-    };
-ssl_opts_crl_config(SSLOpts, _Name) ->
-    %% NOTE: Removing this because DTLS doesn't like any unknown options.
-    maps:remove(enable_crl_check, SSLOpts).
+ensure_dtls_protocol(dtls_options, SSLOpts) ->
+    [{protocol, dtls} | SSLOpts];
+ensure_dtls_protocol(_, SSLOpts) ->
+    SSLOpts.
 
-ssl_opts_drop_unsupported(SSLOpts, _Name) ->
-    %% TODO: Support OCSP stapling
-    maps:without([ocsp], SSLOpts).
-
-ssl_server_opts(SSLOpts, ssl_options) ->
+ssl_server_opts(ssl_options, SSLOpts) ->
     emqx_tls_lib:to_server_opts(tls, SSLOpts);
-ssl_server_opts(SSLOpts, dtls_options) ->
+ssl_server_opts(dtls_options, SSLOpts) ->
     emqx_tls_lib:to_server_opts(dtls, SSLOpts).
-
-ssl_partial_chain(SSLOpts, _Options) ->
-    emqx_tls_lib:opt_partial_chain(SSLOpts).
-
-ssl_verify_fun(SSLOpts, _Options) ->
-    emqx_tls_lib:opt_verify_fun(SSLOpts).
 
 ranch_opts(Type, ListenOn, Opts) ->
     NumAcceptors = maps:get(acceptors, Opts, 4),
@@ -600,10 +714,10 @@ ranch_opts(Type, ListenOn, Opts) ->
     SocketOpts1 =
         case Type of
             wss ->
-                sock_opts(tcp_options, Opts) ++
+                tcp_opts(Opts) ++
                     proplists:delete(handshake_timeout, ssl_opts(ssl_options, Opts));
             ws ->
-                sock_opts(tcp_options, Opts)
+                tcp_opts(Opts)
         end,
     SocketOpts = ip_port(ListenOn) ++ proplists:delete(reuseaddr, SocketOpts1),
     #{
@@ -614,7 +728,7 @@ ranch_opts(Type, ListenOn, Opts) ->
     }.
 
 ws_opts(Opts, Conf) ->
-    ConnMod = maps:get(connection_mod, Conf, emqx_gateway_conn),
+    ConnMod = maps:get(connection_mod, Conf, emqx_gateway_conn_ws),
     WsPaths = [
         {emqx_utils_maps:deep_get([websocket, path], Opts, "") ++ "/[...]", ConnMod, Conf}
     ],
@@ -698,12 +812,28 @@ default_subopts() ->
 
 -spec find_gateway_definitions() -> list(gateway_def()).
 find_gateway_definitions() ->
+    read_pt_populate_if_missing(
+        emqx_gateways,
+        fun do_find_gateway_definitions/0
+    ).
+
+do_find_gateway_definitions() ->
     lists:flatmap(
         fun(App) ->
             lists:flatmap(fun gateways/1, find_attrs(App, gateway))
         end,
         ?GATEWAYS
     ).
+
+read_pt_populate_if_missing(Key, Fn) ->
+    case persistent_term:get(Key, no_value) of
+        no_value ->
+            Value = Fn(),
+            _ = persistent_term:put(Key, {value, Value}),
+            Value;
+        {value, Value} ->
+            Value
+    end.
 
 -spec find_gateway_definition(atom()) -> {ok, map()} | {error, term()}.
 find_gateway_definition(Name) ->

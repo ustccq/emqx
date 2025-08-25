@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 %%
 -module(emqx_gateway_api).
@@ -21,16 +9,6 @@
 -include_lib("hocon/include/hoconsc.hrl").
 
 -behaviour(minirest_api).
-
--import(hoconsc, [mk/2, ref/1, ref/2]).
-
--import(
-    emqx_gateway_http,
-    [
-        return_http_error/2,
-        with_gateway/2
-    ]
-).
 
 %% minirest/dashboard_swagger behaviour callbacks
 -export([
@@ -385,7 +363,8 @@ fields(Gw) when
     Gw == exproto;
     Gw == gbt32960;
     Gw == ocpp;
-    Gw == jt808
+    Gw == jt808;
+    Gw == nats
 ->
     [{name, mk(Gw, #{desc => ?DESC(gateway_name)})}] ++
         convert_listener_struct(emqx_gateway_schema:gateway_schema(Gw));
@@ -397,7 +376,8 @@ fields(Gw) when
     Gw == update_exproto;
     Gw == update_gbt32960;
     Gw == update_ocpp;
-    Gw == update_jt808
+    Gw == update_jt808;
+    Gw == update_nats
 ->
     "update_" ++ GwStr = atom_to_list(Gw),
     Gw1 = list_to_existing_atom(GwStr),
@@ -505,7 +485,16 @@ listeners_schema(?R_REF(_Mod, tcp_udp_listeners)) ->
         ])
     );
 listeners_schema(?R_REF(_Mod, ws_listeners)) ->
-    hoconsc:array(hoconsc:union([ref(ws_listener), ref(wss_listener)])).
+    hoconsc:array(hoconsc:union([ref(ws_listener), ref(wss_listener)]));
+listeners_schema(?R_REF(_Mod, tcp_ws_listeners)) ->
+    hoconsc:array(
+        hoconsc:union([
+            ref(tcp_listener),
+            ref(ssl_listener),
+            ref(ws_listener),
+            ref(wss_listener)
+        ])
+    ).
 
 listener_schema() ->
     hoconsc:union([
@@ -516,6 +505,18 @@ listener_schema() ->
         ref(?MODULE, ws_listener),
         ref(?MODULE, wss_listener)
     ]).
+
+mk(Schema, Opts) ->
+    hoconsc:mk(Schema, Opts).
+
+ref(StructName) ->
+    hoconsc:ref(StructName).
+
+ref(Module, StructName) ->
+    hoconsc:ref(Module, StructName).
+
+return_http_error(Code, Name) ->
+    emqx_gateway_http:return_http_error(Code, Name).
 
 %%--------------------------------------------------------------------
 %% examples
@@ -710,7 +711,7 @@ examples_gateway_confs() ->
                         enable_stats => true,
                         idle_timeout => <<"30s">>,
                         mountpoint => <<"lwm2m/">>,
-                        xml_dir => <<"/etc/emqx/lwm2m_xml">>,
+                        xml_dir => <<"etc/lwm2m_xml">>,
                         lifetime_min => <<"1s">>,
                         lifetime_max => <<"86400s">>,
                         qmode_time_window => <<"22s">>,
@@ -882,7 +883,7 @@ examples_update_gateway_confs() ->
                         enable_stats => true,
                         idle_timeout => <<"30s">>,
                         mountpoint => <<"lwm2m2/">>,
-                        xml_dir => <<"/etc/emqx/lwm2m_xml">>,
+                        xml_dir => <<"etc/lwm2m_xml">>,
                         lifetime_min => <<"1s">>,
                         lifetime_max => <<"86400s">>,
                         qmode_time_window => <<"22s">>,
@@ -911,6 +912,30 @@ examples_update_gateway_confs() ->
                             #{bind => <<"9100">>},
                         handler =>
                             #{address => <<"http://127.0.0.1:9001">>}
+                    }
+            },
+        jt808_gateway =>
+            #{
+                summary => <<"A simple JT808 gateway config">>,
+                value =>
+                    #{
+                        enable => true,
+                        enable_stats => true,
+                        mountpoint => <<"">>,
+                        idle_timeout => <<"30s">>,
+                        retry_interval => <<"8s">>,
+                        max_retry_times => 3,
+                        message_queue_len => 10,
+                        frame => #{
+                            max_length => 65535
+                        },
+                        proto => #{
+                            auth => #{
+                                allow_anonymous => true
+                            },
+                            up_topic => <<"jt808/up/${clientid}/up">>,
+                            dn_topic => <<"jt808/dn/${clientid}/dn">>
+                        }
                     }
             },
         gbt32960_gateway =>
@@ -943,6 +968,21 @@ examples_update_gateway_confs() ->
                             },
                         dnstream => #{topic => <<"cp/${cid}">>},
                         message_format_checking => disable
+                    }
+            },
+        nats_gateway =>
+            #{
+                summary => <<"A simple NATS gateway config">>,
+                value =>
+                    #{
+                        enable => true,
+                        enable_stats => true,
+                        idle_timeout => <<"30s">>,
+                        mountpoint => <<"nats/">>,
+                        protocol =>
+                            #{
+                                max_payload_size => 1048576
+                            }
                     }
             }
     }.

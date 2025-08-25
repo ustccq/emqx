@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_redis_SUITE).
 
@@ -11,6 +11,7 @@
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -include_lib("emqx_bridge/include/emqx_bridge.hrl").
+-include_lib("emqx_resource/include/emqx_resource.hrl").
 
 %%------------------------------------------------------------------------------
 %% CT boilerplate
@@ -122,18 +123,19 @@ wait_for_ci_redis(0, _Config) ->
 wait_for_ci_redis(Checks, Config) ->
     timer:sleep(1000),
     TestHosts = all_test_hosts(),
+    ProxyHost = os:getenv("PROXY_HOST", ?PROXY_HOST),
+    ProxyPort = list_to_integer(os:getenv("PROXY_PORT", ?PROXY_PORT)),
+    emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
     case emqx_common_test_helpers:is_all_tcp_servers_available(TestHosts) of
         true ->
-            ProxyHost = os:getenv("PROXY_HOST", ?PROXY_HOST),
-            ProxyPort = list_to_integer(os:getenv("PROXY_PORT", ?PROXY_PORT)),
             emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
             Apps = emqx_cth_suite:start(
                 [
                     emqx,
                     emqx_conf,
                     emqx_resource,
-                    emqx_connector,
                     emqx_bridge,
+                    emqx_bridge_redis,
                     emqx_rule_engine,
                     emqx_management,
                     {emqx_dashboard, "dashboard.listeners.http { enable = true, bind = 18083 }"}
@@ -165,8 +167,7 @@ end_per_suite(Config) ->
     ok.
 
 init_per_testcase(Testcase, Config0) ->
-    emqx_logger:set_log_level(debug),
-    ok = delete_all_rules(),
+    emqx_bridge_v2_testlib:delete_all_rules(),
     ok = emqx_bridge_v2_SUITE:delete_all_bridges_and_connectors(),
     UniqueNum = integer_to_binary(erlang:unique_integer()),
     Name = <<(atom_to_binary(Testcase))/binary, UniqueNum/binary>>,
@@ -197,6 +198,7 @@ end_per_testcase(_Testcase, Config) ->
     ProxyPort = ?config(proxy_port, Config),
     ok = snabbkaffe:stop(),
     emqx_common_test_helpers:reset_proxy(ProxyHost, ProxyPort),
+    emqx_bridge_v2_testlib:delete_all_rules(),
     ok = emqx_bridge_v2_SUITE:delete_all_bridges_and_connectors().
 
 t_create_delete_bridge(Config) ->
@@ -214,7 +216,7 @@ t_create_delete_bridge(Config) ->
     IsBatch = ?config(is_batch, Config),
     ?assertMatch(
         {ok, _},
-        emqx_bridge:create(Type, Name, BridgeConfig)
+        create(Type, Name, BridgeConfig)
     ),
     ResourceId = emqx_bridge_resource:resource_id(Type, Name),
     ?WAIT(
@@ -228,23 +230,22 @@ t_create_delete_bridge(Config) ->
 
     RuleId = <<"my_rule_id">>,
     RuleConf = #{
-        actions => [Action],
-        description => <<>>,
-        enable => true,
-        id => RuleId,
-        name => <<>>,
-        sql => <<"SELECT * FROM \"t/#\"">>
+        <<"actions">> => [Action],
+        <<"description">> => <<>>,
+        <<"enable">> => true,
+        <<"id">> => RuleId,
+        <<"name">> => <<>>,
+        <<"sql">> => <<"SELECT * FROM \"t/#\"">>
     },
 
     %% check export by rule
-    {ok, _} = emqx_rule_engine:create_rule(RuleConf),
+    {201, _} = emqx_bridge_v2_testlib:create_rule_api2(RuleConf),
     _ = check_resource_queries(ResourceId, <<"t/test">>, IsBatch),
-    ok = emqx_rule_engine:delete_rule(RuleId),
 
     %% check export through local topic
     _ = check_resource_queries(ResourceId, <<"local_topic/test">>, IsBatch),
 
-    ok = emqx_bridge:remove(Type, Name).
+    ok.
 
 % check that we provide correct examples
 t_check_values(_Config) ->
@@ -281,18 +282,20 @@ t_check_replay(Config) ->
 
     ?assertMatch(
         {ok, _},
-        emqx_bridge:create(Type, Name, toxiproxy_redis_bridge_config())
+        create(Type, Name, toxiproxy_redis_bridge_config())
     ),
 
     ResourceId = emqx_bridge_resource:resource_id(Type, Name),
 
     ?WAIT(
-        {ok, connected},
+        {ok, ?status_connected},
         emqx_resource:health_check(ResourceId),
         5
     ),
 
+    ct:timetrap({seconds, 15}),
     ?check_trace(
+        emqx_bridge_v2_testlib:snk_timetrap(),
         ?wait_async_action(
             with_down_failure(Config, ProxyName, fun() ->
                 {_, {ok, _}} =
@@ -307,24 +310,21 @@ t_check_replay(Config) ->
                             ?snk_kind := redis_bridge_connector_send_done,
                             batch := true,
                             result := {error, _}
-                        },
-                        10_000
+                        }
                     )
             end),
-            #{?snk_kind := redis_bridge_connector_send_done, batch := true, result := {ok, _}},
-            10_000
+            #{?snk_kind := redis_bridge_connector_send_done, batch := true, result := {ok, _}}
         ),
         fun(Trace) ->
-            ?assert(
-                ?strict_causality(
-                    #{?snk_kind := redis_bridge_connector_send_done, result := {error, _}},
-                    #{?snk_kind := redis_bridge_connector_send_done, result := {ok, _}},
-                    Trace
-                )
-            )
+            SubTrace = ?of_kind(redis_bridge_connector_send_done, Trace),
+            %% No strict causality here because, depending on timing, multiple batches may
+            %% be enqueued.
+            ?assertMatch([#{result := {error, _}} | _], SubTrace),
+            ?assertMatch([#{result := {ok, _}} | _], lists:reverse(SubTrace)),
+            ok
         end
     ),
-    ok = emqx_bridge:remove(Type, Name).
+    ok.
 
 t_permanent_error(_Config) ->
     Name = <<"invalid_command_bridge">>,
@@ -334,7 +334,7 @@ t_permanent_error(_Config) ->
 
     ?assertMatch(
         {ok, _},
-        emqx_bridge:create(Type, Name, invalid_command_bridge_config())
+        create(Type, Name, invalid_command_bridge_config())
     ),
 
     ?check_trace(
@@ -360,7 +360,7 @@ t_auth_username_password(Config) ->
     BridgeConfig = username_password_redis_bridge_config(),
     ?assertMatch(
         {ok, _},
-        emqx_bridge:create(Type, Name, BridgeConfig)
+        create(Type, Name, BridgeConfig)
     ),
     ResourceId = emqx_bridge_resource:resource_id(Type, Name),
     ?WAIT(
@@ -377,7 +377,7 @@ t_auth_error_username_password(Config) ->
     BridgeConfig = maps:merge(BridgeConfig0, #{<<"password">> => <<"wrong_password">>}),
     ?assertMatch(
         {ok, _},
-        emqx_bridge:create(Type, Name, BridgeConfig)
+        create(Type, Name, BridgeConfig)
     ),
     ResourceId = emqx_bridge_resource:resource_id(Type, Name),
     ?WAIT(
@@ -398,7 +398,7 @@ t_auth_error_password_only(Config) ->
     BridgeConfig = maps:merge(BridgeConfig0, #{<<"password">> => <<"wrong_password">>}),
     ?assertMatch(
         {ok, _},
-        emqx_bridge:create(Type, Name, BridgeConfig)
+        create(Type, Name, BridgeConfig)
     ),
     ResourceId = emqx_bridge_resource:resource_id(Type, Name),
     ?assertEqual(
@@ -417,7 +417,7 @@ t_create_disconnected(Config) ->
 
     ?check_trace(
         with_down_failure(Config, "redis_single_tcp", fun() ->
-            {ok, _} = emqx_bridge:create(
+            {ok, _} = create(
                 Type, Name, toxiproxy_redis_bridge_config()
             )
         end),
@@ -510,14 +510,6 @@ conf_schema(StructName) ->
         roots => [{root, hoconsc:ref(emqx_bridge_redis, StructName)}]
     }.
 
-delete_all_rules() ->
-    lists:foreach(
-        fun(#{id := RuleId}) ->
-            emqx_rule_engine:delete_rule(RuleId)
-        end,
-        emqx_rule_engine:get_rules()
-    ).
-
 all_test_hosts() ->
     Confs = [
         ?REDIS_TOXYPROXY_CONNECT_CONFIG
@@ -558,11 +550,11 @@ redis_connect_ssl_opts(Type) ->
 client_ssl_cert_opts(redis_single) ->
     emqx_authn_test_lib:client_ssl_cert_opts();
 client_ssl_cert_opts(_) ->
-    Dir = code:lib_dir(emqx, etc),
+    Dir = code:lib_dir(emqx),
     #{
-        <<"keyfile">> => filename:join([Dir, <<"certs">>, <<"client-key.pem">>]),
-        <<"certfile">> => filename:join([Dir, <<"certs">>, <<"client-cert.pem">>]),
-        <<"cacertfile">> => filename:join([Dir, <<"certs">>, <<"cacert.pem">>])
+        <<"keyfile">> => filename:join([Dir, <<"etc">>, <<"certs">>, <<"client-key.pem">>]),
+        <<"certfile">> => filename:join([Dir, <<"etc">>, <<"certs">>, <<"client-cert.pem">>]),
+        <<"cacertfile">> => filename:join([Dir, <<"etc">>, <<"certs">>, <<"cacert.pem">>])
     }.
 
 redis_connect_configs() ->
@@ -689,3 +681,6 @@ wait(F, Attempt) ->
             timer:sleep(1000),
             wait(F, Attempt - 1)
     end.
+
+create(Type, Name, Config) ->
+    emqx_bridge_testlib:create_bridge_api(Type, Name, Config).

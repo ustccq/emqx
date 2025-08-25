@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_telemetry_SUITE).
@@ -26,8 +14,10 @@
 -import(proplists, [get_value/2]).
 
 -define(MODULES_CONF, #{
-    <<"dealyed">> => <<"true">>,
-    <<"max_delayed_messages">> => <<"0">>
+    <<"delayed">> => #{
+        <<"enable">> => <<"true">>,
+        <<"max_delayed_messages">> => 0
+    }
 }).
 
 all() -> emqx_common_test_helpers:all(?MODULE).
@@ -40,7 +30,7 @@ suite() ->
 
 apps() ->
     [
-        emqx_conf,
+        {emqx_conf, "authorization.sources = []"},
         emqx_connector,
         emqx_retainer,
         emqx_auth,
@@ -52,20 +42,21 @@ apps() ->
         emqx_bridge_http,
         emqx_bridge,
         emqx_rule_engine,
-        emqx_management
+        emqx_gateway,
+        emqx_exhook,
+        emqx_management,
+        emqx_mgmt_api_test_util:emqx_dashboard()
     ].
 
 init_per_suite(Config) ->
     WorkDir = ?config(priv_dir, Config),
     Apps = emqx_cth_suite:start(apps(), #{work_dir => WorkDir}),
-    emqx_mgmt_api_test_util:init_suite(),
     [{apps, Apps}, {work_dir, WorkDir} | Config].
 
 end_per_suite(Config) ->
     mnesia:clear_table(cluster_rpc_commit),
     mnesia:clear_table(cluster_rpc_mfa),
     Apps = ?config(apps, Config),
-    emqx_mgmt_api_test_util:end_suite(),
     ok = emqx_cth_suite:stop(Apps),
     ok.
 
@@ -103,7 +94,6 @@ init_per_testcase(t_get_telemetry, Config) ->
         "test/emqx_gateway_SUITE_data"
     ),
     ok = emqx_gateway_SUITE:setup_fake_usage_data(Lwm2mDataDir),
-    emqx_common_test_helpers:start_apps([emqx_gateway]),
     Config;
 init_per_testcase(t_advanced_mqtt_features, Config) ->
     {ok, _} = emqx_cluster_rpc:start_link(node(), emqx_cluster_rpc, 1000),
@@ -120,11 +110,13 @@ init_per_testcase(t_authn_authz_info, Config) ->
 init_per_testcase(t_enable, Config) ->
     ok = meck:new(emqx_telemetry_config, [non_strict, passthrough, no_history, no_link]),
     ok = meck:expect(emqx_telemetry_config, is_official_version, fun(_) -> true end),
+    emqx_telemetry_config:set_default_status(true),
     mock_httpc(),
     Config;
 init_per_testcase(t_send_after_enable, Config) ->
     ok = meck:new(emqx_telemetry_config, [non_strict, passthrough, no_history, no_link]),
     ok = meck:expect(emqx_telemetry_config, is_official_version, fun(_) -> true end),
+    emqx_telemetry_config:set_default_status(true),
     mock_httpc(),
     Config;
 init_per_testcase(t_rule_engine_and_data_bridge_info, Config) ->
@@ -134,24 +126,14 @@ init_per_testcase(t_rule_engine_and_data_bridge_info, Config) ->
     Config;
 init_per_testcase(t_exhook_info, Config) ->
     {ok, _} = emqx_cluster_rpc:start_link(node(), emqx_cluster_rpc, 1000),
-    ExhookConf =
-        #{
-            <<"exhook">> =>
-                #{
-                    <<"servers">> =>
-                        [
-                            #{
-                                <<"name">> => "myhook",
-                                <<"url">> => "http://127.0.0.1:9000"
-                            }
-                        ]
-                }
-        },
     {ok, _} = emqx_exhook_demo_svr:start(),
+    ExhookConf = #{
+        <<"name">> => "myhook",
+        <<"url">> => "http://127.0.0.1:9000"
+    },
+    {ok, _} = emqx_exhook_mgr:update_config([exhook, servers], {add, ExhookConf}),
     {ok, Sock} = gen_tcp:connect("localhost", 9000, [], 3000),
     _ = gen_tcp:close(Sock),
-    ok = emqx_common_test_helpers:load_config(emqx_exhook_schema, ExhookConf),
-    emqx_common_test_helpers:start_apps([emqx_exhook]),
     Config;
 init_per_testcase(t_cluster_uuid, Config) ->
     Node = start_peer(n1),
@@ -237,11 +219,13 @@ t_node_uuid(_) ->
     {ok, NodeUUID4} = emqx_telemetry_proto_v1:get_node_uuid(node()),
     ?assertEqual(NodeUUID2, NodeUUID3),
     ?assertEqual(NodeUUID3, NodeUUID4),
+    emqx_telemetry:stop_reporting(),
     ?assertMatch({badrpc, nodedown}, emqx_telemetry_proto_v1:get_node_uuid('fake@node')).
 
 t_cluster_uuid(Config) ->
     Node = proplists:get_value(n1, Config),
-    {ok, ClusterUUID0} = emqx_telemetry:get_cluster_uuid(),
+    {ok, ClusterUUID0} = emqx_telemetry:get_cluster_uuid(timer:seconds(10)),
+    ?assertEqual({ok, ClusterUUID0}, emqx_telemetry:get_cluster_uuid(timer:seconds(1))),
     {ok, ClusterUUID1} = emqx_telemetry_proto_v1:get_cluster_uuid(node()),
     ?assertEqual(ClusterUUID0, ClusterUUID1),
     {ok, NodeUUID0} = emqx_telemetry:get_node_uuid(),
@@ -463,19 +447,16 @@ t_send_after_enable(_) ->
     ok = emqx_telemetry:stop_reporting(),
     ok = snabbkaffe:start_trace(),
     try
-        ok = emqx_telemetry:start_reporting(),
-        Timeout = 12_000,
         ?assertMatch(
             {ok, _},
             ?wait_async_action(
                 ok = emqx_telemetry:start_reporting(),
                 #{?snk_kind := telemetry_data_reported},
-                Timeout
+                _Timeout = 12_000
             )
         ),
         receive
             {request, post, _URL, _Headers, Body} ->
-                {ok, Decoded} = emqx_utils_json:safe_decode(Body, [return_maps]),
                 ?assertMatch(
                     #{
                         <<"uuid">> := _,
@@ -501,7 +482,7 @@ t_send_after_enable(_) ->
                                 <<"delayed">> := _
                             }
                     },
-                    Decoded
+                    emqx_utils_json:decode(Body)
                 )
         after 2100 ->
             exit(telemetry_not_reported)
@@ -621,15 +602,15 @@ mock_httpc() ->
     ).
 
 mock_advanced_mqtt_features() ->
-    Context = emqx_retainer:context(),
     lists:foreach(
         fun(N) ->
             Num = integer_to_binary(N),
             Message = emqx_message:make(<<"retained/", Num/binary>>, <<"payload">>),
-            ok = emqx_retainer:store_retained(Context, Message)
+            ok = emqx_retainer_publisher:store_retained(Message)
         end,
         lists:seq(1, 5)
     ),
+    ct:sleep(100),
 
     lists:foreach(
         fun(N) ->
@@ -728,40 +709,40 @@ assert_gateway_listener_shape(ListenerData, GatewayType) ->
     ).
 
 setup_fake_rule_engine_data() ->
-    {ok, _} =
-        emqx_rule_engine:create_rule(
+    {201, _} =
+        emqx_bridge_v2_testlib:create_rule_api2(
             #{
-                id => <<"rule:t_get_basic_usage_info:1">>,
-                sql => <<"select 1 from topic">>,
-                actions =>
+                <<"id">> => <<"t_get_basic_usage_info_1">>,
+                <<"sql">> => <<"select 1 from topic">>,
+                <<"actions">> =>
                     [
-                        #{function => <<"erlang:hibernate">>, args => #{}},
-                        #{function => console},
+                        #{<<"function">> => <<"erlang:hibernate">>, <<"args">> => #{}},
+                        #{<<"function">> => <<"console">>},
                         <<"webhook:basic_usage_info_webhook">>,
                         <<"webhook:basic_usage_info_webhook_disabled">>
                     ]
             }
         ),
-    {ok, _} =
-        emqx_rule_engine:create_rule(
+    {201, _} =
+        emqx_bridge_v2_testlib:create_rule_api2(
             #{
-                id => <<"rule:t_get_basic_usage_info:2">>,
-                sql => <<"select 1 from topic">>,
-                actions =>
+                <<"id">> => <<"t_get_basic_usage_info_2">>,
+                <<"sql">> => <<"select 1 from topic">>,
+                <<"actions">> =>
                     [
                         <<"mqtt:basic_usage_info_mqtt">>,
                         <<"webhook:basic_usage_info_webhook">>
                     ]
             }
         ),
-    {ok, _} =
-        emqx_rule_engine:create_rule(
+    {201, _} =
+        emqx_bridge_v2_testlib:create_rule_api2(
             #{
-                id => <<"rule:t_get_basic_usage_info:3">>,
-                sql => <<"select 1 from \"$bridges/mqtt:basic_usage_info_mqtt\"">>,
-                actions =>
+                <<"id">> => <<"t_get_basic_usage_info_3">>,
+                <<"sql">> => <<"select 1 from \"$bridges/mqtt:basic_usage_info_mqtt\"">>,
+                <<"actions">> =>
                     [
-                        #{function => console}
+                        #{<<"function">> => <<"console">>}
                     ]
             }
         ),
@@ -789,7 +770,7 @@ start_peer(Name) ->
         fun
             (emqx) ->
                 application:set_env(emqx, boot_modules, []),
-                ekka:join(TestNode),
+                emqx_cluster:join(TestNode),
                 emqx_common_test_helpers:load_config(emqx_modules_schema, ?MODULES_CONF),
                 ok;
             (_App) ->
@@ -822,13 +803,13 @@ stop_peer(Node) ->
     ok = application:start(mria).
 
 leave_cluster() ->
-    try mnesia_hook:module_info() of
-        _ -> ekka:leave()
+    try mnesia_hook:module_info(module) of
+        _ -> emqx_cluster:leave()
     catch
         _:_ ->
             %% We have to set the db_backend to mnesia even for `ekka:leave/0`!!
             application:set_env(mria, db_backend, mnesia),
-            ekka:leave()
+            emqx_cluster:leave()
     end.
 
 is_official_version(V) ->

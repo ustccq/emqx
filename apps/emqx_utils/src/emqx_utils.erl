@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2017-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2017-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@
     proc_stats/0,
     proc_stats/1,
     rand_seed/0,
+    rand_id/1,
     now_to_secs/1,
     now_to_ms/1,
     index_of/2,
@@ -63,12 +64,14 @@
     diff_lists/3,
     merge_lists/3,
     flattermap/2,
-    tcp_keepalive_opts/4,
     format/1,
-    call_first_defined/1,
+    format/2,
+    format_mfal/2,
+    call_first_defined/3,
     ntoa/1,
     foldl_while/3,
-    is_restricted_str/1
+    is_restricted_str/1,
+    interactive_load/1
 ]).
 
 -export([
@@ -257,12 +260,9 @@ drain_down(Cnt, Acc) ->
 %% `ok': There is nothing out of the ordinary.
 %% `shutdown': Some numbers (message queue length hit the limit),
 %%             hence shutdown for greater good (system stability).
-%% [FIXME] cross-dependency on `emqx_types`.
--spec check_oom(emqx_types:oom_policy()) -> ok | {shutdown, term()}.
 check_oom(Policy) ->
     check_oom(self(), Policy).
 
--spec check_oom(pid(), emqx_types:oom_policy()) -> ok | {shutdown, term()}.
 check_oom(_Pid, #{enable := false}) ->
     ok;
 check_oom(Pid, #{
@@ -288,8 +288,10 @@ do_check_oom([{Val, Max, Reason} | Rest]) ->
     end.
 
 tune_heap_size(#{enable := false}) ->
-    ok;
+    ignore;
 %% If the max_heap_size is set to zero, the limit is disabled.
+tune_heap_size(#{max_heap_size := 0}) ->
+    ignore;
 tune_heap_size(#{max_heap_size := MaxHeapSize}) when MaxHeapSize > 0 ->
     MaxSize =
         case erlang:system_info(wordsize) of
@@ -316,11 +318,8 @@ proc_name(Mod, Id) ->
     list_to_atom(lists:concat([Mod, "_", Id])).
 
 %% Get Proc's Stats.
-%% [FIXME] cross-dependency on `emqx_types`.
--spec proc_stats() -> emqx_types:stats().
 proc_stats() -> proc_stats(self()).
 
--spec proc_stats(pid()) -> emqx_types:stats().
 proc_stats(Pid) ->
     case
         process_info(Pid, [
@@ -542,44 +541,50 @@ safe_to_existing_atom(Atom, _Encoding) when is_atom(Atom) ->
 safe_to_existing_atom(_Any, _Encoding) ->
     {error, invalid_type}.
 
--spec tcp_keepalive_opts(term(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
-    {ok, [{keepalive, true} | {raw, non_neg_integer(), non_neg_integer(), binary()}]}
-    | {error, {unsupported_os, term()}}.
-tcp_keepalive_opts({unix, linux}, Idle, Interval, Probes) ->
-    {ok, [
-        {keepalive, true},
-        {raw, 6, 4, <<Idle:32/native>>},
-        {raw, 6, 5, <<Interval:32/native>>},
-        {raw, 6, 6, <<Probes:32/native>>}
-    ]};
-tcp_keepalive_opts({unix, darwin}, Idle, Interval, Probes) ->
-    {ok, [
-        {keepalive, true},
-        {raw, 6, 16#10, <<Idle:32/native>>},
-        {raw, 6, 16#101, <<Interval:32/native>>},
-        {raw, 6, 16#102, <<Probes:32/native>>}
-    ]};
-tcp_keepalive_opts(OS, _Idle, _Interval, _Probes) ->
-    {error, {unsupported_os, OS}}.
-
 format(Term) ->
-    iolist_to_binary(io_lib:format("~0p", [Term])).
+    unicode:characters_to_binary(io_lib:format("~0tp", [Term])).
 
--spec call_first_defined(list({module(), atom(), list()})) -> term() | no_return().
-call_first_defined([{Module, Function, Args} | Rest]) ->
-    try
-        apply(Module, Function, Args)
-    catch
-        error:undef:Stacktrace ->
-            case Stacktrace of
-                [{Module, Function, _, _} | _] ->
-                    call_first_defined(Rest);
-                _ ->
-                    erlang:raise(error, undef, Stacktrace)
-            end
+format(Fmt, Args) ->
+    unicode:characters_to_binary(io_lib:format(Fmt, Args)).
+
+%% @doc Helper function for log formatters.
+-spec format_mfal(map(), map()) -> undefined | binary().
+format_mfal(Data, #{with_mfa := true}) ->
+    Line =
+        case maps:get(line, Data, undefined) of
+            undefined ->
+                <<"">>;
+            Num ->
+                ["(", integer_to_list(Num), ")"]
+        end,
+    case maps:get(mfa, Data, undefined) of
+        {M, F, A} ->
+            iolist_to_binary([
+                atom_to_binary(M, utf8),
+                $:,
+                atom_to_binary(F, utf8),
+                $/,
+                integer_to_binary(A),
+                Line
+            ]);
+        _ ->
+            undefined
     end;
-call_first_defined([]) ->
-    error(none_fun_is_defined).
+format_mfal(_, _) ->
+    undefined.
+
+-spec call_first_defined(module(), atom(), list()) -> term() | no_return().
+call_first_defined(Module, Function, []) ->
+    error({not_exported, Module, Function});
+call_first_defined(Module, Function, [Args | Rest]) ->
+    %% ensure module is loaded
+    ok = interactive_load(Module),
+    case erlang:function_exported(Module, Function, length(Args)) of
+        true ->
+            apply(Module, Function, Args);
+        false ->
+            call_first_defined(Module, Function, Rest)
+    end.
 
 %%------------------------------------------------------------------------------
 %% Internal Functions
@@ -836,8 +841,8 @@ search(ExpectValue, KeyFunc, [Item | List]) ->
 %% The purpose of this function is to adapt to `Fun`s that return either a `[]`
 %% or a term, and to avoid costs of list construction and flattening when
 %% dealing with large lists.
--spec flattermap(Fun, [X]) -> [X] when
-    Fun :: fun((X) -> [X] | X).
+-spec flattermap(Fun, [X]) -> [Y] when
+    Fun :: fun((X) -> [Y] | Y).
 flattermap(_Fun, []) ->
     [];
 flattermap(Fun, [X | Xs]) ->
@@ -867,6 +872,41 @@ ntoa(IP) ->
 is_restricted_str(String) ->
     RE = <<"^[A-Za-z0-9]+[A-Za-z0-9-_]*$">>,
     match =:= re:run(String, RE, [{capture, none}]).
+
+%% @doc Generate random, printable bytes as an ID.
+%% The first byte is ensured to be a-z or A-Z.
+rand_id(Len) when Len > 0 ->
+    iolist_to_binary([rand_first_char(), rand_chars(Len - 1)]).
+
+rand_first_char() ->
+    base62(rand:uniform(52) - 1).
+
+rand_chars(0) ->
+    [];
+rand_chars(N) ->
+    [rand_char() | rand_chars(N - 1)].
+
+rand_char() ->
+    base62(rand:uniform(62) - 1).
+
+base62(I) when I < 26 -> $A + I;
+base62(I) when I < 52 -> $a + I - 26;
+base62(I) -> $0 + I - 52.
+
+%% In production code, EMQX is always booted in embedded mode.
+%% so making a dynamic call to Module:module_info(module) is cheap.
+%% In interactive mode (test, and emqx config check CLI), the first attempt
+%% to make the dynamic call to Module:module_info(module) will cost,
+%% once loaded, it's cheap for subsequent calls.
+%% NOTE: For non-existing modules, this call is not as effective!
+interactive_load(Module) ->
+    try
+        _ = apply(Module, module_info, [module]),
+        ok
+    catch
+        _:_ ->
+            ok
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

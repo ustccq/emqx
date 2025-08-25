@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gbt32960_frame).
@@ -20,7 +20,7 @@
     is_message/1
 ]).
 
--define(FLAG, 1 / binary).
+% -define(FLAG, 1 / binary).
 -define(BYTE, 8 / big - integer).
 -define(WORD, 16 / big - integer).
 -define(DWORD, 32 / big - integer).
@@ -450,8 +450,16 @@ parse_info(<<?INFO_TYPE_CHARGEABLE_TEMP, Number:?BYTE, Rest/binary>>, Acc) ->
         | Acc
     ]);
 parse_info(Rest, Acc) ->
-    ?SLOG(error, #{msg => "invalid_info_feild", rest => Rest, acc => Acc}),
-    error(invalid_info_feild).
+    ?SLOG(warning, #{msg => "customized_info_type", rest => Rest}),
+    lists:reverse(
+        [
+            #{
+                <<"Type">> => <<"CustomData">>,
+                <<"Data">> => base64:encode(Rest)
+            }
+            | Acc
+        ]
+    ).
 
 parse_drive_motor(<<>>, Acc) ->
     lists:reverse(Acc);
@@ -572,7 +580,7 @@ parse_params_(<<16#0F, Val:?WORD, Rest/binary>>, Acc) ->
 parse_params_(<<16#10, Val:?BYTE, Rest/binary>>, Acc) ->
     parse_params_(Rest, [#{<<"0x10">> => Val} | Acc]);
 parse_params_(Cmd, Acc) ->
-    ?SLOG(error, #{msg => "unexcepted_param_identifier", cmd => Cmd}),
+    ?SLOG(error, #{msg => "unexpected_param_identifier", cmd => Cmd}),
     lists:reverse(Acc).
 
 parse_ctrl_param(16#01, Param) ->
@@ -590,7 +598,7 @@ parse_ctrl_param(16#06, <<Level:?BYTE, Msg/binary>>) ->
 parse_ctrl_param(16#07, _) ->
     <<>>;
 parse_ctrl_param(Cmd, Param) ->
-    ?SLOG(error, #{msg => "unexcepted_param", param => Param, cmd => Cmd}),
+    ?SLOG(error, #{msg => "unexpected_param", param => Param, cmd => Cmd}),
     <<>>.
 
 parse_upgrade_feild(Param) ->
@@ -626,10 +634,10 @@ parse_upgrade_feild(Param) ->
 serialize_pkt(Frame, _Opts) ->
     serialize(Frame).
 
-serialize(#frame{cmd = Cmd, ack = Ack, vin = Vin, encrypt = Encrypt, data = Data, rawdata = RawData}) ->
+serialize(#frame{cmd = Cmd, ack = Ack, vin = VIN, encrypt = Encrypt, data = Data, rawdata = RawData}) ->
     Encrypted = encipher(serialize_data(Cmd, Ack, RawData, Data), Encrypt),
     Len = byte_size(Encrypted),
-    Stream = <<Cmd:?BYTE, Ack:?BYTE, Vin:17/binary, Encrypt:?BYTE, Len:?WORD, Encrypted/binary>>,
+    Stream = <<Cmd:?BYTE, Ack:?BYTE, VIN:17/binary, Encrypt:?BYTE, Len:?WORD, Encrypted/binary>>,
     Crc = cal_check(Stream, byte_size(Stream), undefined),
     <<"##", Stream/binary, Crc:?BYTE>>.
 
@@ -745,7 +753,7 @@ tune_ctrl_param(16#06, #{<<"Level">> := Level, <<"Message">> := Msg}) ->
 tune_ctrl_param(16#07, _) ->
     <<>>;
 tune_ctrl_param(Cmd, Param) ->
-    ?SLOG(error, #{msg => "unexcepted_cmd", cmd => Cmd, param => Param}),
+    ?SLOG(error, #{msg => "unexpected_cmd", cmd => Cmd, param => Param}),
     <<>>.
 
 tune_upgrade_feild(Param) ->

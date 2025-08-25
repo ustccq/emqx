@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gateway_auth_ct).
@@ -27,9 +15,7 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    terminate/2,
-    code_change/3,
-    format_status/2
+    terminate/2
 ]).
 
 -import(
@@ -124,19 +110,13 @@ handle_info(_Info, State) ->
 terminate(_Reason, _State) ->
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-format_status(_Opt, Status) ->
-    Status.
-
 %%------------------------------------------------------------------------------
 %% Authenticators
 %%------------------------------------------------------------------------------
 
 on_start_auth(authn_http) ->
     %% start test server
-    {ok, _} = emqx_authn_http_test_server:start_link(?AUTHN_HTTP_PORT, ?AUTHN_HTTP_PATH),
+    {ok, _} = emqx_utils_http_test_server:start_link(?AUTHN_HTTP_PORT, ?AUTHN_HTTP_PATH),
     timer:sleep(1000),
 
     %% set authn for gateway
@@ -165,12 +145,12 @@ on_start_auth(authn_http) ->
         end,
         {ok, Req, State}
     end,
-    emqx_authn_http_test_server:set_handler(Handler),
+    emqx_utils_http_test_server:set_handler(Handler),
 
     timer:sleep(500);
 on_start_auth(authz_http) ->
     ok = emqx_authz_test_lib:reset_authorizers(),
-    {ok, _} = emqx_authz_http_test_server:start_link(?AUTHZ_HTTP_PORT, ?AUTHZ_HTTP_PATH),
+    {ok, _} = emqx_utils_http_test_server:start_link(?AUTHZ_HTTP_PORT, ?AUTHZ_HTTP_PATH),
 
     %% TODO set authz for gateway
     ok = emqx_authz_test_lib:setup_config(
@@ -193,7 +173,7 @@ on_start_auth(authz_http) ->
         end,
         {ok, Req, State}
     end,
-    ok = emqx_authz_http_test_server:set_handler(Handler),
+    ok = emqx_utils_http_test_server:set_handler(Handler),
     timer:sleep(500).
 
 on_stop_auth(authn_http) ->
@@ -202,9 +182,9 @@ on_stop_auth(authn_http) ->
         {204, _} = request(delete, Path)
     end,
     lists:foreach(Delete, ?GATEWAYS),
-    ok = emqx_authn_http_test_server:stop();
+    ok = emqx_utils_http_test_server:stop();
 on_stop_auth(authz_http) ->
-    ok = emqx_authz_http_test_server:stop().
+    ok = emqx_utils_http_test_server:stop().
 
 %%------------------------------------------------------------------------------
 %% Configs

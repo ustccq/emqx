@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_jwt_expire_SUITE).
@@ -37,9 +25,17 @@ end_per_testcase(_, _Config) ->
     ok.
 
 init_per_suite(Config) ->
-    Apps = emqx_cth_suite:start([emqx, emqx_conf, emqx_auth, emqx_auth_jwt], #{
-        work_dir => ?config(priv_dir, Config)
-    }),
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            {emqx_conf, "authorization.no_match = deny, authorization.cache.enable = false"},
+            emqx_auth,
+            emqx_auth_jwt
+        ],
+        #{
+            work_dir => ?config(priv_dir, Config)
+        }
+    ),
     [{apps, Apps} | Config].
 
 end_per_suite(Config) ->
@@ -78,6 +74,65 @@ t_jwt_expire(_Config) ->
     after 5000 ->
         ct:fail("Client should be disconnected by timeout")
     end.
+
+t_will_message_on_auth_expire(_Config) ->
+    _ = process_flag(trap_exit, true),
+
+    %% Set up the authenticator
+    {ok, _} = emqx:update_config(
+        ?PATH,
+        {create_authenticator, ?GLOBAL, auth_config()}
+    ),
+    {ok, [#{provider := emqx_authn_jwt}]} = emqx_authn_chains:list_authenticators(?GLOBAL),
+
+    %% Set up the subscriber, it will receive the will message
+    Now = erlang:system_time(second),
+    WillTopic = <<"t/will">>,
+    PayloadSub = #{
+        <<"username">> => <<"subuser">>,
+        <<"exp">> => Now + 100
+    },
+    JWSSub = emqx_authn_jwt_SUITE:generate_jws('hmac-based', PayloadSub, <<"secret">>),
+    {ok, SubClient} = emqtt:start_link([
+        {username, <<"subuser">>}, {password, JWSSub}, {proto_ver, v5}
+    ]),
+    {ok, _} = emqtt:connect(SubClient),
+    {ok, _, _} = emqtt:subscribe(SubClient, WillTopic, 1),
+
+    %% Set up the publisher, it will publish the will message on auth expire
+    WillPayload = <<"will">>,
+    PayloadPub = #{
+        <<"username">> => <<"pubuser">>,
+        <<"exp">> => Now + 3,
+        <<"acl">> => [
+            #{
+                <<"permission">> => <<"allow">>,
+                <<"action">> => <<"pub">>,
+                <<"topics">> => [WillTopic]
+            }
+        ]
+    },
+    JWSPub = emqx_authn_jwt_SUITE:generate_jws('hmac-based', PayloadPub, <<"secret">>),
+    {ok, PubClient} = emqtt:start_link([
+        {username, <<"pubuser">>},
+        {password, JWSPub},
+        {proto_ver, v5},
+        {will_flag, true},
+        {will_topic, WillTopic},
+        {will_payload, WillPayload},
+        {will_retain, false}
+    ]),
+    {ok, _} = emqtt:connect(PubClient),
+
+    %% Check that the will message is received
+    receive
+        {publish, #{payload := Payload}} when Payload =:= WillPayload -> ok
+    after 5000 ->
+        ct:fail("Will message not received")
+    end,
+
+    %% Clean up
+    ok = emqtt:disconnect(SubClient).
 
 %%--------------------------------------------------------------------
 %% Helper functions

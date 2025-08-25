@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_dashboard_proto_v1).
@@ -21,7 +9,8 @@
 -export([
     introduced_in/0,
     do_sample/2,
-    current_rate/1
+    current_rate/1,
+    deprecated_since/0
 ]).
 
 -include("emqx_dashboard.hrl").
@@ -29,6 +18,9 @@
 
 introduced_in() ->
     "5.0.0".
+
+deprecated_since() ->
+    "5.8.4".
 
 -spec do_sample(node(), Latest :: pos_integer() | infinity) -> list(map()) | emqx_rpc:badrpc().
 do_sample(Node, Latest) ->

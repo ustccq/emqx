@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_mqttsn_channel).
@@ -36,6 +24,7 @@
 -export([
     init/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_out/3,
     handle_deliver/2,
     handle_timeout/3,
@@ -123,6 +112,8 @@
 %% 2h
 -define(DEFAULT_SESSION_EXPIRY, 7200000).
 
+-define(RAND_CLIENTID_BYTES, 16).
+
 %%--------------------------------------------------------------------
 %% Init the channel
 %%--------------------------------------------------------------------
@@ -130,7 +121,7 @@
 %% @doc Init protocol
 init(
     ConnInfo = #{
-        peername := {PeerHost, _},
+        peername := {PeerHost, _} = PeerName,
         sockname := {_, SockPort}
     },
     Option
@@ -152,6 +143,7 @@ init(
             listener => ListenerId,
             protocol => 'mqtt-sn',
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             clientid => undefined,
             username => undefined,
@@ -306,7 +298,7 @@ maybe_assign_clientid(_Packet, ClientInfo = #{clientid := ClientId}) when
     ClientId == undefined;
     ClientId == <<>>
 ->
-    {ok, ClientInfo#{clientid => emqx_guid:to_base62(emqx_guid:gen())}};
+    {ok, ClientInfo#{clientid => emqx_utils:rand_id(?RAND_CLIENTID_BYTES)}};
 maybe_assign_clientid(_Packet, ClientInfo) ->
     {ok, ClientInfo}.
 
@@ -393,7 +385,7 @@ process_connect(
             ClientInfo,
             ConnInfo,
             SessFun,
-            _SessMod = emqx_mqttsn_session
+            emqx_mqttsn_session
         )
     of
         {ok, #{
@@ -430,14 +422,14 @@ ensure_keepalive(Channel = #channel{conninfo = ConnInfo}) ->
 ensure_keepalive_timer(0, Channel) ->
     Channel;
 ensure_keepalive_timer(Interval, Channel) ->
-    Keepalive = emqx_keepalive:init(round(timer:seconds(Interval))),
+    Keepalive = emqx_keepalive:init(Interval),
     ensure_timer(keepalive, Channel#channel{keepalive = Keepalive}).
 
 %%--------------------------------------------------------------------
 %% Handle incoming packet
 %%--------------------------------------------------------------------
 
--spec handle_in(emqx_types:packet() | {frame_error, any()}, channel()) ->
+-spec handle_in(mqtt_sn_message(), channel()) ->
     {ok, channel()}
     | {ok, replies(), channel()}
     | {shutdown, Reason :: term(), channel()}
@@ -502,13 +494,13 @@ handle_in(
                     ok
             end,
             shutdown(normal, Channel);
-        {error, Rc} ->
+        {error, RC} ->
             ?tp(info, ignore_negative_qos, #{
                 topic_id => TopicId,
                 msg_id => MsgId,
-                return_code => Rc
+                return_code => RC
             }),
-            PubAck = ?SN_PUBACK_MSG(TopicId, MsgId, Rc),
+            PubAck = ?SN_PUBACK_MSG(TopicId, MsgId, RC),
             shutdown(normal, PubAck, Channel)
     end;
 handle_in(
@@ -772,6 +764,8 @@ handle_in(
                         Publishes,
                         Channel#channel{session = NSession}
                     );
+                {error, ?RC_PROTOCOL_ERROR} ->
+                    handle_out(disconnect, ?RC_PROTOCOL_ERROR, Channel);
                 {error, ?RC_PACKET_IDENTIFIER_IN_USE} ->
                     ?SLOG(warning, #{
                         msg => "commit_puback_failed",
@@ -1014,15 +1008,9 @@ handle_in(
 ) ->
     AckPkt = ?SN_WILLMSGRESP_MSG(?SN_RC_ACCEPTED),
     NWillMsg = update_will_msg(WillMsg, Payload),
-    {ok, {outgoing, AckPkt}, Channel#channel{will_msg = NWillMsg}};
-handle_in(
-    {frame_error, Reason},
-    Channel = #channel{conn_state = _ConnState}
-) ->
-    ?SLOG(error, #{
-        msg => "unexpected_frame_error",
-        reason => Reason
-    }),
+    {ok, {outgoing, AckPkt}, Channel#channel{will_msg = NWillMsg}}.
+
+handle_frame_error(Reason, Channel) ->
     shutdown(Reason, Channel).
 
 after_message_acked(ClientInfo, Msg, #channel{ctx = Ctx}) ->
@@ -1184,7 +1172,7 @@ do_publish(
                 Channel
             );
         {error, ?RC_RECEIVE_MAXIMUM_EXCEEDED} ->
-            ok = metrics_inc(Ctx, 'packets.publish.dropped'),
+            ok = metrics_inc(Ctx, 'messages.dropped.receive_maximum'),
             handle_out(puback, {TopicId, MsgId, ?SN_RC_CONGESTION}, Channel)
     end.
 
@@ -1542,8 +1530,8 @@ handle_out(publish, Publishes, Channel) ->
     ),
     {Replies2, NChannel2} = goto_asleep_if_buffered_msgs_sent(NChannel),
     {ok, Replies1 ++ Replies2, NChannel2};
-handle_out(puback, {TopicId, MsgId, Rc}, Channel) ->
-    {ok, {outgoing, ?SN_PUBACK_MSG(TopicId, MsgId, Rc)}, Channel};
+handle_out(puback, {TopicId, MsgId, RC}, Channel) ->
+    {ok, {outgoing, ?SN_PUBACK_MSG(TopicId, MsgId, RC)}, Channel};
 handle_out(pubrec, MsgId, Channel) ->
     {ok, {outgoing, ?SN_PUBREC_MSG(?SN_PUBREC, MsgId)}, Channel};
 handle_out(pubrel, MsgId, Channel) ->
@@ -2244,8 +2232,8 @@ reset_timer(Name, Time, Channel) ->
 clean_timer(Name, Channel = #channel{timers = Timers}) ->
     Channel#channel{timers = maps:remove(Name, Timers)}.
 
-interval(keepalive, #channel{keepalive = KeepAlive}) ->
-    emqx_keepalive:info(interval, KeepAlive);
+interval(keepalive, #channel{keepalive = Keepalive}) ->
+    emqx_keepalive:info(check_interval, Keepalive);
 interval(retry_delivery, #channel{session = Session}) ->
     emqx_mqttsn_session:info(retry_interval, Session);
 interval(expire_awaiting_rel, #channel{session = Session}) ->

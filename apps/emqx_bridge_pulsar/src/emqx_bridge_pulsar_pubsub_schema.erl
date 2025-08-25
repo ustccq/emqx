@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_pulsar_pubsub_schema).
 
@@ -46,6 +46,10 @@ fields(action_parameters) ->
         {sync_timeout,
             ?HOCON(emqx_schema:timeout_duration_ms(), #{
                 default => <<"3s">>, desc => ?DESC("producer_sync_timeout")
+            })},
+        {max_inflight,
+            ?HOCON(pos_integer(), #{
+                default => 10, desc => ?DESC("producer_max_inflight")
             })}
     ] ++ emqx_bridge_pulsar:fields(producer_opts);
 fields(producer_pulsar_message) ->
@@ -66,14 +70,24 @@ fields(action_resource_opts) ->
         batch_size,
         batch_time,
         worker_pool_size,
-        request_ttl,
         inflight_window,
-        max_buffer_bytes,
-        query_mode
+        max_buffer_bytes
     ],
-    lists:filter(
+    Fields = lists:filter(
         fun({K, _V}) -> not lists:member(K, UnsupportedOpts) end,
         emqx_bridge_v2_schema:action_resource_opts_fields()
+    ),
+    Overrides = #{request_ttl => #{deprecated => {since, "5.8.1"}}},
+    lists:map(
+        fun({K, Sc}) ->
+            case maps:find(K, Overrides) of
+                {ok, Override} ->
+                    {K, hocon_schema:override(Sc, Override)};
+                error ->
+                    {K, Sc}
+            end
+        end,
+        Fields
     );
 fields(Field) when
     Field == "get_bridge_v2";

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_v2_tests).
 
@@ -75,10 +63,27 @@ connector_resource_opts_test() ->
         start_timeout
     ],
     ConnectorSchemasRefs =
-        lists:map(
-            fun({Type, #{type := ?MAP(_, ?R_REF(SchemaMod, FieldName))}}) ->
-                {Type, find_resource_opts_fields(SchemaMod, FieldName)}
+        lists:foldl(
+            fun
+                ({Type, #{type := ?MAP(_, ?R_REF(SchemaMod, FieldName))}}, Acc) ->
+                    [{Type, find_resource_opts_fields(SchemaMod, FieldName)} | Acc];
+                ({Type, #{type := ?MAP(_, ?UNION(UnionType))}}, Acc) ->
+                    Types =
+                        case UnionType of
+                            List when is_list(List) ->
+                                List;
+                            Func when is_function(Func, 1) ->
+                                Func(all_union_members)
+                        end,
+                    lists:foldl(
+                        fun(?R_REF(SchemaMod, FieldName), InAcc) ->
+                            [{Type, find_resource_opts_fields(SchemaMod, FieldName)} | InAcc]
+                        end,
+                        Acc,
+                        Types
+                    )
             end,
+            [],
             emqx_connector_schema:fields(connectors)
         ),
     ConnectorsMissingRO = [Type || {Type, undefined} <- ConnectorSchemasRefs],

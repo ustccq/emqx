@@ -1,28 +1,16 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_rule_engine_api_SUITE).
 
 -compile(nowarn_export_all).
 -compile(export_all).
+-compile(nowarn_update_literal).
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(CONF_DEFAULT, <<"rule_engine {rules {}}">>).
 -define(SIMPLE_RULE(NAME_SUFFIX), #{
     <<"description">> => <<"A simple rule">>,
     <<"enable">> => true,
@@ -36,13 +24,19 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    application:load(emqx_conf),
-    ok = emqx_common_test_helpers:load_config(emqx_rule_engine_schema, ?CONF_DEFAULT),
-    ok = emqx_common_test_helpers:start_apps([emqx_conf, emqx_rule_engine]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx,
+            emqx_conf,
+            emqx_rule_engine
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    [{apps, Apps} | Config].
 
-end_per_suite(_Config) ->
-    emqx_common_test_helpers:stop_apps([emqx_conf, emqx_rule_engine]),
+end_per_suite(Config) ->
+    Apps = ?config(apps, Config),
+    emqx_cth_suite:stop(Apps),
     ok.
 
 init_per_testcase(t_crud_rule_api, Config) ->
@@ -163,7 +157,7 @@ t_crud_rule_api(_Config) ->
         ),
     ?assertMatch(
         #{<<"select_and_transform_error">> := <<"decode_json_failed">>},
-        emqx_utils_json:decode(SelectAndTransformJsonError, [return_maps])
+        emqx_utils_json:decode(SelectAndTransformJsonError)
     ),
     {400, #{
         code := 'BAD_REQUEST',
@@ -177,7 +171,7 @@ t_crud_rule_api(_Config) ->
         ),
     ?assertMatch(
         #{<<"select_and_transform_error">> := <<"badarg">>},
-        emqx_utils_json:decode(SelectAndTransformBadArgError, [return_maps])
+        emqx_utils_json:decode(SelectAndTransformBadArgError)
     ),
     {400, #{
         code := 'BAD_REQUEST',

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_topics_SUITE).
 
@@ -24,21 +12,21 @@
 all() ->
     emqx_common_test_helpers:all(?MODULE).
 
-init_per_suite(Config) ->
-    Apps = emqx_cth_suite:start(
-        [
-            {emqx, "durable_sessions.enable = true"},
-            emqx_management,
-            emqx_mgmt_api_test_util:emqx_dashboard()
-        ],
-        #{work_dir => emqx_cth_suite:work_dir(Config)}
+init_per_suite(Config0) ->
+    DurableSessionsOpts = #{<<"enable">> => true},
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    ExtraApps = [emqx_management, emqx_mgmt_api_test_util:emqx_dashboard()],
+    Config = emqx_common_test_helpers:start_apps_ds(
+        Config0,
+        ExtraApps,
+        Opts
     ),
     Peer = emqx_common_test_helpers:start_peer(node1, []),
-    [{apps, Apps}, {peer, Peer} | Config].
+    [{peer, Peer} | Config].
 
 end_per_suite(Config) ->
     _ = emqx_common_test_helpers:stop_peer(?config(peer, Config)),
-    ok = emqx_cth_suite:stop(?config(apps, Config)).
+    emqx_common_test_helpers:stop_apps_ds(Config).
 
 t_nodes_api(Config) ->
     Node = atom_to_binary(node(), utf8),
@@ -225,7 +213,7 @@ t_shared_topics_invalid(_Config) ->
     ),
     ?assertMatch(
         #{<<"code">> := <<"INVALID_PARAMTER">>, <<"message">> := <<"topic_filter_invalid">>},
-        emqx_utils_json:decode(Body, [return_maps])
+        emqx_utils_json:decode(Body)
     ).
 
 t_persistent_topics(_Config) ->
@@ -240,7 +228,7 @@ t_persistent_topics(_Config) ->
     ClientPersistent1 = client(SessionId1, PersistentOpts),
     ClientPersistent2 = client(SessionId2, PersistentOpts),
     _ = [
-        ?assertMatch({ok, _, _}, emqtt:subscribe(Client, Topic))
+        ?assertMatch({ok, _, [1]}, emqtt:subscribe(Client, Topic, qos1))
      || {Client, Topics} <- [
             {Client1, [<<"t/client/mem">>, <<"t/+">>]},
             {Client2, [<<"t/client/mem">>, <<"t/+">>]},
@@ -322,7 +310,7 @@ request_json(Method, Path, QS) ->
     decode_response(request_api(Method, Path, QS)).
 
 decode_response({ok, Response}) ->
-    emqx_utils_json:decode(Response, [return_maps]);
+    emqx_utils_json:decode(Response);
 decode_response({error, Reason}) ->
     error({request_api_error, Reason}).
 

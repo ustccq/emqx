@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_coap_SUITE).
@@ -100,7 +88,7 @@ init_per_testcase(t_heartbeat, Config) ->
     OldConf = emqx:get_raw_config([gateway, coap]),
     {ok, _} = emqx_gateway_conf:update_gateway(
         coap,
-        OldConf#{<<"heartbeat">> => <<"800ms">>}
+        OldConf#{<<"heartbeat">> => <<"1s">>}
     ),
     [
         {old_conf, OldConf},
@@ -132,11 +120,18 @@ mqtt_prefix() ->
 ps_prefix() ->
     ?PS_PREFIX.
 
-restart_coap_with_connection_mode(Bool) ->
+update_coap_with_connection_mode(Bool) ->
     Conf = emqx:get_raw_config([gateway, coap]),
     emqx_gateway_conf:update_gateway(
         coap,
         Conf#{<<"connection_required">> => atom_to_binary(Bool)}
+    ).
+
+update_coap_with_mountpoint(Mp) ->
+    Conf = emqx:get_raw_config([gateway, coap]),
+    emqx_gateway_conf:update_gateway(
+        coap,
+        Conf#{<<"mountpoint">> => Mp}
     ).
 
 %%--------------------------------------------------------------------
@@ -145,6 +140,8 @@ restart_coap_with_connection_mode(Bool) ->
 
 t_connection(_) ->
     Action = fun(Channel) ->
+        emqx_gateway_test_utils:meck_emqx_hook_calls(),
+
         %% connection
         Token = connection(Channel),
 
@@ -152,6 +149,11 @@ t_connection(_) ->
         ?assertNotEqual(
             [],
             emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
+        ),
+
+        ?assertMatch(
+            ['client.connect' | _],
+            emqx_gateway_test_utils:collect_emqx_hooks_calls()
         ),
 
         %% heartbeat
@@ -165,7 +167,8 @@ t_connection(_) ->
             emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
         )
     end,
-    do(Action).
+    do(Action),
+    ok.
 
 t_connection_with_short_param_name(_) ->
     Action = fun(Channel) ->
@@ -216,8 +219,9 @@ t_heartbeat(Config) ->
             [],
             emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
         ),
-
-        timer:sleep(Heartbeat * 2),
+        %% The minimum timeout time is 1 second.
+        %% 1.5 * Heartbeat + 0.5 * Heartbeat(< 1s) = 1.5 * 1 + 1 = 2.5
+        timer:sleep(Heartbeat * 2 + 1000),
         ?assertEqual(
             [],
             emqx_gateway_cm_registry:lookup_channels(coap, <<"client1">>)
@@ -306,6 +310,15 @@ t_connection_with_expire(_) ->
         5000
     ).
 
+t_update_not_restart_listener(_) ->
+    update_coap_with_mountpoint(<<"mp/">>),
+    with_connection(fun(_Channel, Token) ->
+        ?assertMatch({ok, changed, _}, send_heartbeat(Token)),
+        update_coap_with_mountpoint(<<>>),
+        ?assertMatch({ok, changed, _}, send_heartbeat(Token)),
+        true
+    end).
+
 t_publish(_) ->
     %% can publish to a normal topic
     Topics = [
@@ -329,7 +342,8 @@ t_publish(_) ->
                 ?assertEqual(Payload, Msg#message.payload)
         after 500 ->
             ?assert(false)
-        end
+        end,
+        true
     end,
     with_connection(Topics, Action).
 
@@ -359,7 +373,9 @@ t_publish_with_retain_qos_expiry(_) ->
                 ?assertEqual(Payload, Msg#message.payload)
         after 500 ->
             ?assert(false)
-        end
+        end,
+
+        true
     end,
     with_connection(Topics, Action),
 
@@ -391,7 +407,8 @@ t_subscribe(_) ->
 
         #coap_content{payload = PayloadRecv} = Notify,
 
-        ?assertEqual(Payload, PayloadRecv)
+        ?assertEqual(Payload, PayloadRecv),
+        true
     end,
 
     with_connection(Topics, Fun),
@@ -430,7 +447,8 @@ t_subscribe_with_qos_opt(_) ->
 
         #coap_content{payload = PayloadRecv} = Notify,
 
-        ?assertEqual(Payload, PayloadRecv)
+        ?assertEqual(Payload, PayloadRecv),
+        true
     end,
 
     with_connection(Topics, Fun),
@@ -467,7 +485,8 @@ t_un_subscribe(_) ->
         {ok, nocontent, _} = do_request(Channel, URI, UnReq),
         ?LOGT("un observer topic:~ts~n", [Topic]),
         timer:sleep(100),
-        ?assertEqual([], emqx:subscribers(Topic))
+        ?assertEqual([], emqx:subscribers(Topic)),
+        true
     end,
 
     with_connection(Topics, Fun).
@@ -496,7 +515,8 @@ t_observe_wildcard(_) ->
 
         #coap_content{payload = PayloadRecv} = Notify,
 
-        ?assertEqual(Payload, PayloadRecv)
+        ?assertEqual(Payload, PayloadRecv),
+        true
     end,
 
     with_connection(Fun).
@@ -525,11 +545,14 @@ t_clients_api(_) ->
             request(get, "/gateways/coap/clients/client1"),
         %% assert
         Client1 = Client2 = Client3 = Client4,
+        %% assert keepalive
+        ?assertEqual(15, maps:get(keepalive, Client4)),
         %% kickout
         {204, _} =
             request(delete, "/gateways/coap/clients/client1"),
         timer:sleep(200),
-        {200, #{data := []}} = request(get, "/gateways/coap/clients")
+        {200, #{data := []}} = request(get, "/gateways/coap/clients"),
+        false
     end,
     with_connection(Fun).
 
@@ -559,7 +582,8 @@ t_clients_subscription_api(_) ->
 
         {204, _} = request(delete, Path ++ "/tx"),
 
-        {200, []} = request(get, Path)
+        {200, []} = request(get, Path),
+        true
     end,
     with_connection(Fun).
 
@@ -577,7 +601,8 @@ t_clients_get_subscription_api(_) ->
 
         observe(Channel, Token, false),
 
-        {200, []} = request(get, Path)
+        {200, []} = request(get, Path),
+        true
     end,
     with_connection(Fun).
 
@@ -611,7 +636,7 @@ t_on_offline_event(_) ->
     do(Fun).
 
 t_connectionless_pubsub(_) ->
-    restart_coap_with_connection_mode(false),
+    update_coap_with_connection_mode(false),
     Fun = fun(Channel) ->
         Topic = <<"t/a">>,
         Payload = <<"123">>,
@@ -637,7 +662,7 @@ t_connectionless_pubsub(_) ->
         ?assertEqual(Payload, PayloadRecv)
     end,
     do(Fun),
-    restart_coap_with_connection_mode(true).
+    update_coap_with_connection_mode(true).
 
 %%--------------------------------------------------------------------
 %% helpers
@@ -772,8 +797,7 @@ with_connection(Action) ->
     Fun = fun(Channel) ->
         Token = connection(Channel),
         timer:sleep(100),
-        Action(Channel, Token),
-        disconnection(Channel, Token),
+        _ = Action(Channel, Token) andalso disconnection(Channel, Token),
         timer:sleep(100)
     end,
     do(Fun).

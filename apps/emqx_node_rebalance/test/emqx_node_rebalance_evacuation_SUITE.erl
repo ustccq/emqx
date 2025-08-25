@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_node_rebalance_evacuation_SUITE).
@@ -204,7 +204,7 @@ t_conn_evicted(Config) ->
     ),
 
     receive
-        {'EXIT', C, {disconnected, 156, _}} -> ok
+        {'EXIT', C, {shutdown, {disconnected, 156, _}}} -> ok
     after 1000 ->
         ct:fail("Connection not evicted")
     end.
@@ -245,7 +245,7 @@ t_session_evicted(Config) ->
     ),
 
     receive
-        {'EXIT', C, {disconnected, ?RC_USE_ANOTHER_SERVER, _}} -> ok
+        {'EXIT', C, {shutdown, {disconnected, ?RC_USE_ANOTHER_SERVER, _}}} -> ok
     after 1000 ->
         ct:fail("Connection not evicted")
     end,

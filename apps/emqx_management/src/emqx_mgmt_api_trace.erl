@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_trace).
 
@@ -22,7 +10,7 @@
 -include_lib("emqx/include/logger.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
 -include_lib("hocon/include/hoconsc.hrl").
--include_lib("emqx_utils/include/emqx_utils_api.hrl").
+-include_lib("emqx_utils/include/emqx_http_api.hrl").
 
 -export([
     api_spec/0,
@@ -88,7 +76,8 @@ schema("/trace") ->
                 200 => hoconsc:ref(trace),
                 400 => emqx_dashboard_swagger:error_codes(
                     [
-                        'INVALID_PARAMS'
+                        'INVALID_PARAMS',
+                        ?EXCEED_LIMIT
                     ],
                     <<"invalid trace params">>
                 ),
@@ -288,6 +277,21 @@ fields(trace) ->
                     "",
                 default => text
             })},
+        {payload_limit,
+            hoconsc:mk(
+                integer(),
+                #{
+                    desc =>
+                        ""
+                        "Determine the maximum bytes of the payload will be printed in the trace file.<br/>\n"
+                        "The truncated part will be displayed as '...' in the trace file.<br/>\n"
+                        "It's only effective when `payload_encode` is `hex` or `text`<br/>\n"
+                        "`0`: No limit<br/>\n"
+                        "Default is 1024 bytes<br/>\n"
+                        "",
+                    default => 1024
+                }
+            )},
         {start_at,
             hoconsc:mk(
                 emqx_utils_calendar:epoch_second(),
@@ -404,43 +408,29 @@ trace(get, _Params) ->
         List0 ->
             List = lists:sort(
                 fun(#{start_at := A}, #{start_at := B}) -> A > B end,
-                emqx_trace:format(List0)
+                List0
             ),
+            Now = erlang:system_time(second),
             Nodes = emqx:running_nodes(),
             TraceSize = wrap_rpc(emqx_mgmt_trace_proto_v2:get_trace_size(Nodes)),
             AllFileSize = lists:foldl(fun(F, Acc) -> maps:merge(Acc, F) end, #{}, TraceSize),
-            Now = erlang:system_time(second),
             Traces =
                 lists:map(
-                    fun(
-                        Trace = #{
-                            name := Name,
-                            start_at := Start,
-                            end_at := End,
-                            enable := Enable,
-                            type := Type,
-                            filter := Filter
-                        }
-                    ) ->
+                    fun(TraceIn = #{name := Name, start_at := Start}) ->
+                        Trace = format_trace(TraceIn, Now, Nodes),
                         FileName = emqx_trace:filename(Name, Start),
                         LogSize = collect_file_size(Nodes, FileName, AllFileSize),
-                        Trace0 = maps:without([enable, filter], Trace),
-                        Trace0#{
-                            log_size => LogSize,
-                            Type => iolist_to_binary(Filter),
-                            start_at => emqx_utils_calendar:epoch_to_rfc3339(Start, second),
-                            end_at => emqx_utils_calendar:epoch_to_rfc3339(End, second),
-                            status => status(Enable, Start, End, Now)
-                        }
+                        Trace#{log_size => LogSize}
                     end,
                     List
                 ),
             {200, Traces}
     end;
-trace(post, #{body := Param}) ->
-    case emqx_trace:create(Param) of
-        {ok, Trace0} ->
-            {200, format_trace(Trace0)};
+trace(post, #{body := Params} = Req) ->
+    Namespace = emqx_dashboard:get_namespace(Req),
+    case emqx_trace:create(mk_trace(Params, Namespace)) of
+        {ok, Created} ->
+            {200, format_trace(Created)};
         {error, {already_existed, Name}} ->
             {409, #{
                 code => 'ALREADY_EXISTS',
@@ -456,6 +446,20 @@ trace(post, #{body := Param}) ->
                 code => 'BAD_TYPE',
                 message => <<"Rolling upgrade in progress, create failed">>
             }};
+        {error, {max_limit_reached, Limit}} ->
+            {400, #{
+                code => ?EXCEED_LIMIT,
+                message =>
+                    case Limit of
+                        0 ->
+                            <<"Creating traces is disallowed">>;
+                        _ ->
+                            <<
+                                "Number of existing traces has reached the allowed "
+                                "maximum, please delete outdated traces first"
+                            >>
+                    end
+            }};
         {error, Reason} ->
             {400, #{
                 code => 'INVALID_PARAMS',
@@ -466,29 +470,42 @@ trace(delete, _Param) ->
     ok = emqx_trace:clear(),
     {204}.
 
-format_trace(Trace0) ->
-    [
-        #{
-            start_at := Start,
-            end_at := End,
-            enable := Enable,
-            type := Type,
-            filter := Filter
-        } = Trace1
-    ] = emqx_trace:format([Trace0]),
-    Now = erlang:system_time(second),
+mk_trace(Params, Namespace) ->
+    Trace0 = #{type := Type} = emqx_utils_maps:safe_atom_key_map(Params),
+    Trace1 = maps:without([type, Type], Trace0),
+    Trace1#{
+        filter => {Type, maps:get(Type, Trace0)},
+        namespace => Namespace
+    }.
+
+format_trace(Trace) ->
+    format_trace(Trace, erlang:system_time(second), emqx:running_nodes()).
+
+format_trace(
+    Trace = #{
+        enable := Enable,
+        name := Name,
+        start_at := Start,
+        end_at := End,
+        filter := {Type, Filter}
+    },
+    Now,
+    Nodes
+) ->
     LogSize = lists:foldl(
         fun(Node, Acc) -> Acc#{Node => 0} end,
         #{},
-        emqx:running_nodes()
+        Nodes
     ),
-    Trace2 = maps:without([enable, filter], Trace1),
-    Trace2#{
-        log_size => LogSize,
+    TraceOut = maps:with([name, payload_encode, payload_limit, formatter], Trace),
+    TraceOut#{
+        name => Name,
+        type => Type,
         Type => iolist_to_binary(Filter),
         start_at => emqx_utils_calendar:epoch_to_rfc3339(Start, second),
         end_at => emqx_utils_calendar:epoch_to_rfc3339(Start, second),
-        status => status(Enable, Start, End, Now)
+        status => status(Enable, Start, End, Now),
+        log_size => LogSize
     }.
 
 delete_trace(delete, #{bindings := #{name := Name}}) ->

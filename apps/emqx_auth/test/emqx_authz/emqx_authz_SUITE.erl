@@ -1,16 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%% http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_SUITE).
@@ -304,7 +293,7 @@ t_update_source(_) ->
             #{type := redis, enable := false},
             #{type := file, enable := false}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, _} = emqx_authz:update(?CMD_REPLACE, []).
@@ -347,7 +336,7 @@ t_replace_all(_) ->
             #{type := mongodb, enable := true},
             #{type := http, enable := true}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
     Ids = [http, mongodb, mysql, postgresql, redis, file],
     %% metrics
@@ -366,7 +355,7 @@ t_replace_all(_) ->
         )
     ),
     %% hooks status
-    ?assertMatch([#{type := http, enable := false}], emqx_authz:lookup()),
+    ?assertMatch([#{type := http, enable := false}], emqx_authz:lookup_states()),
     %% metrics
     ?assert(emqx_metrics_worker:has_metrics(authz_metrics, http)),
     lists:foreach(
@@ -407,7 +396,7 @@ t_move_source(_) ->
             #{type := redis},
             #{type := file}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, _} = emqx_authz:move(postgresql, ?CMD_MOVE_FRONT),
@@ -420,7 +409,7 @@ t_move_source(_) ->
             #{type := redis},
             #{type := file}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, _} = emqx_authz:move(http, ?CMD_MOVE_REAR),
@@ -433,7 +422,7 @@ t_move_source(_) ->
             #{type := file},
             #{type := http}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, _} = emqx_authz:move(mysql, ?CMD_MOVE_BEFORE(postgresql)),
@@ -446,7 +435,7 @@ t_move_source(_) ->
             #{type := file},
             #{type := http}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     {ok, _} = emqx_authz:move(mongodb, ?CMD_MOVE_AFTER(http)),
@@ -459,7 +448,7 @@ t_move_source(_) ->
             #{type := http},
             #{type := mongodb}
         ],
-        emqx_authz:lookup()
+        emqx_authz:lookup_states()
     ),
 
     ok.
@@ -673,6 +662,78 @@ t_publish_last_will_testament_banned_client_connecting(_Config) ->
     ok = snabbkaffe:stop(),
 
     ok.
+
+t_sikpped_as_superuser(_Config) ->
+    ClientInfo = #{
+        clientid => <<"clientid">>,
+        username => <<"username">>,
+        peerhost => {127, 0, 0, 1},
+        zone => default,
+        listener => 'tcp:default',
+        is_superuser => true
+    },
+    ?check_trace(
+        begin
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH(?QOS_0), <<"p/t/0">>)
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH(?QOS_1), <<"p/t/1">>)
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(ClientInfo, ?AUTHZ_PUBLISH(?QOS_2), <<"p/t/2">>)
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(ClientInfo, ?AUTHZ_SUBSCRIBE(?QOS_0), <<"s/t/0">>)
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(ClientInfo, ?AUTHZ_SUBSCRIBE(?QOS_1), <<"s/t/1">>)
+            ),
+            ?assertEqual(
+                allow,
+                emqx_access_control:authorize(ClientInfo, ?AUTHZ_SUBSCRIBE(?QOS_2), <<"s/t/2">>)
+            )
+        end,
+        fun(Trace) ->
+            ?assertMatch(
+                [
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_0, action_type := publish}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_1, action_type := publish}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_2, action_type := publish}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_0, action_type := subscribe}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_1, action_type := subscribe}
+                    },
+                    #{
+                        reason := client_is_superuser,
+                        action := #{qos := ?QOS_2, action_type := subscribe}
+                    }
+                ],
+                ?of_kind(authz_skipped, Trace)
+            ),
+            ok
+        end
+    ),
+
+    ok = snabbkaffe:stop().
 
 stop_apps(Apps) ->
     lists:foreach(fun application:stop/1, Apps).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_gcp_device_authn_SUITE).
@@ -162,8 +162,8 @@ test_rsa_key(private) ->
     data_file("private_key.pem").
 
 data_file(Name) ->
-    Dir = code:lib_dir(emqx_auth, test),
-    list_to_binary(filename:join([Dir, "data", Name])).
+    Dir = code:lib_dir(emqx_auth),
+    list_to_binary(filename:join([Dir, "test", "data", Name])).
 
 credential(ClientId, JWT) ->
     #{

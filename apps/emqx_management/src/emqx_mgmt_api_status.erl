@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_status).
 
@@ -103,8 +91,8 @@ get_status(get, Params) ->
     running_status(iolist_to_binary(Format)).
 
 running_status(Format) ->
-    case emqx_dashboard_listener:is_ready(timer:seconds(20)) of
-        true ->
+    case emqx_dashboard:listeners_status() of
+        #{stopped := []} ->
             AppStatus = application_status(),
             Body = do_get_status(AppStatus, Format),
             StatusCode =
@@ -114,7 +102,7 @@ running_status(Format) ->
                 end,
             ContentType =
                 case Format of
-                    <<"json">> -> <<"applicatin/json">>;
+                    <<"json">> -> <<"application/json">>;
                     _ -> <<"text/plain">>
                 end,
             Headers = #{
@@ -122,7 +110,7 @@ running_status(Format) ->
                 <<"retry-after">> => <<"15">>
             },
             {StatusCode, Headers, iolist_to_binary(Body)};
-        false ->
+        _ ->
             {503, #{<<"retry-after">> => <<"15">>}, <<>>}
     end.
 
@@ -130,6 +118,7 @@ do_get_status(AppStatus, <<"json">>) ->
     BrokerStatus = broker_status(),
     emqx_utils_json:encode(#{
         node_name => atom_to_binary(node(), utf8),
+        cluster => atom_to_binary(cluster(), utf8),
         rel_vsn => vsn(),
         broker_status => atom_to_binary(BrokerStatus),
         app_status => atom_to_binary(AppStatus)
@@ -157,3 +146,6 @@ application_status() ->
         false -> not_running;
         {value, _Val} -> running
     end.
+
+cluster() ->
+    emqx_config:get([cluster, name]).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_connector_aggreg_csv_tests).
@@ -66,7 +66,8 @@ fill_close_(CSV0, [Records | LRest]) ->
     {Writes, CSV} = emqx_connector_aggreg_csv:fill(Records, CSV0),
     [Writes | fill_close_(CSV, LRest)];
 fill_close_(CSV, []) ->
-    [emqx_connector_aggreg_csv:close(CSV)].
+    Trailer = emqx_connector_aggreg_csv:close(CSV),
+    [Trailer].
 
 string(Writes) ->
     unicode:characters_to_list(Writes).

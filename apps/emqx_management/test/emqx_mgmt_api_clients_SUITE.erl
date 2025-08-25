@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_clients_SUITE).
 -compile(export_all).
@@ -23,20 +11,40 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("proper/include/proper.hrl").
 -include_lib("snabbkaffe/include/snabbkaffe.hrl").
+-include_lib("emqx/src/emqx_tracepoints.hrl").
 -include_lib("emqx/include/asserts.hrl").
 
+-define(HTTP200, {"HTTP/1.1", 200, "OK"}).
+-define(HTTP201, {"HTTP/1.1", 201, "Created"}).
+-define(HTTP204, {"HTTP/1.1", 204, "No Content"}).
+-define(HTTP400, {"HTTP/1.1", 400, "Bad Request"}).
+-define(HTTP404, {"HTTP/1.1", 404, "Not Found"}).
+
+-define(assertContainsClientids(RES, EXPECTED), assert_contains_clientids(RES, EXPECTED, ?LINE)).
+
+-define(CLIENTID(SUFFIX), <<(atom_to_binary(?FUNCTION_NAME))/binary, "_", SUFFIX/binary>>).
+
 all() ->
-    AllTCs = emqx_common_test_helpers:all(?MODULE),
     [
-        {group, persistent_sessions},
-        {group, msgs_base64_encoding},
-        {group, msgs_plain_encoding}
-        | AllTCs -- (persistent_session_testcases() ++ client_msgs_testcases())
+        {group, general},
+        {group, persistence_enabled},
+        {group, persistence_disabled_cluster}
     ].
 
 groups() ->
+    AllTCs = emqx_common_test_helpers:all(?MODULE),
+    GeneralTCs =
+        AllTCs --
+            (persistent_session_testcases() ++
+                persistence_disabled_cluster_testcases() ++ client_msgs_testcases()),
     [
-        {persistent_sessions, persistent_session_testcases()},
+        {general, [
+            {group, msgs_base64_encoding},
+            {group, msgs_plain_encoding}
+            | GeneralTCs
+        ]},
+        {persistence_enabled, persistent_session_testcases()},
+        {persistence_disabled_cluster, persistence_disabled_cluster_testcases()},
         {msgs_base64_encoding, client_msgs_testcases()},
         {msgs_plain_encoding, client_msgs_testcases()}
     ].
@@ -48,9 +56,16 @@ persistent_session_testcases() ->
         t_persistent_sessions3,
         t_persistent_sessions4,
         t_persistent_sessions5,
-        t_persistent_sessions6,
         t_persistent_sessions_subscriptions1,
-        t_list_clients_v2
+        t_list_clients_v2,
+        t_list_clients_v2_limit,
+        t_list_clients_v2_exact_filters,
+        t_list_clients_v2_regular_filters,
+        t_list_clients_v2_bad_query_string_parameters
+    ].
+persistence_disabled_cluster_testcases() ->
+    [
+        t_bulk_subscribe
     ].
 client_msgs_testcases() ->
     [
@@ -59,43 +74,65 @@ client_msgs_testcases() ->
     ].
 
 init_per_suite(Config) ->
-    ok = snabbkaffe:start_trace(),
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_group(general, Config) ->
     Apps = emqx_cth_suite:start(
         [
-            emqx,
-            emqx_conf,
+            {emqx_conf, "listeners.quic.test { enable = true, bind = 1883, mountpoint = \"a\"}"},
             emqx_management,
             emqx_mgmt_api_test_util:emqx_dashboard()
         ],
         #{work_dir => emqx_cth_suite:work_dir(Config)}
     ),
-    {ok, _} = emqx_common_test_http:create_default_app(),
-    [{apps, Apps} | Config].
-
-end_per_suite(Config) ->
-    Apps = ?config(apps, Config),
-    emqx_cth_suite:stop(Apps),
-    ok.
-
-init_per_group(persistent_sessions, Config) ->
+    [
+        {apps, Apps},
+        {api_auth_header, emqx_mgmt_api_test_util:auth_header_()}
+        | Config
+    ];
+init_per_group(persistence_enabled, Config0) ->
+    DurableSessionsOpts = #{
+        <<"enable">> => true,
+        <<"disconnected_session_count_refresh_interval">> => <<"100ms">>,
+        <<"checkpoint_interval">> => 0
+    },
+    Opts = #{durable_sessions_opts => DurableSessionsOpts},
+    AppSpecs = [emqx_management],
+    Dashboard = emqx_mgmt_api_test_util:emqx_dashboard(),
+    ClusterSpecs = [
+        {emqx_mgmt_api_clients_SUITE1, #{apps => AppSpecs ++ [Dashboard]}},
+        {emqx_mgmt_api_clients_SUITE2, #{apps => AppSpecs}}
+    ],
+    Config = emqx_common_test_helpers:start_cluster_ds(Config0, ClusterSpecs, Opts),
+    [N1 | _] = ?config(cluster_nodes, Config),
+    [
+        {api_auth_header, erpc:call(N1, emqx_mgmt_api_test_util, auth_header_, [])}
+        | Config
+    ];
+init_per_group(persistence_disabled_cluster, Config) ->
     AppSpecs = [
-        {emqx,
-            "durable_sessions.enable = true\n"
-            "durable_sessions.disconnected_session_count_refresh_interval = 100ms"},
+        emqx,
+        emqx_conf,
         emqx_management
     ],
-    Dashboard = emqx_mgmt_api_test_util:emqx_dashboard(
-        "dashboard.listeners.http { enable = true, bind = 18084 }"
-    ),
+    Dashboard = emqx_mgmt_api_test_util:emqx_dashboard(),
     Cluster = [
-        {emqx_mgmt_api_clients_SUITE1, #{role => core, apps => AppSpecs ++ [Dashboard]}},
-        {emqx_mgmt_api_clients_SUITE2, #{role => core, apps => AppSpecs}}
+        {mgmt_api_clients_SUITE1, #{apps => AppSpecs ++ [Dashboard]}},
+        {mgmt_api_clients_SUITE2, #{apps => AppSpecs}}
     ],
-    Nodes = emqx_cth_cluster:start(
-        Cluster,
-        #{work_dir => emqx_cth_suite:work_dir(Config)}
-    ),
-    [{nodes, Nodes} | Config];
+    Nodes =
+        [N1 | _] = emqx_cth_cluster:start(
+            Cluster,
+            #{work_dir => emqx_cth_suite:work_dir(Config)}
+        ),
+    [
+        {nodes, Nodes},
+        {api_auth_header, erpc:call(N1, emqx_mgmt_api_test_util, auth_header_, [])}
+        | Config
+    ];
 init_per_group(msgs_base64_encoding, Config) ->
     [{payload_encoding, base64} | Config];
 init_per_group(msgs_plain_encoding, Config) ->
@@ -103,14 +140,33 @@ init_per_group(msgs_plain_encoding, Config) ->
 init_per_group(_Group, Config) ->
     Config.
 
-end_per_group(persistent_sessions, Config) ->
-    Nodes = ?config(nodes, Config),
-    emqx_cth_cluster:stop(Nodes),
+end_per_group(general, Config) ->
+    Apps = ?config(apps, Config),
+    ok = emqx_cth_suite:stop(Apps);
+end_per_group(Group, Config) when
+    Group =:= persistence_enabled
+->
+    emqx_common_test_helpers:stop_cluster_ds(Config),
     ok;
+end_per_group(Group, Config) when
+    Group =:= persistence_disabled_cluster
+->
+    Nodes = ?config(nodes, Config),
+    ok = emqx_cth_cluster:stop(Nodes);
 end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(_TC, Config) ->
+    %% NOTE
+    %% Wait until there are no stale clients data before running the testcase.
+    ?retry(
+        _Timeout = 100,
+        _N = 10,
+        ?assertMatch(
+            {ok, {?HTTP200, _, #{<<"data">> := []}}},
+            list_request(Config)
+        )
+    ),
     ok = snabbkaffe:start_trace(),
     Config.
 
@@ -133,9 +189,7 @@ end_per_testcase(_TC, _Config) ->
     ok = snabbkaffe:stop(),
     ok.
 
-t_clients(_) ->
-    process_flag(trap_exit, true),
-
+t_clients(Config) ->
     Username1 = <<"user1">>,
     ClientId1 = <<"client1">>,
 
@@ -145,8 +199,6 @@ t_clients(_) ->
     Topic = <<"topic_1">>,
     Qos = 0,
 
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-
     {ok, C1} = emqtt:start_link(#{
         username => Username1,
         clientid => ClientId1,
@@ -155,15 +207,14 @@ t_clients(_) ->
     }),
     {ok, _} = emqtt:connect(C1),
     {ok, C2} = emqtt:start_link(#{username => Username2, clientid => ClientId2}),
-    {ok, _} = emqtt:connect(C2),
+    {ok, _} = emqtt:quic_connect(C2),
 
     timer:sleep(300),
 
     %% get /clients
     ClientsPath = emqx_mgmt_api_test_util:api_path(["clients"]),
-    {ok, Clients} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
-    ClientsResponse = emqx_utils_json:decode(Clients, [return_maps]),
-    ClientsMeta = maps:get(<<"meta">>, ClientsResponse),
+    {ok, {?HTTP200, _, Clients}} = request(get, ClientsPath, Config),
+    ClientsMeta = maps:get(<<"meta">>, Clients),
     ClientsPage = maps:get(<<"page">>, ClientsMeta),
     ClientsLimit = maps:get(<<"limit">>, ClientsMeta),
     ClientsCount = maps:get(<<"count">>, ClientsMeta),
@@ -172,142 +223,109 @@ t_clients(_) ->
     ?assertEqual(ClientsCount, 2),
 
     %% get /clients/:clientid
-    Client1Path = emqx_mgmt_api_test_util:api_path(["clients", binary_to_list(ClientId1)]),
-    {ok, Client1} = emqx_mgmt_api_test_util:request_api(get, Client1Path),
-    Client1Response = emqx_utils_json:decode(Client1, [return_maps]),
-    ?assertEqual(Username1, maps:get(<<"username">>, Client1Response)),
-    ?assertEqual(ClientId1, maps:get(<<"clientid">>, Client1Response)),
-    ?assertEqual(120, maps:get(<<"expiry_interval">>, Client1Response)),
+    Client1Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId1]),
+    {ok, {?HTTP200, _, Client1}} = request(get, Client1Path, Config),
+    ?assertEqual(Username1, maps:get(<<"username">>, Client1)),
+    ?assertEqual(ClientId1, maps:get(<<"clientid">>, Client1)),
+    ?assertEqual(120, maps:get(<<"expiry_interval">>, Client1)),
 
     %% delete /clients/:clientid kickout
-    Client2Path = emqx_mgmt_api_test_util:api_path(["clients", binary_to_list(ClientId2)]),
-    {ok, _} = emqx_mgmt_api_test_util:request_api(delete, Client2Path),
-    Kick =
-        receive
-            {'EXIT', C2, _} ->
-                ok
-        after 300 ->
-            timeout
-        end,
-    ?assertEqual(ok, Kick),
+    true = erlang:unlink(C2),
+    MRef = erlang:monitor(process, C2),
+    Client2Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId2]),
+    {ok, {?HTTP204, _, _}} = request(delete, Client2Path, [], Config),
+    ?assertReceive({'DOWN', MRef, process, C2, _}),
     %% Client info is cleared after DOWN event
     ?retry(_Interval = 100, _Attempts = 5, begin
-        AfterKickoutResponse2 = emqx_mgmt_api_test_util:request_api(get, Client2Path),
-        ?assertEqual(AfterKickoutResponse2, {error, {"HTTP/1.1", 404, "Not Found"}})
+        ?assertMatch(
+            {error, {?HTTP404, _, _}},
+            request(get, Client2Path, Config)
+        )
     end),
 
     %% get /clients/:clientid/authorization/cache should have no authz cache
     Client1AuthzCachePath = emqx_mgmt_api_test_util:api_path([
         "clients",
-        binary_to_list(ClientId1),
+        ClientId1,
         "authorization",
         "cache"
     ]),
-    {ok, Client1AuthzCache0} = emqx_mgmt_api_test_util:request_api(get, Client1AuthzCachePath),
-    ?assertEqual("[]", Client1AuthzCache0),
+    ?assertMatch(
+        {ok, {?HTTP200, _, []}},
+        request(get, Client1AuthzCachePath, Config)
+    ),
 
     %% post /clients/:clientid/subscribe
     SubscribeBody = #{topic => Topic, qos => Qos, nl => 1, rh => 1},
-    SubscribePath = emqx_mgmt_api_test_util:api_path([
-        "clients",
-        binary_to_list(ClientId1),
-        "subscribe"
-    ]),
-    {ok, _} = emqx_mgmt_api_test_util:request_api(
-        post,
-        SubscribePath,
-        "",
-        AuthHeader,
-        SubscribeBody
-    ),
+    SubscribePath = emqx_mgmt_api_test_util:api_path(["clients", ClientId1, "subscribe"]),
+    {ok, {?HTTP200, _, _}} = request(post, SubscribePath, SubscribeBody, Config),
     timer:sleep(100),
     {_, [{AfterSubTopic, #{qos := AfterSubQos}}]} = emqx_mgmt:list_client_subscriptions(ClientId1),
     ?assertEqual(AfterSubTopic, Topic),
     ?assertEqual(AfterSubQos, Qos),
 
     %% get /clients/:clientid/subscriptions
-    SubscriptionsPath = emqx_mgmt_api_test_util:api_path([
-        "clients",
-        binary_to_list(ClientId1),
-        "subscriptions"
-    ]),
-    {ok, SubscriptionsRes} = emqx_mgmt_api_test_util:request_api(
-        get,
-        SubscriptionsPath,
-        "",
-        AuthHeader
-    ),
-    [SubscriptionsData] = emqx_utils_json:decode(SubscriptionsRes, [return_maps]),
+    SubscriptionsPath = emqx_mgmt_api_test_util:api_path(["clients", ClientId1, "subscriptions"]),
     ?assertMatch(
-        #{
-            <<"clientid">> := ClientId1,
-            <<"nl">> := 1,
-            <<"rap">> := 0,
-            <<"rh">> := 1,
-            <<"node">> := _,
-            <<"qos">> := Qos,
-            <<"topic">> := Topic
-        },
-        SubscriptionsData
+        {ok,
+            {?HTTP200, _, [
+                #{
+                    <<"clientid">> := ClientId1,
+                    <<"nl">> := 1,
+                    <<"rap">> := 0,
+                    <<"rh">> := 1,
+                    <<"node">> := _,
+                    <<"qos">> := Qos,
+                    <<"topic">> := Topic
+                }
+            ]}},
+        request(get, SubscriptionsPath, Config)
     ),
 
     %% post /clients/:clientid/unsubscribe
-    UnSubscribePath = emqx_mgmt_api_test_util:api_path([
-        "clients",
-        binary_to_list(ClientId1),
-        "unsubscribe"
-    ]),
+    UnSubscribePath = emqx_mgmt_api_test_util:api_path(["clients", ClientId1, "unsubscribe"]),
     UnSubscribeBody = #{topic => Topic},
-    {ok, _} = emqx_mgmt_api_test_util:request_api(
-        post,
-        UnSubscribePath,
-        "",
-        AuthHeader,
-        UnSubscribeBody
+    ?assertMatch(
+        {ok, {?HTTP204, _, _}},
+        request(post, UnSubscribePath, UnSubscribeBody, Config)
     ),
     timer:sleep(100),
     ?assertEqual([], emqx_mgmt:list_client_subscriptions(ClientId1)),
 
     %% testcase cleanup, kickout client1
-    {ok, _} = emqx_mgmt_api_test_util:request_api(delete, Client1Path),
-    timer:sleep(300),
-    AfterKickoutResponse1 = emqx_mgmt_api_test_util:request_api(get, Client1Path),
-    ?assertEqual({error, {"HTTP/1.1", 404, "Not Found"}}, AfterKickoutResponse1).
+    disconnect_and_destroy_session(C1).
 
 t_persistent_sessions1(Config) ->
-    [N1, _N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    [N1, _N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
 
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
+    ?assertMatch({ok, {?HTTP200, _, #{<<"data">> := []}}}, list_request(Config)),
 
     ?check_trace(
         begin
             %% Scenario 1
             %% 1) Client connects and is listed as connected.
             ?tp(notice, "scenario 1", #{}),
-            O = #{api_port => APIPort},
             ClientId = <<"c1">>,
             C1 = connect_client(#{port => Port1, clientid => ClientId}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N1, clientid => ClientId, status => connected}, Config),
             %% 2) Client disconnects and is listed as disconnected.
             ok = emqtt:disconnect(C1),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => disconnected}),
+            assert_single_client(
+                #{node => N1, clientid => ClientId, status => disconnected}, Config
+            ),
             %% 3) Client reconnects and is listed as connected.
             C2 = connect_client(#{port => Port1, clientid => ClientId}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N1, clientid => ClientId, status => connected}, Config),
             %% 4) Client disconnects.
-            ok = emqtt:stop(C2),
             %% 5) Session is GC'ed, client is removed from list.
-            ?tp(notice, "gc", #{}),
-            %% simulate GC
-            ok = erpc:call(N1, emqx_persistent_session_ds, destroy_session, [ClientId]),
+            disconnect_and_destroy_session(C2),
             ?retry(
                 100,
                 20,
                 ?assertMatch(
-                    {ok, {{_, 200, _}, _, #{<<"data">> := []}}},
-                    list_request(APIPort)
+                    {ok, {?HTTP200, _, #{<<"data">> := []}}},
+                    list_request(Config)
                 )
             ),
             ok
@@ -317,67 +335,55 @@ t_persistent_sessions1(Config) ->
     ok.
 
 t_persistent_sessions2(Config) ->
-    [N1, _N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    [N1, _N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
 
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
+    ?assertMatch({ok, {?HTTP200, _, #{<<"data">> := []}}}, list_request(Config)),
 
     ?check_trace(
         begin
             %% Scenario 2
             %% 1) Client connects and is listed as connected.
             ?tp(notice, "scenario 2", #{}),
-            O = #{api_port => APIPort},
             ClientId = <<"c2">>,
             C1 = connect_client(#{port => Port1, clientid => ClientId}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N1, clientid => ClientId, status => connected}, Config),
             unlink(C1),
             %% 2) Client connects to the same node and takes over, listed only once.
             C2 = connect_client(#{port => Port1, clientid => ClientId}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
-            disconnect_and_destroy_session(C2),
-            ?retry(
-                100,
-                20,
-                ?assertMatch(
-                    {ok, {{_, 200, _}, _, #{<<"data">> := []}}},
-                    list_request(APIPort)
-                )
-            )
+            assert_single_client(#{node => N1, clientid => ClientId, status => connected}, Config),
+            disconnect_and_destroy_session(C2)
         end,
         []
     ),
     ok.
 
 t_persistent_sessions3(Config) ->
-    [N1, N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    [N1, N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
     Port2 = get_mqtt_port(N2, tcp),
 
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
+    ?assertMatch({ok, {?HTTP200, _, #{<<"data">> := []}}}, list_request(Config)),
 
     ?check_trace(
         begin
             %% Scenario 3
             %% 1) Client connects and is listed as connected.
             ?tp(notice, "scenario 3", #{}),
-            O = #{api_port => APIPort},
             ClientId = <<"c3">>,
             C1 = connect_client(#{port => Port1, clientid => ClientId}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N1, clientid => ClientId, status => connected}, Config),
             unlink(C1),
             %% 2) Client connects to *another node* and takes over, listed only once.
             C2 = connect_client(#{port => Port2, clientid => ClientId}),
-            assert_single_client(O#{node => N2, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N2, clientid => ClientId, status => connected}, Config),
             %% Doesn't show up in the other node while alive
             ?retry(
                 100,
                 20,
                 ?assertMatch(
-                    {ok, {{_, 200, _}, _, #{<<"data">> := []}}},
-                    list_request(APIPort, "node=" ++ atom_to_list(N1))
+                    {ok, {?HTTP200, _, #{<<"data">> := []}}},
+                    list_request(#{node => N1}, Config)
                 )
             ),
             disconnect_and_destroy_session(C2)
@@ -387,37 +393,39 @@ t_persistent_sessions3(Config) ->
     ok.
 
 t_persistent_sessions4(Config) ->
-    [N1, N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    [N1, N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
     Port2 = get_mqtt_port(N2, tcp),
 
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
+    ?assertMatch({ok, {?HTTP200, _, #{<<"data">> := []}}}, list_request(Config)),
 
     ?check_trace(
         begin
             %% Scenario 4
             %% 1) Client connects and is listed as connected.
             ?tp(notice, "scenario 4", #{}),
-            O = #{api_port => APIPort},
             ClientId = <<"c4">>,
             C1 = connect_client(#{port => Port1, clientid => ClientId}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N1, clientid => ClientId, status => connected}, Config),
             %% 2) Client disconnects and is listed as disconnected.
             ok = emqtt:stop(C1),
             %% While disconnected, shows up in both nodes.
-            assert_single_client(O#{node => N1, clientid => ClientId, status => disconnected}),
-            assert_single_client(O#{node => N2, clientid => ClientId, status => disconnected}),
+            assert_single_client(
+                #{node => N1, clientid => ClientId, status => disconnected}, Config
+            ),
+            assert_single_client(
+                #{node => N2, clientid => ClientId, status => disconnected}, Config
+            ),
             %% 3) Client reconnects to *another node* and is listed as connected once.
             C2 = connect_client(#{port => Port2, clientid => ClientId}),
-            assert_single_client(O#{node => N2, clientid => ClientId, status => connected}),
+            assert_single_client(#{node => N2, clientid => ClientId, status => connected}, Config),
             %% Doesn't show up in the other node while alive
             ?retry(
                 100,
                 20,
                 ?assertMatch(
-                    {ok, {{_, 200, _}, _, #{<<"data">> := []}}},
-                    list_request(APIPort, "node=" ++ atom_to_list(N1))
+                    {ok, {?HTTP200, _, #{<<"data">> := []}}},
+                    list_request(#{node => N1}, Config)
                 )
             ),
             disconnect_and_destroy_session(C2)
@@ -427,12 +435,11 @@ t_persistent_sessions4(Config) ->
     ok.
 
 t_persistent_sessions5(Config) ->
-    [N1, N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    [N1, N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
     Port2 = get_mqtt_port(N2, tcp),
 
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
+    ?assertMatch({ok, {?HTTP200, _, #{<<"data">> := []}}}, list_request(Config)),
 
     ?check_trace(
         begin
@@ -441,6 +448,7 @@ t_persistent_sessions5(Config) ->
             ClientId2 = <<"c6">>,
             ClientId3 = <<"c7">>,
             ClientId4 = <<"c8">>,
+            ClientIds = [ClientId1, ClientId2, ClientId3, ClientId4],
             %% persistent
             C1 = connect_client(#{port => Port1, clientid => ClientId1}),
             C2 = connect_client(#{port => Port2, clientid => ClientId2}),
@@ -452,26 +460,24 @@ t_persistent_sessions5(Config) ->
                 port => Port2, clientid => ClientId4, expiry => 0, clean_start => true
             }),
 
-            P1 = list_request(APIPort, "limit=3&page=1"),
-            P2 = list_request(APIPort, "limit=3&page=2"),
+            P1 = list_request(#{limit => 3, page => 1}, Config),
+            P2 = list_request(#{limit => 3, page => 2}, Config),
             ?assertMatch(
                 {ok,
-                    {{_, 200, _}, _, #{
+                    {?HTTP200, _, #{
                         <<"data">> := [_, _, _],
                         <<"meta">> := #{
-                            <<"count">> := 4,
-                            <<"hasnext">> := true
+                            <<"count">> := 4
                         }
                     }}},
                 P1
             ),
             ?assertMatch(
                 {ok,
-                    {{_, 200, _}, _, #{
+                    {?HTTP200, _, #{
                         <<"data">> := [_],
                         <<"meta">> := #{
-                            <<"count">> := 4,
-                            <<"hasnext">> := false
+                            <<"count">> := 4
                         }
                     }}},
                 P2
@@ -479,133 +485,66 @@ t_persistent_sessions5(Config) ->
             {ok, {_, _, #{<<"data">> := R1}}} = P1,
             {ok, {_, _, #{<<"data">> := R2}}} = P2,
             ?assertEqual(
-                lists:sort([ClientId1, ClientId2, ClientId3, ClientId4]),
+                lists:sort(ClientIds),
                 lists:sort(lists:map(fun(#{<<"clientid">> := CId}) -> CId end, R1 ++ R2))
             ),
             ?assertMatch(
                 {ok,
-                    {{_, 200, _}, _, #{
+                    {?HTTP200, _, #{
                         <<"data">> := [_, _],
                         <<"meta">> := #{
-                            <<"count">> := 4,
-                            <<"hasnext">> := true
+                            <<"count">> := 4
                         }
                     }}},
-                list_request(APIPort, "limit=2&page=1")
+                list_request(#{limit => 2, page => 1}, Config)
             ),
             %% Disconnect persistent sessions
-            lists:foreach(fun emqtt:stop/1, [C1, C2]),
+            lists:foreach(fun stop_and_commit/1, [C1, C2]),
 
+            %% the order of the durable session list is not stable
+            %% so we make sure one request is to list all in-mem,
+            %% and then the next is to list all durable.
             P3 =
                 ?retry(200, 10, begin
-                    P3_ = list_request(APIPort, "limit=3&page=1"),
+                    P3a = list_request(#{limit => 2, page => 1}, Config),
                     ?assertMatch(
                         {ok,
-                            {{_, 200, _}, _, #{
-                                <<"data">> := [_, _, _],
+                            {?HTTP200, _, #{
+                                <<"data">> := [_, _],
                                 <<"meta">> := #{
-                                    <<"count">> := 4,
-                                    <<"hasnext">> := true
+                                    <<"count">> := 4
                                 }
                             }}},
-                        P3_
+                        P3a
                     ),
-                    P3_
+                    P3a
                 end),
             P4 =
                 ?retry(200, 10, begin
-                    P4_ = list_request(APIPort, "limit=3&page=2"),
+                    P4a = list_request(#{limit => 2, page => 2}, Config),
                     ?assertMatch(
                         {ok,
-                            {{_, 200, _}, _, #{
-                                <<"data">> := [_],
+                            {?HTTP200, _, #{
+                                <<"data">> := [_, _],
                                 <<"meta">> := #{
-                                    <<"count">> := 4,
-                                    <<"hasnext">> := false
+                                    <<"count">> := 4
                                 }
                             }}},
-                        P4_
+                        P4a
                     ),
-                    P4_
+                    P4a
                 end),
             {ok, {_, _, #{<<"data">> := R3}}} = P3,
             {ok, {_, _, #{<<"data">> := R4}}} = P4,
             ?assertEqual(
-                lists:sort([ClientId1, ClientId2, ClientId3, ClientId4]),
+                lists:sort(ClientIds),
                 lists:sort(lists:map(fun(#{<<"clientid">> := CId}) -> CId end, R3 ++ R4))
             ),
 
-            lists:foreach(fun emqtt:stop/1, [C3, C4]),
-            lists:foreach(
-                fun(ClientId) ->
-                    ok = erpc:call(N1, emqx_persistent_session_ds, destroy_session, [ClientId])
-                end,
-                [ClientId1, ClientId2, ClientId3, ClientId4]
-            ),
-
-            ok
-        end,
-        []
-    ),
-    ok.
-
-%% Checks that expired durable sessions are returned with `is_expired => true'.
-t_persistent_sessions6(Config) ->
-    [N1, _N2] = ?config(nodes, Config),
-    APIPort = 18084,
-    Port1 = get_mqtt_port(N1, tcp),
-
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
-
-    ?check_trace(
-        begin
-            O = #{api_port => APIPort},
-            ClientId = <<"c1">>,
-            C1 = connect_client(#{port => Port1, clientid => ClientId, expiry => 1}),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => connected}),
-            ?retry(
-                100,
-                20,
-                ?assertMatch(
-                    {ok, {{_, 200, _}, _, #{<<"data">> := [#{<<"is_expired">> := false}]}}},
-                    list_request(APIPort)
-                )
-            ),
-
-            ok = emqtt:disconnect(C1),
-            %% Wait for session to be considered expired but not GC'ed
-            ct:sleep(2_000),
-            assert_single_client(O#{node => N1, clientid => ClientId, status => disconnected}),
-            N1Bin = atom_to_binary(N1),
-            ?retry(
-                100,
-                20,
-                ?assertMatch(
-                    {ok,
-                        {{_, 200, _}, _, #{
-                            <<"data">> := [
-                                #{
-                                    <<"is_expired">> := true,
-                                    <<"node">> := N1Bin,
-                                    <<"disconnected_at">> := <<_/binary>>
-                                }
-                            ]
-                        }}},
-                    list_request(APIPort)
-                )
-            ),
-            ?assertMatch(
-                {ok,
-                    {{_, 200, _}, _, #{
-                        <<"is_expired">> := true,
-                        <<"node">> := N1Bin,
-                        <<"disconnected_at">> := <<_/binary>>
-                    }}},
-                get_client_request(APIPort, ClientId)
-            ),
-
-            C2 = connect_client(#{port => Port1, clientid => ClientId}),
-            disconnect_and_destroy_session(C2),
+            lists:foreach(fun disconnect_and_destroy_session/1, [C3, C4]),
+            C1B = connect_client(#{port => Port1, clientid => ClientId1}),
+            C2B = connect_client(#{port => Port2, clientid => ClientId2}),
+            lists:foreach(fun disconnect_and_destroy_session/1, [C1B, C2B]),
 
             ok
         end,
@@ -615,11 +554,10 @@ t_persistent_sessions6(Config) ->
 
 %% Check that the output of `/clients/:clientid/subscriptions' has the expected keys.
 t_persistent_sessions_subscriptions1(Config) ->
-    [N1, _N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    [N1, _N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
 
-    ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := []}}}, list_request(APIPort)),
+    ?assertMatch({ok, {?HTTP200, _, #{<<"data">> := []}}}, list_request(Config)),
 
     ?check_trace(
         begin
@@ -628,7 +566,7 @@ t_persistent_sessions_subscriptions1(Config) ->
             {ok, _, [?RC_GRANTED_QOS_1]} = emqtt:subscribe(C1, <<"topic/1">>, 1),
             ?assertMatch(
                 {ok,
-                    {{_, 200, _}, _, [
+                    {?HTTP200, _, [
                         #{
                             <<"durable">> := true,
                             <<"node">> := <<_/binary>>,
@@ -640,14 +578,14 @@ t_persistent_sessions_subscriptions1(Config) ->
                             <<"topic">> := <<"topic/1">>
                         }
                     ]}},
-                get_subscriptions_request(APIPort, ClientId)
+                get_subscriptions_request(ClientId, Config)
             ),
 
             %% Just disconnect
             ok = emqtt:disconnect(C1),
             ?assertMatch(
                 {ok,
-                    {{_, 200, _}, _, [
+                    {?HTTP200, _, [
                         #{
                             <<"durable">> := true,
                             <<"node">> := null,
@@ -659,7 +597,7 @@ t_persistent_sessions_subscriptions1(Config) ->
                             <<"topic">> := <<"topic/1">>
                         }
                     ]}},
-                get_subscriptions_request(APIPort, ClientId)
+                get_subscriptions_request(ClientId, Config)
             ),
 
             C2 = connect_client(#{port => Port1, clientid => ClientId}),
@@ -670,24 +608,21 @@ t_persistent_sessions_subscriptions1(Config) ->
     ),
     ok.
 
-t_clients_bad_value_type(_) ->
+t_clients_bad_value_type(Config) ->
     %% get /clients
-    AuthHeader = [emqx_common_test_http:default_auth_header()],
     ClientsPath = emqx_mgmt_api_test_util:api_path(["clients"]),
-    QsString = cow_qs:qs([{<<"ip_address">>, <<"127.0.0.1:8080">>}]),
-    {ok, 400, Resp} = emqx_mgmt_api_test_util:request_api(
-        get, ClientsPath, QsString, AuthHeader, [], #{compatible_mode => true}
-    ),
+    QS = cow_qs:qs([{<<"ip_address">>, <<"127.0.0.1:8080">>}]),
     ?assertMatch(
-        #{
-            <<"code">> := <<"INVALID_PARAMETER">>,
-            <<"message">> :=
-                <<"the ip_address parameter expected type is ip, but the value is 127.0.0.1:8080">>
-        },
-        emqx_utils_json:decode(Resp, [return_maps])
+        {error,
+            {?HTTP400, _, #{
+                <<"code">> := <<"INVALID_PARAMETER">>,
+                <<"message">> :=
+                    <<"the ip_address parameter expected type is ip, but the value is 127.0.0.1:8080">>
+            }}},
+        request(get, ClientsPath, [], QS, Config)
     ).
 
-t_authz_cache(_) ->
+t_authz_cache(Config) ->
     ClientId = <<"client_authz">>,
 
     {ok, C} = emqtt:start_link(#{clientid => ClientId}),
@@ -700,25 +635,22 @@ t_authz_cache(_) ->
         "authorization",
         "cache"
     ]),
-    {ok, ClientAuthzCache} = emqx_mgmt_api_test_util:request_api(get, ClientAuthzCachePath),
     ?assertMatch(
-        [
-            #{
-                <<"access">> :=
-                    #{<<"action_type">> := <<"subscribe">>, <<"qos">> := 1},
-                <<"result">> := <<"allow">>,
-                <<"topic">> := <<"topic/1">>,
-                <<"updated_time">> := _
-            }
-        ],
-        emqx_utils_json:decode(ClientAuthzCache, [return_maps])
+        {ok,
+            {{_HTTP, 200, _}, _, [
+                #{
+                    <<"access">> := #{<<"action_type">> := <<"subscribe">>, <<"qos">> := 1},
+                    <<"result">> := <<"allow">>,
+                    <<"topic">> := <<"topic/1">>,
+                    <<"updated_time">> := _
+                }
+            ]}},
+        request(get, ClientAuthzCachePath, Config)
     ),
 
     ok = emqtt:stop(C).
 
-t_kickout_clients(_) ->
-    process_flag(trap_exit, true),
-
+t_kickout_clients(Config) ->
     ClientId1 = <<"client1">>,
     ClientId2 = <<"client2">>,
     ClientId3 = <<"client3">>,
@@ -733,6 +665,8 @@ t_kickout_clients(_) ->
     {ok, _} = emqtt:connect(C2),
     {ok, C3} = emqtt:start_link(#{clientid => ClientId3}),
     {ok, _} = emqtt:connect(C3),
+
+    _MRefs = [erlang:unlink(C) andalso erlang:monitor(process, C) || C <- [C1, C2, C3]],
 
     emqx_common_test_helpers:wait_for(
         ?FUNCTION_NAME,
@@ -753,9 +687,8 @@ t_kickout_clients(_) ->
 
     %% get /clients
     ClientsPath = emqx_mgmt_api_test_util:api_path(["clients"]),
-    {ok, Clients} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
-    ClientsResponse = emqx_utils_json:decode(Clients, [return_maps]),
-    ClientsMeta = maps:get(<<"meta">>, ClientsResponse),
+    {ok, {{_HTTP, 200, _}, _, Clients}} = request(get, ClientsPath, Config),
+    ClientsMeta = maps:get(<<"meta">>, Clients),
     ClientsPage = maps:get(<<"page">>, ClientsMeta),
     ClientsLimit = maps:get(<<"limit">>, ClientsMeta),
     ClientsCount = maps:get(<<"count">>, ClientsMeta),
@@ -766,24 +699,19 @@ t_kickout_clients(_) ->
     %% kickout clients
     KickoutPath = emqx_mgmt_api_test_util:api_path(["clients", "kickout", "bulk"]),
     KickoutBody = [ClientId1, ClientId2, ClientId3],
-    {ok, 204, _} = emqx_mgmt_api_test_util:request_api_with_body(post, KickoutPath, KickoutBody),
+    ?assertMatch(
+        {ok, {{_HTTP, 204, _}, _, _}},
+        request(post, KickoutPath, KickoutBody, Config)
+    ),
+    ?assertReceive({'DOWN', _MRef, process, C1, _}),
+    ?assertReceive({'DOWN', _MRef, process, C2, _}),
+    ?assertReceive({'DOWN', _MRef, process, C3, _}),
+    ?assertMatch(
+        {ok, {_200, _, #{<<"meta">> := #{<<"count">> := 0}}}},
+        request(get, ClientsPath, Config)
+    ).
 
-    ReceiveExit = fun({ClientPid, ClientId}) ->
-        receive
-            {'EXIT', Pid, _} when Pid =:= ClientPid ->
-                ok
-        after 1000 ->
-            error({timeout, ClientId})
-        end
-    end,
-    lists:foreach(ReceiveExit, [{C1, ClientId1}, {C2, ClientId2}, {C3, ClientId3}]),
-    {ok, Clients2} = emqx_mgmt_api_test_util:request_api(get, ClientsPath),
-    ClientsResponse2 = emqx_utils_json:decode(Clients2, [return_maps]),
-    ?assertMatch(#{<<"meta">> := #{<<"count">> := 0}}, ClientsResponse2).
-
-t_query_clients_with_time(_) ->
-    process_flag(trap_exit, true),
-
+t_query_clients_with_time(Config) ->
     Username1 = <<"user1">>,
     ClientId1 = <<"client1">>,
 
@@ -797,7 +725,6 @@ t_query_clients_with_time(_) ->
 
     timer:sleep(100),
 
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     ClientsPath = emqx_mgmt_api_test_util:api_path(["clients"]),
     %% get /clients with time(rfc3339)
     NowTimeStampInt = erlang:system_time(millisecond),
@@ -816,18 +743,14 @@ t_query_clients_with_time(_) ->
     GteParamRfc3339 = [Param ++ Rfc3339String || Param <- GteKeys],
     GteParamStamp = [Param ++ TimeStampString || Param <- GteKeys],
 
-    RequestResults =
-        [
-            emqx_mgmt_api_test_util:request_api(get, ClientsPath, Param, AuthHeader)
-         || Param <-
-                LteParamRfc3339 ++ LteParamStamp ++
-                    GteParamRfc3339 ++ GteParamStamp
-        ],
-    DecodedResults = [
-        emqx_utils_json:decode(Response, [return_maps])
-     || {ok, Response} <- RequestResults
+    RequestResults = [
+        begin
+            {ok, {?HTTP200, _, Result}} = request(get, ClientsPath, [], Param, Config),
+            Result
+        end
+     || Param <- LteParamRfc3339 ++ LteParamStamp ++ GteParamRfc3339 ++ GteParamStamp
     ],
-    {LteResponseDecodeds, GteResponseDecodeds} = lists:split(4, DecodedResults),
+    {LteResponseDecodeds, GteResponseDecodeds} = lists:split(4, RequestResults),
     %% EachData :: list()
     [
         ?assert(time_string_to_epoch_millisecond(CreatedAt) < NowTimeStampInt)
@@ -844,14 +767,11 @@ t_query_clients_with_time(_) ->
      || #{<<"data">> := EachData} <- GteResponseDecodeds
     ],
 
-    %% testcase cleanup, kickout client1 and client2
-    Client1Path = emqx_mgmt_api_test_util:api_path(["clients", binary_to_list(ClientId1)]),
-    Client2Path = emqx_mgmt_api_test_util:api_path(["clients", binary_to_list(ClientId2)]),
-    {ok, _} = emqx_mgmt_api_test_util:request_api(delete, Client1Path),
-    {ok, _} = emqx_mgmt_api_test_util:request_api(delete, Client2Path).
+    %% testcase cleanup, stop client1 and client2
+    ok = emqtt:stop(C1),
+    ok = emqtt:stop(C2).
 
-t_query_multiple_clients(_) ->
-    process_flag(trap_exit, true),
+t_query_multiple_clients(Config) ->
     ClientIdsUsers = [
         {<<"multi_client1">>, <<"multi_user1">>},
         {<<"multi_client1-1">>, <<"multi_user1">>},
@@ -872,7 +792,7 @@ t_query_multiple_clients(_) ->
     ),
     timer:sleep(100),
 
-    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    Auth = ?config(api_auth_header, Config),
 
     %% Not found clients/users
     ?assertEqual([], get_clients(Auth, "clientid=no_such_client")),
@@ -1006,8 +926,7 @@ t_query_multiple_clients(_) ->
     ?assertEqual([], get_clients(Auth, AllClientsQs ++ "&like_username=nouser")),
     ?assertEqual([], get_clients(Auth, AllUsersQs ++ "&like_clientid=nouser")).
 
-t_query_multiple_clients_urlencode(_) ->
-    process_flag(trap_exit, true),
+t_query_multiple_clients_urlencode(Config) ->
     ClientIdsUsers = [
         {<<"multi_client=a?">>, <<"multi_user=a?">>},
         {<<"mutli_client=b?">>, <<"multi_user=b?">>}
@@ -1022,15 +941,14 @@ t_query_multiple_clients_urlencode(_) ->
     ),
     timer:sleep(100),
 
-    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    Auth = ?config(api_auth_header, Config),
     ClientsQs = uri_string:compose_query([{<<"clientid">>, C} || {C, _} <- ClientIdsUsers]),
     UsersQs = uri_string:compose_query([{<<"username">>, U} || {_, U} <- ClientIdsUsers]),
     ExpectedClients = lists:sort([C || {C, _} <- ClientIdsUsers]),
     ?assertEqual(ExpectedClients, lists:sort(get_clients(Auth, ClientsQs))),
     ?assertEqual(ExpectedClients, lists:sort(get_clients(Auth, UsersQs))).
 
-t_query_clients_with_fields(_) ->
-    process_flag(trap_exit, true),
+t_query_clients_with_fields(Config) ->
     TCBin = atom_to_binary(?FUNCTION_NAME),
     ClientId = <<TCBin/binary, "_client">>,
     Username = <<TCBin/binary, "_user">>,
@@ -1038,8 +956,15 @@ t_query_clients_with_fields(_) ->
     {ok, _} = emqtt:connect(C),
     timer:sleep(100),
 
-    Auth = emqx_mgmt_api_test_util:auth_header_(),
+    Auth = ?config(api_auth_header, Config),
     ?assertEqual([#{<<"clientid">> => ClientId}], get_clients_all_fields(Auth, "fields=clientid")),
+    ?assertMatch(
+        {ok,
+            {?HTTP200, _, #{
+                <<"data">> := [#{<<"client_attrs">> := #{}}]
+            }}},
+        list_request(#{fields => client_attrs}, Config)
+    ),
     ?assertEqual(
         [#{<<"clientid">> => ClientId, <<"username">> => Username}],
         get_clients_all_fields(Auth, "fields=clientid,username")
@@ -1072,6 +997,7 @@ get_clients(Auth, Qs, ExpectError, ClientIdOnly) ->
     Resp = emqx_mgmt_api_test_util:request_api(get, ClientsPath, Qs, Auth),
     case ExpectError of
         false ->
+            ct:pal("get clients response:\n  ~p", [Resp]),
             {ok, Body} = Resp,
             #{<<"data">> := Clients} = emqx_utils_json:decode(Body),
             case ClientIdOnly of
@@ -1082,14 +1008,15 @@ get_clients(Auth, Qs, ExpectError, ClientIdOnly) ->
             Resp
     end.
 
-t_keepalive(_Config) ->
+t_keepalive(Config) ->
     Username = "user_keepalive",
     ClientId = "client_keepalive",
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "keepalive"]),
     Body = #{interval => 11},
-    {error, {"HTTP/1.1", 404, "Not Found"}} =
-        emqx_mgmt_api_test_util:request_api(put, Path, <<"">>, AuthHeader, Body),
+    ?assertMatch(
+        {error, {?HTTP404, _, _}},
+        request(put, Path, Body, Config)
+    ),
     %% 65535 is the max value of keepalive
     MaxKeepalive = 65535,
     InitKeepalive = round(MaxKeepalive / 1.5 + 1),
@@ -1099,73 +1026,90 @@ t_keepalive(_Config) ->
     {ok, _} = emqtt:connect(C1),
     [Pid] = emqx_cm:lookup_channels(list_to_binary(ClientId)),
     %% will reset to max keepalive if keepalive > max keepalive
-    #{conninfo := #{keepalive := InitKeepalive}} = emqx_connection:info(Pid),
-    ?assertMatch({keepalive, 65535000, _}, element(5, element(9, sys:get_state(Pid)))),
+    ?assertMatch(
+        #{conninfo := #{keepalive := InitKeepalive}},
+        emqx_cm:get_chan_info(list_to_binary(ClientId))
+    ),
+    ?assertMatch(
+        #{max_idle_millisecond := 65536500},
+        emqx_cth_broker:connection_info({channel, keepalive}, list_to_binary(ClientId))
+    ),
 
-    {ok, NewClient} = emqx_mgmt_api_test_util:request_api(put, Path, <<"">>, AuthHeader, Body),
-    #{<<"keepalive">> := 11} = emqx_utils_json:decode(NewClient, [return_maps]),
-    #{conninfo := #{keepalive := Keepalive}} = emqx_connection:info(Pid),
-    ?assertEqual(11, Keepalive),
+    ?assertMatch(
+        {ok, {?HTTP200, _, #{<<"keepalive">> := 11}}},
+        request(put, Path, Body, Config)
+    ),
+    ?assertMatch(
+        #{conninfo := #{keepalive := 11}},
+        emqx_connection:info(Pid)
+    ),
     %% Disable keepalive
-    Body1 = #{interval => 0},
-    {ok, NewClient1} = emqx_mgmt_api_test_util:request_api(put, Path, <<"">>, AuthHeader, Body1),
-    #{<<"keepalive">> := 0} = emqx_utils_json:decode(NewClient1, [return_maps]),
-    ?assertMatch(#{conninfo := #{keepalive := 0}}, emqx_connection:info(Pid)),
+    ?assertMatch(
+        {ok, {?HTTP200, _, #{<<"keepalive">> := 0}}},
+        request(put, Path, #{interval => 0}, Config)
+    ),
+    ?assertMatch(
+        #{conninfo := #{keepalive := 0}},
+        emqx_connection:info(Pid)
+    ),
     %% Maximal keepalive
-    Body2 = #{interval => 65536},
-    {error, {"HTTP/1.1", 400, _}} =
-        emqx_mgmt_api_test_util:request_api(put, Path, <<"">>, AuthHeader, Body2),
-    emqtt:disconnect(C1),
-    ok.
+    ?assertMatch(
+        {error, {?HTTP400, _, #{<<"code">> := <<"BAD_REQUEST">>}}},
+        request(put, Path, #{interval => 65536}, Config)
+    ),
+    ok = emqtt:disconnect(C1).
 
-t_client_id_not_found(_Config) ->
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-    Http = {"HTTP/1.1", 404, "Not Found"},
-    Body = "{\"code\":\"CLIENTID_NOT_FOUND\",\"message\":\"Client ID not found\"}",
+t_client_id_not_found(Config) ->
+    Body = #{
+        <<"code">> => <<"CLIENTID_NOT_FOUND">>,
+        <<"message">> => <<"Client ID not found">>
+    },
 
     PathFun = fun(Suffix) ->
         emqx_mgmt_api_test_util:api_path(["clients", "no_existed_clientid"] ++ Suffix)
     end,
     ReqFun = fun(Method, Path) ->
-        emqx_mgmt_api_test_util:request_api(
-            Method, Path, "", AuthHeader, [], #{return_all => true}
-        )
+        request(Method, Path, [], [], Config)
     end,
-
     PostFun = fun(Method, Path, Data) ->
-        emqx_mgmt_api_test_util:request_api(
-            Method, Path, "", AuthHeader, Data, #{return_all => true}
-        )
+        request(Method, Path, Data, [], Config)
     end,
 
     %% Client lookup
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(get, PathFun([]))),
+    ?assertMatch({error, {?HTTP404, _, Body}}, ReqFun(get, PathFun([]))),
     %% Client kickout
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(delete, PathFun([]))),
+    ?assertMatch({error, {?HTTP404, _, Body}}, ReqFun(delete, PathFun([]))),
     %% Client Subscription list
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(get, PathFun(["subscriptions"]))),
+    ?assertMatch({error, {?HTTP404, _, Body}}, ReqFun(get, PathFun(["subscriptions"]))),
     %% AuthZ Cache lookup
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(get, PathFun(["authorization", "cache"]))),
+    ?assertMatch({error, {?HTTP404, _, Body}}, ReqFun(get, PathFun(["authorization", "cache"]))),
     %% AuthZ Cache clean
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(delete, PathFun(["authorization", "cache"]))),
+    ?assertMatch(
+        {error, {?HTTP404, _, Body}},
+        ReqFun(delete, PathFun(["authorization", "cache"]))
+    ),
     %% Client Subscribe
     SubBody = #{topic => <<"testtopic">>, qos => 1, nl => 1, rh => 1},
-    ?assertMatch({error, {Http, _, Body}}, PostFun(post, PathFun(["subscribe"]), SubBody)),
+    ?assertMatch({error, {?HTTP404, _, Body}}, PostFun(post, PathFun(["subscribe"]), SubBody)),
     ?assertMatch(
-        {error, {Http, _, Body}}, PostFun(post, PathFun(["subscribe", "bulk"]), [SubBody])
+        {error, {?HTTP404, _, Body}}, PostFun(post, PathFun(["subscribe", "bulk"]), [SubBody])
     ),
     %% Client Unsubscribe
     UnsubBody = #{topic => <<"testtopic">>},
-    ?assertMatch({error, {Http, _, Body}}, PostFun(post, PathFun(["unsubscribe"]), UnsubBody)),
     ?assertMatch(
-        {error, {Http, _, Body}}, PostFun(post, PathFun(["unsubscribe", "bulk"]), [UnsubBody])
+        {error, {?HTTP404, _, Body}},
+        PostFun(post, PathFun(["unsubscribe"]), UnsubBody)
+    ),
+    ?assertMatch(
+        {error, {?HTTP404, _, Body}},
+        PostFun(post, PathFun(["unsubscribe", "bulk"]), [UnsubBody])
     ),
     %% Mqueue messages
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(get, PathFun(["mqueue_messages"]))),
+    ?assertMatch({error, {?HTTP404, _, Body}}, ReqFun(get, PathFun(["mqueue_messages"]))),
     %% Inflight messages
-    ?assertMatch({error, {Http, _, Body}}, ReqFun(get, PathFun(["inflight_messages"]))).
+    ?assertMatch({error, {?HTTP404, _, Body}}, ReqFun(get, PathFun(["inflight_messages"]))).
 
-t_sessions_count(_Config) ->
+t_sessions_count(Config) ->
     ClientId = atom_to_binary(?FUNCTION_NAME),
     Topic = <<"t/test_sessions_count">>,
     Conf0 = emqx_config:get([broker]),
@@ -1182,21 +1126,16 @@ t_sessions_count(_Config) ->
     {ok, _} = emqtt:connect(Client),
     {ok, _, _} = emqtt:subscribe(Client, Topic, 1),
     Path = emqx_mgmt_api_test_util:api_path(["sessions_count"]),
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
     ?assertMatch(
-        {ok, "1"},
-        emqx_mgmt_api_test_util:request_api(
-            get, Path, "since=" ++ integer_to_list(Since), AuthHeader
-        )
+        {ok, {?HTTP200, _, 1}},
+        request(get, Path, [], "since=" ++ integer_to_list(Since), Config)
     ),
     ok = emqtt:disconnect(Client),
     %% simulate the situation in which the process is not running
     ok = supervisor:terminate_child(emqx_cm_sup, emqx_cm_registry_keeper),
     ?assertMatch(
-        {error, {_, 400, _}},
-        emqx_mgmt_api_test_util:request_api(
-            get, Path, "since=" ++ integer_to_list(Since), AuthHeader
-        )
+        {error, {?HTTP400, _, _}},
+        request(get, Path, [], "since=" ++ integer_to_list(Since), Config)
     ),
     %% restore default value
     ok = emqx_config:put(#{broker => Conf0}),
@@ -1210,21 +1149,18 @@ t_mqueue_messages(Config) ->
     ok = client_with_mqueue(ClientId, Topic, Count),
     Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "mqueue_messages"]),
     ?assert(Count =< emqx:get_config([mqtt, max_mqueue_len])),
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-    IsMqueue = true,
-    test_messages(Path, Topic, Count, AuthHeader, ?config(payload_encoding, Config), IsMqueue),
+
+    AuthHeader = ?config(api_auth_header, Config),
+    PayloadEncoding = ?config(payload_encoding, Config),
+    test_messages(Path, Topic, Count, AuthHeader, PayloadEncoding, _IsMqueue = true),
 
     ?assertMatch(
-        {error, {_, 400, _}},
-        emqx_mgmt_api_test_util:request_api(
-            get, Path, "limit=10&position=not-valid", AuthHeader
-        )
+        {error, {?HTTP400, _, #{<<"code">> := <<"INVALID_PARAMETER">>}}},
+        request(get, Path, [], "limit=10&position=not-valid", Config)
     ),
     ?assertMatch(
-        {error, {_, 400, _}},
-        emqx_mgmt_api_test_util:request_api(
-            get, Path, "limit=-5&position=not-valid", AuthHeader
-        )
+        {error, {?HTTP400, _, #{<<"code">> := <<"BAD_REQUEST">>}}},
+        request(get, Path, [], "limit=-5&position=not-valid", Config)
     ).
 
 t_inflight_messages(Config) ->
@@ -1234,23 +1170,18 @@ t_inflight_messages(Config) ->
     {ok, Client} = client_with_inflight(ClientId, Topic, PubCount),
     Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "inflight_messages"]),
     InflightLimit = emqx:get_config([mqtt, max_inflight]),
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-    IsMqueue = false,
-    test_messages(
-        Path, Topic, InflightLimit, AuthHeader, ?config(payload_encoding, Config), IsMqueue
-    ),
+
+    AuthHeader = ?config(api_auth_header, Config),
+    PayloadEncoding = ?config(payload_encoding, Config),
+    test_messages(Path, Topic, InflightLimit, AuthHeader, PayloadEncoding, _IsMqueue = false),
 
     ?assertMatch(
-        {error, {_, 400, _}},
-        emqx_mgmt_api_test_util:request_api(
-            get, Path, "limit=10&position=not-int", AuthHeader
-        )
+        {error, {?HTTP400, _, #{<<"code">> := <<"INVALID_PARAMETER">>}}},
+        request(get, Path, [], "limit=10&position=not-int", Config)
     ),
     ?assertMatch(
-        {error, {_, 400, _}},
-        emqx_mgmt_api_test_util:request_api(
-            get, Path, "limit=-5&position=invalid-int", AuthHeader
-        )
+        {error, {?HTTP400, _, #{<<"code">> := <<"BAD_REQUEST">>}}},
+        request(get, Path, [], "limit=-5&position=invalid-int", Config)
     ),
     emqtt:stop(Client).
 
@@ -1437,7 +1368,7 @@ decode_payload(Payload, base64) ->
 decode_payload(Payload, _) ->
     Payload.
 
-t_subscribe_shared_topic(_Config) ->
+t_subscribe_shared_topic(Config) ->
     ClientId = <<"client_subscribe_shared">>,
 
     {ok, C} = emqtt:start_link(#{clientid => ClientId}),
@@ -1447,19 +1378,8 @@ t_subscribe_shared_topic(_Config) ->
     {ok, PC} = emqtt:start_link(#{clientid => ClientPuber}),
     {ok, _} = emqtt:connect(PC),
 
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-
-    Http200 = {"HTTP/1.1", 200, "OK"},
-    Http204 = {"HTTP/1.1", 204, "No Content"},
-
     PathFun = fun(Suffix) ->
-        emqx_mgmt_api_test_util:api_path(["clients", "client_subscribe_shared"] ++ Suffix)
-    end,
-
-    PostFun = fun(Method, Path, Data) ->
-        emqx_mgmt_api_test_util:request_api(
-            Method, Path, "", AuthHeader, Data, #{return_all => true}
-        )
+        emqx_mgmt_api_test_util:api_path(["clients", ClientId] ++ Suffix)
     end,
 
     SharedT = <<"$share/group/testtopic">>,
@@ -1471,15 +1391,16 @@ t_subscribe_shared_topic(_Config) ->
     %% ====================
     %% Client Subscribe
     ?assertMatch(
-        {ok, {Http200, _, _}},
-        PostFun(post, PathFun(["subscribe"]), SubBodyFun(SharedT))
+        {ok, {?HTTP200, _, _}},
+        request(post, PathFun(["subscribe"]), SubBodyFun(SharedT), Config)
     ),
     ?assertMatch(
-        {ok, {Http200, _, _}},
-        PostFun(
+        {ok, {?HTTP200, _, _}},
+        request(
             post,
             PathFun(["subscribe", "bulk"]),
-            [SubBodyFun(T) || T <- [SharedT, NonSharedT]]
+            [SubBodyFun(T) || T <- [SharedT, NonSharedT]],
+            Config
         )
     ),
 
@@ -1515,20 +1436,21 @@ t_subscribe_shared_topic(_Config) ->
     %% ====================
     %% Client Unsubscribe
     ?assertMatch(
-        {ok, {Http204, _, _}},
-        PostFun(post, PathFun(["unsubscribe"]), UnSubBodyFun(SharedT))
+        {ok, {?HTTP204, _, _}},
+        request(post, PathFun(["unsubscribe"]), UnSubBodyFun(SharedT), Config)
     ),
     ?assertMatch(
-        {ok, {Http204, _, _}},
-        PostFun(
+        {ok, {?HTTP204, _, _}},
+        request(
             post,
             PathFun(["unsubscribe", "bulk"]),
-            [UnSubBodyFun(T) || T <- [SharedT, NonSharedT]]
+            [UnSubBodyFun(T) || T <- [SharedT, NonSharedT]],
+            Config
         )
     ),
 
     %% assert subscription
-    ?assertEqual([], ets:tab2list(?SUBSCRIPTION)),
+    ?retry(200, 10, ?assertEqual([], ets:tab2list(?SUBSCRIPTION))),
     ?assertEqual([], ets:tab2list(?SUBOPTION)),
     ?assertEqual([], ets:tab2list(emqx_shared_subscription)),
 
@@ -1538,34 +1460,68 @@ t_subscribe_shared_topic(_Config) ->
     ?assertNotReceive({publish, #{topic := <<"testtopic">>, payload := <<"msg3">>}}),
     ?assertNotReceive({publish, #{topic := <<"t/1">>, payload := <<"msg4">>}}).
 
-t_subscribe_shared_topic_nl(_Config) ->
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
-    Http400 = {"HTTP/1.1", 400, "Bad Request"},
-    Body =
-        "{\"code\":\"INVALID_PARAMETER\","
-        "\"message\":\"Invalid Subscribe options: `no_local` not allowed for shared-sub. See [MQTT-3.8.3-4]\"}",
+t_subscribe_shared_topic_nl(Config) ->
     ClientId = <<"client_subscribe_shared">>,
-
     {ok, C} = emqtt:start_link(#{clientid => ClientId}),
     {ok, _} = emqtt:connect(C),
 
-    PathFun = fun(Suffix) ->
-        emqx_mgmt_api_test_util:api_path(["clients", "client_subscribe_shared"] ++ Suffix)
-    end,
-    PostFun = fun(Method, Path, Data) ->
-        emqx_mgmt_api_test_util:request_api(
-            Method, Path, "", AuthHeader, Data, #{return_all => true}
-        )
-    end,
-    T = <<"$share/group/testtopic">>,
+    Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "subscribe"]),
+    Topic = <<"$share/group/testtopic">>,
     ?assertMatch(
-        {error, {Http400, _, Body}},
-        PostFun(post, PathFun(["subscribe"]), #{topic => T, qos => 1, nl => 1, rh => 1})
+        {error,
+            {?HTTP400, _, #{
+                <<"code">> := <<"INVALID_PARAMETER">>,
+                <<"message">> :=
+                    <<"Invalid Subscribe options: `no_local` not allowed for shared-sub", _/bytes>>
+            }}},
+        request(post, Path, #{topic => Topic, qos => 1, nl => 1, rh => 1}, Config)
     ).
 
-t_list_clients_v2(Config) ->
+%% Checks that we can use the bulk subscribe API on a different node than the one a client
+%% is connected to.
+t_bulk_subscribe(Config) ->
     [N1, N2] = ?config(nodes, Config),
-    APIPort = 18084,
+    Port1 = get_mqtt_port(N1, tcp),
+    Port2 = get_mqtt_port(N2, tcp),
+    ?check_trace(
+        begin
+            ClientId1 = <<"bulk-sub1">>,
+            _C1 = connect_client(#{port => Port2, clientid => ClientId1, clean_start => true}),
+            ClientId2 = <<"bulk-sub2">>,
+            C2 = connect_client(#{port => Port1, clientid => ClientId2, clean_start => true}),
+            Topic = <<"testtopic">>,
+            BulkSub = [#{topic => Topic, qos => 1, nl => 1, rh => 1}],
+            ?assertMatch({200, [_]}, bulk_subscribe_request(ClientId1, Config, BulkSub)),
+            ?retry(
+                100,
+                5,
+                ?assertMatch(
+                    {200, [_]},
+                    get_subscriptions_request(ClientId1, Config, #{simplify_result => true})
+                )
+            ),
+            {ok, _} = emqtt:publish(C2, Topic, <<"hi1">>, [{qos, 1}]),
+            ?assertReceive({publish, #{topic := Topic, payload := <<"hi1">>}}),
+            BulkUnsub = [#{topic => Topic}],
+            ?assertMatch({204, _}, bulk_unsubscribe_request(ClientId1, Config, BulkUnsub)),
+            ?retry(
+                100,
+                5,
+                ?assertMatch(
+                    {200, []},
+                    get_subscriptions_request(ClientId1, Config, #{simplify_result => true})
+                )
+            ),
+            {ok, _} = emqtt:publish(C2, Topic, <<"hi2">>, [{qos, 1}]),
+            ?assertNotReceive({publish, _}),
+            ok
+        end,
+        []
+    ),
+    ok.
+
+t_list_clients_v2(Config) ->
+    [N1, N2] = ?config(cluster_nodes, Config),
     Port1 = get_mqtt_port(N1, tcp),
     Port2 = get_mqtt_port(N2, tcp),
 
@@ -1597,19 +1553,17 @@ t_list_clients_v2(Config) ->
                 port => Port2, clientid => ClientId6, expiry => 0, clean_start => true
             }),
             %% offline persistent clients
-            ok = emqtt:stop(C3),
-            ok = emqtt:stop(C4),
+            lists:foreach(fun stop_and_commit/1, [C3, C4]),
 
             %% one by one
             QueryParams1 = #{limit => "1"},
-            Res1 = list_all_v2(APIPort, QueryParams1),
+            Res1 = list_all_v2(QueryParams1, Config),
             ?assertMatch(
                 [
                     #{
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1618,7 +1572,6 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1627,7 +1580,6 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1636,7 +1588,6 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1645,7 +1596,6 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1654,28 +1604,26 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := false,
                                 <<"count">> := 1
                             }
                     }
                 ],
                 Res1
             ),
-            assert_contains_clientids(Res1, AllClientIds),
+            ?assertContainsClientids(Res1, AllClientIds),
 
             %% Reusing the same cursors yield the same pages
-            traverse_in_reverse_v2(APIPort, QueryParams1, Res1),
+            traverse_in_reverse_v2(QueryParams1, Res1, Config),
 
             %% paging
             QueryParams2 = #{limit => "4"},
-            Res2 = list_all_v2(APIPort, QueryParams2),
+            Res2 = list_all_v2(QueryParams2, Config),
             ?assertMatch(
                 [
                     #{
                         <<"data">> := [_, _, _, _],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 4,
                                 <<"cursor">> := _
                             }
@@ -1684,25 +1632,23 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_, _],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := false,
                                 <<"count">> := 2
                             }
                     }
                 ],
                 Res2
             ),
-            assert_contains_clientids(Res2, AllClientIds),
-            traverse_in_reverse_v2(APIPort, QueryParams2, Res2),
+            ?assertContainsClientids(Res2, AllClientIds),
+            traverse_in_reverse_v2(QueryParams2, Res2, Config),
 
             QueryParams3 = #{limit => "2"},
-            Res3 = list_all_v2(APIPort, QueryParams3),
+            Res3 = list_all_v2(QueryParams3, Config),
             ?assertMatch(
                 [
                     #{
                         <<"data">> := [_, _],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 2,
                                 <<"cursor">> := _
                             }
@@ -1711,7 +1657,6 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_, _],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 2,
                                 <<"cursor">> := _
                             }
@@ -1720,43 +1665,40 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_, _],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := false,
                                 <<"count">> := 2
                             }
                     }
                 ],
                 Res3
             ),
-            assert_contains_clientids(Res3, AllClientIds),
-            traverse_in_reverse_v2(APIPort, QueryParams3, Res3),
+            ?assertContainsClientids(Res3, AllClientIds),
+            traverse_in_reverse_v2(QueryParams3, Res3, Config),
 
             %% fuzzy filters
             QueryParams4 = #{limit => "100", like_clientid => "ca"},
-            Res4 = list_all_v2(APIPort, QueryParams4),
+            Res4 = list_all_v2(QueryParams4, Config),
             ?assertMatch(
                 [
                     #{
                         <<"data">> := [_, _, _],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := false,
                                 <<"count">> := 3
                             }
                     }
                 ],
                 Res4
             ),
-            assert_contains_clientids(Res4, [ClientId1, ClientId4, ClientId5]),
-            traverse_in_reverse_v2(APIPort, QueryParams4, Res4),
+            ?assertContainsClientids(Res4, [ClientId1, ClientId4, ClientId5]),
+            traverse_in_reverse_v2(QueryParams4, Res4, Config),
             QueryParams5 = #{limit => "1", like_clientid => "ca"},
-            Res5 = list_all_v2(APIPort, QueryParams5),
+            Res5 = list_all_v2(QueryParams5, Config),
             ?assertMatch(
                 [
                     #{
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1765,7 +1707,6 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := true,
                                 <<"count">> := 1,
                                 <<"cursor">> := _
                             }
@@ -1774,15 +1715,14 @@ t_list_clients_v2(Config) ->
                         <<"data">> := [_],
                         <<"meta">> :=
                             #{
-                                <<"hasnext">> := false,
                                 <<"count">> := 1
                             }
                     }
                 ],
                 Res5
             ),
-            assert_contains_clientids(Res5, [ClientId1, ClientId4, ClientId5]),
-            traverse_in_reverse_v2(APIPort, QueryParams5, Res5),
+            ?assertContainsClientids(Res5, [ClientId1, ClientId4, ClientId5]),
+            traverse_in_reverse_v2(QueryParams5, Res5, Config),
 
             lists:foreach(
                 fun(C) ->
@@ -1802,7 +1742,7 @@ t_list_clients_v2(Config) ->
 
             ?assertMatch(
                 {error, {{_, 400, _}, _, #{<<"message">> := <<"bad cursor">>}}},
-                list_v2_request(APIPort, #{limit => "1", cursor => EvilAtomBin})
+                list_v2_request(#{limit => "1", cursor => EvilAtomBin}, Config)
             ),
             %% Verify that the atom was not created
             erpc:call(N1, fun() ->
@@ -1817,6 +1757,255 @@ t_list_clients_v2(Config) ->
                 AllClientIds
             ),
 
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% This testcase verifies pagination of durable sessions:
+t_list_clients_v2_limit(Config) ->
+    [Node1, Node2] = ?config(cluster_nodes, Config),
+    Nclients = 10,
+    %% Create clients:
+    Clients = [
+        begin
+            Node =
+                case I rem 2 of
+                    0 -> Node1;
+                    1 -> Node2
+                end,
+            ClientId = ?CLIENTID((integer_to_binary(I))),
+            Pid = connect_client(#{
+                port => get_mqtt_port(Node, tcp),
+                clientid => ClientId,
+                clean_start => true
+            }),
+            {ClientId, Node, Pid}
+        end
+     || I <- lists:seq(1, Nclients)
+    ],
+    {ClientIds, _, _} = lists:unzip3(Clients),
+    try
+        ct:sleep(1000),
+        %% Set pagination options:
+        Limit = 8,
+        QP = #{<<"limit">> => integer_to_binary(Limit)},
+        %% 1. Verify API output when all clients are online:
+        (fun() ->
+            %% Since we have 10 clients in total, we should get all results on 2 pages.
+            {ok, {{_, 200, _}, _, Res1}} = list_v2_request(
+                QP,
+                Config
+            ),
+            #{<<"meta">> := #{<<"count">> := 8, <<"cursor">> := Cursor1}, <<"data">> := _} = Res1,
+            {ok, {{_, 200, _}, _, Res2}} = list_v2_request(
+                QP#{<<"cursor">> => Cursor1},
+                Config
+            ),
+            #{<<"meta">> := Meta2 = #{<<"count">> := 2}, <<"data">> := _} = Res2,
+            ?assertNot(maps:is_key(<<"cursor">>, Meta2), Meta2),
+            ?assertContainsClientids([Res1, Res2], ClientIds)
+        end)(),
+        %% 2. Verify output when half of the clients is offline:
+        {_Keep, Stop} = lists:split(Nclients div 2, Clients),
+        (fun() ->
+            %% Shutdown half of the clients:
+            [
+                begin
+                    ct:pal("Disconnecting ~p", [ClientId]),
+                    emqtt:stop(Pid)
+                end
+             || {ClientId, _, Pid} <- Stop
+            ],
+            ct:sleep(1000),
+            %% Verify result:
+            {ok, {{_, 200, _}, _, Res1}} = list_v2_request(
+                QP,
+                Config
+            ),
+            #{<<"meta">> := #{<<"count">> := 8, <<"cursor">> := Cursor1}, <<"data">> := _} = Res1,
+            {ok, {{_, 200, _}, _, Res2}} = list_v2_request(
+                QP#{<<"cursor">> => Cursor1},
+                Config
+            ),
+            #{<<"meta">> := Meta2 = #{<<"count">> := 2}, <<"data">> := _} = Res2,
+            ?assertNot(maps:is_key(<<"cursor">>, Meta2), Meta2),
+            ?assertContainsClientids([Res1, Res2], ClientIds)
+        end)()
+    after
+        %% 3. Cleanup:
+        _ = [
+            begin
+                try
+                    emqtt:stop(Pid)
+                catch
+                    _:_ -> ok
+                end,
+                erpc:call(Node, emqx_persistent_session_ds, kick_offline_session, [ClientId])
+            end
+         || {ClientId, Node, Pid} <- Clients
+        ],
+        ok
+    end.
+
+%% Checks that exact match filters (username) works in clients_v2 API.
+t_list_clients_v2_exact_filters(Config) ->
+    [N1, N2] = ?config(cluster_nodes, Config),
+    Port1 = get_mqtt_port(N1, tcp),
+    Port2 = get_mqtt_port(N2, tcp),
+    Id = fun(Bin) -> iolist_to_binary([atom_to_binary(?FUNCTION_NAME), <<"-">>, Bin]) end,
+    ?check_trace(
+        begin
+            ClientId1 = Id(<<"ps1">>),
+            ClientId2 = Id(<<"ps2">>),
+            ClientId3 = Id(<<"ps3-offline">>),
+            ClientId4 = Id(<<"ps4-offline">>),
+            ClientId5 = Id(<<"mem2">>),
+            ClientId6 = Id(<<"mem3">>),
+            Username1 = Id(<<"u1">>),
+            Username2 = Id(<<"u2">>),
+            C1 = connect_client(#{
+                port => Port1,
+                clientid => ClientId1,
+                clean_start => true,
+                username => Username1
+            }),
+            C2 = connect_client(#{
+                port => Port2,
+                clientid => ClientId2,
+                clean_start => true,
+                username => Username2
+            }),
+            C3 = connect_client(#{port => Port1, clientid => ClientId3, clean_start => true}),
+            C4 = connect_client(#{port => Port2, clientid => ClientId4, clean_start => true}),
+            %% in-memory clients
+            C5 = connect_client(#{
+                port => Port1,
+                clientid => ClientId5,
+                expiry => 0,
+                clean_start => true,
+                username => Username1
+            }),
+            C6 = connect_client(#{
+                port => Port2,
+                clientid => ClientId6,
+                expiry => 0,
+                clean_start => true,
+                username => Username2
+            }),
+            %% offline persistent clients
+            lists:foreach(fun stop_and_commit/1, [C3, C4]),
+
+            %% Username query
+            QueryParams1 = [
+                {"limit", "100"},
+                {"username", Username1}
+            ],
+            Res1 = list_all_v2(QueryParams1, Config),
+            ?assertContainsClientids(Res1, [ClientId1, ClientId5]),
+
+            QueryParams2 = [
+                {"limit", "100"},
+                {"username", Username1},
+                {"username", Username2}
+            ],
+            Res2 = list_all_v2(QueryParams2, Config),
+            ?assertContainsClientids(Res2, [ClientId1, ClientId2, ClientId5, ClientId6]),
+
+            C3B = connect_client(#{port => Port1, clientid => ClientId3}),
+            C4B = connect_client(#{port => Port2, clientid => ClientId4}),
+
+            lists:foreach(fun disconnect_and_destroy_session/1, [C1, C2, C3B, C4B]),
+            lists:foreach(fun emqtt:stop/1, [C5, C6]),
+
+            ok
+        end,
+        []
+    ),
+    ok.
+
+%% Checks that regular filters (non fuzzy and not username) work in clients_v2 API.
+t_list_clients_v2_regular_filters(Config) ->
+    [N1, _N2] = ?config(cluster_nodes, Config),
+    Port1 = get_mqtt_port(N1, tcp),
+    Id = fun(Bin) -> iolist_to_binary([atom_to_binary(?FUNCTION_NAME), <<"-">>, Bin]) end,
+    ?check_trace(
+        begin
+            ConnectedAt = binary_to_list(emqx_utils_calendar:now_to_rfc3339()),
+            ClientId1 = Id(<<"ps1-offline">>),
+            Username1 = Id(<<"u1">>),
+            C1 = connect_client(#{
+                port => Port1,
+                clientid => ClientId1,
+                clean_start => false,
+                username => Username1
+            }),
+            stop_and_commit(C1),
+            %% Let the client goes offline from emqx_cm
+            timer:sleep(100),
+
+            QueryParams1 = [
+                {"limit", "100"},
+                {"gte_connected_at", ConnectedAt}
+            ],
+            Res1 = list_all_v2(QueryParams1, Config),
+            ?assertContainsClientids(Res1, [ClientId1]),
+
+            QueryParams2 = [
+                {"limit", "100"},
+                {"lte_connected_at", ConnectedAt}
+            ],
+            Res2 = list_all_v2(QueryParams2, Config),
+            ?assertMatch(
+                [
+                    #{
+                        <<"data">> := [],
+                        <<"meta">> := #{<<"count">> := 0}
+                    }
+                ],
+                Res2
+            ),
+
+            QueryParams3 = [
+                {"limit", "100"},
+                {"conn_state", "connected"}
+            ],
+            Res3 = list_all_v2(QueryParams3, Config),
+            ?assertMatch(
+                [
+                    #{
+                        <<"data">> := [],
+                        <<"meta">> := #{<<"count">> := 0}
+                    }
+                ],
+                Res3
+            ),
+
+            ?tp(warning, destroy_session, #{clientid => ClientId1}),
+            ok = erpc:call(N1, emqx_persistent_session_ds, destroy_session, [ClientId1])
+        end,
+        []
+    ),
+    ok.
+
+%% Checks that we return pretty errors when user uses bad value types for a query string
+%% parameter.
+t_list_clients_v2_bad_query_string_parameters(Config) ->
+    ?check_trace(
+        begin
+            QueryParams1 = [
+                {"ip_address", "10.50.0.0:60748"}
+            ],
+            Res1 = simplify_result(list_v2_request(QueryParams1, Config)),
+            ?assertMatch(
+                {400, #{
+                    <<"message">> :=
+                        <<"the ip_address parameter expected type is ip, but the value is",
+                            _/binary>>
+                }},
+                Res1
+            ),
             ok
         end,
         []
@@ -1893,11 +2082,14 @@ get_mqtt_port(Node, Type) ->
     {_IP, Port} = erpc:call(Node, emqx_config, get, [[listeners, Type, default, bind]]),
     Port.
 
-request(Method, Path, Params) ->
-    request(Method, Path, Params, _QueryParams = "").
+request(Method, Path, Config) ->
+    request(Method, Path, _Params = [], _QueryParams = "", Config).
 
-request(Method, Path, Params, QueryParams) ->
-    AuthHeader = emqx_mgmt_api_test_util:auth_header_(),
+request(Method, Path, Params, Config) ->
+    request(Method, Path, Params, _QueryParams = "", Config).
+
+request(Method, Path, Params, QueryParams, Config) ->
+    AuthHeader = ?config(api_auth_header, Config),
     Opts = #{return_all => true},
     case emqx_mgmt_api_test_util:request_api(Method, Path, QueryParams, AuthHeader, Params, Opts) of
         {ok, {Status, Headers, Body0}} ->
@@ -1905,7 +2097,7 @@ request(Method, Path, Params, QueryParams) ->
             {ok, {Status, Headers, Body}};
         {error, {Status, Headers, Body0}} ->
             Body =
-                case emqx_utils_json:safe_decode(Body0, [return_maps]) of
+                case emqx_utils_json:safe_decode(Body0) of
                     {ok, Decoded0 = #{<<"message">> := Msg0}} ->
                         Msg = maybe_json_decode(Msg0),
                         Decoded0#{<<"message">> := Msg};
@@ -1920,43 +2112,69 @@ request(Method, Path, Params, QueryParams) ->
     end.
 
 maybe_json_decode(X) ->
-    case emqx_utils_json:safe_decode(X, [return_maps]) of
+    case emqx_utils_json:safe_decode(X) of
         {ok, Decoded} -> Decoded;
         {error, _} -> X
     end.
 
-get_subscriptions_request(APIPort, ClientId) ->
-    Host = "http://127.0.0.1:" ++ integer_to_list(APIPort),
-    Path = emqx_mgmt_api_test_util:api_path(Host, ["clients", ClientId, "subscriptions"]),
-    request(get, Path, []).
+get_subscriptions_request(ClientId, Config) ->
+    get_subscriptions_request(ClientId, Config, _Opts = #{}).
 
-get_client_request(Port, ClientId) ->
-    Host = "http://127.0.0.1:" ++ integer_to_list(Port),
-    Path = emqx_mgmt_api_test_util:api_path(Host, ["clients", ClientId]),
-    request(get, Path, []).
+get_subscriptions_request(ClientId, Config, Opts) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "subscriptions"]),
+    Res = request(get, Path, [], Config),
+    Simplify = maps:get(simplify_result, Opts, false),
+    case Simplify of
+        true -> simplify_result(Res);
+        false -> Res
+    end.
 
-list_request(Port) ->
-    list_request(Port, _QueryParams = "").
+get_client_request(ClientId, Config) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId]),
+    request(get, Path, [], Config).
 
-list_request(Port, QueryParams) ->
-    Host = "http://127.0.0.1:" ++ integer_to_list(Port),
-    Path = emqx_mgmt_api_test_util:api_path(Host, ["clients"]),
-    request(get, Path, [], QueryParams).
+list_request(Config) ->
+    list_request(_QueryString = "", Config).
 
-list_v2_request(Port, QueryParams = #{}) ->
-    Host = "http://127.0.0.1:" ++ integer_to_list(Port),
-    Path = emqx_mgmt_api_test_util:api_path(Host, ["clients_v2"]),
-    QS = uri_string:compose_query(maps:to_list(emqx_utils_maps:binary_key_map(QueryParams))),
-    request(get, Path, [], QS).
+list_request(QueryParams, Config) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients"]),
+    request(get, Path, [], compose_query_string(QueryParams), Config).
 
-list_all_v2(Port, QueryParams = #{}) ->
-    do_list_all_v2(Port, QueryParams, _Acc = []).
+bulk_subscribe_request(ClientId, Config, Body) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "subscribe", "bulk"]),
+    simplify_result(request(post, Path, Body, Config)).
 
-do_list_all_v2(Port, QueryParams, Acc) ->
-    case list_v2_request(Port, QueryParams) of
+bulk_unsubscribe_request(ClientId, Config, Body) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId, "unsubscribe", "bulk"]),
+    simplify_result(request(post, Path, Body, Config)).
+
+simplify_result(Res) ->
+    case Res of
+        {error, {{_, Status, _}, _, Body}} ->
+            {Status, Body};
+        {ok, {{_, Status, _}, _, Body}} ->
+            {Status, Body}
+    end.
+
+list_v2_request(QueryParams, Config) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients_v2"]),
+    request(get, Path, [], compose_query_string(QueryParams), Config).
+
+list_all_v2(QueryParams, Config) ->
+    do_list_all_v2(QueryParams, Config, _Acc = []).
+
+do_list_all_v2(QueryParams, Config, Acc) ->
+    case list_v2_request(QueryParams, Config) of
         {ok, {{_, 200, _}, _, Resp = #{<<"meta">> := #{<<"cursor">> := Cursor}}}} ->
-            do_list_all_v2(Port, QueryParams#{cursor => Cursor}, [Resp | Acc]);
-        {ok, {{_, 200, _}, _, Resp = #{<<"meta">> := #{<<"hasnext">> := false}}}} ->
+            do_list_all_v2(QueryParams#{cursor => Cursor}, Config, [Resp | Acc]);
+        {ok, {{_, 200, _}, _, #{<<"data">> := []} = Resp}} ->
+            case Acc of
+                [] ->
+                    [Resp];
+                _ ->
+                    lists:reverse(Acc)
+            end;
+        {ok, {{_, 200, _}, _, Resp}} ->
             lists:reverse([Resp | Acc]);
         Other ->
             error(
@@ -1968,17 +2186,22 @@ do_list_all_v2(Port, QueryParams, Acc) ->
             )
     end.
 
-lookup_request(ClientId) ->
-    lookup_request(ClientId, 18083).
+lookup_request(ClientId, Config) ->
+    Path = emqx_mgmt_api_test_util:api_path(["clients", ClientId]),
+    request(get, Path, [], Config).
 
-lookup_request(ClientId, Port) ->
-    Host = "http://127.0.0.1:" ++ integer_to_list(Port),
-    Path = emqx_mgmt_api_test_util:api_path(Host, ["clients", ClientId]),
-    request(get, Path, []).
+compose_query_string(QueryParams = #{}) ->
+    QPList = maps:to_list(QueryParams),
+    compose_query_string(QPList);
+compose_query_string([{_, _} | _] = QueryParams) ->
+    uri_string:compose_query(
+        [{emqx_utils_conv:bin(K), emqx_utils_conv:bin(V)} || {K, V} <- QueryParams]
+    );
+compose_query_string(QueryString) when is_list(QueryString) ->
+    QueryString.
 
-assert_single_client(Opts) ->
+assert_single_client(Opts, Config) ->
     #{
-        api_port := APIPort,
         clientid := ClientId,
         node := Node,
         status := Connected
@@ -1997,7 +2220,7 @@ assert_single_client(Opts) ->
                     <<"data">> := [#{<<"connected">> := IsConnected}],
                     <<"meta">> := #{<<"count">> := 1}
                 }}},
-            list_request(APIPort)
+            list_request(Config)
         )
     ),
     ?retry(
@@ -2005,13 +2228,13 @@ assert_single_client(Opts) ->
         20,
         ?assertMatch(
             {ok, {{_, 200, _}, _, #{<<"data">> := [#{<<"connected">> := IsConnected}]}}},
-            list_request(APIPort, "node=" ++ atom_to_list(Node)),
+            list_request("node=" ++ atom_to_list(Node), Config),
             #{node => Node}
         )
     ),
     ?assertMatch(
         {ok, {{_, 200, _}, _, #{<<"connected">> := IsConnected}}},
-        lookup_request(ClientId, APIPort)
+        lookup_request(ClientId, Config)
     ),
     ?assertMatch(
         {ok,
@@ -2024,7 +2247,7 @@ assert_single_client(Opts) ->
                 <<"listener">> := _,
                 <<"clean_start">> := _
             }}},
-        get_client_request(APIPort, ClientId)
+        get_client_request(ClientId, Config)
     ),
     ok.
 
@@ -2034,61 +2257,69 @@ connect_client(Opts) ->
         clean_start => false
     },
     #{
-        port := Port,
-        clientid := ClientId,
-        clean_start := CleanStart,
+        port := _Port,
+        clientid := _ClientId,
         expiry := EI
-    } = maps:merge(Defaults, Opts),
-    {ok, C} = emqtt:start_link([
-        {port, Port},
-        {proto_ver, v5},
-        {clientid, ClientId},
-        {clean_start, CleanStart},
-        {properties, #{'Session-Expiry-Interval' => EI}}
-    ]),
+    } = ConnOpts0 = maps:merge(Defaults, Opts),
+    ConnOpts1 = maps:without([expiry], ConnOpts0),
+    ConnOpts = emqx_utils_maps:deep_merge(
+        #{
+            proto_ver => v5,
+            properties => #{'Session-Expiry-Interval' => EI}
+        },
+        ConnOpts1
+    ),
+    {ok, C} = emqtt:start_link(ConnOpts),
     {ok, _} = emqtt:connect(C),
     C.
 
-assert_contains_clientids(Results, ExpectedClientIds) ->
+assert_contains_clientids(Results, ExpectedClientIds, Line) ->
     ContainedClientIds = [
         ClientId
      || #{<<"data">> := Rows} <- Results,
         #{<<"clientid">> := ClientId} <- Rows
     ],
-    ?assertEqual(
+    snabbkaffe_diff:assert_lists_eq(
         lists:sort(ExpectedClientIds),
         lists:sort(ContainedClientIds),
-        #{results => Results}
+        #{comment => Line}
     ).
 
-traverse_in_reverse_v2(APIPort, QueryParams0, Results) ->
-    Cursors0 =
-        lists:map(
-            fun(#{<<"meta">> := Meta}) ->
-                maps:get(<<"cursor">>, Meta, <<"wontbeused">>)
-            end,
-            Results
-        ),
-    Cursors1 = [<<"none">> | lists:droplast(Cursors0)],
+traverse_in_reverse_v2(QueryParams0, Results, Config) ->
+    Cursors = [C || #{<<"meta">> := #{<<"cursor">> := C}} <- lists:droplast(Results)],
+    CursorParams = [#{} | [#{cursor => C} || C <- Cursors]],
     DirectOrderClientIds = [
         ClientId
      || #{<<"data">> := Rows} <- Results,
         #{<<"clientid">> := ClientId} <- Rows
     ],
-    ReverseCursors = lists:reverse(Cursors1),
+    ReverseCursorParams = lists:reverse(CursorParams),
     do_traverse_in_reverse_v2(
-        APIPort, QueryParams0, ReverseCursors, DirectOrderClientIds, _Acc = []
+        QueryParams0, Config, ReverseCursorParams, DirectOrderClientIds, _Acc = []
     ).
 
-do_traverse_in_reverse_v2(_APIPort, _QueryParams0, _Cursors = [], DirectOrderClientIds, Acc) ->
+do_traverse_in_reverse_v2(_QueryParams0, _Config, [], DirectOrderClientIds, Acc) ->
     ?assertEqual(DirectOrderClientIds, Acc);
-do_traverse_in_reverse_v2(APIPort, QueryParams0, [Cursor | Rest], DirectOrderClientIds, Acc) ->
-    QueryParams = QueryParams0#{cursor => Cursor},
-    Res0 = list_v2_request(APIPort, QueryParams),
+do_traverse_in_reverse_v2(QueryParams0, Config, [CursorParam | Rest], DirectOrderClientIds, Acc) ->
+    QueryParams = maps:merge(QueryParams0, CursorParam),
+    Res0 = list_v2_request(QueryParams, Config),
     ?assertMatch({ok, {{_, 200, _}, _, #{<<"data">> := _}}}, Res0),
     {ok, {{_, 200, _}, _, #{<<"data">> := Rows}}} = Res0,
     ClientIds = [ClientId || #{<<"clientid">> := ClientId} <- Rows],
-    do_traverse_in_reverse_v2(APIPort, QueryParams0, Rest, DirectOrderClientIds, ClientIds ++ Acc).
+    do_traverse_in_reverse_v2(QueryParams0, Config, Rest, DirectOrderClientIds, ClientIds ++ Acc).
 
 disconnect_and_destroy_session(Client) ->
     ok = emqtt:disconnect(Client, ?RC_SUCCESS, #{'Session-Expiry-Interval' => 0}).
+
+%% To avoid a race condition where we try to delete the session while it's terminating and
+%% committing.  This shouldn't happen realistically, because we have a safe grace period
+%% before attempting to GC a session.
+%% Also, we need to wait until offline metadata is committed before checking the v2 client
+%% list, to avoid flaky batch results.
+stop_and_commit(Client) ->
+    {ok, {ok, _}} =
+        ?wait_async_action(
+            emqtt:stop(Client),
+            #{?snk_kind := ?sessds_terminate}
+        ),
+    ok.

@@ -71,6 +71,9 @@ mqttSubscriptionTopic: mqttuser0002/sub/#
 mqttPubSubTopic: mqttuser0002/pubsub/1
 mqttPubSubTopic: mqttuser0002/pubsub/+
 mqttPubSubTopic: mqttuser0002/pubsub/#
+mqttAclRule: [{"permission": "allow", "action": "pub", "topic": "mqttuser0002/rawrule1/1"}]
+mqttAclRule: {"permission": "allow", "action": "pub", "topic": "mqttuser0002/rawrule2/#"}
+mqttAclTtl: 1s
 userPassword:: e1NTSEF9bjlYZHRvRzRRL1RRM1RRRjRZK2toSmJNQkg0cVhqNE0=
 
 ## create user mqttuser0003
@@ -166,12 +169,18 @@ uid: mqttuser0008 (test)
 isSuperuser: TRUE
 userPassword: {SHA}FCzJLOp66OwsZ9DQzXSxdTd9c0U=
 
+## This user's password is `mqttuser0009 \\test\\`, i.e
+## it has _double_ backslashes around the `test` string.
+## The username is `mqttuser0009 \test\`, i.e with _single_
+## backslashes.
+## Note that these single backslashes are escaped in the dn
+## and not escaped in the uid field specification.
 objectClass: top
 dn:uid=mqttuser0009 \\test\\,ou=testdevice,dc=emqx,dc=io
 objectClass: mqttUser
 objectClass: mqttDevice
 objectClass: mqttSecurity
-uid: mqttuser0009 \\test\\
+uid: mqttuser0009 \test\
 isSuperuser: TRUE
 userPassword: {SHA}awxXARLqWYx+xy0677D/TLjlyHA=
 
@@ -194,3 +203,18 @@ objectClass: dashboardUser
 uid: viewer2
 ugroup: group1
 userPassword: {SHA}SR0qZpf8pYKKAbn6ILFvX91JuQg=
+
+## create user=mqttuser0010,
+#         password=mqttuser0010,
+#         passhash={SHA}znSPP0hz/0QGs88iiEB4D8qnwOw=
+#         base64passhash=e1NIQX16blNQUDBoei8wUUdzODhpaUVCNEQ4cW53T3c9
+dn:uid=mqttuser0010,ou=testdevice,dc=emqx,dc=io
+objectClass: top
+objectClass: mqttUser
+objectClass: mqttDevice
+objectClass: mqttSecurity
+uid: mqttuser0010
+isEnabled: TRUE
+clientIdOverride: overridden_clientid
+mqttAccountName: user10
+userPassword:: e1NIQX16blNQUDBoei8wUUdzODhpaUVCNEQ4cW53T3c9

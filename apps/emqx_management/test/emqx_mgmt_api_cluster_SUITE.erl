@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_cluster_SUITE).
 
@@ -21,7 +9,15 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
+%%------------------------------------------------------------------------------
+%% Defs
+%%------------------------------------------------------------------------------
+
 -define(APPS, [emqx_conf, emqx_management]).
+
+%%------------------------------------------------------------------------------
+%% CT boilerplate
+%%------------------------------------------------------------------------------
 
 all() ->
     emqx_common_test_helpers:all(?MODULE).
@@ -41,9 +37,12 @@ init_per_testcase(TC = t_cluster_invite_api_timeout, Config0) ->
 init_per_testcase(TC = t_cluster_invite_async, Config0) ->
     Config = [{tc_name, TC} | Config0],
     [{cluster, cluster(Config)} | setup(Config)];
-init_per_testcase(_TC, Config) ->
-    emqx_mgmt_api_test_util:init_suite(?APPS),
-    Config.
+init_per_testcase(TC, Config) ->
+    Apps = emqx_cth_suite:start(
+        ?APPS ++ [emqx_mgmt_api_test_util:emqx_dashboard()],
+        #{work_dir => emqx_cth_suite:work_dir(TC, Config)}
+    ),
+    [{tc_apps, Apps} | Config].
 
 end_per_testcase(t_cluster_topology_api_replicants, Config) ->
     emqx_cth_cluster:stop(?config(cluster, Config)),
@@ -54,15 +53,95 @@ end_per_testcase(t_cluster_invite_api_timeout, Config) ->
 end_per_testcase(t_cluster_invite_async, Config) ->
     emqx_cth_cluster:stop(?config(cluster, Config)),
     cleanup(Config);
-end_per_testcase(_TC, _Config) ->
-    emqx_mgmt_api_test_util:end_suite(?APPS).
+end_per_testcase(_TC, Config) ->
+    ok = emqx_cth_suite:stop(?config(tc_apps, Config)).
+
+%%------------------------------------------------------------------------------
+%% Helper fns
+%%------------------------------------------------------------------------------
+
+cluster(Config) ->
+    Nodes = emqx_cth_cluster:start(
+        [
+            {data_backup_core1, #{
+                apps => ?APPS ++ [emqx_mgmt_api_test_util:emqx_dashboard()],
+                role => core
+            }},
+            {data_backup_core2, #{apps => ?APPS, role => core}},
+            {data_backup_replicant, #{apps => ?APPS, role => replicant}}
+        ],
+        #{work_dir => work_dir(Config)}
+    ),
+    Nodes.
+
+setup(Config) ->
+    WorkDir = filename:join(work_dir(Config), local),
+    Started = emqx_cth_suite:start(?APPS, #{work_dir => WorkDir}),
+    [{suite_apps, Started} | Config].
+
+cleanup(Config) ->
+    emqx_cth_suite:stop(?config(suite_apps, Config)).
+
+work_dir(Config) ->
+    filename:join(?config(priv_dir, Config), ?config(tc_name, Config)).
+
+waiting_the_async_invitation_succeed(Node, TargetNode) ->
+    waiting_the_async_invitation_succeed(Node, TargetNode, 100).
+
+waiting_the_async_invitation_succeed(_Node, _TargetNode, 0) ->
+    error(timeout);
+waiting_the_async_invitation_succeed(Node, TargetNode, N) ->
+    {200, #{
+        in_progress := InProgress,
+        succeed := Succeed,
+        failed := Failed
+    }} = rpc:call(Node, emqx_mgmt_api_cluster, get_invitation_status, [get, #{}]),
+    case find_node_info_list(TargetNode, InProgress) of
+        error ->
+            case find_node_info_list(TargetNode, Succeed) of
+                error ->
+                    case find_node_info_list(TargetNode, Failed) of
+                        error -> error;
+                        Info1 -> {failed, Info1}
+                    end;
+                Info2 ->
+                    {succeed, Info2}
+            end;
+        _Info ->
+            timer:sleep(1000),
+            waiting_the_async_invitation_succeed(Node, TargetNode, N - 1)
+    end.
+
+find_node_info_list(Node, List) ->
+    L = lists:filter(fun(#{node := N}) -> N =:= Node end, List),
+    case L of
+        [] -> error;
+        [Info] -> Info
+    end.
+
+cluster_info() ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => get,
+        url => emqx_mgmt_api_test_util:api_path(["cluster"])
+    }).
+
+update_cluster_info(Params) ->
+    emqx_mgmt_api_test_util:simple_request(#{
+        method => put,
+        body => Params,
+        url => emqx_mgmt_api_test_util:api_path(["cluster"])
+    }).
+
+%%------------------------------------------------------------------------------
+%% Test cases
+%%------------------------------------------------------------------------------
 
 t_cluster_topology_api_empty_resp(_) ->
     ClusterTopologyPath = emqx_mgmt_api_test_util:api_path(["cluster", "topology"]),
     {ok, Resp} = emqx_mgmt_api_test_util:request_api(get, ClusterTopologyPath),
     ?assertEqual(
         [#{<<"core_node">> => atom_to_binary(node()), <<"replicant_nodes">> => []}],
-        emqx_utils_json:decode(Resp, [return_maps])
+        emqx_utils_json:decode(Resp)
     ).
 
 t_cluster_topology_api_replicants(Config) ->
@@ -75,19 +154,26 @@ t_cluster_topology_api_replicants(Config) ->
             [
                 #{
                     core_node := Core1,
-                    replicant_nodes :=
-                        [#{node := Replicant, streams := _}]
+                    replicant_nodes := _
                 },
                 #{
                     core_node := Core2,
-                    replicant_nodes :=
-                        [#{node := Replicant, streams := _}]
+                    replicant_nodes := _
                 }
             ],
             Resp
         )
      || Resp <- [lists:sort(R) || R <- [Core1Resp, Core2Resp, ReplResp]]
-    ].
+    ],
+    %% Occasionally, the replicant may decide to not connect to one core (seen at tests)...
+    Core1RespReplicants = lists:usort([
+        Rep
+     || R <- [Core1Resp, Core2Resp, ReplResp],
+        #{replicant_nodes := Reps} <- R,
+        #{node := Rep} <- Reps
+    ]),
+    ?assertMatch([Replicant], Core1RespReplicants),
+    ok.
 
 t_cluster_invite_api_timeout(Config) ->
     %% assert the cluster is created
@@ -97,17 +183,22 @@ t_cluster_invite_api_timeout(Config) ->
         [
             #{
                 core_node := Core1,
-                replicant_nodes :=
-                    [#{node := Replicant, streams := _}]
+                replicant_nodes := _
             },
             #{
                 core_node := Core2,
-                replicant_nodes :=
-                    [#{node := Replicant, streams := _}]
+                replicant_nodes := _
             }
         ],
         lists:sort(Core1Resp)
     ),
+    %% Occasionally, the replicant may decide to connect to one core (seen at tests)...
+    Core1RespReplicants = lists:usort([
+        Rep
+     || #{replicant_nodes := Reps} <- Core1Resp,
+        #{node := Rep} <- Reps
+    ]),
+    ?assertMatch([Replicant], Core1RespReplicants),
 
     %% force leave the core2
     {204} = rpc:call(
@@ -178,17 +269,22 @@ t_cluster_invite_async(Config) ->
         [
             #{
                 core_node := Core1,
-                replicant_nodes :=
-                    [#{node := Replicant, streams := _}]
+                replicant_nodes := _
             },
             #{
                 core_node := Core2,
-                replicant_nodes :=
-                    [#{node := Replicant, streams := _}]
+                replicant_nodes := _
             }
         ],
         lists:sort(Core1Resp)
     ),
+    %% Occasionally, the replicant may decide to connect to one core (seen at tests)...
+    Core1RespReplicants = lists:usort([
+        Rep
+     || #{replicant_nodes := Reps} <- Core1Resp,
+        #{node := Rep} <- Reps
+    ]),
+    ?assertMatch([Replicant], Core1RespReplicants),
 
     %% force leave the core2
     {204} = rpc:call(
@@ -203,7 +299,7 @@ t_cluster_invite_async(Config) ->
         [
             #{
                 core_node := Core1,
-                replicant_nodes := [_]
+                replicant_nodes := _
             }
         ],
         lists:sort(Core1Resp2)
@@ -296,59 +392,32 @@ t_cluster_invite_async(Config) ->
     ),
     ok.
 
-cluster(Config) ->
-    NodeSpec = #{apps => ?APPS},
-    Nodes = emqx_cth_cluster:start(
-        [
-            {data_backup_core1, NodeSpec#{role => core}},
-            {data_backup_core2, NodeSpec#{role => core}},
-            {data_backup_replicant, NodeSpec#{role => replicant}}
-        ],
-        #{work_dir => work_dir(Config)}
+t_cluster_info(_TCConfig) ->
+    ?assertMatch(
+        {200, #{
+            <<"name">> := <<"emqxcl">>,
+            <<"nodes">> := [N],
+            <<"self">> := N,
+            <<"description">> := _
+        }},
+        cluster_info()
     ),
-    Nodes.
-
-setup(Config) ->
-    WorkDir = filename:join(work_dir(Config), local),
-    Started = emqx_cth_suite:start(?APPS, #{work_dir => WorkDir}),
-    [{suite_apps, Started} | Config].
-
-cleanup(Config) ->
-    emqx_cth_suite:stop(?config(suite_apps, Config)).
-
-work_dir(Config) ->
-    filename:join(?config(priv_dir, Config), ?config(tc_name, Config)).
-
-waiting_the_async_invitation_succeed(Node, TargetNode) ->
-    waiting_the_async_invitation_succeed(Node, TargetNode, 100).
-
-waiting_the_async_invitation_succeed(_Node, _TargetNode, 0) ->
-    error(timeout);
-waiting_the_async_invitation_succeed(Node, TargetNode, N) ->
-    {200, #{
-        in_progress := InProgress,
-        succeed := Succeed,
-        failed := Failed
-    }} = rpc:call(Node, emqx_mgmt_api_cluster, get_invitation_status, [get, #{}]),
-    case find_node_info_list(TargetNode, InProgress) of
-        error ->
-            case find_node_info_list(TargetNode, Succeed) of
-                error ->
-                    case find_node_info_list(TargetNode, Failed) of
-                        error -> error;
-                        Info1 -> {failed, Info1}
-                    end;
-                Info2 ->
-                    {succeed, Info2}
-            end;
-        _Info ->
-            timer:sleep(1000),
-            waiting_the_async_invitation_succeed(Node, TargetNode, N - 1)
-    end.
-
-find_node_info_list(Node, List) ->
-    L = lists:filter(fun(#{node := N}) -> N =:= Node end, List),
-    case L of
-        [] -> error;
-        [Info] -> Info
-    end.
+    ?assertMatch(
+        {200, #{
+            <<"name">> := <<"emqxcl">>,
+            <<"nodes">> := [N],
+            <<"self">> := N,
+            <<"description">> := <<"my cool cluster">>
+        }},
+        update_cluster_info(#{<<"description">> => <<"my cool cluster">>})
+    ),
+    ?assertMatch(
+        {200, #{
+            <<"name">> := <<"emqxcl">>,
+            <<"nodes">> := [N],
+            <<"self">> := N,
+            <<"description">> := <<"my cool cluster">>
+        }},
+        cluster_info()
+    ),
+    ok.

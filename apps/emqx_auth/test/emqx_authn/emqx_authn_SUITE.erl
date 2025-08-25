@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authn_SUITE).
@@ -327,5 +315,30 @@ t_update_conf(Config) when is_list(Config) ->
     ok.
 
 parse(Bytes) ->
-    {ok, Frame, <<>>, {none, _}} = emqx_frame:parse(Bytes),
+    {Frame, <<>>, _} = emqx_frame:parse(Bytes),
     Frame.
+
+authenticate_return_quota_exceeded_hook(_, _) ->
+    {stop, {error, quota_exceeded}}.
+
+t_authenticate_return_quota_exceeded({init, Config}) ->
+    Priority = 0,
+    ok = emqx_hooks:put(
+        'client.authenticate', {?MODULE, authenticate_return_quota_exceeded_hook, []}, Priority
+    ),
+    Config;
+t_authenticate_return_quota_exceeded({'end', _Config}) ->
+    ok = emqx_hooks:del('client.authenticate', {?MODULE, authenticate_return_quota_exceeded_hook});
+t_authenticate_return_quota_exceeded(Config) when is_list(Config) ->
+    {ok, Client} = emqtt:start_link([
+        {clientid, <<"tests-cli1">>},
+        {password, <<"pass">>},
+        {proto_ver, v5}
+    ]),
+    _ = monitor(process, Client),
+    _ = unlink(Client),
+    ?assertMatch({error, {quota_exceeded, _}}, emqtt:connect(Client)),
+    receive
+        {'DOWN', _, process, Client, Reason} ->
+            ?assertEqual({shutdown, quota_exceeded}, Reason)
+    end.

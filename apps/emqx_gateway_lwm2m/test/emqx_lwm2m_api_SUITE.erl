@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_lwm2m_api_SUITE).
@@ -24,7 +12,8 @@
 -define(LOGT(Format, Args), ct:pal("TEST_SUITE: " ++ Format, Args)).
 
 -include("emqx_lwm2m.hrl").
--include("emqx_gateway_coap/include/emqx_coap.hrl").
+-include("../../emqx_gateway_coap/include/emqx_coap.hrl").
+-include_lib("emqx/include/emqx_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
@@ -58,23 +47,26 @@ all() ->
     emqx_common_test_helpers:all(?MODULE).
 
 init_per_suite(Config) ->
-    application:load(emqx_gateway),
-    application:load(emqx_gateway_lwm2m),
-    DefaultConfig = emqx_lwm2m_SUITE:default_config(),
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, DefaultConfig),
-    emqx_mgmt_api_test_util:init_suite([emqx_conf, emqx_auth]),
-    Config.
+    Apps = emqx_cth_suite:start(
+        [
+            emqx_conf,
+            emqx_gateway_lwm2m,
+            emqx_gateway,
+            emqx_auth,
+            emqx_management,
+            emqx_mgmt_api_test_util:emqx_dashboard()
+        ],
+        #{work_dir => emqx_cth_suite:work_dir(Config)}
+    ),
+    ok = emqx_conf_cli:load_config(?global_ns, emqx_lwm2m_SUITE:default_config(), #{mode => replace}),
+    [{suite_apps, Apps} | Config].
 
 end_per_suite(Config) ->
-    timer:sleep(300),
-    {ok, _} = emqx_conf:remove([<<"gateway">>, <<"lwm2m">>], #{}),
-    emqx_mgmt_api_test_util:end_suite([emqx_auth, emqx_conf]),
-    Config.
+    emqx_cth_suite:stop(?config(suite_apps, Config)),
+    ok.
 
 init_per_testcase(_AllTestCase, Config) ->
-    DefaultConfig = emqx_lwm2m_SUITE:default_config(),
-    ok = emqx_common_test_helpers:load_config(emqx_gateway_schema, DefaultConfig),
-    {ok, _} = application:ensure_all_started(emqx_gateway),
+    ok = emqx_conf_cli:load_config(?global_ns, emqx_lwm2m_SUITE:default_config(), #{mode => replace}),
     {ok, ClientUdpSock} = gen_udp:open(0, [binary, {active, false}]),
 
     {ok, C} = emqtt:start_link([{host, "localhost"}, {port, 1883}, {clientid, <<"c1">>}]),
@@ -86,7 +78,6 @@ init_per_testcase(_AllTestCase, Config) ->
 end_per_testcase(_AllTestCase, Config) ->
     gen_udp:close(?config(sock, Config)),
     emqtt:disconnect(?config(emqx_c, Config)),
-    ok = application:stop(emqx_gateway),
     timer:sleep(300).
 
 %%--------------------------------------------------------------------
@@ -347,10 +338,10 @@ no_received_request(ClientId, Path, Action) ->
         <<"codeMsg">> => <<"reply_not_received">>,
         <<"path">> => Path
     },
-    ?assertEqual(NotReceived, emqx_utils_json:decode(Response, [return_maps])).
+    ?assertEqual(NotReceived, emqx_utils_json:decode(Response)).
 normal_received_request(ClientId, Path, Action) ->
     Response = call_lookup_api(ClientId, Path, Action),
-    RCont = emqx_utils_json:decode(Response, [return_maps]),
+    RCont = emqx_utils_json:decode(Response),
     ?assertEqual(list_to_binary(ClientId), maps:get(<<"clientid">>, RCont, undefined)),
     ?assertEqual(Path, maps:get(<<"path">>, RCont, undefined)),
     ?assertEqual(Action, maps:get(<<"action">>, RCont, undefined)),

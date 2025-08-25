@@ -1,21 +1,12 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_authz_utils).
 
+-feature(maybe_expr, enable).
+
+-include_lib("emqx/include/emqx_placeholder.hrl").
 -include_lib("emqx_authz.hrl").
 -include_lib("snabbkaffe/include/trace.hrl").
 
@@ -23,12 +14,13 @@
     cleanup_resources/0,
     make_resource_id/1,
     create_resource/2,
-    create_resource/3,
     update_resource/2,
     remove_resource/1,
     update_config/2,
     vars_for_rule_query/2,
-    parse_rule_from_row/2
+    authorize_with_row/6,
+    init_state/2,
+    cleanup_resource_config/2
 ]).
 
 -export([
@@ -36,8 +28,14 @@
     content_type/1
 ]).
 
--define(DEFAULT_RESOURCE_OPTS, #{
-    start_after_created => false
+-export([
+    cached_simple_sync_query/3
+]).
+
+-define(DEFAULT_RESOURCE_OPTS(Type), #{
+    start_after_created => false,
+    spawn_buffer_workers => false,
+    owner_id => Type
 }).
 
 -include_lib("emqx/include/logger.hrl").
@@ -46,61 +44,93 @@
 %% APIs
 %%--------------------------------------------------------------------
 
-create_resource(Module, Config) ->
-    ResourceId = make_resource_id(Module),
-    create_resource(ResourceId, Module, Config).
+-spec create_resource(module(), map()) -> ok | no_return().
+create_resource(
+    ConnectorModule,
+    #{resource_id := ResourceId, type := Type, resource_config := ResourceConfig} = State
+) ->
+    maybe
+        {ok, _} ?=
+            emqx_resource:create_local(
+                ResourceId,
+                ?AUTHZ_RESOURCE_GROUP,
+                ConnectorModule,
+                ResourceConfig,
+                ?DEFAULT_RESOURCE_OPTS(Type)
+            ),
+        ok = start_resource_if_enabled(State)
+    else
+        {error, Reason} ->
+            error({create_resource_error, Reason})
+    end.
 
-create_resource(ResourceId, Module, Config) ->
-    Result = emqx_resource:create_local(
-        ResourceId,
-        ?AUTHZ_RESOURCE_GROUP,
-        Module,
-        Config,
-        ?DEFAULT_RESOURCE_OPTS
-    ),
-    start_resource_if_enabled(Result, ResourceId, Config).
-
-update_resource(Module, #{annotations := #{id := ResourceId}} = Config) ->
-    Result =
-        case
+-spec update_resource(module(), map()) -> ok | no_return().
+update_resource(
+    ConnectorModule,
+    #{resource_id := ResourceId, type := Type, resource_config := ResourceConfig} = State
+) ->
+    maybe
+        {ok, _} ?=
             emqx_resource:recreate_local(
                 ResourceId,
-                Module,
-                Config,
-                ?DEFAULT_RESOURCE_OPTS
-            )
-        of
-            {ok, _} -> {ok, ResourceId};
-            {error, Reason} -> {error, Reason}
-        end,
-    start_resource_if_enabled(Result, ResourceId, Config).
+                ConnectorModule,
+                ResourceConfig,
+                ?DEFAULT_RESOURCE_OPTS(Type)
+            ),
+        ok = start_resource_if_enabled(State)
+    else
+        {error, Reason} ->
+            error({update_resource_error, Reason})
+    end.
 
+-spec remove_resource(emqx_resource:resource_id()) -> ok.
 remove_resource(ResourceId) ->
     emqx_resource:remove_local(ResourceId).
 
-start_resource_if_enabled({ok, _} = Result, ResourceId, #{enable := true}) ->
-    _ = emqx_resource:start(ResourceId),
-    Result;
-start_resource_if_enabled(Result, _ResourceId, _Config) ->
-    Result.
+-spec cleanup_resource_config([atom()], map()) -> map().
+cleanup_resource_config(WithoutFields, Source) ->
+    maps:without([enable, type] ++ WithoutFields, Source).
 
+-spec start_resource_if_enabled(map()) -> ok | {error, term()}.
+start_resource_if_enabled(#{resource_id := ResourceId, enable := true, type := Type}) ->
+    case emqx_resource:start(ResourceId) of
+        ok ->
+            ok;
+        %% NOTE
+        %% we allow creation of resources that cannot be started
+        {error, Reason} ->
+            ?SLOG(warning, #{
+                msg => "failed_to_start_authz_resource",
+                resource_id => ResourceId,
+                reason => Reason,
+                type => Type
+            }),
+            ok
+    end;
+start_resource_if_enabled(#{resource_id := _ResourceId, enable := false}) ->
+    ok.
+
+-spec cleanup_resources() -> ok.
 cleanup_resources() ->
     lists:foreach(
         fun emqx_resource:remove_local/1,
         emqx_resource:list_group_instances(?AUTHZ_RESOURCE_GROUP)
     ).
 
+-spec make_resource_id(term()) -> emqx_resource:resource_id().
 make_resource_id(Name) ->
-    NameBin = emqx_utils_conv:bin(Name),
+    NameBin = iolist_to_binary(["authz:", emqx_utils_conv:bin(Name)]),
     emqx_resource:generate_id(NameBin).
 
+-spec update_config(emqx_utils_maps:config_key_path(), emqx_config:update_request()) ->
+    {ok, emqx_config:update_result()} | {error, emqx_config:update_error()}.
 update_config(Path, ConfigRequest) ->
     emqx_conf:update(Path, ConfigRequest, #{
         rawconf_with_defaults => true,
         override_to => cluster
     }).
 
--spec parse_http_resp_body(binary(), binary()) -> allow | deny | ignore | error.
+-spec parse_http_resp_body(binary(), binary()) -> allow | deny | ignore | error | {error, term()}.
 parse_http_resp_body(<<"application/x-www-form-urlencoded", _/binary>>, Body) ->
     try
         result(maps:from_list(cow_qs:parse_qs(Body)))
@@ -109,15 +139,12 @@ parse_http_resp_body(<<"application/x-www-form-urlencoded", _/binary>>, Body) ->
     end;
 parse_http_resp_body(<<"application/json", _/binary>>, Body) ->
     try
-        result(emqx_utils_json:decode(Body, [return_maps]))
+        result(emqx_utils_json:decode(Body))
     catch
         _:_ -> error
-    end.
-
-result(#{<<"result">> := <<"allow">>}) -> allow;
-result(#{<<"result">> := <<"deny">>}) -> deny;
-result(#{<<"result">> := <<"ignore">>}) -> ignore;
-result(_) -> error.
+    end;
+parse_http_resp_body(ContentType = <<_/binary>>, _Body) ->
+    {error, <<"unsupported content-type: ", ContentType/binary>>}.
 
 -spec content_type(cow_http:headers()) -> binary().
 content_type(Headers) when is_list(Headers) ->
@@ -129,17 +156,7 @@ content_type(Headers) when is_list(Headers) ->
         <<"application/json">>
     ).
 
--define(RAW_RULE_KEYS, [<<"permission">>, <<"action">>, <<"topic">>, <<"qos">>, <<"retain">>]).
-
-parse_rule_from_row(ColumnNames, Row) ->
-    RuleRaw = maps:with(?RAW_RULE_KEYS, maps:from_list(lists:zip(ColumnNames, to_list(Row)))),
-    case emqx_authz_rule_raw:parse_rule(RuleRaw) of
-        {ok, {Permission, Action, Topics}} ->
-            emqx_authz_rule:compile({Permission, all, Action, Topics});
-        {error, Reason} ->
-            error(Reason)
-    end.
-
+-spec vars_for_rule_query(emqx_types:clientinfo(), emqx_types:pubsub()) -> map().
 vars_for_rule_query(Client, ?authz_action(PubSub, Qos) = Action) ->
     Client#{
         action => PubSub,
@@ -147,11 +164,89 @@ vars_for_rule_query(Client, ?authz_action(PubSub, Qos) = Action) ->
         retain => maps:get(retain, Action, false)
     }.
 
+-spec cached_simple_sync_query(
+    emqx_auth_cache:cache_key(),
+    emqx_resource:resource_id(),
+    _Request :: term()
+) -> term().
+cached_simple_sync_query(CacheKey, ResourceID, Query) ->
+    emqx_auth_utils:cached_simple_sync_query(?AUTHZ_CACHE, CacheKey, ResourceID, Query).
+
+-spec authorize_with_row(
+    emqx_authz_source:source_type(),
+    emqx_types:clientinfo(),
+    emqx_types:pubsub(),
+    emqx_types:topic(),
+    [binary()] | undefined,
+    [binary()] | map()
+) -> nomatch | {matched, allow | deny | ignore}.
+authorize_with_row(Type, Client, Action, Topic, ColumnNames, Row) ->
+    try
+        maybe
+            {ok, Rule} ?= parse_rule_from_row(ColumnNames, Row),
+            {matched, Permission} ?= emqx_authz_rule:match(Client, Action, Topic, Rule),
+            {matched, Permission}
+        else
+            nomatch ->
+                nomatch;
+            {error, Reason0} ->
+                log_match_rule_error(Type, Row, Reason0),
+                nomatch
+        end
+    catch
+        throw:Reason1 ->
+            log_match_rule_error(Type, Row, Reason1),
+            nomatch
+    end.
+
+-spec init_state(emqx_authz_source:source(), map()) -> emqx_authz_source:source_state().
+init_state(#{type := Type, enable := Enable} = _Source, Values) ->
+    maps:merge(
+        #{
+            type => Type,
+            enable => Enable
+        },
+        Values
+    ).
+
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
+
+result(#{<<"result">> := <<"allow">>}) -> allow;
+result(#{<<"result">> := <<"deny">>}) -> deny;
+result(#{<<"result">> := <<"ignore">>}) -> ignore;
+result(_) -> error.
+
+parse_rule_from_row(_ColumnNames, RuleMap = #{}) ->
+    case emqx_authz_rule_raw:parse_rule(RuleMap) of
+        {ok, {Permission, Who, Action, Topics}} ->
+            {ok, emqx_authz_rule:compile({Permission, Who, Action, Topics})};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+parse_rule_from_row(ColumnNames, Row) ->
+    RuleMap = maps:from_list(lists:zip(ColumnNames, to_list(Row))),
+    parse_rule_from_row(ColumnNames, RuleMap).
 
 to_list(Tuple) when is_tuple(Tuple) ->
     tuple_to_list(Tuple);
 to_list(List) when is_list(List) ->
     List.
+
+log_match_rule_error(Type, Row, Reason0) ->
+    Msg0 = #{
+        msg => "match_rule_error",
+        rule => Row,
+        type => Type
+    },
+    Msg1 =
+        case is_map(Reason0) of
+            true -> maps:merge(Msg0, Reason0);
+            false -> Msg0#{reason => Reason0}
+        end,
+    ?SLOG(
+        error,
+        Msg1,
+        #{tag => "AUTHZ"}
+    ).

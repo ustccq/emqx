@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_bridge_greptimedb_connector).
 
@@ -16,6 +16,7 @@
 
 %% callbacks of behaviour emqx_resource
 -export([
+    resource_type/0,
     callback_mode/0,
     on_start/2,
     on_stop/2,
@@ -67,6 +68,8 @@
 
 %% -------------------------------------------------------------------------------------------------
 %% resource callback
+resource_type() -> greptimedb.
+
 callback_mode() -> async_if_possible.
 
 on_add_channel(
@@ -107,6 +110,10 @@ on_start(InstId, Config) ->
     %% See: greptimedb:start_client/1
     start_client(InstId, Config).
 
+on_stop(InstId, #{client := Client}) ->
+    Res = greptimedb:stop_client(Client),
+    ?tp(greptimedb_client_stopped, #{instance_id => InstId}),
+    Res;
 on_stop(InstId, _State) ->
     case emqx_resource:get_allocated_resources(InstId) of
         #{?greptime_client := Client} ->
@@ -229,13 +236,14 @@ roots() ->
     ].
 
 fields("connector") ->
-    [server_field()] ++
+    [server_field(), ttl_field()] ++
         credentials_fields() ++
         emqx_connector_schema_lib:ssl_fields();
 %% ============ begin: schema for old bridge configs ============
 fields(common) ->
     [
         server_field(),
+        ttl_field(),
         precision_field()
     ];
 fields(greptimedb) ->
@@ -258,6 +266,13 @@ precision_field() ->
 
 server_field() ->
     {server, server()}.
+
+ttl_field() ->
+    {ttl,
+        mk(binary(), #{
+            required => false,
+            desc => ?DESC("ttl")
+        })}.
 
 server() ->
     Meta = #{
@@ -288,7 +303,7 @@ start_client(InstId, Config) ->
     }),
     try do_start_client(InstId, ClientConfig, Config) of
         Res = {ok, #{client := Client}} ->
-            ok = emqx_resource:allocate_resource(InstId, ?greptime_client, Client),
+            ok = emqx_resource:allocate_resource(InstId, ?MODULE, ?greptime_client, Client),
             Res;
         {error, Reason} ->
             {error, Reason}
@@ -359,7 +374,7 @@ do_start_client(
             {error, Reason}
     end.
 
-grpc_config() ->
+grpc_opts() ->
     #{
         sync_start => true,
         connect_timeout => ?CONNECT_TIMEOUT
@@ -371,6 +386,11 @@ client_config(
         server := Server
     }
 ) ->
+    Hints =
+        case maps:find(ttl, Config) of
+            {ok, TimeToLive} -> #{<<"ttl">> => TimeToLive};
+            _ -> #{}
+        end,
     #{hostname := Host, port := Port} = emqx_schema:parse_server(Server, ?GREPTIMEDB_HOST_OPTIONS),
     [
         {endpoints, [{http, str(Host), Port}]},
@@ -378,7 +398,8 @@ client_config(
         {pool, InstId},
         {pool_type, random},
         {auto_reconnect, ?AUTO_RECONNECT_S},
-        {gprc_options, grpc_config()}
+        {grpc_hints, Hints},
+        {grpc_opts, grpc_opts()}
     ] ++ protocol_config(Config).
 
 protocol_config(

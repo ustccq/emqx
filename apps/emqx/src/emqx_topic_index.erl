@@ -1,28 +1,17 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% @doc Topic index implemetation with ETS table as ordered-set storage.
 
 -module(emqx_topic_index).
 
--export([new/0]).
+-export([new/0, new/1]).
 -export([insert/4]).
 -export([delete/3]).
 -export([match/2]).
 -export([matches/3]).
+-export([matches_filter/3]).
 
 -export([make_key/2]).
 
@@ -36,11 +25,15 @@
 -type match(ID) :: key(ID).
 -type words() :: emqx_trie_search:words().
 
-%% @doc Create a new ETS table suitable for topic index.
-%% Usable mostly for testing purposes.
 -spec new() -> ets:table().
 new() ->
-    ets:new(?MODULE, [public, ordered_set, {read_concurrency, true}]).
+    new([public, {read_concurrency, true}]).
+
+%% @doc Create a new ETS table suitable for topic index.
+%% Usable mostly for testing purposes.
+-spec new(list()) -> ets:table().
+new(Options) ->
+    ets:new(?MODULE, [ordered_set | Options]).
 
 %% @doc Insert a new entry into the index that associates given topic filter to given
 %% record ID, and attaches arbitrary record to the entry. This allows users to choose
@@ -71,6 +64,12 @@ match(Topic, Tab) ->
 -spec matches(emqx_types:topic(), ets:table(), emqx_trie_search:opts()) -> [match(_ID)].
 matches(Topic, Tab, Opts) ->
     emqx_trie_search:matches(Topic, make_nextf(Tab), Opts).
+
+%% @doc Match given topic filter against the index and return _all_ matches.
+%% If `unique` option is given, return only unique matches by record ID.
+-spec matches_filter(emqx_types:topic(), ets:table(), emqx_trie_search:opts()) -> [match(_ID)].
+matches_filter(TopicFilter, Tab, Opts) ->
+    emqx_trie_search:matches_filter(TopicFilter, make_nextf(Tab), Opts).
 
 %% @doc Extract record ID from the match.
 -spec get_id(match(ID)) -> ID.

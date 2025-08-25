@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2024-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,14 +23,40 @@
 
 -define(SYNTAX_ERROR, {error, "syntax error before:" ++ _}).
 
-redner_test_() ->
+render_test_() ->
     [
         {"direct var reference", fun() -> ?assertEqual({ok, <<"1">>}, render("a", #{a => 1})) end},
+        {"direct var reference missing", fun() ->
+            ?assertMatch({error, #{reason := var_unbound}}, render("a", #{}))
+        end},
+        {"direct var reference undefined", fun() ->
+            ?assertEqual({ok, <<"">>}, render("a", #{a => undefined}))
+        end},
+        {"var reference undefined", fun() ->
+            ?assertEqual(
+                {ok, <<"/c1">>}, render("concat([a, '/', c])", #{a => undefined, c => <<"c1">>})
+            )
+        end},
+        {"direct var reference null", fun() ->
+            ?assertEqual({ok, <<"">>}, render("a", #{a => null}))
+        end},
+        {"direct var reference emptry str", fun() ->
+            ?assertEqual({ok, <<"">>}, render("a", #{a => <<>>}))
+        end},
         {"concat strings", fun() ->
             ?assertEqual({ok, <<"a,b">>}, render("concat(['a',',','b'])", #{}))
         end},
         {"concat empty string", fun() ->
             ?assertEqual({ok, <<"">>}, render("concat([''])", #{}))
+        end},
+        {"identifier with hyphen", fun() ->
+            ?assertEqual(
+                {ok, <<"10">>},
+                render(
+                    "pub_props.Message-Expiry-Interval",
+                    #{pub_props => #{'Message-Expiry-Interval' => 10}}
+                )
+            )
         end},
         {"tokens 1st", fun() ->
             ?assertEqual({ok, <<"a">>}, render("nth(1,tokens(var, ','))", #{var => <<"a,b">>}))
@@ -126,7 +152,7 @@ inject_allowed_module_test() ->
             render(atom_to_list(?MODULE) ++ ".concat('a','b')", #{})
         ),
         ?assertMatch(
-            {error, #{reason := unallowed_veriform_module, module := emqx}},
+            {error, #{reason := unallowed_variform_module, module := emqx}},
             render("emqx.concat('a','b')", #{})
         )
     after
@@ -173,13 +199,49 @@ coalesce_test_() ->
         end}
     ].
 
+literal_test_() ->
+    [
+        ?_assertEqual({ok, <<"true">>}, render("true", #{})),
+        ?_assertEqual({ok, <<"0">>}, render("0", #{})),
+        ?_assertEqual({ok, <<"1.1">>}, render(<<"1.1">>, #{})),
+        ?_assertEqual({ok, <<"0.1">>}, render(<<"1.0e-1">>, #{})),
+        ?_assertEqual({ok, <<"0.011">>}, render(<<"1.1e-2">>, #{})),
+        ?_assertEqual({ok, <<"">>}, render(<<"''">>, #{})),
+        ?_assertEqual({ok, <<"string">>}, render(<<"'string'">>, #{})),
+        ?_assertEqual({ok, <<"string">>}, render(<<"\"string\"">>, #{}))
+    ].
+
+boolean_literal_test_() ->
+    [
+        ?_assertEqual({ok, <<"T">>}, render("iif(true,'T','F')", #{}))
+    ].
+
 compare_string_test_() ->
     [
+        %% is_nil test
+        ?_assertEqual({ok, <<"true">>}, render("is_empty('')", #{})),
+        ?_assertEqual({ok, <<"true">>}, render("is_empty(a)", #{<<"a">> => undefined})),
+        ?_assertEqual({ok, <<"true">>}, render("is_empty(a)", #{<<"a">> => null})),
+        ?_assertEqual({ok, <<"false">>}, render("is_empty('a')", #{})),
+        ?_assertEqual({ok, <<"false">>}, render("is_empty(a)", #{<<"a">> => "1"})),
+
         %% Testing str_eq/2
         ?_assertEqual({ok, <<"true">>}, render("str_eq('a', 'a')", #{})),
         ?_assertEqual({ok, <<"false">>}, render("str_eq('a', 'b')", #{})),
         ?_assertEqual({ok, <<"true">>}, render("str_eq('', '')", #{})),
         ?_assertEqual({ok, <<"false">>}, render("str_eq('a', '')", #{})),
+        ?_assertEqual(
+            {ok, <<"true">>}, render("str_eq(a, b)", #{<<"a">> => <<"1">>, <<"b">> => <<"1">>})
+        ),
+
+        %% Testing str_neq/2
+        ?_assertEqual({ok, <<"false">>}, render("str_neq('a', 'a')", #{})),
+        ?_assertEqual({ok, <<"true">>}, render("str_neq('a', 'b')", #{})),
+        ?_assertEqual({ok, <<"false">>}, render("str_neq('', '')", #{})),
+        ?_assertEqual({ok, <<"true">>}, render("str_neq('a', '')", #{})),
+        ?_assertEqual(
+            {ok, <<"false">>}, render("str_neq(a, b)", #{<<"a">> => <<"1">>, <<"b">> => <<"1">>})
+        ),
 
         %% Testing str_lt/2
         ?_assertEqual({ok, <<"true">>}, render("str_lt('a', 'b')", #{})),
@@ -209,6 +271,11 @@ compare_numbers_test_() ->
     [
         ?_assertEqual({ok, <<"true">>}, render("num_eq(1, 1)", #{})),
         ?_assertEqual({ok, <<"false">>}, render("num_eq(2, 1)", #{})),
+        ?_assertEqual({ok, <<"false">>}, render("num_eq(a, b)", #{<<"a">> => 1, <<"b">> => 2})),
+
+        ?_assertEqual({ok, <<"false">>}, render("num_neq(1, 1)", #{})),
+        ?_assertEqual({ok, <<"true">>}, render("num_neq(2, 1)", #{})),
+        ?_assertEqual({ok, <<"true">>}, render("num_neq(a, b)", #{<<"a">> => 1, <<"b">> => 2})),
 
         ?_assertEqual({ok, <<"true">>}, render("num_lt(1, 2)", #{})),
         ?_assertEqual({ok, <<"false">>}, render("num_lt(2, 2)", #{})),
@@ -227,12 +294,12 @@ compare_numbers_test_() ->
 
 syntax_error_test_() ->
     [
-        {"empty expression", fun() -> ?assertMatch(?SYNTAX_ERROR, render("", #{})) end},
-        {"const string single quote", fun() -> ?assertMatch(?SYNTAX_ERROR, render("'a'", #{})) end},
-        {"const string double quote", fun() ->
-            ?assertMatch(?SYNTAX_ERROR, render(<<"\"a\"">>, #{}))
-        end},
-        {"no arity", fun() -> ?assertMatch(?SYNTAX_ERROR, render("concat()", #{})) end}
+        {"empty expression", fun() -> ?assertMatch(?SYNTAX_ERROR, render("", #{})) end}
+    ].
+
+maps_test_() ->
+    [
+        {"arity zero", ?_assertEqual({ok, <<"0">>}, render(<<"maps.size(maps.new())">>, #{}))}
     ].
 
 render(Expression, Bindings) ->

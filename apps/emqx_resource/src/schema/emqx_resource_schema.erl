@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_resource_schema).
@@ -55,6 +43,8 @@ create_opts(Overrides) ->
             {buffer_mode, fun buffer_mode/1},
             {worker_pool_size, fun worker_pool_size/1},
             {health_check_interval, fun health_check_interval/1},
+            {health_check_interval_jitter, fun health_check_interval_jitter/1},
+            {health_check_timeout, fun health_check_timeout/1},
             {resume_interval, fun resume_interval/1},
             {metrics_flush_interval, fun metrics_flush_interval/1},
             {start_after_created, fun start_after_created/1},
@@ -113,6 +103,18 @@ health_check_interval(default) -> ?HEALTHCHECK_INTERVAL_RAW;
 health_check_interval(required) -> false;
 health_check_interval(validator) -> fun health_check_interval_range/1;
 health_check_interval(_) -> undefined.
+
+health_check_interval_jitter(type) -> emqx_schema:timeout_duration_ms();
+health_check_interval_jitter(desc) -> ?DESC("health_check_interval_jitter");
+health_check_interval_jitter(default) -> ?HEALTHCHECK_INTERVAL_JITTER_RAW;
+health_check_interval_jitter(required) -> false;
+health_check_interval_jitter(_) -> undefined.
+
+health_check_timeout(type) -> hoconsc:union([emqx_schema:timeout_duration_ms(), infinity]);
+health_check_timeout(desc) -> ?DESC("health_check_timeout");
+health_check_timeout(default) -> ?HEALTHCHECK_TIMEOUT_RAW;
+health_check_timeout(required) -> false;
+health_check_timeout(_) -> undefined.
 
 health_check_interval_range(HealthCheckInterval) when
     is_integer(HealthCheckInterval) andalso

@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2021-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 %% MQTT over QUIC
@@ -25,6 +13,7 @@
 -behaviour(quicer_remote_stream).
 
 -include("logger.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
 
 %% emqx transport Callbacks
 -export([
@@ -33,14 +22,21 @@
     getstat/2,
     fast_close/1,
     shutdown/2,
+    shutdown/3,
+    abort_read/2,
     ensure_ok_or_exit/2,
-    async_send/3,
+    send/2,
     setopts/2,
     getopts/2,
     peername/1,
     sockname/1,
-    peercert/1
+    peercert/1,
+    peersni/1,
+    wait_for_close/1
 ]).
+
+-export_type([cb_ret/0, cb_data/0, connection_handle/0, stream_handle/0, socket_info/0]).
+
 -include_lib("quicer/include/quicer.hrl").
 -include_lib("emqx/include/emqx_quic.hrl").
 
@@ -61,7 +57,7 @@
 
 -export_type([socket/0]).
 
--opaque socket() :: {quic, connection_handle(), stream_handle(), socket_info()}.
+-type socket() :: {quic, connection_handle(), stream_handle(), socket_info()}.
 
 -type socket_info() :: #{
     is_orphan => boolean(),
@@ -106,6 +102,10 @@ peercert(_S) ->
     %% @todo but unsupported by msquic
     nossl.
 
+peersni(_S) ->
+    %% @todo
+    undefined.
+
 getstat({quic, Conn, _Stream, _Info}, Stats) ->
     case quicer:getstat(Conn, Stats) of
         {error, _} -> {error, closed};
@@ -141,16 +141,46 @@ fast_close({ConnOwner, Conn, _ConnInfo}) when is_pid(ConnOwner) ->
     ok;
 fast_close({quic, _Conn, Stream, _Info}) ->
     %% Force flush, cutoff time 3s
-    _ = quicer:shutdown_stream(Stream, 3000),
+    _ = quicer:shutdown_stream(Stream, ?QUIC_SAFE_TIMEOUT),
     %% @FIXME Since we shutdown the control stream, we shutdown the connection as well
     %% *BUT* Msquic does not flush the send buffer if we shutdown the connection after
     %% gracefully shutdown the stream.
     % quicer:async_shutdown_connection(Conn, ?QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0),
     ok.
 
-shutdown({quic, _Conn, Stream, _Info}, read_write) ->
+-spec wait_for_close(quicer:stream_handle()) -> ok.
+wait_for_close(Stream) ->
+    receive
+        %% We are expecting peer to close the stream
+        {quic, Evtname, Stream, _} when
+            Evtname =:= peer_send_shutdown orelse
+                Evtname =:= peer_send_aborted orelse
+                Evtname =:= stream_closed
+        ->
+            ok
+    after ?QUIC_SAFE_TIMEOUT ->
+        ok
+    end.
+
+shutdown(Socket, Dir) ->
+    shutdown(Socket, Dir, ?QUIC_SAFE_TIMEOUT).
+
+shutdown({quic, _Conn, Stream, _Info}, read_write, Timeout) ->
     %% A graceful shutdown means both side shutdown the read and write gracefully.
-    quicer:shutdown_stream(Stream, ?QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 1, 5000).
+    quicer:shutdown_stream(Stream, ?QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 1, Timeout).
+
+abort_read({quic, _Conn, Stream, _Info}, Reason) ->
+    %% while waiting for write to complete, abort read.
+    %% use async to unblock the caller.
+    Flag = ?QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE,
+    quicer:async_shutdown_stream(
+        Stream, Flag, reason_code(Reason)
+    ).
+
+reason_code(takenover) -> ?RC_SESSION_TAKEN_OVER;
+reason_code(discarded) -> ?RC_SESSION_TAKEN_OVER;
+reason_code(kicked) -> ?RC_ADMINISTRATIVE_ACTION;
+reason_code(_) -> ?RC_UNSPECIFIED_ERROR.
 
 -spec ensure_ok_or_exit(atom(), list(term())) -> term().
 ensure_ok_or_exit(Fun, Args = [Sock | _]) when is_atom(Fun), is_list(Args) ->
@@ -165,7 +195,7 @@ ensure_ok_or_exit(Fun, Args = [Sock | _]) when is_atom(Fun), is_list(Args) ->
             Result
     end.
 
-async_send({quic, _Conn, Stream, _Info}, Data, _Options) ->
+send({quic, _Conn, Stream, _Info}, Data) ->
     case quicer:async_send(Stream, Data, ?QUICER_SEND_FLAG_SYNC) of
         {ok, _Len} -> ok;
         {error, X, Y} -> {error, {X, Y}};

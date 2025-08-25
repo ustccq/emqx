@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_mgmt_api_nodes).
 
@@ -269,13 +257,13 @@ nodes(get, _Params) ->
     list_nodes(#{}).
 
 node(get, #{bindings := #{node := NodeName}}) ->
-    emqx_utils_api:with_node(NodeName, to_ok_result_fun(fun get_node/1)).
+    with_node(NodeName, to_ok_result_fun(fun get_node/1)).
 
 node_metrics(get, #{bindings := #{node := NodeName}}) ->
-    emqx_utils_api:with_node(NodeName, to_ok_result_fun(fun emqx_mgmt:get_metrics/1)).
+    with_node(NodeName, to_ok_result_fun(fun emqx_mgmt:get_metrics/1)).
 
 node_stats(get, #{bindings := #{node := NodeName}}) ->
-    emqx_utils_api:with_node(NodeName, to_ok_result_fun(fun emqx_mgmt:get_stats/1)).
+    with_node(NodeName, to_ok_result_fun(fun emqx_mgmt:get_stats/1)).
 
 %%--------------------------------------------------------------------
 %% api apply
@@ -312,3 +300,6 @@ to_ok_result_fun(Fun) when is_function(Fun) ->
 
 not_found() ->
     emqx_dashboard_swagger:error_codes(['NOT_FOUND'], <<"Node not found">>).
+
+with_node(Name, Fn) ->
+    emqx_mgmt_api_lib:with_node(Name, Fn).

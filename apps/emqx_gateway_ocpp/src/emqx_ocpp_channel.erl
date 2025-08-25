@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2022-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2022-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 
 -module(emqx_ocpp_channel).
@@ -41,6 +29,7 @@
     init/2,
     authenticate/2,
     handle_in/2,
+    handle_frame_error/2,
     handle_deliver/2,
     handle_out/3,
     handle_timeout/3,
@@ -209,7 +198,7 @@ stats(#channel{mqueue = MQueue}) ->
 -spec init(emqx_types:conninfo(), map()) -> channel().
 init(
     ConnInfo = #{
-        peername := {PeerHost, _Port},
+        peername := {PeerHost, _Port} = PeerName,
         sockname := {_Host, SockPort}
     },
     Options
@@ -230,6 +219,7 @@ init(
             listener => ListenerId,
             protocol => ocpp,
             peerhost => PeerHost,
+            peername => PeerName,
             sockport => SockPort,
             clientid => undefined,
             username => undefined,
@@ -325,9 +315,9 @@ enrich_client(
 
 set_log_meta(#channel{
     clientinfo = #{clientid := ClientId},
-    conninfo = #{peername := Peername}
+    conninfo = #{peername := PeerName}
 }) ->
-    emqx_logger:set_metadata_peername(esockd:format(Peername)),
+    emqx_logger:set_metadata_peername(esockd:format(PeerName)),
     emqx_logger:set_metadata_clientid(ClientId).
 
 run_conn_hooks(_UserInfo, Channel = #channel{conninfo = ConnInfo}) ->
@@ -435,16 +425,20 @@ handle_in(Frame = #{type := Type}, Channel) when
 ->
     _ = publish(Frame, Channel),
     try_deliver(Channel);
-handle_in({frame_error, {badjson, ReasonStr}}, Channel) ->
+handle_in(Frame, Channel) ->
+    ?SLOG(error, #{msg => "unexpected_frame", frame => Frame}),
+    {ok, Channel}.
+
+handle_frame_error({badjson, ReasonStr}, Channel) ->
     shutdown({frame_error, {badjson, iolist_to_binary(ReasonStr)}}, Channel);
-handle_in({frame_error, {validation_faliure, Id, ReasonStr}}, Channel) ->
+handle_frame_error({validation_failure, Id, ReasonStr}, Channel) ->
     handle_out(
         dnstream,
         ?ERR_FRAME(Id, ?OCPP_ERR_FormationViolation, iolist_to_binary(ReasonStr)),
         Channel
     );
-handle_in(Frame, Channel) ->
-    ?SLOG(error, #{msg => "unexpected_incoming", frame => Frame}),
+handle_frame_error(Reason, Channel) ->
+    ?SLOG(error, #{msg => "ocpp_frame_error", reason => Reason}),
     {ok, Channel}.
 
 %%--------------------------------------------------------------------
@@ -744,7 +738,7 @@ frame2payload(Frame = #{type := ?OCPP_MSG_TYPE_ID_CALLERROR}) ->
     ).
 
 payload2frame(Payload) when is_binary(Payload) ->
-    payload2frame(emqx_utils_json:decode(Payload, [return_maps]));
+    payload2frame(emqx_utils_json:decode(Payload));
 payload2frame(#{
     <<"MessageTypeId">> := ?OCPP_MSG_TYPE_ID_CALL,
     <<"UniqueId">> := Id,

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2023-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2023-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -112,6 +112,25 @@ foreach_test() ->
     ?assertEqual(
         [1, 2, 3, 4, 5, 6],
         emqx_utils_stream:consume(emqx_utils_stream:mqueue(100))
+    ).
+
+fold_test() ->
+    S = emqx_utils_stream:drop(2, emqx_utils_stream:list([1, 2, 3, 4, 5])),
+    ?assertEqual(
+        3 * 4 * 5,
+        emqx_utils_stream:fold(fun(X, P) -> P * X end, 1, S)
+    ).
+
+fold_n_test() ->
+    S = emqx_utils_stream:repeat(
+        emqx_utils_stream:map(
+            fun(X) -> X * 2 end,
+            emqx_utils_stream:list([1, 2, 3])
+        )
+    ),
+    ?assertMatch(
+        {2 + 4 + 6 + 2 + 4 + 6 + 2, _SRest},
+        emqx_utils_stream:fold(fun(X, Sum) -> Sum + X end, 0, _N = 7, S)
     ).
 
 chainmap_test() ->

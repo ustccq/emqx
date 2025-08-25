@@ -1,17 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2024 EMQ Technologies Co., Ltd. All Rights Reserved.
-%%
-%% Licensed under the Apache License, Version 2.0 (the "License");
-%% you may not use this file except in compliance with the License.
-%% You may obtain a copy of the License at
-%%
-%%     http://www.apache.org/licenses/LICENSE-2.0
-%%
-%% Unless required by applicable law or agreed to in writing, software
-%% distributed under the License is distributed on an "AS IS" BASIS,
-%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-%% See the License for the specific language governing permissions and
-%% limitations under the License.
+%% Copyright (c) 2020-2025 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%--------------------------------------------------------------------
 -module(emqx_config_logger).
 
@@ -169,7 +157,7 @@ tr_file_handler({HandlerName, SubConf}) ->
         level => conf_get("level", SubConf),
         config => HandlerConf#{
             type => Type,
-            file => FilePath,
+            file => emqx_schema:naive_env_interpolation(FilePath),
             max_no_files => RotationCount,
             max_no_bytes => RotationSize
         },
@@ -187,6 +175,9 @@ logger_file_handlers(Conf) ->
     logger_handlers(Handlers).
 
 logger_handlers(Handlers) ->
+    keep_only_enabeld(Handlers).
+
+keep_only_enabeld(Handlers) ->
     lists:filter(
         fun({_Name, Handler}) ->
             conf_get("enable", Handler, false)
@@ -237,32 +228,38 @@ log_formatter(HandlerName, Conf) ->
             _ ->
                 conf_get("formatter", Conf)
         end,
-    TsFormat = timstamp_format(Conf),
+    TsFormat = timestamp_format(Conf),
+    WithMfa = conf_get("with_mfa", Conf),
+    PayloadEncode = conf_get("payload_encode", Conf, text),
     do_formatter(
-        Format, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat
+        Format, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat, WithMfa, PayloadEncode
     ).
 
 %% auto | epoch | rfc3339
-timstamp_format(Conf) ->
+timestamp_format(Conf) ->
     conf_get("timestamp_format", Conf).
 
 %% helpers
-do_formatter(json, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat) ->
+do_formatter(json, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat, WithMfa, PayloadEncode) ->
     {emqx_logger_jsonfmt, #{
         chars_limit => CharsLimit,
         single_line => SingleLine,
         time_offset => TimeOffSet,
         depth => Depth,
-        timestamp_format => TsFormat
+        timestamp_format => TsFormat,
+        with_mfa => WithMfa,
+        payload_encode => PayloadEncode
     }};
-do_formatter(text, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat) ->
+do_formatter(text, CharsLimit, SingleLine, TimeOffSet, Depth, TsFormat, WithMfa, PayloadEncode) ->
     {emqx_logger_textfmt, #{
         template => ["[", level, "] ", msg, "\n"],
         chars_limit => CharsLimit,
         single_line => SingleLine,
         time_offset => TimeOffSet,
         depth => Depth,
-        timestamp_format => TsFormat
+        timestamp_format => TsFormat,
+        with_mfa => WithMfa,
+        payload_encode => PayloadEncode
     }}.
 
 %% Don't record all logger message
